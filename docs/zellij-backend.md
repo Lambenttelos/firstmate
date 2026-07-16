@@ -95,7 +95,7 @@ Zellij tasks additionally record:
 | Headless session start | `zellij attach -b <name>` with stdin redirected from `/dev/null` and no controlling TTY | Creates the session and returns promptly (cannot actually attach without a TTY, so it exits after creating). The session persists with zero attached clients - `dump-screen`, `list-panes`, etc. all work against it. Running it again against an EXISTING session prints `"Session already exists"` and exits 1 - harmless, since existence is checked first via `list-sessions` and the launch call's own exit status is never inspected. |
 | Session existence check | `zellij list-sessions --short --no-formatting` | Plain one-name-per-line output, safe to `grep -qxF`. Passive - never starts a session (unlike herdr's `target_ready`, which DOES auto-start: a herdr server restart is non-destructive and recovers persisted state, but zellij's `kill-session` is destructive, so auto-recreating under an unexpected name would silently orphan whatever the caller meant to reach). |
 | Duplicate task check | `zellij action list-tabs --json`, match by home-scoped `.name` | Zellij does NOT enforce tab-name uniqueness itself (verified: two tabs can share a name, same as herdr's tabs). The adapter's own duplicate check is required, and it checks the home-scoped title such as `fm-firstmate-a1b2c3d4-<id>` (see "Home-scoped tab titles" above), never the bare `fm-<id>` label. |
-| Create task tab | `zellij action new-tab --cwd <dir> --name <scoped-title>` | Returns the created tab's bare integer id on stdout, exactly as documented (resolves report gap #3). No `--no-focus`-equivalent flag exists at all - see "Focus-steal on new-tab" below. The caller passes `fm-<id>`, but the adapter creates `fm-<home-label>-<id>`. |
+| Create task tab | `zellij action new-tab --cwd <dir> --name <scoped-title>` | Usually returns the created tab's bare integer id on stdout, but on zellij 0.44.3+ can return exit 0 with empty stdout (tab IS created successfully; id may route to an attached client's terminal instead of CLI stdout - see "new-tab empty-stdout" below). When stdout is empty, `create_task` resolves the tab id by matching the home-scoped title through `list-tabs --json`. No `--no-focus`-equivalent flag exists at all - see "Focus-steal on new-tab" below. The caller passes `fm-<id>`, but the adapter creates `fm-<home-label>-<id>`. |
 | Pane discovery | `zellij action list-panes --json`, filter `.tab_id == <id> and .is_plugin == false` | `tab_id`, `id` (the pane's own bare integer id), `is_plugin`, and `pane_cwd` are ALL present in the default `--json` output with no extra flags (`--tab`/`--geometry`/`--state`/`--command` add more fields but are not needed here). Terminal (non-plugin) pane ids are globally unique across a session's whole tab set - a SEPARATE incrementing namespace from plugin panes, which is why a plugin pane and a terminal pane can share the same bare `id` (the CLI's own `--pane-id` contract, `"3 (equivalent to terminal_3)"`, already documents this split). |
 | Worktree-path discovery | marked active cwd probe + capture-scrape (`fm_backend_zellij_current_path`), NOT `.pane_cwd` | `.pane_cwd` reflects a `cd` run directly in the pane's own top-level shell, but does NOT follow a NESTED SUBSHELL's own `cd` (exactly what `treehouse get` does) - see "Worktree-path discovery: pane_cwd does not track a subshell" below. This directly contradicts the design report's assumption that passive `pane_cwd` polling would be "acceptable for tmux and zellij" (report gap #4 is NOT cleanly resolved as originally framed; the adapter works around it instead). |
 | Send literal (unsubmitted) | `zellij action paste --pane-id <id> -- <text>` | Uses bracketed paste mode, does NOT auto-submit. Verified directly: a marker sent this way sits unexecuted at the prompt until a separate Enter. Behaves like tmux's `send-keys -l` / herdr's `pane send-text`. Chosen over `write-chars` per the design report's recommendation for popup-safety parity with the other backends. The `--` separator keeps option-shaped text such as `--help` literal. |
@@ -158,7 +158,8 @@ This means the exit code can **never** be trusted to detect a bad target on this
    This catches a whole session gone (killed externally, or a stale meta from a prior run), the normal stale-pane case, and stale numeric pane ids reused by an unrelated recreated session.
    Explicit raw `session:pane` targets keep the pane-only check because they intentionally have no recorded `fm-<id>` ownership context.
    Kill checks the session, resolves the tab from the pane when possible, and uses teardown's recorded `zellij_tab_id` fallback when the pane is already gone only after `list-tabs --json` proves the tab still matches the expected caller-facing `fm-<id>` label through that same title check.
-2. Output-**shape** validation rejects the "session not found" text fallback structurally: `fm_backend_zellij_create_task` requires `new-tab`'s stdout to parse as a bare integer (the colored session-list text does not), and every `list-panes`/`list-tabs` consumer pipes through `jq`, which fails to parse the plain-text fallback as JSON.
+2. Output-**shape** validation rejects the "session not found" text fallback structurally: every `list-panes`/`list-tabs` consumer pipes through `jq`, which fails to parse the plain-text fallback as JSON.
+   `fm_backend_zellij_create_task` accepts a numeric `new-tab` stdout as the fast path, and on empty/stdout falls back to resolving the tab id through `list-tabs --json` matched by the home-scoped title (see "new-tab empty-stdout" below). If that title-based resolution also fails, `create_task` reports a hard error and aborts - it never silently trusts a mismatched or missing tab.
 
 **Accepted residual gaps**: a pane can still die in the brief window between `fm_backend_zellij_target_ready`'s ownership check and the operation's own `zellij action` call.
 That remaining race degrades to "the operation quietly did nothing" - the same class of gap firstmate already tolerates for an unverified send on any backend, caught downstream by `fm-spawn.sh`'s worktree-discovery poll timing out after 60s, `fm_backend_zellij_send_text_submit`'s preflight or content-diff retry loop (which reports `send-failed`, `pending`, or `unknown` rather than a false "sent" for these cases), or the watcher's stale-pane detection eventually noticing a pane that never changes.
@@ -180,6 +181,36 @@ Same as herdr's tabs and unlike tmux's own window-name uniqueness: `zellij actio
 Unlike herdr (where closing a tab's only root pane also closes the tab), zellij's `close-pane --pane-id <id>` leaves an empty "ghost" tab behind in `list-tabs --json` - verified: the tab entry persists with zero panes until explicitly closed.
 `close-tab-by-id <id>` on a still-LIVE tab (pane running normally) was separately verified to cleanly remove both the pane and the tab in one call, needing no `close-pane` first.
 This is why `fm_backend_zellij_kill` resolves the owning tab id from the pane when possible, accepts teardown's recorded `zellij_tab_id` as a fallback when the pane has already gone, verifies the expected caller-facing `fm-<id>` label through the home-scoped-title or unambiguous legacy-title check when teardown provides it, and calls `close-tab-by-id`, rather than mirroring herdr's simpler "close the pane, the tab follows" contract.
+
+## `new-tab` empty-stdout on zellij 0.44.3+ (field evidence, 2026-07-16)
+
+On zellij 0.44.3, `zellij action new-tab` can return exit 0 with empty stdout.
+The tab IS created successfully, but its id is not echoed to the CLI call's stdout.
+
+Leading (unconfirmed) hypothesis: zellij is client/server, and `new-tab` routes the created tab id to an attached client's terminal rather than the CLI call's stdout, so a call with no attached client gets empty stdout.
+Regardless of root cause, the empty-stdout path is real and was observed live: 6 consecutive `create_task` spawn attempts for the `test-green-t8` secondmate all failed on the empty-stdout abort, while the same firstmate home's attached-session zellij spawns worked (their stdout carried the id).
+
+The fix (committed to `bin/backends/zellij.sh` on the `fm/fix-zellij-newtab-spawn` branch):
+
+- Fast path unchanged: when `new-tab` echos a numeric id, use it.
+- Empty-stdout path: after `new-tab` returns empty stdout, call `zellij action list-tabs --json` and match the tab whose `.name` equals the home-scoped title `create_task` just set (e.g. `fm-firstmate-a1b2c3d4-fix-login-k3`).
+  Mismatched or unrelated tabs are never picked - the match is scoped to the exact title this home just created.
+- If that resolution also fails (no matching tab found), `create_task` reports a hard error: `"could not resolve tab by home-scoped title"`.
+
+Empirical evidence from a live 0.44.3 session:
+
+```
+$ zellij --version
+zellij 0.44.3
+$ zellij action new-tab --cwd /tmp --name fm-test-empty-stdout; echo "exit=$?"
+(no output)
+exit=0
+$ zellij action list-tabs --json | jq '.[] | {tab_id, name}'
+{
+  "tab_id": 3,
+  "name": "fm-test-empty-stdout"
+}
+```
 
 ## Composer verification: delta-based
 

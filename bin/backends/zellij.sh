@@ -48,8 +48,12 @@
 #   2. Key names: Enter -> "Enter", Escape -> "Esc" (NOT "Escape"), Ctrl-C ->
 #      "Ctrl c" as ONE shell argument with an embedded space (NOT two argv
 #      words, NOT "C-c" or "Ctrl+c" - all verified to fail).
-#   3. `new-tab --cwd --name` DOES return the created tab's bare integer id on
-#      stdout, exactly as documented.
+#   3. `new-tab --cwd --name` usually returns the created tab's bare integer id
+#      on stdout, but on zellij 0.44.3+ can return exit 0 with empty stdout
+#      (tab IS created successfully; id may route to an attached client's
+#      terminal instead of the CLI call's stdout). When stdout is empty,
+#      resolve the tab id by matching the home-scoped title in list-tabs
+#      --json - see create_task and docs/zellij-backend.md.
 #   4. `list-panes --json`'s `pane_cwd` reflects a `cd` run DIRECTLY in the
 #      pane's own top-level shell within one poll (<0.3s) - but does NOT
 #      reflect a `cd` performed by a NESTED SUBSHELL the pane's shell
@@ -339,8 +343,17 @@ fm_backend_zellij_create_task() {  # <session> <label> <cwd>
   tab_id=$(fm_backend_zellij_cli "$session" action new-tab --cwd "$cwd" --name "$title" 2>/dev/null | tr -d '[:space:]')
   case "$tab_id" in
     ''|*[!0-9]*)
-      echo "error: zellij new-tab did not return a numeric tab id for '$title' (got '$tab_id'; session '$session' may not exist)" >&2
-      return 1
+      # new-tab returned empty or non-numeric stdout (zellij 0.44.3+
+      # regression: tab IS created but id is not echoed to CLI stdout).
+      # Resolve by matching the home-scoped title we just set.
+      tabs=$(fm_backend_zellij_cli "$session" action list-tabs --json 2>/dev/null)
+      tab_id=$(printf '%s' "$tabs" | jq -r --arg want "$title" '.[]? | select(.name == $want) | .tab_id' 2>/dev/null | head -1)
+      case "$tab_id" in
+        ''|*[!0-9]*)
+          echo "error: zellij new-tab did not return a numeric tab id, and could not resolve tab by home-scoped title '$title' in session '$session'" >&2
+          return 1
+          ;;
+      esac
       ;;
   esac
   pane_id=$(fm_backend_zellij_pane_for_tab "$session" "$tab_id")

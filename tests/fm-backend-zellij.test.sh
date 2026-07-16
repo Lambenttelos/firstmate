@@ -520,6 +520,57 @@ test_create_task_no_restore_when_new_tab_was_already_active() {
   pass "fm_backend_zellij_create_task: skips the restore call when there was no previously-active tab"
 }
 
+# --- create_task: empty-stdout new-tab id resolution (zellij 0.44.3+) ---------
+
+test_create_task_resolves_tab_by_title_when_newtab_stdout_empty() {
+  local dir fb out title
+  dir="$TMP_ROOT/create-title-resolve"; mkdir -p "$dir/responses"
+  title=$(zellij_expected_scoped_title fm-empty-out)
+  # 1: list-tabs --json -> no existing tabs, none active
+  printf '[]\n' > "$dir/responses/1.out"
+  # 2: new-tab returns empty stdout (no file = success + empty stdout)
+  # 3: list-tabs --json -> new tab appears with matching home-scoped title
+  printf '[{"tab_id":6,"name":"%s","active":true}]\n' "$title" > "$dir/responses/3.out"
+  # 4: list-panes --json -> terminal pane of the new tab
+  printf '[{"id":14,"tab_id":6,"is_plugin":false}]\n' > "$dir/responses/4.out"
+  fb=$(make_zellij_fakebin "$dir")
+  out=$( PATH="$fb:$PATH" FM_ZELLIJ_LOG="$dir/log" FM_ZELLIJ_RESPONSES="$dir/responses" \
+    FM_ZELLIJ_SESSION_LIST="firstmate" \
+    bash -c '. "$0/bin/backends/zellij.sh"; fm_backend_zellij_create_task firstmate fm-empty-out /tmp/proj' "$ROOT" )
+  [ "$out" = "6 14" ] || fail "create_task should resolve tab_id from title fallback and echo '<tab_id> <pane_id>', got '$out'"
+  # Verify new-tab was called, then list-tabs was called again (empty-stdout fallback)
+  assert_contains "$(cat "$dir/log")" $'\x1f''new-tab'$'\x1f''--cwd' \
+    "create_task did not call new-tab at all (empty-stdout path)"
+  # list-tabs should appear twice: once for dup/active check, once for title resolution
+  local list_tabs_count
+  list_tabs_count=$(grep -c $'\x1f''list-tabs'$'\x1f''--json' "$dir/log" 2>/dev/null || true)
+  [ "$list_tabs_count" = "2" ] || fail "create_task empty-stdout path should call list-tabs twice (dup check + title resolution), got $list_tabs_count"
+  pass "fm_backend_zellij_create_task: resolves tab_id from home-scoped title when new-tab stdout is empty (zellij 0.44.3+)"
+}
+
+test_create_task_errors_when_newtab_stdout_empty_and_title_not_found() {
+  local dir fb out status title
+  dir="$TMP_ROOT/create-title-missing"; mkdir -p "$dir/responses"
+  title=$(zellij_expected_scoped_title fm-missing-tab)
+  # 1: list-tabs --json -> no existing tabs, none active
+  printf '[]\n' > "$dir/responses/1.out"
+  # 2: new-tab returns empty stdout (no file = success + empty stdout)
+  # 3: list-tabs --json -> still no tabs (new-tab genuinely failed,
+  #    or list-tabs after new-tab doesn't include it)
+  printf '[]\n' > "$dir/responses/3.out"
+  fb=$(make_zellij_fakebin "$dir")
+  out=$( PATH="$fb:$PATH" FM_ZELLIJ_LOG="$dir/log" FM_ZELLIJ_RESPONSES="$dir/responses" \
+    FM_ZELLIJ_SESSION_LIST="firstmate" \
+    bash -c '. "$0/bin/backends/zellij.sh"; fm_backend_zellij_create_task firstmate fm-missing-tab /tmp/proj' "$ROOT" 2>&1 )
+  status=$?
+  [ "$status" -ne 0 ] || fail "create_task should fail when new-tab stdout is empty and title not found in list-tabs"
+  assert_contains "$out" "could not resolve tab by home-scoped title" \
+    "create_task did not report the title-resolution failure"
+  assert_contains "$out" "$title" \
+    "create_task's error did not name the home-scoped title it searched for"
+  pass "fm_backend_zellij_create_task: hard error when new-tab stdout empty and title not found in list-tabs"
+}
+
 # --- capture / send_key / send_literal / current_path / kill -----------------
 
 test_capture_small_reads_use_viewport_and_trim() {
@@ -1040,6 +1091,8 @@ test_create_task_refuses_duplicate_label
 test_create_task_creates_and_parses_ids
 test_create_task_restores_previously_active_tab
 test_create_task_no_restore_when_new_tab_was_already_active
+test_create_task_resolves_tab_by_title_when_newtab_stdout_empty
+test_create_task_errors_when_newtab_stdout_empty_and_title_not_found
 test_capture_small_reads_use_viewport_and_trim
 test_capture_large_reads_use_full_scrollback_and_trim
 test_capture_fails_when_pane_absent
