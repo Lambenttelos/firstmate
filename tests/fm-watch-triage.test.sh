@@ -1270,6 +1270,78 @@ test_afk_paused_changed_pane_hands_off_plain_stale() {
   pass "AFK changed paused panes hand off plain stale identities for daemon-owned pause triage"
 }
 
+# --- secondmate context-handoff monitor (secondmate_context_sweep) -----------
+# The slow-poll context monitor wakes firstmate once with a check: wake when a
+# live secondmate's context crosses the threshold, and stays quiet otherwise.
+
+# Write a claude transcript under CLAUDE_CONFIG_DIR for <home> whose last
+# main-thread usage sums to <tokens>.
+write_sm_transcript() {  # <config-dir> <home> <tokens>
+  local config=$1 home=$2 tokens=$3 dir
+  dir="$config/projects/$(printf '%s' "$home" | tr '/.' '--')"
+  mkdir -p "$dir"
+  printf '{"type":"assistant","message":{"usage":{"input_tokens":%s,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}\n' \
+    "$tokens" > "$dir/s.jsonl"
+}
+
+test_secondmate_over_context_threshold_surfaced() {
+  local dir state fakebin out drain_out config home pid
+  dir=$(make_case sm-context-over); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; drain_out="$dir/drain.out"
+  config="$dir/claude"; home="$dir/sm-home"; mkdir -p "$home/data"
+  fm_write_meta "$state/pricing.meta" "window=test:fm-pricing" "kind=secondmate" "harness=claude" "home=$home"
+  write_sm_transcript "$config" "$home" 260000
+  PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=1 FM_HEARTBEAT=999999 CLAUDE_CONFIG_DIR="$config" "$WATCH" > "$out" &
+  pid=$!
+  wait_for_exit "$pid" 40 || fail "watcher did not surface a secondmate over its context threshold: $(cat "$out")"
+  grep -F "secondmate-context pricing" "$out" >/dev/null || fail "watcher did not print the context wake reason: $(cat "$out")"
+  FM_STATE_OVERRIDE="$state" "$DRAIN" > "$drain_out" 2>/dev/null || fail "drain after the context wake failed"
+  grep "$(printf '\tcheck\t')" "$drain_out" | grep -F "secondmate-context-pricing" >/dev/null \
+    || fail "context crossing was not queued as a check wake"
+  [ -e "$state/.sm-context-surfaced-test_fm-pricing" ] || fail "context crossing did not record its surfaced marker"
+  pass "a secondmate over its context threshold is surfaced once as a check wake"
+}
+
+test_secondmate_under_context_threshold_absorbed() {
+  local dir state fakebin out config home pid
+  dir=$(make_case sm-context-under); state="$dir/state"; fakebin="$dir/fakebin"; out="$dir/watch.out"
+  config="$dir/claude"; home="$dir/sm-home"; mkdir -p "$home/data"
+  fm_write_meta "$state/pricing.meta" "window=test:fm-pricing" "kind=secondmate" "harness=claude" "home=$home"
+  # Pre-arm a surfaced marker; an under-threshold read must clear it (re-arm) and never wake.
+  : > "$state/.sm-context-surfaced-test_fm-pricing"
+  write_sm_transcript "$config" "$home" 50000
+  PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=1 FM_HEARTBEAT=999999 CLAUDE_CONFIG_DIR="$config" "$WATCH" > "$out" &
+  pid=$!
+  if ! wait_live "$pid" 20; then
+    reap "$pid"; fail "watcher exited for a secondmate under its context threshold (should stay quiet): $(cat "$out")"
+  fi
+  grep -F "secondmate-context" "$out" >/dev/null && { reap "$pid"; fail "under-threshold secondmate printed a context wake"; }
+  [ ! -e "$state/.sm-context-surfaced-test_fm-pricing" ] || { reap "$pid"; fail "under-threshold read did not re-arm (clear) the surfaced marker"; }
+  reap "$pid"
+  pass "a secondmate under its context threshold is not surfaced and its marker re-arms"
+}
+
+test_secondmate_unknown_context_fails_closed() {
+  local dir state fakebin out config home pid
+  dir=$(make_case sm-context-unknown); state="$dir/state"; fakebin="$dir/fakebin"; out="$dir/watch.out"
+  config="$dir/claude"; home="$dir/sm-home"; mkdir -p "$home/data"
+  # codex harness: no verified read -> unknown -> must never wake (fail closed),
+  # even though a transcript exists at the claude path.
+  fm_write_meta "$state/pricing.meta" "window=test:fm-pricing" "kind=secondmate" "harness=codex" "home=$home"
+  write_sm_transcript "$config" "$home" 260000
+  PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=1 FM_HEARTBEAT=999999 CLAUDE_CONFIG_DIR="$config" "$WATCH" > "$out" &
+  pid=$!
+  if ! wait_live "$pid" 20; then
+    reap "$pid"; fail "watcher exited on an unreadable secondmate context (should fail closed): $(cat "$out")"
+  fi
+  grep -F "secondmate-context" "$out" >/dev/null && { reap "$pid"; fail "an unreadable context triggered a wake instead of failing closed"; }
+  reap "$pid"
+  pass "an unreadable (non-claude) secondmate context never wakes (fails closed)"
+}
+
 test_signal_reason_is_actionable_classifier
 test_stale_is_terminal_classifier
 test_scan_captain_relevant_statuses_classifier
@@ -1304,3 +1376,6 @@ test_heartbeat_backstop_surfaces_unsurfaced_status
 test_beacon_stays_fresh_while_absorbing
 test_afk_present_reverts_watcher_to_one_shot
 test_afk_paused_changed_pane_hands_off_plain_stale
+test_secondmate_over_context_threshold_surfaced
+test_secondmate_under_context_threshold_absorbed
+test_secondmate_unknown_context_fails_closed

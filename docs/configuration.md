@@ -187,6 +187,15 @@ Those inherited values are defaults and rules only; `fm-spawn` still permits a c
 For grok, `fm-spawn.sh` installs one firstmate-owned global turn-end hook under `$GROK_HOME/hooks/`, or `~/.grok/hooks/` when `GROK_HOME` is unset, and drops a per-task `.fm-grok-turnend` pointer in the worktree, with teardown removing the task token and pointer.
 For Pi secondmate launches, `fm-spawn.sh` starts Pi with `-e` pointed at the secondmate home's own tracked `.pi/extensions/fm-primary-pi-watch.ts` and `.pi/extensions/fm-primary-turnend-guard.ts`, both already present from the secondmate home's git worktree.
 
+## Secondmate context-handoff threshold (config/secondmate-context-threshold)
+
+`config/secondmate-context-threshold` is an optional local, gitignored file holding a single positive integer: the context-window token count at which a live secondmate is handed off to a fresh agent instead of running `/compact`.
+The first non-empty, non-comment line is parsed; an absent file, a non-integer, or a non-positive value falls back to the default `200000`, so a typo never silently disables the safety net.
+`200000` is the point a 200k-window model reaches auto-compact; raise the knob for a larger-window model.
+This is the primary's monitoring knob and is not inherited into secondmate homes, because secondmates do not spawn secondmates and so have nothing downstream that reads it.
+The primary's watcher reads each live secondmate's usage on its slow-poll cadence (claude only; every other harness reads unknown and is skipped) and wakes firstmate once when the count first crosses the threshold.
+The read mechanism and the evidence behind the claude-only support live in [`docs/secondmate-context-handoff.md`](secondmate-context-handoff.md); the handoff procedure lives in the `secondmate-provisioning` skill; exact flags and paths live in the headers and `--help` of [`bin/fm-secondmate-context.sh`](../bin/fm-secondmate-context.sh) and [`bin/fm-secondmate-handoff.sh`](../bin/fm-secondmate-handoff.sh).
+
 ## Crew dispatch profiles (config/crew-dispatch.json)
 
 `config/crew-dispatch.json` is an optional local, gitignored file containing natural-language rules that firstmate reads before dispatching a crewmate or scout.

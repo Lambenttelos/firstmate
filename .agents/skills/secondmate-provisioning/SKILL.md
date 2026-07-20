@@ -2,8 +2,8 @@
 name: secondmate-provisioning
 description: >-
   Agent-only reference for persistent secondmate setup and retirement.
-  Use when creating, seeding, validating, launching, recovering, handing backlog to, pushing inherited local material into, or retiring a secondmate home, or when editing data/secondmates.md.
-  Covers home leases, transactional seeding, project clone restrictions, secondmate harness pins, inherited local-material push, idle charter, handoff helper, and teardown safety.
+  Use when creating, seeding, validating, launching, recovering, handing backlog to, pushing inherited local material into, or retiring a secondmate home, when handing a context-full secondmate off to a fresh agent, or when editing data/secondmates.md.
+  Covers home leases, transactional seeding, project clone restrictions, secondmate harness pins, inherited local-material push, idle charter, backlog and context handoff, and teardown safety.
 user-invocable: false
 metadata:
   internal: true
@@ -143,6 +143,24 @@ Done records stay with their home for pruning or archiving.
 It is idempotent; an item already in the secondmate backlog is skipped.
 It refuses any destination that is not a genuine seeded firstmate home with safe operational directories and a matching `.fm-secondmate-home` marker, so a move can never land in a project.
 Do not hand off `local-only` items.
+
+## Context handoff
+
+When a persistent secondmate's context window fills, `/compact` degrades its working memory and answer quality.
+Hand its work off to a FRESH secondmate agent that recovers from durable on-disk state plus a continuation document, done BEFORE the context fills, instead of compacting the tired agent.
+This owns the procedure; the read mechanism and its claude-only evidence live in `docs/secondmate-context-handoff.md`, the threshold knob in `docs/configuration.md`, and exact flags and paths in the two scripts' headers and `--help`.
+
+The primary's watcher reads each live secondmate's context usage on its slow-poll cadence and wakes firstmate with a `check:` `secondmate-context <id>` event when the count first crosses the configured threshold (default 200000 tokens, `config/secondmate-context-threshold`).
+The read is claude-only and fails closed: every other harness reads unknown and never triggers a handoff.
+On that wake, or when the captain asks for a proactive handoff, run:
+
+```sh
+bin/fm-secondmate-handoff.sh <id>
+```
+
+It orchestrates, idempotently and failing closed: it resolves the secondmate from `state/<id>.meta` and refuses a non-secondmate, a missing window (that is a recovery case, not a handoff), or a missing home; refuses unless the context is over the threshold (`--force` bypasses that gate for a captain-directed proactive handoff, and an unreadable read refuses without it); refuses to steer a mid-turn agent; steers the secondmate to write its continuation document to the durable in-home path `data/handoff-latest.md` (never OS temp) via `/handoff`, then run `stow`; waits, bounded, for that document; exits the old agent with the harness-correct exit form (`harness-adapters`); and respawns a fresh secondmate with `bin/fm-spawn.sh <id> --secondmate`, pointing it at the durable document plus its charter.
+Inspect a planned handoff first with `bin/fm-secondmate-context.sh <id>` (a read-only usage report) or `FM_SM_HANDOFF_DRY_RUN=1`.
+The respawn preserves the home's backlog, projects, and in-flight crew exactly as the recovery path below does; a context handoff never tears down or discards unlanded work, and never uses `--force` teardown.
 
 ## Recovery
 

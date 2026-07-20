@@ -45,6 +45,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
+CONFIG="${FM_CONFIG_OVERRIDE:-$FM_HOME/config}"
 mkdir -p "$STATE"
 
 # shellcheck source=bin/fm-wake-lib.sh
@@ -81,6 +82,11 @@ mkdir -p "$STATE"
 # cheap when no records exist and never scrapes secondmate conversation.
 # shellcheck source=bin/fm-pending-reply-lib.sh
 . "$SCRIPT_DIR/fm-pending-reply-lib.sh"
+# Secondmate context-window read + threshold, for the slow-poll context monitor
+# (secondmate_context_sweep). Fails closed: an unreadable/unsupported harness
+# yields no tokens and never wakes. See docs/secondmate-context-handoff.md.
+# shellcheck source=bin/fm-secondmate-context-lib.sh
+. "$SCRIPT_DIR/fm-secondmate-context-lib.sh"
 
 WATCH_LOCK="$STATE/.watch.lock"
 WATCH_PATH="$SCRIPT_DIR/fm-watch.sh"
@@ -251,6 +257,46 @@ recorded_windows() {
     seen="$seen|$w|"
     printf '%s\n' "$w"
   done
+}
+
+# secondmate_context_sweep: the slow-poll context monitor. For each live
+# secondmate window, read its context-window occupancy (claude only; every other
+# harness reads unknown and is skipped - fail closed, no false handoff) and wake
+# firstmate once when it first crosses the configured threshold, so a proactive
+# handoff replaces the context-full agent BEFORE it must /compact. A per-window
+# surfaced marker makes the crossing idempotent: the wake fires once and re-arms
+# only after the count drops back under the threshold (a fresh post-handoff
+# agent). Runs only on the CHECK_INTERVAL cadence, never on every fast poll.
+# Like the *.check.sh loop it lives in, wake() exits the cycle; a second crossed
+# secondmate surfaces on a later cycle.
+secondmate_context_sweep() {
+  local threshold w meta home harness tokens key marker id reason
+  threshold=$(fm_sm_context_threshold "$CONFIG")
+  while IFS= read -r w; do
+    [ -n "$w" ] || continue
+    [ "$(window_kind "$w")" = secondmate ] || continue
+    meta=$(fm_backend_meta_for_window "$w" "$STATE" 2>/dev/null || true)
+    [ -n "$meta" ] || continue
+    home=$(fm_meta_get "$meta" home); [ -n "$home" ] || home=$(fm_meta_get "$meta" worktree)
+    [ -n "$home" ] || continue
+    harness=$(fm_meta_get "$meta" harness); [ -n "$harness" ] || harness=$(fm_backend_of_meta "$meta")
+    tokens=$(fm_sm_context_tokens "$home" "$harness" 2>/dev/null || true)
+    key=$(printf '%s' "$w" | tr ':/.' '___')
+    marker="$STATE/.sm-context-surfaced-$key"
+    if [ -n "$tokens" ] && [ "$tokens" -ge "$threshold" ]; then
+      [ -e "$marker" ] && continue
+      : > "$marker"
+      id=$(window_to_task "$w" "$STATE")
+      reason="check: secondmate-context $id (context ${tokens} tokens >= threshold ${threshold})"
+      fm_wake_append check "secondmate-context-$id" "$reason" || exit 1
+      touch "$STATE/.last-check"
+      wake "$reason"
+    else
+      rm -f "$marker"
+    fi
+  done <<EOF
+$(recorded_windows)
+EOF
 }
 
 # Exit reporting a wake. Consecutive heartbeats with no other wake in between
@@ -820,6 +866,9 @@ while :; do
       touch "$STATE/.last-check"
       wake "$reason"
     fi
+    # Slow-poll context monitor: wake once when a secondmate crosses the handoff
+    # threshold. wake() exits the cycle when it fires (marker prevents re-fire).
+    secondmate_context_sweep
     touch "$STATE/.last-check"
   fi
 
