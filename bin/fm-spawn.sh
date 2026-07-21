@@ -1,14 +1,20 @@
 #!/usr/bin/env bash
 # Spawn a direct report: a crewmate in a treehouse or Orca worktree, or a
 # secondmate in its isolated firstmate home.
-# Usage: fm-spawn.sh <task-id> <project-dir> [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>] [--scout]
-#        fm-spawn.sh <task-id> [<firstmate-home>] [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>] --secondmate
+# Usage: fm-spawn.sh <task-id> <project-dir> [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>] [--env <KEY=VAL>]... [--scout]
+#        fm-spawn.sh <task-id> [<firstmate-home>] [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>] [--env <KEY=VAL>]... --secondmate
 #   --harness <name> is the explicit per-spawn harness/profile adapter. The old
 #   positional harness arg still works for back-compat.
 #   --model <name> and --effort <low|medium|high|xhigh|max> are concrete profile
 #   axes chosen by firstmate at intake. They are only threaded into harnesses whose
 #   installed CLIs were verified to support that axis; unsupported axes are omitted
 #   from that harness's launch rather than guessed.
+#   --env KEY=VAL (repeatable) exports KEY=VAL into the crewmate pane shell
+#   before the agent launches, so the agent and every child process inherits it.
+#   Last --env for the same KEY wins (shell `export` override). This is the
+#   per-spawn API-token swap path for harnesses whose auth rides an env var -
+#   e.g. OPENCODE_API_KEY for a second opencode-go workspace. The wrapper
+#   bin/fm-spawn-joe.sh owns the canonical joe-workspace token lookup + call.
 #   --backend <name> is the explicit runtime session-provider backend for this
 #   spawn. Without it, the script resolves FM_BACKEND, then config/backend, then
 #   runtime auto-detection (the runtime firstmate itself is executing inside -
@@ -151,6 +157,7 @@ HARNESS_SET=0
 MODEL_SET=0
 EFFORT_SET=0
 BACKEND_SET=0
+ENV_OVERRIDES=()
 POS=()
 want_value=
 for a in "$@"; do
@@ -163,6 +170,13 @@ for a in "$@"; do
       model) MODEL=$a; MODEL_SET=1 ;;
       effort) EFFORT=$a; EFFORT_SET=1 ;;
       backend) BACKEND_ARG=$a; BACKEND_SET=1 ;;
+      env_override)
+        case "$a" in
+          *=*) ;;
+          *) echo "error: --env requires KEY=VAL (got: $a)" >&2; exit 1 ;;
+        esac
+        ENV_OVERRIDES+=("$a")
+        ;;
       *) echo "error: internal parser state for --$want_value" >&2; exit 1 ;;
     esac
     want_value=
@@ -179,6 +193,15 @@ for a in "$@"; do
     --effort=*) EFFORT=${a#--effort=}; EFFORT_SET=1 ;;
     --backend) want_value=backend ;;
     --backend=*) BACKEND_ARG=${a#--backend=}; BACKEND_SET=1 ;;
+    --env) want_value=env_override ;;
+    --env=*)
+      v=${a#--env=}
+      case "$v" in
+        *=*) ;;
+        *) echo "error: --env requires KEY=VAL (got: $v)" >&2; exit 1 ;;
+      esac
+      ENV_OVERRIDES+=("$v")
+      ;;
     *) POS+=("$a") ;;
   esac
 done
@@ -187,6 +210,16 @@ done
 [ "$MODEL_SET" -eq 0 ] || [ -n "$MODEL" ] || { echo "error: --model requires a non-empty value" >&2; exit 1; }
 [ "$EFFORT_SET" -eq 0 ] || [ -n "$EFFORT" ] || { echo "error: --effort requires a non-empty value" >&2; exit 1; }
 [ "$BACKEND_SET" -eq 0 ] || [ -n "$BACKEND_ARG" ] || { echo "error: --backend requires a non-empty value" >&2; exit 1; }
+# Validate each --env KEY=VAL form. KEY must be a POSIX shell env-var name
+# (letters/digits/underscore, not starting with a digit); VAL is anything (may
+# be empty).
+for kv in "${ENV_OVERRIDES[@]}"; do
+  k=${kv%%=*}
+  case "$k" in
+    ''|[0-9]*|*[!A-Za-z0-9_]*)
+      echo "error: --env KEY must be a POSIX env var name (got: $k)" >&2; exit 1 ;;
+  esac
+done
 case "$EFFORT" in
   ''|low|medium|high|xhigh|max) ;;
   *) echo "error: --effort must be one of low, medium, high, xhigh, max" >&2; exit 1 ;;
@@ -1281,6 +1314,17 @@ fi
 # process (go build, go test, ...) inherit it. Sent before the launch command so
 # the env is set when the agent starts; the brief sleep lets the export land.
 spawn_send_text_line "$T" "export GOTMPDIR=$TASK_TMP/gotmp"
+# Apply any per-spawn --env KEY=VAL overrides into the pane shell env through
+# the same channel the GOTMPDIR export uses, so the agent and its children
+# inherit the swapped token. Last --env for the same KEY wins (shell `export`
+# override). VAL is shell-quoted so a token containing shell metacharacters
+# cannot escape the export.
+for kv in "${ENV_OVERRIDES[@]}"; do
+  k=${kv%%=*}; v=${kv#*=}
+  sq_v=$(shell_quote "$v")
+  spawn_send_text_line "$T" "export $k=$sq_v"
+  sleep 0.1
+done
 sleep 0.3
 spawn_send_literal "$T" "$LAUNCH"
 sleep 0.3
