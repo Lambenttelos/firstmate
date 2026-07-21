@@ -213,7 +213,7 @@ done
 # Validate each --env KEY=VAL form. KEY must be a POSIX shell env-var name
 # (letters/digits/underscore, not starting with a digit); VAL is anything (may
 # be empty).
-for kv in "${ENV_OVERRIDES[@]}"; do
+for kv in "${ENV_OVERRIDES[@]+"${ENV_OVERRIDES[@]}"}"; do
   k=${kv%%=*}
   case "$k" in
     ''|[0-9]*|*[!A-Za-z0-9_]*)
@@ -1319,7 +1319,7 @@ spawn_send_text_line "$T" "export GOTMPDIR=$TASK_TMP/gotmp"
 # inherit the swapped token. Last --env for the same KEY wins (shell `export`
 # override). VAL is shell-quoted so a token containing shell metacharacters
 # cannot escape the export.
-for kv in "${ENV_OVERRIDES[@]}"; do
+for kv in "${ENV_OVERRIDES[@]+"${ENV_OVERRIDES[@]}"}"; do
   k=${kv%%=*}; v=${kv#*=}
   sq_v=$(shell_quote "$v")
   spawn_send_text_line "$T" "export $k=$sq_v"

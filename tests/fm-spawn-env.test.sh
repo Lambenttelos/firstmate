@@ -94,6 +94,19 @@ SH
   chmod +x "$fake_spawn"
 }
 
+test_no_env_override_survives_set_u() {
+  local out status
+  # Regression: on bash 3.2 (macOS default), "${ENV_OVERRIDES[@]}" on an empty
+  # array under `set -u` throws "unbound variable" and aborts before any
+  # validation runs. Spawning with zero --env flags must not hit that.
+  out=$(run_spawn nope-env-z9 projects/none 2>&1)
+  status=$?
+  printf '%s\n' "$out" | grep -F 'unbound variable' >/dev/null \
+    && fail "spawn with no --env should not throw unbound variable; got: $out"
+  [ "$status" -ne 0 ] || fail "spawn with no brief should still fail (missing brief), got status 0"
+  pass "spawn with zero --env overrides does not throw unbound variable under set -u"
+}
+
 test_wrapper_passes_token_from_env() {
   local home fake_spawn sentinel out status args
   home="$TMP_ROOT/env-token-z6 home"
@@ -168,6 +181,7 @@ test_env_requires_equals
 test_env_inline_requires_equals
 test_env_rejects_bad_key
 test_env_accepts_empty_value
+test_no_env_override_survives_set_u
 test_wrapper_passes_token_from_env
 test_wrapper_reads_token_from_zshenv
 test_wrapper_fails_loud_when_token_missing
