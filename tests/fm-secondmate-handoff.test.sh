@@ -106,6 +106,18 @@ test_force_bypasses_threshold() {
   pass "--force bypasses the threshold and unknown-read gate"
 }
 
+test_env_force_bypasses_threshold() {
+  local fmhome home config out
+  # FM_SM_HANDOFF_FORCE=1 must behave exactly like --force (documented env knob).
+  IFS=$'\t' read -r fmhome home config < <(setup_home env-force -)
+  out=$(FM_HOME="$fmhome" CLAUDE_CONFIG_DIR="$config" FM_SM_HANDOFF_DRY_RUN=1 \
+    FM_SM_HANDOFF_FORCE=1 "$ROOT/bin/fm-secondmate-handoff.sh" sm 2>&1)
+  expect_code 0 "$?" "FM_SM_HANDOFF_FORCE=1 proceeds despite unknown read"
+  assert_contains "$out" "forced" "env-forced handoff should announce itself"
+  assert_contains "$out" "fm-spawn.sh sm --secondmate" "env-forced handoff still respawns"
+  pass "FM_SM_HANDOFF_FORCE env bypasses the threshold like --force"
+}
+
 test_capture_idempotent() {
   local fmhome home config out
   IFS=$'\t' read -r fmhome home config < <(setup_home idem 260000)
@@ -123,6 +135,7 @@ test_refuse_no_window_or_home
 test_threshold_gate
 test_dry_run_full_sequence_over_threshold
 test_force_bypasses_threshold
+test_env_force_bypasses_threshold
 test_capture_idempotent
 
 echo "# all fm-secondmate-handoff tests passed"

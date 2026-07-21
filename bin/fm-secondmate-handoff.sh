@@ -64,7 +64,7 @@ See docs/secondmate-context-handoff.md and the secondmate-provisioning skill.
 EOF
 }
 
-FORCE=
+FORCE=${FM_SM_HANDOFF_FORCE:-}
 ID=
 for arg in "$@"; do
   case "$arg" in
@@ -202,7 +202,13 @@ if [ -n "$DRY_RUN" ]; then
 else
   if agent_alive; then
     echo "exiting the old '$ID' agent..."
-    "$SCRIPT_DIR/fm-send.sh" "$ID" "/exit" || true
+    # Harness-correct exit form (harness-adapters): codex and pi quit with
+    # /quit; claude, opencode, and grok use /exit.
+    case "$HARNESS" in
+      codex|pi) EXIT_CMD=/quit ;;
+      *) EXIT_CMD=/exit ;;
+    esac
+    "$SCRIPT_DIR/fm-send.sh" "$ID" "$EXIT_CMD" || true
     waited=0
     while ! agent_dead; do
       if [ "$waited" -ge "$EXIT_TIMEOUT" ]; then
