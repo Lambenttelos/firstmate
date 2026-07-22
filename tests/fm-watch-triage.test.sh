@@ -463,14 +463,20 @@ test_stale_terminal_status_overridden_by_active_run() {
     FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_STALE_ESCALATE_SECS=999 FM_POLL=1 FM_SIGNAL_GRACE=1 \
     FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
   pid=$!
-  if ! wait_live "$pid" 30; then
-    reap "$pid"; fail "watcher exited for a stale terminal-looking status the run-step overrides (should absorb): $(cat "$out")"
-  fi
-  [ ! -s "$out" ] || fail "the overridden stale terminal status printed a wake reason during absorb"
-  [ ! -s "$state/.wake-queue" ] || fail "the overridden stale terminal status enqueued a wake during absorb"
-  [ "$(cat "$state/.stale-$key" 2>/dev/null || true)" = "$pane_hash" ] || fail "stale suppressor not advanced on absorb"
-  [ -s "$state/.stale-since-$key" ] || fail "stale-since escalation timer was not recorded on absorb"
-  [ ! -e "$state/.hb-surfaced-validating" ] || fail "an absorbed wake must not mark the status line as surfaced"
+  # Poll until the watcher processes the stale scan (suppressor advances) rather
+  # than checking after a fixed wait, which raced startup. It must stay alive and
+  # never surface while absorbing.
+  i=0
+  while [ "$i" -lt 40 ]; do
+    kill -0 "$pid" 2>/dev/null || { reap "$pid"; fail "watcher exited for a stale terminal-looking status the run-step overrides (should absorb): $(cat "$out")"; }
+    [ "$(cat "$state/.stale-$key" 2>/dev/null || true)" = "$pane_hash" ] && break
+    sleep 0.1; i=$((i + 1))
+  done
+  [ "$(cat "$state/.stale-$key" 2>/dev/null || true)" = "$pane_hash" ] || { reap "$pid"; fail "stale suppressor not advanced on absorb"; }
+  [ ! -s "$out" ] || { reap "$pid"; fail "the overridden stale terminal status printed a wake reason during absorb"; }
+  [ ! -s "$state/.wake-queue" ] || { reap "$pid"; fail "the overridden stale terminal status enqueued a wake during absorb"; }
+  [ -s "$state/.stale-since-$key" ] || { reap "$pid"; fail "stale-since escalation timer was not recorded on absorb"; }
+  [ ! -e "$state/.hb-surfaced-validating" ] || { reap "$pid"; fail "an absorbed wake must not mark the status line as surfaced"; }
   reap "$pid"
 
   # Phase B: backdate the idle timer past the threshold; the run genuinely
@@ -611,13 +617,19 @@ test_nonterminal_stale_provably_working_absorbed_then_escalated() {
     FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_STALE_ESCALATE_SECS=999 FM_POLL=1 FM_SIGNAL_GRACE=1 \
     FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
   pid=$!
-  if ! wait_live "$pid" 30; then
-    reap "$pid"; fail "watcher exited for a fresh provably-working non-terminal stale (should absorb): $(cat "$out")"
-  fi
-  [ ! -s "$out" ] || fail "fresh provably-working stale printed a wake reason during absorb"
-  [ ! -s "$state/.wake-queue" ] || fail "fresh provably-working stale enqueued a wake during absorb"
-  [ "$(cat "$state/.stale-$key" 2>/dev/null || true)" = "$pane_hash" ] || fail "stale suppressor not advanced on absorb"
-  [ -s "$state/.stale-since-$key" ] || fail "stale-since escalation timer was not recorded on absorb"
+  # Poll until the watcher processes the stale scan (suppressor advances) rather
+  # than checking after a fixed wait, which raced startup. It must stay alive and
+  # never surface while absorbing.
+  i=0
+  while [ "$i" -lt 40 ]; do
+    kill -0 "$pid" 2>/dev/null || { reap "$pid"; fail "watcher exited for a fresh provably-working non-terminal stale (should absorb): $(cat "$out")"; }
+    [ "$(cat "$state/.stale-$key" 2>/dev/null || true)" = "$pane_hash" ] && break
+    sleep 0.1; i=$((i + 1))
+  done
+  [ "$(cat "$state/.stale-$key" 2>/dev/null || true)" = "$pane_hash" ] || { reap "$pid"; fail "stale suppressor not advanced on absorb"; }
+  [ ! -s "$out" ] || { reap "$pid"; fail "fresh provably-working stale printed a wake reason during absorb"; }
+  [ ! -s "$state/.wake-queue" ] || { reap "$pid"; fail "fresh provably-working stale enqueued a wake during absorb"; }
+  [ -s "$state/.stale-since-$key" ] || { reap "$pid"; fail "stale-since escalation timer was not recorded on absorb"; }
   reap "$pid"
 
   # Phase B: backdate the idle timer past the threshold; the next run escalates.
