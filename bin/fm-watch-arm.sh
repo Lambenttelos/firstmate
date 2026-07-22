@@ -330,12 +330,32 @@ if [ "$mode" = restart ]; then
       kill -TERM "$lock_pid" 2>/dev/null || true
       # Wait for it to actually exit before relaunching, so the fresh watcher
       # either takes a released lock or reclaims a now-dead-pid stale lock instead
-      # of seeing the dying one as a live holder and no-opping.
+      # of seeing the dying one as a live holder and no-opping. The watcher now
+      # waits on a backgrounded sleep child, so SIGTERM interrupts its terminal
+      # wait and runs its cleanup trap right away; this bound is normally
+      # satisfied in well under a second.
       i=0
       while [ "$i" -lt 50 ] && fm_pid_alive "$lock_pid"; do
         sleep 0.1
         i=$((i + 1))
       done
+      if fm_pid_alive "$lock_pid" && [ "$(fm_path_age "$BEAT")" -ge "$GRACE" ]; then
+        # SIGTERM did not land and the beacon is stale past the grace: this is a
+        # genuinely wedged watcher (e.g. stuck mid-syscall, or a machine that just
+        # resumed from suspend), not a healthy-but-TERM-resistant peer, so force it
+        # down. SIGKILL is untrappable, so the watcher's EXIT trap never runs and
+        # would otherwise strand state/.watch.lock and block every future re-arm;
+        # clear the lock here so a forced termination never leaves it dangling. A
+        # healthy peer (fresh beacon) is left alone - the fresh child no-ops on its
+        # held lock and the arm attaches to it below.
+        kill -KILL "$lock_pid" 2>/dev/null || true
+        i=0
+        while [ "$i" -lt 50 ] && fm_pid_alive "$lock_pid"; do
+          sleep 0.1
+          i=$((i + 1))
+        done
+        clear_stale_recorded_watcher_lock
+      fi
     else
       clear_stale_recorded_watcher_lock
     fi

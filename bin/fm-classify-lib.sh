@@ -345,6 +345,29 @@ crew_absorb_class() {  # <id>
   printf 'none'
 }
 
+# Stable terminal-dedup verdict for a stale crew whose last log line is
+# captain-relevant. The watcher keys its terminal stale-suppression on THIS
+# (bin/fm-crew-state.sh's reconciled state) instead of the volatile pane hash, so
+# a done/failed crew stops re-firing when only the harness footer timer redraws
+# the pane; it re-surfaces only when the reconciled verdict actually changes.
+# Prints a token-tight string that changes only with the reconciled state: the
+# state word, plus the source+detail for a parked crew so a change of open
+# decision re-surfaces. Empty on an unreadable verdict, which the caller must
+# treat as "surface" (never silently suppress on an unknown state). Same cost as
+# crew_absorb_class - one bounded fm-crew-state.sh read - so callers run it only
+# on a first-sighting/changed-pane stale path, never every wake.
+crew_state_verdict() {  # <id>
+  local id=$1 line state
+  [ -n "$id" ] || return 0
+  line=$("$FM_CREW_STATE_BIN" "$id" 2>/dev/null) || true
+  case "$line" in state:*) ;; *) return 0 ;; esac
+  state=${line#state: }; state=${state%% *}
+  case "$state" in
+    parked) printf 'parked %s' "${line#*source: }" ;;
+    *)      printf '%s' "$state" ;;
+  esac
+}
+
 # 0 if crew <id> shows POSITIVE evidence it is still working (crew_absorb_class
 # reports `working`). This is the "provably working" predicate at the heart of
 # absorb-only-when-provably-working: a no-verb turn-end or stale wake is absorbed

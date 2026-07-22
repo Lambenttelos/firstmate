@@ -113,14 +113,29 @@ else
   stat_sig()   { stat -c '%s:%Y' "$1" 2>/dev/null; }
 fi
 
-POLL=${FM_POLL:-15}                   # seconds between cycles
+POLL=${FM_POLL:-600}                  # seconds between cycles (captain default: 10 min).
+                                      # Keep POLL < grace (WATCHER_STALE_GRACE, set
+                                      # above) so a full cycle's wait never outlives
+                                      # the liveness beacon - see beacon_sleep and the
+                                      # start-up invariant check in the runtime section.
 HEARTBEAT=${FM_HEARTBEAT:-600}        # base seconds between heartbeat scans
 HEARTBEAT_MAX=${FM_HEARTBEAT_MAX:-7200}  # heartbeat backoff cap
-CHECK_INTERVAL=${FM_CHECK_INTERVAL:-300}  # seconds between *.check.sh sweeps
+CHECK_INTERVAL=${FM_CHECK_INTERVAL:-600}  # seconds between *.check.sh sweeps (captain default: 10 min)
 CHECK_TIMEOUT=${FM_CHECK_TIMEOUT:-30}     # seconds allowed per *.check.sh
 SIGNAL_GRACE=${FM_SIGNAL_GRACE:-30}   # seconds to linger after a signal so trailing
                                       # signals (a status write, then the same turn's
                                       # turn-end hook) coalesce into one wake
+# Longest blind-sleep slice. A single `sleep POLL` refreshes the beacon only at
+# the loop top, so once POLL approaches the grace a healthy sleeping watcher
+# reads as dead for the back of every cycle (the wedge). beacon_sleep splits the
+# wait into slices no longer than min(POLL, grace/2) and re-touches the beacon
+# each slice, so a healthy watcher stays fresh within the grace for the whole
+# cycle and a machine-suspend can strand the beacon for at most one slice past
+# resume. Floor at 1s so a tiny grace still makes progress.
+_beacon_half=$(( WATCHER_STALE_GRACE / 2 ))
+[ "$_beacon_half" -lt 1 ] && _beacon_half=1
+if [ "$POLL" -lt "$_beacon_half" ]; then BEACON_SLICE=$POLL; else BEACON_SLICE=$_beacon_half; fi
+[ "$BEACON_SLICE" -lt 1 ] && BEACON_SLICE=1
 # Busy signatures per harness, OR-ed. Extend via env when new adapters are verified.
 # claude/codex: "esc to interrupt"; opencode: "esc interrupt"; pi: "Working...";
 # grok: "Ctrl+c:cancel" (the mid-turn cancel hint in grok's keybind bar, shown iff a
@@ -371,7 +386,7 @@ handle_paused_stale() {  # <window> <task> <hash>
   key=$(printf '%s' "$win" | tr ':/.' '___')
   printf '%s' "$h" > "$STATE/.stale-$key"
   : > "$STATE/.paused-$key"
-  rm -f "$STATE/.stale-since-$key" "$STATE/.wedge-escalations-$key"
+  rm -f "$STATE/.stale-since-$key" "$STATE/.wedge-escalations-$key" "$STATE/.stale-verdict-$key"
   statusf="$STATE/$task.status"
   mtime=$(stat_mtime "$statusf")
   case "$mtime" in ''|*[!0-9]*) mtime=$(date +%s) ;; esac
@@ -401,7 +416,7 @@ clear_pause_tracking() {  # <window>
   key=${key//\//_}
   key=${key//./_}
   clear_pause_state "$win"
-  rm -f "$STATE/.stale-$key" "$STATE/.stale-since-$key" "$STATE/.wedge-escalations-$key"
+  rm -f "$STATE/.stale-$key" "$STATE/.stale-since-$key" "$STATE/.wedge-escalations-$key" "$STATE/.stale-verdict-$key"
 }
 
 # Reconcile a declared pause or captain-held status with authoritative crew state.
@@ -458,7 +473,7 @@ surface_nonterminal_stale() {  # <window> <hash>
   key=$(printf '%s' "$win" | tr ':/.' '___')
   fm_wake_append stale "$win" "stale: $win" || exit 1
   printf '%s' "$h" > "$STATE/.stale-$key"
-  rm -f "$STATE/.stale-since-$key"
+  rm -f "$STATE/.stale-since-$key" "$STATE/.stale-verdict-$key"
   task=$(window_to_task "$win" "$STATE")
   last=$(last_status_line "$STATE/$task.status")
   if status_is_paused_or_captain_held "$last"; then
@@ -644,6 +659,28 @@ heartbeat_scan_finds_actionable() {
 # loop is the permanent fail-closed backstop). This preserves the single live
 # supervision cycle: the reader is a short-lived subprocess of THIS watcher, not
 # a second watcher, so every guard/beacon/arm/turn-end mechanism is unchanged.
+# beacon_sleep: sleep `total` seconds while keeping the liveness beacon fresh and
+# staying promptly interruptible. The sleep runs as a backgrounded child we
+# `wait` on, so a HUP/INT/TERM delivered to this watcher runs its trap right away
+# instead of being deferred behind a foreground `sleep` - the recovery wedge
+# where --restart's SIGTERM could not land until the whole poll elapsed. The
+# beacon is re-touched every slice (see BEACON_SLICE) so a healthy sleeping
+# watcher never reads as dead mid-cycle.
+_beacon_sleep_child=
+beacon_sleep() {  # <total-seconds>
+  local slice remaining=$1
+  while [ "$remaining" -gt 0 ]; do
+    slice=$BEACON_SLICE
+    [ "$remaining" -lt "$slice" ] && slice=$remaining
+    sleep "$slice" &
+    _beacon_sleep_child=$!
+    wait "$_beacon_sleep_child"
+    _beacon_sleep_child=
+    touch "$STATE/.last-watcher-beat"
+    remaining=$((remaining - slice))
+  done
+}
+
 event_wait_or_sleep() {
   local w b session first_backend="" first_session="" rec rc
   local windows=()
@@ -667,7 +704,7 @@ event_wait_or_sleep() {
   done < <(recorded_windows)
 
   if [ "${#windows[@]}" -eq 0 ]; then
-    sleep "$POLL"
+    beacon_sleep "$POLL"
     return
   fi
 
@@ -683,7 +720,7 @@ event_wait_or_sleep() {
     _event_cap_fails=0
   fi
   if [ "$_event_cap_ok" != 1 ]; then
-    sleep "$POLL"
+    beacon_sleep "$POLL"
     return
   fi
 
@@ -700,7 +737,7 @@ event_wait_or_sleep() {
       # pure polling for the rest of this watcher process.
       _event_cap_fails=$((_event_cap_fails + 1))
       [ "$_event_cap_fails" -ge "$EVENT_CAP_FAIL_MAX" ] && _event_cap_ok=0
-      sleep "$POLL"
+      beacon_sleep "$POLL"
       ;;
     *)
       # 1: a clean full-budget wait with no actionable edge - the reader already
@@ -745,6 +782,15 @@ if [ "${BASH_SOURCE[0]}" != "$0" ]; then
   return 0
 fi
 
+# Invariant: POLL must stay below the beacon grace, or a cycle's wait could
+# outlive the beacon and read as dead. beacon_sleep already slices the wait to
+# hold this even when the invariant is violated, so this only warns rather than
+# refusing to start - but a violated invariant means the operator-chosen poll
+# cadence is fighting the grace and should be reconciled.
+if [ "$POLL" -ge "$WATCHER_STALE_GRACE" ]; then
+  echo "watcher: FM_POLL=${POLL}s >= grace ${WATCHER_STALE_GRACE}s; the beacon is kept fresh by slicing the wait, but set FM_POLL below the grace to match cadence to liveness." >&2
+fi
+
 # Before acquiring the watcher lock or enumerating any runnable check, replace
 # or quarantine checks created by older versions. The migration compares bytes
 # and reads data only; it never invokes legacy check files through Bash.
@@ -779,7 +825,16 @@ watcher_cleanup() {
   fm_lock_release "$WATCH_LOCK"
 }
 trap watcher_cleanup EXIT
-trap 'exit 1' HUP INT TERM
+# On a stop signal, kill the backgrounded beacon_sleep child (if the loop is in
+# its terminal wait) so the trap is not deferred behind a foreground sleep, then
+# exit so the EXIT trap releases the lock. This is what lets --restart's SIGTERM
+# clear a sleeping watcher promptly instead of waiting out the whole poll.
+# shellcheck disable=SC2329 # Invoked indirectly by the signal trap below.
+watcher_signal_exit() {
+  [ -n "${_beacon_sleep_child:-}" ] && kill "$_beacon_sleep_child" 2>/dev/null
+  exit 1
+}
+trap watcher_signal_exit HUP INT TERM
 # This watcher's own pid, as recorded in the lock by fm_lock_claim (which writes
 # ${BASHPID:-$$} from this same main shell). Read directly, never via a command
 # substitution, so it matches the stored holder pid for the self-eviction check.
@@ -879,7 +934,7 @@ while :; do
   # signature for an already-pending file (last write wins below).
   pending=$(scan_signals)
   if [ -n "$pending" ]; then
-    sleep "$SIGNAL_GRACE"
+    beacon_sleep "$SIGNAL_GRACE"
     pending=$(printf '%s\n%s' "$pending" "$(scan_signals)")
     files=""
     while IFS=$(printf '\t') read -r sf sig f; do
@@ -993,15 +1048,31 @@ EOF
           # line. On a NEW hash, give an active run/busy pane (the same
           # authoritative source fm-crew-state.sh itself already prioritizes
           # over the log) a chance to override before trusting the log.
+          vf="$STATE/.stale-verdict-$key"
           if [ "$(cat "$sf" 2>/dev/null || true)" != "$h" ]; then
-            if crew_is_provably_working "$(window_to_task "$w" "$STATE")"; then
+            # The pane changed, but a captain-relevant log line does not move once
+            # firstmate hands a crew off, so the harness footer's live "Churned
+            # for Xm Ys" / "Total:" counters advance the hash on every redraw and
+            # would re-surface an already-handled terminal crew each poll. Decide
+            # on the RECONCILED crew state, not the pixels: if fm-crew-state's
+            # verdict is unchanged from the one already surfaced, this is pure
+            # redraw churn - advance the hash and stay silent (keeping any running
+            # wedge timer honest). Re-surface only when the verdict itself changes.
+            verdict=$(crew_state_verdict "$(window_to_task "$w" "$STATE")")
+            if [ -n "$verdict" ] && [ "$verdict" = "$(cat "$vf" 2>/dev/null || true)" ]; then
+              printf '%s' "$h" > "$sf"
+              [ -e "$ssf" ] && wedge_timer_check "$w" "$ssf" "stale (overridden terminal status)" "$ewf"
+              triage_log "absorbed stale (terminal verdict unchanged - ${verdict}): $w"
+            elif crew_is_provably_working "$(window_to_task "$w" "$STATE")"; then
               printf '%s' "$h" > "$sf"
               date +%s > "$ssf"
+              [ -n "$verdict" ] && printf '%s' "$verdict" > "$vf"
               triage_log "absorbed stale (provably working, overriding a stale captain-relevant status): $w"
             else
               fm_wake_append stale "$w" "stale: $w" || exit 1
               printf '%s' "$h" > "$sf"
               rm -f "$ssf"
+              [ -n "$verdict" ] && printf '%s' "$verdict" > "$vf"
               mark_surfaced "$STATE/$(window_to_task "$w" "$STATE").status"
               wake "stale: $w"
             fi

@@ -311,13 +311,19 @@ test_provably_working_signal_absorbed() {
   export FM_FAKE_CREW_STATE='state: working · source: run-step · validating (running)'
   watch_bg "$state" "$fakebin" "$out"
   pid=$!
-  if ! wait_live "$pid" 30; then
-    reap "$pid"; fail "watcher exited for a working: signal whose crew is provably working (should absorb): $(cat "$out")"
-  fi
-  [ ! -s "$out" ] || fail "provably-working signal printed a wake reason: $(cat "$out")"
-  [ ! -s "$state/.wake-queue" ] || fail "provably-working signal enqueued a durable wake record"
-  [ -s "$state/.seen-task_status" ] || fail "provably-working signal did not advance its .seen-* suppressor"
-  [ -e "$state/.last-watcher-beat" ] || fail "watcher beacon was not touched while absorbing"
+  # Poll until the watcher has actually processed the signal scan (its .seen-*
+  # suppressor advances) rather than checking after a fixed wait, which raced the
+  # watcher's startup. It must stay alive and never queue a wake while absorbing.
+  i=0
+  while [ "$i" -lt 40 ]; do
+    kill -0 "$pid" 2>/dev/null || { reap "$pid"; fail "watcher exited for a working: signal whose crew is provably working (should absorb): $(cat "$out")"; }
+    [ -s "$state/.seen-task_status" ] && break
+    sleep 0.1; i=$((i + 1))
+  done
+  [ -s "$state/.seen-task_status" ] || { reap "$pid"; fail "provably-working signal did not advance its .seen-* suppressor"; }
+  [ ! -s "$out" ] || { reap "$pid"; fail "provably-working signal printed a wake reason: $(cat "$out")"; }
+  [ ! -s "$state/.wake-queue" ] || { reap "$pid"; fail "provably-working signal enqueued a durable wake record"; }
+  [ -e "$state/.last-watcher-beat" ] || { reap "$pid"; fail "watcher beacon was not touched while absorbing"; }
   reap "$pid"
   pass "a no-verb signal whose crew is provably working is absorbed (no exit, no queue, suppressor advanced, beacon present)"
 }
@@ -480,6 +486,101 @@ test_stale_terminal_status_overridden_by_active_run() {
   grep -F "possible wedge" "$out" >/dev/null || fail "escalation did not flag a possible wedge"
   unset FM_FAKE_CREW_STATE
   pass "a stale terminal-looking status is overridden and absorbed while a run is actively working, then wedge-escalated"
+}
+
+# --- terminal stale, verdict unchanged across a pane redraw: absorbed ----------
+# Churn regression: the harness footer carries a live "Churned for Xm Ys" timer
+# and a running "Total:" counter, so every pane redraw advances the 40-line hash
+# even when the crew's reconciled state has not moved. Keying terminal
+# suppression on the pane hash re-surfaced an already-handled done crew on every
+# redraw. The suppressor is now keyed on the reconciled fm-crew-state verdict, so
+# a redraw that leaves the verdict unchanged is absorbed, and only a real verdict
+# change re-surfaces.
+test_terminal_stale_verdict_unchanged_absorbs_pane_redraw() {
+  local dir state fakebin out capture_file window key old_hash new_hash sig pid
+  dir=$(make_case terminal-verdict-churn); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; capture_file="$dir/pane.txt"
+  window="test:fm-done"
+  printf 'window=%s\nkind=ship\n' "$window" > "$state/done.meta"
+  printf 'done: PR https://example.test/pr/9 checks green\n' > "$state/done.status"
+  sig=$(seen_sig "$state/done.status"); printf '%s' "$sig" > "$state/.seen-done_status"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  # Already surfaced on a prior poll: the done verdict is recorded and the stale
+  # suppressor holds the pane hash from that surface.
+  old_hash=$(hash_text "Ready for /no-mistakes. Churned for 9m 28s")
+  printf '%s' "$old_hash" > "$state/.stale-$key"
+  printf 'done' > "$state/.stale-verdict-$key"
+  # The footer timer ticked: the pane hash changes, the reconciled state does not.
+  printf 'Ready for /no-mistakes. Churned for 9m 31s' > "$capture_file"
+  new_hash=$(hash_text "Ready for /no-mistakes. Churned for 9m 31s")
+  printf '%s' "$new_hash" > "$state/.hash-$key"
+  printf '1\n' > "$state/.count-$key"
+  export FM_FAKE_CREW_STATE='state: done · source: run-step · checks green'
+
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  # Wait until the watcher has actually processed the stale scan (the suppressor
+  # advances to the new hash) while it stays alive and never queues a wake.
+  i=0
+  while [ "$i" -lt 60 ]; do
+    kill -0 "$pid" 2>/dev/null || { reap "$pid"; fail "watcher exited on a footer-timer redraw of an already-surfaced done crew (should absorb): $(cat "$out")"; }
+    [ "$(cat "$state/.stale-$key" 2>/dev/null || true)" = "$new_hash" ] && break
+    sleep 0.1; i=$((i + 1))
+  done
+  [ "$(cat "$state/.stale-$key" 2>/dev/null || true)" = "$new_hash" ] || { reap "$pid"; fail "stale suppressor was not advanced to the new pane hash on absorb"; }
+  [ ! -s "$out" ] || { reap "$pid"; fail "a footer-timer redraw of a done crew printed a wake reason"; }
+  [ ! -s "$state/.wake-queue" ] || { reap "$pid"; fail "a footer-timer redraw of a done crew enqueued a stale wake"; }
+  reap "$pid"
+
+  # The reconciled state genuinely changes (done -> failed): it must re-surface,
+  # even though this is just another pane redraw.
+  export FM_FAKE_CREW_STATE='state: failed · source: run-step · run failed'
+  : > "$out"
+  printf 'Ready for /no-mistakes. Churned for 9m 34s' > "$capture_file"
+  printf '%s' "$(hash_text "Ready for /no-mistakes. Churned for 9m 34s")" > "$state/.hash-$key"
+  printf '1\n' > "$state/.count-$key"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  wait_for_exit "$pid" 40 || fail "watcher did not re-surface when the reconciled verdict changed"
+  grep -Fx "stale: $window" "$out" >/dev/null || fail "a changed reconciled verdict did not print a stale wake"
+  [ "$(cat "$state/.stale-verdict-$key" 2>/dev/null || true)" = failed ] || fail "the stored verdict was not updated to the new reconciled state"
+  unset FM_FAKE_CREW_STATE
+  pass "a terminal crew is absorbed across pane redraws while its reconciled verdict holds, and re-surfaces only when the verdict changes"
+}
+
+# --- the liveness beacon stays fresh through a full terminal sleep -------------
+# Wedge regression: the beacon was touched only at the loop top, so a poll longer
+# than the grace left a healthy sleeping watcher reading as dead for the back of
+# every cycle. beacon_sleep slices the terminal wait below the grace and re-touches
+# the beacon each slice, so its age never crosses the grace mid-sleep.
+test_beacon_stays_fresh_through_terminal_sleep() {
+  local dir state fakebin out pid i m now age
+  dir=$(make_case beacon-sleep-slice); state="$dir/state"; fakebin="$dir/fakebin"; out="$dir/watch.out"
+  # Empty fleet: every cycle falls straight through to the terminal wait. A poll
+  # longer than the grace is exactly the wedge configuration.
+  PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_POLL=4 FM_WATCHER_STALE_GRACE=2 FM_GUARD_GRACE=2 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  # Sample across a window longer than one full poll; the age must never exceed
+  # the 2s grace while the watcher sits in beacon_sleep.
+  i=0
+  while [ "$i" -lt 25 ]; do
+    kill -0 "$pid" 2>/dev/null || { reap "$pid"; fail "watcher exited early: $(cat "$out")"; }
+    m=$(file_mtime "$state/.last-watcher-beat")
+    if [ -n "$m" ]; then
+      now=$(date +%s); age=$(( now - m ))
+      [ "$age" -le 2 ] || { reap "$pid"; fail "beacon aged ${age}s past the 2s grace during the terminal sleep"; }
+    fi
+    sleep 0.2
+    i=$((i + 1))
+  done
+  reap "$pid"
+  pass "the liveness beacon stays fresh through a full terminal sleep (beacon_sleep slices the wait below the grace)"
 }
 
 # --- non-terminal stale, crew provably working: absorbed, then wedge-escalated ---
@@ -1357,6 +1458,8 @@ test_working_note_not_working_surfaced
 test_actionable_signal_surfaced
 test_terminal_stale_surfaced
 test_stale_terminal_status_overridden_by_active_run
+test_terminal_stale_verdict_unchanged_absorbs_pane_redraw
+test_beacon_stays_fresh_through_terminal_sleep
 test_nonterminal_stale_provably_working_absorbed_then_escalated
 test_wedge_escalation_marks_demand_deep_inspection_after_threshold
 test_wedge_escalation_resets_when_pane_becomes_active

@@ -473,6 +473,49 @@ test_watch_restart_attaches_to_healthy_peer() {
   pass "watch restart attaches to a verified healthy peer and later surfaces a successor gap"
 }
 
+test_watch_restart_force_clears_wedged_watcher() {
+  local dir state fakebin out peer identity armpid i lock_pid back
+  dir=$(make_case restart-wedged)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  out="$dir/restart.out"
+  mark_pr_check_migration_complete "$state"
+  # A genuinely wedged watcher: its identity matches the lock, but it ignores
+  # SIGTERM and its beacon is stale past the grace (the recovery scenario the
+  # operator hit - live PID, stale beacon, TERM cannot land).
+  node -e 'process.on("SIGTERM", () => {}); setTimeout(() => {}, 300000)' &
+  peer=$!
+  identity=$(FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_pid_identity "$2"' _ "$LIB" "$peer") || fail "could not identify peer pid"
+  mkdir "$state/.watch.lock"
+  printf '%s\n' "$peer" > "$state/.watch.lock/pid"
+  printf '%s\n' "$dir" > "$state/.watch.lock/fm-home"
+  printf '%s\n' "$WATCH" > "$state/.watch.lock/watcher-path"
+  printf '%s\n' "$identity" > "$state/.watch.lock/pid-identity"
+  back=$(( $(date +%s) - 500 ))
+  touch "$state/.last-watcher-beat"
+  if [ "$(uname)" = Darwin ]; then touch -mt "$(date -r "$back" '+%Y%m%d%H%M.%S')" "$state/.last-watcher-beat"
+  else touch -m -d "@$back" "$state/.last-watcher-beat"; fi
+  # Pin the grace hermetically (the ambient env may raise it well past the
+  # backdated beacon age): a 500s-stale beacon with a 2s grace is unambiguously wedged.
+  PATH="$fakebin:$PATH" FM_HOME="$dir" FM_GUARD_GRACE=2 FM_POLL=5 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH_ARM" --restart > "$out" &
+  armpid=$!
+  i=0
+  while [ "$i" -lt 120 ]; do
+    grep -qF 'watcher: started pid=' "$out" 2>/dev/null && break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  grep -qF 'watcher: started pid=' "$out" || fail "restart did not start a fresh watcher after force-clearing the wedged one: $(cat "$out")"
+  is_live_non_zombie "$peer" && fail "restart did not force-kill the TERM-resistant wedged watcher"
+  lock_pid=$(cat "$state/.watch.lock/pid" 2>/dev/null || true)
+  { [ -n "$lock_pid" ] && [ "$lock_pid" != "$peer" ] && kill -0 "$lock_pid" 2>/dev/null; } \
+    || fail "the lock was stranded or not taken over by a live fresh watcher (got '$lock_pid')"
+  kill "$armpid" "$lock_pid" "$peer" 2>/dev/null || true
+  wait "$armpid" 2>/dev/null || true
+  wait "$peer" 2>/dev/null || true
+  pass "watch restart force-clears a wedged TERM-resistant watcher and never strands the lock"
+}
+
 test_watcher_self_evicts_on_lock_takeover() {
   local dir state fakebin out pid i lock_pid
   dir=$(make_case self-evict)
@@ -972,6 +1015,7 @@ test_lock_late_claim_loses_after_recreate
 test_lock_paused_mid_acquire_claim_fails_during_steal
 test_watch_restart_rejects_reused_pid
 test_watch_restart_attaches_to_healthy_peer
+test_watch_restart_force_clears_wedged_watcher
 test_watcher_self_evicts_on_lock_takeover
 test_arm_self_eviction_is_loud_without_successor
 test_arm_attaches_and_waits_for_live_fresh_watcher
