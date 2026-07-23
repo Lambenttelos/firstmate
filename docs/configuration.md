@@ -210,18 +210,22 @@ Readings are kernel-wide, taken from `sysctl` and `vm_stat` on macOS and from `/
 Firstmate's own `ps` view is sandboxed to a small subset of the host, so summing per-process usage would silently under-report a loaded machine.
 For the same reason the reading is a host total and never attributes load to a particular crew.
 The crew count in the reading is the number of crews whose agent is actually running, not the number of recorded tasks, so a task that has stopped but has not been cleaned up yet no longer inflates the count or the shed advice.
+Only the watcher's sweep pays for that liveness answer, and it caches the verdict, so the count every other caller shows is at most one sweep interval old (`FM_RESOURCE_INTERVAL`, default 900 seconds).
+When no cached verdict is available, or it is older than two sweep intervals, the reading falls back to the count of recorded tasks and says so with "liveness unverified" instead of presenting it as a verified count.
 
 Three callers consult the monitor, and all three only report:
 
 - [`bin/fm-spawn.sh`](../bin/fm-spawn.sh) prints the reading to stderr as a pre-dispatch `warning:` advisory when the host is degraded or critical, and still spawns.
+  It reads the cached crew-liveness verdict and never probes a backend, so an unresponsive backend cannot delay a dispatch.
 - [`bin/fm-watch.sh`](../bin/fm-watch.sh) sweeps on this cadence and wakes firstmate with `check: host-resources <reading>` when pressure first gets worse than the level firstmate was last told about, and annotates a heartbeat with the last cached reading while the monitor is enabled and that reading is still recent.
 - [`bin/fm-session-start.sh`](../bin/fm-session-start.sh) prints one reading in the fleet-state digest, so a session opens knowing whether the machine can take more work.
+  It reads the same cached verdict, so the digest stays fast and bounded whatever the backends are doing.
 
 Nothing in this path pauses, sheds, or kills anything.
 Shedding load is the captain's decision, so the monitor's job ends at reporting the pressure and the crew count the host can support.
 An unknown reading, on a host where no kernel-wide probe answers, and a disabled monitor both stay silent instead of alarming, the same never-wake-on-an-unreadable-probe rule the secondmate context monitor follows.
 
-The watcher keeps its sweep state in `state/.last-resource` (sweep cadence), `state/.resource-status` (latest reading, read by the heartbeat annotation), and `state/.resource-surfaced` (worst level already reported, so recovery to healthy re-arms the monitor silently).
+The watcher keeps its sweep state in `state/.last-resource` (sweep cadence), `state/.resource-status` (latest reading, read by the heartbeat annotation), `state/.resource-live` (last verified running-crew count, read by the synchronous callers), and `state/.resource-surfaced` (worst level already reported, so recovery to healthy re-arms the monitor silently).
 These are watcher internals; never edit them by hand.
 
 ## Crew dispatch profiles (config/crew-dispatch.json)

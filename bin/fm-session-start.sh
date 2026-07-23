@@ -383,6 +383,8 @@ done
 [ "$ORPHAN_STATUS_FOUND" -eq 1 ] || printf '(none)\n'
 
 subsection "Host resources"
+# No --sweep here: the digest is fast and bounded, so it reads the watcher's
+# cached crew-liveness verdict rather than probing any backend.
 RESOURCE_OUT=$("$SCRIPT_DIR/fm-resource-check.sh" 2>/dev/null) || true
 if [ -n "$RESOURCE_OUT" ]; then
   printf '%s\n' "$RESOURCE_OUT"

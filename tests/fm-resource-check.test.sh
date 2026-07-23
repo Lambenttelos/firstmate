@@ -159,16 +159,21 @@ test_shed_advice_names_the_overage_only_when_over_ceiling() {
   pass "shed advice appears only when live crews exceed the recommended ceiling"
 }
 
-# run_in_home <home> <fakebin> <override>...: the healthy baseline minus the
-# injected crew count, so the script's own liveness-probing count is exercised.
+# run_in_home <home> <fakebin> [--sweep] <override>...: the healthy baseline minus
+# the injected crew count, so the script's own crew counting is exercised. Pass
+# --sweep first to take the watcher's probing path instead of the cached one.
 run_in_home() {
-  local home=$1 fakebin=$2
+  local home=$1 fakebin=$2 sweep=()
   shift 2
+  if [ "${1:-}" = --sweep ]; then
+    sweep=(--sweep)
+    shift
+  fi
   RC=0
   OUT=$(env PATH="$fakebin:$PATH" FM_RESOURCE_INTERVAL=900 FM_RESOURCE_CORES=10 \
     FM_RESOURCE_RAM_GB=16 FM_RESOURCE_LOAD1=5.0 FM_RESOURCE_AVAIL_MB=8000 \
     FM_RESOURCE_SWAP_USED_MB=100 FM_RESOURCE_SWAP_TOTAL_MB=8192 \
-    FM_HOME="$home" "$@" "$CHECK" 2>&1) || RC=$?
+    FM_HOME="$home" "$@" "$CHECK" "${sweep[@]+"${sweep[@]}"}" 2>&1) || RC=$?
 }
 
 # fake_tmux <dir> <alive-window-suffix>: a tmux whose pane_current_command reads
@@ -199,7 +204,7 @@ test_live_crew_count_comes_from_recorded_work() {
   fakebin=$(fake_tmux "$TMP_ROOT/live-count-bin")
   fm_write_meta "$home/state/alpha.meta" "window=firstmate:fm-alpha" "harness=echo"
   fm_write_meta "$home/state/beta.meta" "window=firstmate:fm-beta" "harness=echo"
-  run_in_home "$home" "$fakebin"
+  run_in_home "$home" "$fakebin" --sweep
   expect_code 0 "$RC" "live-count exit"
   assert_contains "$OUT" "live crews 2" \
     "a crew whose liveness cannot be read must still count"
@@ -213,11 +218,113 @@ test_live_crew_count_excludes_agents_that_are_not_running() {
   fm_write_meta "$home/state/alpha.meta" "window=firstmate:fm-alpha" "harness=claude"
   fm_write_meta "$home/state/beta.meta" "window=firstmate:fm-beta" "harness=claude"
   fm_write_meta "$home/state/gamma.meta" "window=firstmate:fm-gamma" "harness=claude"
-  run_in_home "$home" "$fakebin"
+  run_in_home "$home" "$fakebin" --sweep
   expect_code 0 "$RC" "divergent live-count exit"
   assert_contains "$OUT" "live crews 1" \
     "recorded work whose agent has exited must not count as a live crew"
+  assert_not_contains "$OUT" "liveness unverified" \
+    "a probed sweep reports a verified count"
+  [ "$(cat "$home/state/.resource-live")" = 1 ] \
+    || fail "the sweep must cache its verified count for the synchronous callers"
   pass "the live-crew count follows running agents, not recorded task files"
+}
+
+test_synchronous_reading_uses_the_cached_verdict() {
+  local home fakebin
+  home=$(make_home live-count-cached)
+  fakebin=$(fake_tmux "$TMP_ROOT/live-count-cached-bin" fm-alpha)
+  fm_write_meta "$home/state/alpha.meta" "window=firstmate:fm-alpha" "harness=claude"
+  fm_write_meta "$home/state/beta.meta" "window=firstmate:fm-beta" "harness=claude"
+  fm_write_meta "$home/state/gamma.meta" "window=firstmate:fm-gamma" "harness=claude"
+  printf '1\n' > "$home/state/.resource-live"
+  run_in_home "$home" "$fakebin"
+  expect_code 0 "$RC" "cached live-count exit"
+  assert_contains "$OUT" "live crews 1" \
+    "the synchronous path must use the sweep's cached verdict, not the meta count"
+  assert_not_contains "$OUT" "liveness unverified" "a fresh cached verdict is verified"
+  pass "a synchronous reading reports the sweep's cached running-crew count"
+}
+
+test_synchronous_reading_never_probes_a_wedged_backend() {
+  local home fakebin started elapsed
+  home=$(make_home live-count-wedged)
+  fakebin=$(fm_fakebin "$TMP_ROOT/live-count-wedged-bin")
+  printf '#!/usr/bin/env bash\nsleep 60\n' > "$fakebin/tmux"
+  chmod +x "$fakebin/tmux"
+  fm_write_meta "$home/state/alpha.meta" "window=firstmate:fm-alpha" "harness=claude"
+  fm_write_meta "$home/state/beta.meta" "window=firstmate:fm-beta" "harness=claude"
+  started=$SECONDS
+  run_in_home "$home" "$fakebin"
+  elapsed=$((SECONDS - started))
+  expect_code 0 "$RC" "wedged-backend synchronous exit"
+  [ "$elapsed" -lt 10 ] || fail "a synchronous reading waited ${elapsed}s on a wedged backend"
+  assert_contains "$OUT" "live crews 2 (recorded work, liveness unverified)" \
+    "with no cached verdict the count must fall back to recorded work and say so"
+  pass "a dispatch-path reading never probes, so a wedged backend cannot delay it"
+}
+
+test_stale_cached_verdict_degrades_honestly() {
+  local home fakebin
+  home=$(make_home live-count-stale)
+  fakebin=$(fake_tmux "$TMP_ROOT/live-count-stale-bin" fm-alpha)
+  fm_write_meta "$home/state/alpha.meta" "window=firstmate:fm-alpha" "harness=claude"
+  fm_write_meta "$home/state/beta.meta" "window=firstmate:fm-beta" "harness=claude"
+  printf '1\n' > "$home/state/.resource-live"
+  touch -t 202001010000 "$home/state/.resource-live"
+  run_in_home "$home" "$fakebin"
+  expect_code 0 "$RC" "stale cached live-count exit"
+  assert_contains "$OUT" "live crews 2 (recorded work, liveness unverified)" \
+    "a verdict older than two sweeps must not pass as a verified count"
+  pass "a cached verdict older than two sweep intervals degrades and says so"
+}
+
+test_sweep_without_the_backend_library_labels_its_count() {
+  local home fakebin
+  home=$(make_home live-count-nolib)
+  fakebin=$(fake_tmux "$TMP_ROOT/live-count-nolib-bin" fm-alpha)
+  mkdir -p "$TMP_ROOT/norootbin/bin"
+  fm_write_meta "$home/state/alpha.meta" "window=firstmate:fm-alpha" "harness=claude"
+  run_in_home "$home" "$fakebin" --sweep FM_ROOT_OVERRIDE="$TMP_ROOT/norootbin"
+  expect_code 0 "$RC" "backend-less sweep exit"
+  assert_contains "$OUT" "live crews 1 (recorded work, liveness unverified)" \
+    "a sweep that cannot read liveness must not present recorded work as verified"
+  pass "a sweep with no backend library labels its recorded-work count honestly"
+}
+
+test_probe_timeout_leaves_no_stuck_backend_process() {
+  local home fakebin started elapsed
+  home=$(make_home probe-wedged)
+  fakebin=$(fm_fakebin "$TMP_ROOT/probe-wedged-bin")
+  # A distinctive duration so the survivor check cannot match unrelated sleeps.
+  printf '#!/usr/bin/env bash\nsleep 4711\n' > "$fakebin/tmux"
+  chmod +x "$fakebin/tmux"
+  fm_write_meta "$home/state/alpha.meta" "window=firstmate:fm-alpha" "harness=claude"
+  started=$SECONDS
+  run_in_home "$home" "$fakebin" --sweep FM_RESOURCE_PROBE_TIMEOUT=1
+  elapsed=$((SECONDS - started))
+  expect_code 0 "$RC" "wedged-probe sweep exit"
+  [ "$elapsed" -lt 15 ] || fail "a wedged probe hung the sweep for ${elapsed}s"
+  assert_contains "$OUT" "live crews 1" "an unanswered probe must still count its crew"
+  sleep 1
+  if pgrep -f 'sleep 4711' >/dev/null 2>&1; then
+    pkill -f 'sleep 4711' >/dev/null 2>&1 || true
+    fail "the wedged backend command outlived its probe timeout"
+  fi
+  pass "a probe timeout terminates the wedged backend command, not just the waiter"
+}
+
+test_malformed_probe_timeout_never_takes_monitoring_dark() {
+  local home fakebin
+  home=$(make_home probe-timeout)
+  fakebin=$(fake_tmux "$TMP_ROOT/probe-timeout-bin" fm-alpha)
+  fm_write_meta "$home/state/alpha.meta" "window=firstmate:fm-alpha" "harness=claude"
+  fm_write_meta "$home/state/beta.meta" "window=firstmate:fm-beta" "harness=claude"
+  run_in_home "$home" "$fakebin" --sweep FM_RESOURCE_PROBE_TIMEOUT=5s
+  expect_code 0 "$RC" "malformed probe-timeout exit"
+  assert_contains "$OUT" "resources: healthy" \
+    "a malformed probe timeout must fall back, not degrade the whole reading"
+  assert_contains "$OUT" "live crews 1" "the sweep must still probe with the fallback timeout"
+  pass "a malformed probe timeout falls back instead of taking the monitor dark"
 }
 
 test_injected_live_count_still_wins() {
@@ -225,10 +332,13 @@ test_injected_live_count_still_wins() {
   home=$(make_home live-count-injected)
   fakebin=$(fake_tmux "$TMP_ROOT/live-count-injected-bin" fm-alpha)
   fm_write_meta "$home/state/alpha.meta" "window=firstmate:fm-alpha" "harness=claude"
-  run_in_home "$home" "$fakebin" FM_RESOURCE_LIVE=6
+  run_in_home "$home" "$fakebin" --sweep FM_RESOURCE_LIVE=6
   expect_code 0 "$RC" "injected live-count exit"
   assert_contains "$OUT" "live crews 6" "an injected crew count must be used verbatim"
-  pass "the FM_RESOURCE_LIVE injection seam still overrides the probe"
+  run_in_home "$home" "$fakebin" FM_RESOURCE_LIVE=6
+  expect_code 0 "$RC" "injected live-count exit on the synchronous path"
+  assert_contains "$OUT" "live crews 6" "injection must win on the cached path too"
+  pass "the FM_RESOURCE_LIVE injection seam still overrides both crew-count paths"
 }
 
 test_unreadable_host_is_unknown_and_never_alarms() {
@@ -464,6 +574,12 @@ test_worst_of_three_decides_the_status
 test_shed_advice_names_the_overage_only_when_over_ceiling
 test_live_crew_count_comes_from_recorded_work
 test_live_crew_count_excludes_agents_that_are_not_running
+test_synchronous_reading_uses_the_cached_verdict
+test_synchronous_reading_never_probes_a_wedged_backend
+test_stale_cached_verdict_degrades_honestly
+test_sweep_without_the_backend_library_labels_its_count
+test_probe_timeout_leaves_no_stuck_backend_process
+test_malformed_probe_timeout_never_takes_monitoring_dark
 test_injected_live_count_still_wins
 test_unreadable_host_is_unknown_and_never_alarms
 test_partial_reading_never_passes_as_healthy

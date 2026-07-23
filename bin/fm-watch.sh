@@ -137,6 +137,8 @@ CHECK_TIMEOUT=${FM_CHECK_TIMEOUT:-30}     # seconds allowed per *.check.sh
 # An unrunnable or unparseable resolver falls back to that default rather than
 # silently switching the monitor off for this watcher's whole lifetime; the
 # fallback is logged once at startup so the condition is visible.
+# Mirror of bin/fm-resource-check.sh's RESOURCE_INTERVAL_DEFAULT, which is the
+# single source of truth for this number; keep the two in step.
 RESOURCE_INTERVAL_DEFAULT=900
 RESOURCE_INTERVAL_FELL_BACK=
 RESOURCE_INTERVAL=$("$SCRIPT_DIR/fm-resource-check.sh" --interval 2>/dev/null || printf '')
@@ -345,6 +347,8 @@ EOF
 # of nagged about every sweep. It is monitor-and-report only: nothing here pauses,
 # sheds or kills anything, because shedding load is the captain's decision.
 #
+# This sweep is the ONLY caller that runs the check with --sweep, so crew-liveness
+# probing happens once per cadence here and never on a synchronous path.
 # .resource-status caches the latest reading for the heartbeat annotation.
 # .resource-surfaced remembers the worst level already reported; recovery to
 # healthy re-arms it SILENTLY (no wake), so the fleet is only interrupted for
@@ -353,7 +357,7 @@ EOF
 # never-wake-on-an-unreadable-probe rule as secondmate_context_sweep.
 resource_sweep() {
   local out rc status last rank last_rank reason
-  out=$("$SCRIPT_DIR/fm-resource-check.sh" 2>/dev/null) && rc=0 || rc=$?
+  out=$("$SCRIPT_DIR/fm-resource-check.sh" --sweep 2>/dev/null) && rc=0 || rc=$?
   case "$rc" in
     0) status=healthy ;;
     1) status=degraded ;;

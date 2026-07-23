@@ -19,6 +19,9 @@
 #
 # Usage:
 #   fm-resource-check.sh              print one reading line, exit with its status
+#   fm-resource-check.sh --sweep      same, but probe crew liveness and refresh the
+#                                     cache. The watcher's slow sweep is the ONLY
+#                                     caller that may use it; see CEILING below.
 #   fm-resource-check.sh --interval   print the resolved sweep interval in seconds
 #   fm-resource-check.sh --help
 #
@@ -48,14 +51,27 @@
 #              kernel is already swapping.
 #   by CPU:    the current live-crew count adjusted by load per core (+3 under
 #              1.0, +1 under 2.0, -1 under 4.0, halved at or above 4.0), floor 1.
-# Live crews are the RUNNING ones: every state/*.meta is probed with
-# bin/fm-backend.sh's fm_backend_agent_alive and only a CONFIDENT `dead` verdict
-# is excluded, so a meta whose agent has exited but which has not been torn down
-# yet stops inflating the count and the shed advice. An ambiguous or unreadable
-# probe counts that one crew as live rather than discarding the whole reading,
-# and each probe is bounded by FM_RESOURCE_PROBE_TIMEOUT seconds (default 5) so a
-# wedged backend cannot hang the sweep. An IDLE agent is cheap; concurrent test
-# and browser runs are what exhaust a host, so the SHED line names those first.
+# Live crews are the RUNNING ones, and ONLY the watcher's slow sweep pays for
+# that answer. Under --sweep every state/*.meta is probed with bin/fm-backend.sh's
+# fm_backend_agent_alive, only a CONFIDENT `dead` verdict is excluded - so a meta
+# whose agent has exited but which has not been torn down yet stops inflating the
+# count and the shed advice - and the resulting count is cached in
+# state/.resource-live. An ambiguous or unreadable probe counts that one crew as
+# live rather than discarding the whole reading; each probe is bounded by
+# FM_RESOURCE_PROBE_TIMEOUT seconds (default 5, malformed values falling back to
+# it) and is terminated as a process group, so a wedged backend can neither hang
+# the sweep nor leak a stuck process behind it.
+#
+# Every OTHER caller (bin/fm-spawn.sh before a dispatch, bin/fm-session-start.sh
+# inside its fast digest) READS that cache and never probes, so a wedged backend
+# can never delay a dispatch or a session start. The cached verdict is therefore
+# at most one sweep interval old (FM_RESOURCE_INTERVAL, default 900s); a cache
+# that is missing, unreadable or older than two sweep intervals degrades
+# immediately to the cheap count of recorded state/*.meta files, and the reading
+# then says "liveness unverified" rather than passing recorded work off as a
+# verified count. The same honest label is used when bin/fm-backend.sh cannot be
+# sourced during a sweep. An IDLE agent is cheap; concurrent test and browser
+# runs are what exhaust a host, so the SHED line names those first.
 #
 # Every reading can be injected for tests via FM_RESOURCE_CORES,
 # FM_RESOURCE_RAM_GB, FM_RESOURCE_LOAD1, FM_RESOURCE_AVAIL_MB,
@@ -94,9 +110,11 @@ usage() {
        { exit }' "$0"
 }
 
+SWEEP=0
 case "${1:-}" in
   -h|--help) usage; exit 0 ;;
   --interval) resolve_interval; exit 0 ;;
+  --sweep) SWEEP=1 ;;
   '') : ;;
   *) echo "error: unknown argument '$1'" >&2; exit 64 ;;
 esac
@@ -197,18 +215,27 @@ read_swap_total_mb() {
 }
 
 # probe_verdict: fm_backend_agent_alive for one endpoint, bounded and tolerant.
-# The probe runs in a child so a wedged backend cannot hang the sweep, and
-# anything that is not a confident alive/dead answer degrades to unknown for that
-# one crew rather than spoiling the whole reading.
-PROBE_TIMEOUT=${FM_RESOURCE_PROBE_TIMEOUT:-5}
+# The probe runs in its own PROCESS GROUP (job control, restored immediately) so
+# a timeout terminates the wedged backend command too, not just the shell waiting
+# on it. Anything that is not a confident alive/dead answer degrades to unknown
+# for that one crew rather than spoiling the whole reading. A malformed timeout
+# knob falls back to the default instead of aborting the reading.
+PROBE_TIMEOUT_DEFAULT=5
+PROBE_TIMEOUT=${FM_RESOURCE_PROBE_TIMEOUT:-$PROBE_TIMEOUT_DEFAULT}
+case "$PROBE_TIMEOUT" in ''|0|*[!0-9]*) PROBE_TIMEOUT=$PROBE_TIMEOUT_DEFAULT ;; esac
 probe_verdict() {  # <backend> <target>
   local out pid slices=0 verdict
-  out="${TMPDIR:-/tmp}/fm-resource-probe.$$.$RANDOM"
+  out=$(mktemp "${TMPDIR:-/tmp}/fm-resource-probe.XXXXXX" 2>/dev/null) || {
+    printf 'unknown'
+    return 0
+  }
+  set -m
   ( fm_backend_agent_alive "$1" "$2" 2>/dev/null || printf 'unknown' ) > "$out" 2>/dev/null &
   pid=$!
+  set +m
   while kill -0 "$pid" 2>/dev/null; do
     if [ "$slices" -ge $(( PROBE_TIMEOUT * 5 )) ]; then
-      kill -TERM "$pid" 2>/dev/null || true
+      kill -TERM -"$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
       break
     fi
     sleep 0.2
@@ -220,19 +247,36 @@ probe_verdict() {  # <backend> <target>
   case "$verdict" in alive|dead) printf '%s' "$verdict" ;; *) printf 'unknown' ;; esac
 }
 
-read_live_crews() {
-  local v meta backend target n=0
-  v=${FM_RESOURCE_LIVE:-}
-  if [ -n "$v" ]; then
-    printf '%s' "$v"
-    return 0
+# The live-crew readers run inside a command substitution, so they cannot set a
+# variable for the caller: each prints "<note><TAB><count>" and the caller splits
+# it. The note comes first because a command substitution strips trailing
+# whitespace; it is empty for a verified count and names the degradation
+# otherwise, so a recorded-work count is never displayed as a verified one.
+UNVERIFIED_NOTE=' (recorded work, liveness unverified)'
+
+count_metas() {  # <note>
+  local meta n=0
+  for meta in "$STATE"/*.meta; do
+    [ -f "$meta" ] && n=$((n + 1))
+  done
+  printf '%s\t%s' "$1" "$n"
+}
+
+mtime_of() {  # epoch seconds of <file>, empty when unreadable
+  if [ "$(uname)" = Darwin ]; then
+    stat -f %m "$1" 2>/dev/null
+  else
+    stat -c %Y "$1" 2>/dev/null
   fi
+}
+
+# sweep_live_crews: the probing path, watcher-only. Caches the verified count so
+# every synchronous caller can read it without touching a backend.
+sweep_live_crews() {
+  local meta backend target n=0
   # shellcheck source=bin/fm-backend.sh
   . "$FM_ROOT/bin/fm-backend.sh" 2>/dev/null || {
-    for meta in "$STATE"/*.meta; do
-      [ -f "$meta" ] && n=$((n + 1))
-    done
-    printf '%s' "$n"
+    count_metas "$UNVERIFIED_NOTE"
     return 0
   }
   for meta in "$STATE"/*.meta; do
@@ -244,7 +288,39 @@ read_live_crews() {
     fi
     n=$((n + 1))
   done
-  printf '%s' "$n"
+  [ -d "$STATE" ] && printf '%s\n' "$n" > "$LIVE_CACHE" 2>/dev/null
+  printf '\t%s' "$n"
+}
+
+# cached_live_crews: the synchronous path. Reads the sweep's verdict and NEVER
+# probes, so a wedged backend cannot delay a dispatch or a session start.
+cached_live_crews() {
+  local cached age m now
+  cached=$(cat "$LIVE_CACHE" 2>/dev/null || true)
+  m=$(mtime_of "$LIVE_CACHE")
+  now=$(date +%s)
+  age=999999
+  case "$m" in ''|*[!0-9]*) : ;; *) age=$(( now - m )) ;; esac
+  if is_uint "$cached" && [ "$age" -lt $(( $(resolve_interval) * 2 )) ]; then
+    printf '\t%s' "$cached"
+    return 0
+  fi
+  count_metas "$UNVERIFIED_NOTE"
+}
+
+LIVE_CACHE="$STATE/.resource-live"
+read_live_crews() {
+  local v
+  v=${FM_RESOURCE_LIVE:-}
+  if [ -n "$v" ]; then
+    printf '\t%s' "$v"
+    return 0
+  fi
+  if [ "$SWEEP" = 1 ]; then
+    sweep_live_crews
+  else
+    cached_live_crews
+  fi
 }
 
 CORES=$(read_cores)
@@ -253,7 +329,9 @@ LOAD1=$(read_load1)
 AVAIL_MB=$(read_avail_mb)
 SWAP_USED=$(read_swap_used_mb)
 SWAP_TOTAL=$(read_swap_total_mb)
-LIVE=$(read_live_crews)
+LIVE_READING=$(read_live_crews)
+LIVE=${LIVE_READING##*$'\t'}
+LIVE_NOTE=${LIVE_READING%$'\t'*}
 
 if ! is_uint "$CORES" || [ "$CORES" -lt 1 ] \
   || ! is_num "$LOAD1" || ! is_num "$AVAIL_MB" \
@@ -297,8 +375,8 @@ BY_CPU=$(awk -v l="$LOAD_PER_CORE_EXACT" -v n="$LIVE" 'BEGIN{
 if [ "$BY_MEM" -lt "$BY_CPU" ]; then CEILING=$BY_MEM; else CEILING=$BY_CPU; fi
 [ "$CEILING" -ge 1 ] || CEILING=1
 
-printf 'resources: %s | load %s (%sx over %s cores) | avail %s MB of %s GB | swap %s%% of %sM | live crews %s | recommended ceiling %s\n' \
-  "$STATUS" "$LOAD1" "$LOAD_PER_CORE" "$CORES" "$AVAIL_MB" "$RAM_GB" "$SWAP_PCT" "$SWAP_TOTAL" "$LIVE" "$CEILING"
+printf 'resources: %s | load %s (%sx over %s cores) | avail %s MB of %s GB | swap %s%% of %sM | live crews %s%s | recommended ceiling %s\n' \
+  "$STATUS" "$LOAD1" "$LOAD_PER_CORE" "$CORES" "$AVAIL_MB" "$RAM_GB" "$SWAP_PCT" "$SWAP_TOTAL" "$LIVE" "$LIVE_NOTE" "$CEILING"
 
 if [ "$RC" -ne 0 ] && [ "$LIVE" -gt "$CEILING" ]; then
   printf 'resources: SHED %s crew(s) - stop the heaviest test and browser runs first, they cost far more than an idle agent\n' \

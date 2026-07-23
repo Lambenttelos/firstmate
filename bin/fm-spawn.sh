@@ -159,6 +159,8 @@ fm_refuse_if_gate_agent
 # REPORTS and never refuses or sheds - whether to stop work is the captain's
 # call, not this script's. Same batch gate as the guard above, so a batch warns
 # once rather than once per pair. A healthy, unknown or disabled reading is silent.
+# The check runs WITHOUT --sweep, so it reads the watcher's cached crew-liveness
+# verdict and never probes a backend: a wedged backend cannot delay a dispatch.
 if [ -z "${FM_SPAWN_NO_GUARD:-}" ]; then
   RESOURCE_OUT=$("$FM_ROOT/bin/fm-resource-check.sh" 2>/dev/null) && RESOURCE_RC=0 || RESOURCE_RC=$?
   case "$RESOURCE_RC" in
