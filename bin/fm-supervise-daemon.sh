@@ -129,15 +129,10 @@
 #          FM_AFK_INBOX_BEACON_STALE_SECS seconds without a stamp on
 #                                   state/.afk-inbox.beat before the paneless
 #                                   undelivered alarm treats firstmate's inbox
-#                                   reader as gone (default: twice FM_MAX_DEFER_SECS,
-#                                   so 600s at defaults; invalid/zero uses that
-#                                   derived default). The alarm needs an overdue
-#                                   record AND a stale beacon, so neither an armed
-#                                   reader waiting through a long turn nor the
-#                                   turn that processes a delivery - during which
-#                                   no reader runs at all - alarms. A reader that
-#                                   is never re-armed still alarms within that
-#                                   window of its last sign of life.
+#                                   reader as gone. docs/configuration.md
+#                                   ("Away-mode paneless delivery") owns the
+#                                   default, the reporting bound, and why they are
+#                                   derived from FM_MAX_DEFER_SECS.
 #          FM_WEDGE_ALARM_CHANNEL   override config/wedge-alarm with a single
 #                                   active-alert directive for that wedge alarm
 #                                   (off|auto|osascript|herdr|command:<cmd>). An
@@ -251,19 +246,10 @@ OUTBOX_PROBE_NOT_BEFORE=0
 # undelivered alarm treats the reader as gone, expressed as a multiple of the
 # effective max-defer window rather than a fixed number of seconds.
 #
-# The window this has to survive is one firstmate TURN, not one poll interval.
-# The reader delivers, acknowledges, and EXITS; firstmate then processes those
-# digests and only re-arms it at the end of that turn, so nothing stamps the
-# beacon for the whole turn. A fixed window shorter than max-defer therefore goes
-# stale at almost the same moment a record appended at the start of that turn
-# becomes overdue, which alarms the away captain on the healthy path. Deriving it
-# from max-defer keeps the two comparable however max-defer is configured.
-#
-# BOUND. A reader that is never re-armed, or a firstmate that died, is still
-# reported within this multiple of max-defer after its last sign of life (600s at
-# defaults), because a reader that is actually alive delivers within one poll and
-# re-stamps the beacon on that acknowledgement. Raising max-defer itself was
-# rejected on purpose: that trades this false alarm for a silent gap.
+# The window this has to survive is one firstmate TURN, not one poll interval,
+# and the reporting bound that follows from it, are owned by
+# docs/configuration.md ("Away-mode paneless delivery"); deriving the window from
+# max-defer here is what keeps the two comparable however max-defer is configured.
 INBOX_BEACON_STALE_DEFER_MULTIPLE=2
 # The captain-relevant verb set and the status classifiers (last_status_line,
 # status_is_captain_relevant, window_to_task, scan_captain_relevant_statuses) now
@@ -762,13 +748,12 @@ paneless_delivery() {
 }
 
 # Seconds without a reader beacon stamp before the paneless undelivered alarm
-# treats firstmate's inbox reader as gone. Defaults to
-# INBOX_BEACON_STALE_DEFER_MULTIPLE times the effective max-defer window, so an
-# ordinary firstmate turn - during which no reader is running at all - cannot trip
-# it, while a reader that is never re-armed still alarms within that bound. A
-# non-numeric or zero override falls back to the derived default rather than
-# disabling the staleness check, because a staleness window of zero would make
-# every armed reader look dead and restore the false alarm this gate removes.
+# treats firstmate's inbox reader as gone: INBOX_BEACON_STALE_DEFER_MULTIPLE times
+# the effective max-defer window (see docs/configuration.md for that default and
+# its reporting bound). A non-numeric or zero override falls back to the derived
+# default rather than disabling the staleness check, because a staleness window of
+# zero would make every armed reader look dead and restore the false alarm this
+# gate removes.
 inbox_beacon_stale_secs() {
   local secs=${FM_AFK_INBOX_BEACON_STALE_SECS:-} max_defer
   case "$secs" in
@@ -1046,7 +1031,7 @@ wedge_alarm_notify() {  # <summary> <marker>
 #                    subsystem this run does not have.
 inject_wedge_alarm() {  # <state> <age-seconds> [mode]
   local state=$1 age=$2 mode=${3:-pane} marker target backend max_defer now notify=1
-  local cause detail headline report report_rc=0 picked_up=0
+  local cause detail headline report report_rc=0
   marker="$state/.subsuper-inject-wedged"
   case "$mode" in
     paneless)
@@ -1081,21 +1066,20 @@ inject_wedge_alarm() {  # <state> <age-seconds> [mode]
       # acknowledged every record between housekeeping's oldest-pending probe and
       # this write, so the escalation WAS delivered. That is this alarm's own
       # success condition - the same way the pane path retires the marker on a
-      # confirmed submit - so it records the outcome instead of waking the away
-      # captain. Suppression is allowed ONLY here; an inbox that could not be READ
-      # still alarms, because a failed read is never an empty one.
-      picked_up=1
-      notify=0
-      cause="firstmate's away-mode inbox reader picked every record up while this alarm was being written"
-      detail='No records remain pending in the away-mode inbox.'
-      headline=$(printf 'fm away-mode inject RECOVERED: %ss undelivered, then picked up as of %s' \
-        "$age" "$(date '+%Y-%m-%dT%H:%M:%S%z')")
+      # confirmed submit - so it neither wakes the away captain nor writes the
+      # marker: $marker means WEDGED to every one of its consumers, and
+      # bin/fm-afk-return.sh files its first line as wedge catch-up evidence that
+      # the away-mode skill then surfaces on the while-you-were-out report. The
+      # outcome is recorded in the daemon log instead, and housekeeping retires
+      # any pre-existing marker on its own terms. Suppression is allowed ONLY
+      # here; an inbox that could not be READ still alarms, because a failed read
+      # is never an empty one.
+      log "away-mode escalation ${age}s undelivered; firstmate's away-mode inbox reader picked every record up while this alarm was being written. No alert raised and no wedge marker written."
+      return 0
     fi
   fi
   now=$(_now)
-  if [ "$picked_up" -eq 1 ]; then
-    log "away-mode escalation ${age}s undelivered; ${cause}. No alert raised; outcome recorded in $marker."
-  elif [ "$WEDGE_ALARM_LAST_EPOCH" -gt 0 ] && [ $((now - WEDGE_ALARM_LAST_EPOCH)) -lt "$max_defer" ]; then
+  if [ "$WEDGE_ALARM_LAST_EPOCH" -gt 0 ] && [ $((now - WEDGE_ALARM_LAST_EPOCH)) -lt "$max_defer" ]; then
     notify=0
   else
     WEDGE_ALARM_LAST_EPOCH=$now
@@ -1105,9 +1089,7 @@ inject_wedge_alarm() {  # <state> <age-seconds> [mode]
     printf '%s\n' "$headline"
     printf '%s\n' "$detail"
     if [ "$mode" = paneless ]; then
-      if [ "$picked_up" -eq 1 ]; then
-        printf '(the reader acknowledged them while this alarm was being written; nothing is waiting)\n'
-      elif [ "$report_rc" -ne 0 ]; then
+      if [ "$report_rc" -ne 0 ]; then
         printf '(the away-mode inbox could not be read while writing this alarm; its records are still pending)\n'
       else
         printf '%s\n' "$report"

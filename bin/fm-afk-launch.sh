@@ -495,12 +495,11 @@ fm_afk_launch_start() {
   if ! fm_afk_launch_reconcile; then
     result=1
   else
-    if fm_afk_clear_stale_artifacts "$FM_AFK_LAUNCH_STATE"; then
-      result=0
-    else
-      fm_afk_launch_log "failed to clear stale away-mode artifacts"
-      result=1
-    fi
+    # Deliberately NOT fatal, and deliberately the same verdict bin/fm-afk-start.sh
+    # reaches on the direct path: see fm_afk_stale_artifact_continue_message.
+    fm_afk_clear_stale_artifacts "$FM_AFK_LAUNCH_STATE" \
+      || fm_afk_launch_log "$(fm_afk_stale_artifact_continue_message)"
+    result=0
   fi
   if [ "$result" -eq 0 ]; then
     fm_afk_launch_mark_daemon_starting
@@ -603,19 +602,20 @@ fm_afk_launch_start_no_terminal() {
   done < <(fm_afk_session_artifact_names)
   fm_afk_launch_reconcile || result=1
   if [ "$result" -eq 0 ]; then
-    if ! fm_afk_clear_stale_artifacts "$FM_AFK_LAUNCH_STATE"; then
-      fm_afk_launch_log "failed to clear stale away-mode artifacts"
-      result=1
+    # Deliberately NOT fatal, and deliberately the same verdict bin/fm-afk-start.sh
+    # reaches on the direct path: see fm_afk_stale_artifact_continue_message.
+    fm_afk_clear_stale_artifacts "$FM_AFK_LAUNCH_STATE" \
+      || fm_afk_launch_log "$(fm_afk_stale_artifact_continue_message)"
+    # native expects a daemon next and claims the bring-up window; daemonless
+    # declares that no daemon runs here at all, so it drops any decayed claim.
+    if [ "$mode" = native ]; then
+      fm_afk_launch_mark_daemon_starting
     else
-      # native expects a daemon next and claims the bring-up window; daemonless
-      # declares that no daemon runs here at all, so it drops any decayed claim.
-      if [ "$mode" = native ]; then
-        fm_afk_launch_mark_daemon_starting
-      else
-        fm_afk_daemon_pending_clear "$FM_AFK_LAUNCH_STATE" ||
-          fm_afk_launch_log "failed to clear a stale daemon-starting marker"
-      fi
-      fm_afk_launch_flag_write || result=1
+      fm_afk_daemon_pending_clear "$FM_AFK_LAUNCH_STATE" ||
+        fm_afk_launch_log "failed to clear a stale daemon-starting marker"
+    fi
+    if ! fm_afk_launch_flag_write; then
+      result=1
     fi
   fi
   if [ "$result" -eq 0 ]; then

@@ -2252,9 +2252,10 @@ test_paneless_marker_says_so_when_the_inbox_cannot_be_read() {
 # The third branch of the same listing: the reader acknowledged everything between
 # housekeeping's oldest-pending probe and this write, so the escalation WAS
 # delivered. That is the alarm's own success condition - the pane path retires its
-# marker on a confirmed submit for the same reason - so it records the outcome and
-# does not wake the away captain, and it still never renders a heading with
-# nothing under it.
+# marker on a confirmed submit for the same reason - so it records the outcome in
+# the daemon log ONLY. It must not wake the away captain and must not write
+# .subsuper-inject-wedged: that file means WEDGED to every consumer, and
+# bin/fm-afk-return.sh files its first line as wedge catch-up evidence.
 test_paneless_marker_reports_records_picked_up_while_it_was_written() {
   local dir state fakebin marker alarms daemon_log
   dir=$(make_supercase paneless-marker-ack-race)
@@ -2275,17 +2276,49 @@ test_paneless_marker_reports_records_picked_up_while_it_was_written() {
     FM_AFK_DELIVERY_MODE=paneless FM_WEDGE_ALARM_LOG="$alarms" \
     inject_wedge_alarm "$state" 6000 paneless
 
-  [ -s "$marker" ] || fail "the alarm wrote no durable marker for the outcome"
-  grep -F 'RECOVERED' "$marker" >/dev/null \
-    || fail "the marker still reads as wedged after the reader picked everything up: $(cat "$marker")"
-  grep -F 'No records remain pending' "$marker" >/dev/null \
-    || fail "the marker did not say the inbox is empty: $(cat "$marker")"
+  [ ! -e "$marker" ] \
+    || fail "a delivered escalation left a wedge marker behind: $(cat "$marker")"
   [ ! -s "$alarms" ] || fail "an escalation the reader had already picked up alerted the away captain"
   grep -F 'ERROR: away-mode escalation undelivered' "$daemon_log" >/dev/null \
     && fail "a delivered escalation was logged as an undelivered-escalation error"
+  grep -F 'picked every record up' "$daemon_log" >/dev/null \
+    || fail "the pick-up outcome was not recorded in the daemon log: $(cat "$daemon_log")"
+
+  pass "an alarm whose inbox read finds every record acknowledged logs the outcome and writes no wedge marker"
+}
+
+# The same success condition must not RETIRE an existing marker either: clearing
+# .subsuper-inject-wedged stays housekeeping's job on its own terms, and its mtime
+# is the only re-alarm rate limit that survives a daemon restart.
+test_paneless_pick_up_leaves_an_existing_marker_alone() {
+  local dir state fakebin marker alarms daemon_log
+  dir=$(make_supercase paneless-marker-ack-race-existing)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  marker="$state/.subsuper-inject-wedged"
+  alarms="$dir/alarms.log"; : > "$alarms"
+  daemon_log="$dir/daemon.log"; : > "$daemon_log"
+  afk_enter "$state"
+
+  printf 'fm away-mode inject WEDGED: an earlier alarm\n' > "$marker"
+  # Age the marker past the re-alarm window so the rate limit is not what keeps
+  # this quiet.
+  touch -t 200001010000 "$marker"
+  printf '%s\t1\tescalation\t%sSupervisor escalate (1 event(s)): alpha.status: blocked: needs a token\n' \
+    "$(( $(date +%s) - 6000 ))" "$FM_INJECT_MARK" > "$state/.afk-outbox"
+  printf '1\n' > "$state/.afk-outbox.ack"
+
+  WEDGE_ALARM_LAST_EPOCH=0
+  PATH="$fakebin:$PATH" LOG="$daemon_log" FM_SUPERVISOR_TARGET="" \
+    FM_AFK_DELIVERY_MODE=paneless FM_WEDGE_ALARM_LOG="$alarms" \
+    inject_wedge_alarm "$state" 6000 paneless
+
+  grep -F 'an earlier alarm' "$marker" >/dev/null \
+    || fail "the pick-up branch rewrote or removed an existing wedge marker: $(cat "$marker" 2>/dev/null)"
+  [ ! -s "$alarms" ] || fail "an escalation the reader had already picked up alerted the away captain"
 
   rm -f "$marker"
-  pass "an alarm whose inbox read finds every record acknowledged records the recovery and raises no alert"
+  pass "the pick-up branch neither writes nor retires the wedge marker"
 }
 
 test_paneless_delivery_stays_presence_gated() {
@@ -2438,5 +2471,6 @@ test_paneless_alarm_fires_within_its_bound_for_a_dead_or_missing_reader
 test_inbox_beacon_stale_window_is_derived_from_max_defer
 test_paneless_marker_says_so_when_the_inbox_cannot_be_read
 test_paneless_marker_reports_records_picked_up_while_it_was_written
+test_paneless_pick_up_leaves_an_existing_marker_alone
 test_paneless_delivery_stays_presence_gated
 test_pane_delivery_never_writes_the_inbox

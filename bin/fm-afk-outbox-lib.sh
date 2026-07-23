@@ -231,6 +231,25 @@ _fm_afk_outbox_lock_acquire() {  # <lock-dir>
   return 1
 }
 
+# Can this state directory be looked INTO at all? Every cheap `[ -e ]` / `[ -s ]`
+# early return below only STATS a path, and a stat inside a directory that cannot
+# be traversed or read (mode 000, a revoked ACL, a bad mount) fails exactly the
+# way an absent file does. Without this guard those early returns would answer
+# "the read succeeded and found nothing" for an outbox nobody could look at,
+# which is the same failed-read-is-not-an-empty-read conflation
+# FM_AFK_OUTBOX_UNREADABLE exists to prevent - it would let the reader print a
+# healthy idle line, let housekeeping retire the wedge marker, and let the return
+# catch-up gate delete escalations it never saw.
+# An ABSENT state directory is legitimately empty, not a failure: no away session
+# has written anything here yet. Only a directory that EXISTS and still cannot be
+# traversed and read - or a path that exists and is not a directory at all - is a
+# failed read.
+_fm_afk_outbox_state_readable() {  # <state>
+  local state=$1
+  [ -e "$state" ] || return 0
+  [ -d "$state" ] && [ -x "$state" ] && [ -r "$state" ]
+}
+
 _fm_afk_outbox_int() {  # <text> -> the integer, or 0
   local value=$1
   case "$value" in
@@ -253,6 +272,7 @@ _fm_afk_outbox_int() {  # <text> -> the integer, or 0
 fm_afk_outbox_ack_seq() {  # <state>
   local file value rc=0
   file=$(fm_afk_outbox_ack_file "$1")
+  _fm_afk_outbox_state_readable "$1" || return "$FM_AFK_OUTBOX_UNREADABLE"
   [ -e "$file" ] || { printf '0'; return 0; }
   value=$(head -n 1 "$file" 2>/dev/null) || rc=$?
   [ "$rc" -eq 0 ] || return "$FM_AFK_OUTBOX_UNREADABLE"
@@ -272,6 +292,7 @@ fm_afk_outbox_ack_seq() {  # <state>
 _fm_afk_outbox_last_seq() {  # <state>
   local file last rc=0
   file=$(fm_afk_outbox_file "$1")
+  _fm_afk_outbox_state_readable "$1" || return "$FM_AFK_OUTBOX_UNREADABLE"
   [ -s "$file" ] || { printf '0'; return 0; }
   last=$(awk -F '\t' 'NF >= 4 && $2 ~ /^[0-9]+$/ && $2+0 > max { max = $2+0 } END { print max+0 }' \
     "$file" 2>/dev/null) || rc=$?
@@ -352,6 +373,11 @@ fm_afk_outbox_append() {  # <state> <kind> <digest>
 fm_afk_outbox_pending() {  # <state>
   local state=$1 lock ack file records rc=0
   file=$(fm_afk_outbox_file "$state")
+  # Ordered before the `[ -s ]` short-circuit on purpose: a state directory that
+  # cannot be looked into fails that stat exactly like an absent outbox, so
+  # answering it here is what keeps "no outbox file" and "cannot look at the
+  # outbox" separate outcomes.
+  _fm_afk_outbox_state_readable "$state" || return "$FM_AFK_OUTBOX_UNREADABLE"
   [ -s "$file" ] || return 0
   fm_afk_outbox_lock_lib "$state" || return "$FM_AFK_OUTBOX_UNREADABLE"
   lock=$(fm_afk_outbox_lock_file "$state")
@@ -460,6 +486,7 @@ fm_afk_outbox_pending_report() {  # <state>
 _fm_afk_outbox_compact() {  # <state>
   local state=$1 file lock ack compact_file
   file=$(fm_afk_outbox_file "$state")
+  _fm_afk_outbox_state_readable "$state" || return 1
   [ -s "$file" ] || return 0
   fm_afk_outbox_lock_lib "$state" || return 1
   lock=$(fm_afk_outbox_lock_file "$state")

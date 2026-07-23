@@ -88,6 +88,19 @@ fm_afk_session_artifact_names() {
   fm_afk_outbox_artifact_names
 }
 
+# The one wording every away-mode entry point uses after fm_afk_clear_stale_artifacts
+# fails. Away mode must still come up: refusing to enter costs the captain ALL
+# supervision over a rare filesystem condition, which is the exact outcome the
+# pull-delivery path exists to prevent, while a lock whose owner is dead is
+# already stolen by bin/fm-wake-lib.sh and a genuinely unusable one surfaces at
+# runtime through the paneless append-failure alarm. Both bin/fm-afk-start.sh's
+# direct start and both bin/fm-afk-launch.sh entry points render THIS text, so an
+# operator reading either sees the same fact and the two paths cannot drift into
+# disagreeing about whether away mode may come up.
+fm_afk_stale_artifact_continue_message() {
+  printf 'continuing into daemon startup despite the stale away-mode artifact(s) named above'
+}
+
 # Every failure NAMES the artifact it could not clear on stderr in addition to
 # returning non-zero, so no caller can turn a clearing problem into a silent stop.
 fm_afk_clear_stale_artifacts() {  # <state-dir>
@@ -161,7 +174,7 @@ fm_afk_start_main() {
   # clear on stderr, so the problem is reported rather than swallowed.
   if [ "${FM_AFK_STATE_PREPARED:-0}" != 1 ]; then
     if ! fm_afk_clear_stale_artifacts "$FM_AFK_STATE"; then
-      echo "afk: continuing into daemon startup despite the stale away-mode artifact(s) named above" >&2
+      echo "afk: $(fm_afk_stale_artifact_continue_message)" >&2
     fi
   fi
 

@@ -847,21 +847,67 @@ unit_refresh_validates_record() {
   rm -rf "$st"
 }
 
-unit_clear_failure_aborts_entry() {
-  local st
+# An artifact that will not clear must NOT cost the captain away-mode supervision
+# entirely: refusing to enter over a rare filesystem condition is the exact
+# outcome the away-mode delivery path exists to prevent, and bin/fm-afk-start.sh's
+# direct start already continues. Both launcher entry points must reach the same
+# verdict, in the same words, and both must NAME the artifact they could not clear.
+#
+# The unclearable artifact is real rather than stubbed: the outbox lock directory
+# holds a mode-000 non-empty subdirectory, so neither the portable lock helper's
+# removal path nor `rm -rf` can retire it.
+unit_clear_failure_still_enters_away_mode() {
+  local st out
+  if [ "$(id -u)" = 0 ]; then
+    pass "clear failure: skipped, running as root where mode 000 does not deny a removal"
+    return 0
+  fi
   st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-clear-fail.XXXXXX")
   mkdir -p "$st/state"
-  : > "$st/state/.subsuper-escalations"
-  if FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" bash -c '
+
+  seed_unclearable_lock() {
+    rm -rf "$st/state/.afk-outbox.lock"
+    mkdir -p "$st/state/.afk-outbox.lock/inner"
+    : > "$st/state/.afk-outbox.lock/inner/held"
+    chmod 000 "$st/state/.afk-outbox.lock/inner"
+  }
+  release_unclearable_lock() {
+    chmod 700 "$st/state/.afk-outbox.lock/inner" 2>/dev/null || true
+    rm -rf "$st/state/.afk-outbox.lock"
+  }
+
+  seed_unclearable_lock
+  out=$(FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" bash -c '
     . "$1"
     fm_afk_launch_reconcile() { return 0; }
-    fm_afk_clear_stale_artifacts() { return 1; }
-    ! fm_afk_launch_start_native
-  ' _ "$LAUNCH" && [ ! -e "$st/state/.afk" ] && [ -e "$st/state/.subsuper-escalations" ]; then
-    pass "clear failure: native entry aborts and restores prior state"
+    fm_afk_launch_start_native
+  ' _ "$LAUNCH" 2>&1)
+  if [ -e "$st/state/.afk" ] \
+    && printf '%s' "$out" | grep -F "could not clear stale away-mode artifact $st/state/.afk-outbox.lock" >/dev/null \
+    && printf '%s' "$out" | grep -F "$(fm_afk_stale_artifact_continue_message)" >/dev/null; then
+    pass "clear failure: native entry names the artifact and still enters away mode"
   else
-    fail "clear failure: native entry proceeded or lost prior state"
+    fail "clear failure: native entry refused or did not name the artifact: $out"
   fi
+  release_unclearable_lock
+  rm -f "$st/state/.afk" "$st/state/.afk-daemon-terminal"
+
+  seed_unclearable_lock
+  out=$(FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" FM_SUPERVISOR_TARGET=synthetic:0 \
+    FM_SUPERVISOR_BACKEND=tmux bash -c '
+    . "$1"
+    fm_afk_launch_reconcile() { return 0; }
+    fm_afk_launch_create_tmux() { return 0; }
+    fm_afk_launch_start
+  ' _ "$LAUNCH" 2>&1)
+  if [ -e "$st/state/.afk" ] \
+    && printf '%s' "$out" | grep -F "could not clear stale away-mode artifact $st/state/.afk-outbox.lock" >/dev/null \
+    && printf '%s' "$out" | grep -F "$(fm_afk_stale_artifact_continue_message)" >/dev/null; then
+    pass "clear failure: terminal entry names the artifact and still enters away mode"
+  else
+    fail "clear failure: terminal entry refused or did not name the artifact: $out"
+  fi
+  release_unclearable_lock
   rm -rf "$st"
 }
 
@@ -1048,7 +1094,7 @@ unit_lock_requires_complete_metadata
 unit_stop_surfaces_afk_removal_failure
 unit_stop_confirms_daemon_exit
 unit_refresh_validates_record
-unit_clear_failure_aborts_entry
+unit_clear_failure_still_enters_away_mode
 unit_confirmed_absence_succeeds
 unit_incomplete_restore_retains_backup
 unit_flag_write_failure_aborts

@@ -447,6 +447,56 @@ test_an_unreadable_acknowledgement_mark_is_not_a_zero() {
   pass "an unreadable or garbled acknowledgement mark fails the read instead of replaying every record"
 }
 
+# One layer deeper again: every cheap `[ -e ]` / `[ -s ]` early return only STATS
+# a path, and a stat inside a state DIRECTORY that cannot be traversed fails
+# exactly the way an absent file does. Without the state-readability guard the
+# pending read short-circuits to "read succeeded, found nothing" before the lock,
+# the file read, or the acknowledgement mark ever get a say - reopening the same
+# loss chain: a healthy reader line, a retired wedge marker, and a return gate
+# that deletes an outbox it never saw. An ABSENT state directory stays a genuine
+# empty, because no away session has written anything there yet.
+test_an_untraversable_state_directory_is_not_an_empty_outbox() {
+  local state rc out probe
+  if [ "$(id -u)" = 0 ]; then
+    pass "skipped: running as root, where mode 000 does not deny a read"
+    return 0
+  fi
+  state=$(make_inbox_case unreadable-state-dir)
+
+  rc=0; out=$(fm_afk_outbox_pending "$state/never-entered") || rc=$?
+  [ "$rc" -eq 0 ] && [ -z "$out" ] \
+    || fail "an ABSENT state directory must read as a genuine empty, got rc=$rc out='$out'"
+
+  enter_away "$state"
+  append_digest "$state" "Supervisor escalate (1 event(s)): alpha.status: blocked: needs a token"
+  chmod 000 "$state"
+
+  for probe in fm_afk_outbox_pending fm_afk_outbox_pending_report \
+    fm_afk_outbox_pending_count fm_afk_outbox_oldest_pending_epoch fm_afk_outbox_ack_seq; do
+    rc=0; out=$("$probe" "$state") || rc=$?
+    [ "$rc" -eq "$FM_AFK_OUTBOX_UNREADABLE" ] \
+      || fail "$probe must report unreadable for an untraversable state directory, got rc=$rc"
+    [ -z "$out" ] || fail "$probe printed '$out' for a state directory it could not look into"
+  done
+
+  rc=0; out=$(fm_afk_outbox_deliver "$state") || rc=$?
+  [ "$rc" -eq "$FM_AFK_OUTBOX_DELIVER_UNREADABLE" ] \
+    || fail "deliver must report unreadable for an untraversable state directory, got rc=$rc"
+
+  rc=0; out=$(run_inbox "$state" --once) || rc=$?
+  [ "$rc" -ne 0 ] || fail "the reader exited 0 on an untraversable state directory: $out"
+  case "$out" in
+    *"afk-inbox: nothing pending"*|*"afk-inbox: idle after"*|*"afk-inbox: delivered "*)
+      fail "the reader printed a healthy status line for a failed read: $out" ;;
+  esac
+
+  chmod 700 "$state"
+  [ ! -e "$state/.afk-outbox.ack" ] || fail "a failed read acknowledged records it never delivered"
+  [ "$(fm_afk_outbox_pending_count "$state")" -eq 1 ] \
+    || fail "the record did not stay pending after the failed reads"
+  pass "an untraversable state directory fails the read instead of reading as an empty outbox"
+}
+
 # The outbox must not grow for a whole away session: acknowledged records are
 # dropped so the reader's one-second poll stays proportional to what is pending.
 # Safety outranks the speedup - nothing above the mark may ever be removed, and
@@ -672,6 +722,7 @@ test_append_failure_is_reported_rather_than_hanging
 test_an_unreadable_outbox_is_never_reported_as_an_empty_one
 test_a_present_but_unreadable_outbox_file_is_not_an_empty_one
 test_an_unreadable_acknowledgement_mark_is_not_a_zero
+test_an_untraversable_state_directory_is_not_an_empty_outbox
 test_acknowledged_records_are_compacted_without_losing_pending_ones
 test_reader_exits_non_zero_when_the_outbox_cannot_be_read
 test_concurrent_readers_never_announce_what_they_did_not_deliver

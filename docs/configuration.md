@@ -112,7 +112,8 @@ That alarm also requires the reader's liveness beacon to be absent or stale, bec
 The reader stamps `.afk-inbox.beat` when it arms, on every poll iteration, and on every acknowledgement, and `FM_AFK_INBOX_BEACON_STALE_SECS` sets how stale it must be.
 Its default is twice `FM_MAX_DEFER_SECS` (600 seconds at defaults; an invalid or zero value uses that derived default) because the window it must survive is one firstmate turn rather than one poll interval: the reader exits as soon as it delivers, so nothing stamps the beacon while firstmate processes the digests and only re-arms it at the end of that turn.
 A reader that is never re-armed, or a firstmate that died, is therefore still reported within that window of its last sign of life rather than silently, and raising `FM_MAX_DEFER_SECS` instead is the wrong fix because that trades the false alarm for a silent gap.
-An alarm whose own inbox read then finds every record already acknowledged records that recovery in the marker and raises no alert, while an inbox that could not be read still alarms.
+An alarm whose own inbox read then finds every record already acknowledged records that recovery in the daemon log only, raising no alert and writing no wedge marker, because that marker means wedged to every consumer that surfaces it; an inbox that could not be read still alarms.
+A read that cannot even look into `state/` is a failed read too, not an empty outbox, so an untraversable state directory blocks the reader and return catch-up rather than reading as nothing pending.
 The [`afk`](../.agents/skills/afk/SKILL.md) skill owns the operating procedure.
 
 ## Away-mode wedge alarm channels (config/wedge-alarm)
