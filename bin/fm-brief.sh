@@ -259,6 +259,10 @@ The report is the only thing that survives, so anything worth keeping must be in
 7. Never stop, restart, or update the shared \`no-mistakes\` daemon - it is one instance serving
    every lane/home, so restarting it kills other lanes' in-flight pipeline runs. On ANY no-mistakes
    daemon error, append \`blocked: {the daemon error}\` and stop; only firstmate manages the daemon.
+8. Run every heavy command - unit suites, end-to-end suites, lint sweeps, builds - through
+   \`$FM_ROOT/bin/fm-heavy-run.sh --task $ID -- <command>\`. It queues the run so the whole fleet
+   is not thrashing one machine, then gives you the command's real output and exit status.
+   It prints a queued notice while you wait; that is normal, not a hang.
 
 # Definition of done
 Write your findings to \`$DATA/$ID/report.md\`.
@@ -369,6 +373,10 @@ $RULE1
 7. Never stop, restart, or update the shared \`no-mistakes\` daemon - it is one instance serving
    every lane/home, so restarting it kills other lanes' in-flight pipeline runs. On ANY no-mistakes
    daemon error, append \`blocked: {the daemon error}\` and stop; only firstmate manages the daemon.
+8. Run every heavy command - unit suites, end-to-end suites, lint sweeps, builds - through
+   \`$FM_ROOT/bin/fm-heavy-run.sh --task $ID -- <command>\`. It queues the run so the whole fleet
+   is not thrashing one machine, then gives you the command's real output and exit status.
+   It prints a queued notice while you wait; that is normal, not a hang.
 
 # Project memory
 If \`AGENTS.md\` or \`CLAUDE.md\` already exists, or if this task produced durable project-intrinsic knowledge, run \`$FM_ROOT/bin/fm-ensure-agents-md.sh .\` in the worktree.
