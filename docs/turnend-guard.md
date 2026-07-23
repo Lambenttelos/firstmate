@@ -35,7 +35,9 @@ A fresh leftover beacon blocks if the watcher lock is missing, dead, or identity
 ## Away Mode
 
 Away mode alone does not transfer watcher ownership.
-`bin/fm-afk-daemon-lib.sh` owns the question for the whole repo: `fm_afk_daemon_owns_supervision <state-dir> <bin-dir>` is true only when `state/.afk` exists AND a live away-mode supervision daemon actually holds this home's `state/.supervise-daemon.lock`, matched strictly against this home's own `bin/fm-supervise-daemon.sh`, so another home's daemon can never satisfy the check.
+`bin/fm-afk-daemon-lib.sh` owns the question for the whole repo: `fm_afk_daemon_owns_supervision <state-dir> <bin-dir>` is true only when `state/.afk` exists AND a live away-mode supervision daemon actually holds this home's `state/.supervise-daemon.lock`.
+Home scoping comes from that per-home lock path and the pid identity recorded beside it, so another home's daemon can never satisfy the check.
+Strict matching adds no cross-home discrimination, because scripts come from the shared tracked code root; it only rejects a live process that is not this repo's `bin/fm-supervise-daemon.sh` when no pid identity was recorded.
 The turn-end guard, the watcher's triage gate in `bin/fm-watch.sh`, the pull-based banner in `bin/fm-guard.sh`, and the session-start digest all ask that one function rather than reading the flag.
 
 With away mode on and a live daemon, the daemon owns supervision and the repair instruction still points at `/afk`, unchanged.

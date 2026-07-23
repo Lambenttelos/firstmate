@@ -29,6 +29,12 @@
 #   fm-afk-launch.sh start-native
 #                              Prepare lifecycle state for a harness-native
 #                              background job and record that no terminal exists.
+#   fm-afk-launch.sh start-daemonless
+#                              Enter the away POSTURE with NO daemon at all, for
+#                              a home whose captain session has no injectable
+#                              supervisor pane. Writes the same durable lifecycle
+#                              state, creates no terminal, and starts nothing;
+#                              this home keeps arming its own watcher.
 #   fm-afk-launch.sh stop      Correct-ordered exit: SIGTERM the daemon so its
 #                              cleanup flushes WHILE state/.afk is still present,
 #                              wait for it, close the recorded terminal by exact
@@ -123,7 +129,7 @@ fm_afk_launch_lock_release() {
 }
 
 fm_afk_launch_usage() {
-  sed -n '2,34p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '2,43p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 # The command run inside the created terminal. Real launch runs the shared
@@ -164,7 +170,7 @@ fm_afk_launch_record_read() {
   case "$FM_AFK_REC_BACKEND" in
     herdr) [ -n "$extra" ] ;;
     tmux) : ;;
-    none) [ "$FM_AFK_REC_TARGET" = - ] && [ "$extra" = native ] ;;
+    none) [ "$FM_AFK_REC_TARGET" = - ] && { [ "$extra" = native ] || [ "$extra" = daemonless ]; } ;;
     *) return 2 ;;
   esac || { fm_afk_launch_log "daemon terminal record is malformed; refusing to act on it"; return 2; }
 }
@@ -505,7 +511,20 @@ fm_afk_launch_start() {
 }
 
 fm_afk_launch_start_native() {
-  local backup artifact had_afk=0 result=0
+  fm_afk_launch_start_no_terminal native
+}
+
+# The daemon-free away posture: same durable lifecycle state as start-native,
+# but nothing will run a daemon afterwards, so the record says so. A home whose
+# captain session has no injectable supervisor pane enters away mode here and
+# keeps arming its own watcher (.agents/skills/afk/SKILL.md).
+fm_afk_launch_start_daemonless() {
+  fm_afk_launch_start_no_terminal daemonless
+}
+
+# <record-extra>: shared no-terminal lifecycle entry.
+fm_afk_launch_start_no_terminal() {
+  local mode=$1 backup artifact had_afk=0 result=0
   mkdir -p "$FM_AFK_LAUNCH_STATE" || return 1
   if [ -e "$FM_AFK_LAUNCH_STATE/.afk-return-catchup" ]; then
     fm_afk_launch_log "return catch-up is still pending; run bin/fm-afk-return.sh check before re-entering away mode"
@@ -537,7 +556,7 @@ fm_afk_launch_start_native() {
     fi
   fi
   if [ "$result" -eq 0 ]; then
-    fm_afk_launch_record_write none - native || result=1
+    fm_afk_launch_record_write none - "$mode" || result=1
   fi
   if [ "$result" -ne 0 ]; then
     fm_afk_launch_restore_backup "$backup" "$had_afk" || result=1
@@ -610,6 +629,7 @@ fm_afk_launch_main() {
   case "${1:-start}" in
     start) fm_afk_launch_start ;;
     start-native) fm_afk_launch_start_native ;;
+    start-daemonless) fm_afk_launch_start_daemonless ;;
     stop) fm_afk_launch_stop ;;
     reconcile) fm_afk_launch_reconcile ;;
     -h|--help|help) fm_afk_launch_usage ;;

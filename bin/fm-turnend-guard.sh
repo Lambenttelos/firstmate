@@ -92,9 +92,10 @@ fm_watcher_healthy "$STATE" "$WATCH" "$GRACE" "$FM_HOME" && exit 0
 # session runs outside any injectable supervisor pane deliberately runs away mode
 # WITHOUT a daemon: the away posture is on, while this home's own watcher stays
 # the real supervision mechanism. Only a live daemon for THIS home transfers
-# watcher ownership away (bin/fm-afk-daemon-lib.sh; strict matching so another
-# home's daemon can never satisfy this check), so the repair line points at
-# re-arming the watcher unless a daemon really owns it here.
+# watcher ownership away (bin/fm-afk-daemon-lib.sh; this home's own lock path
+# keeps another home's daemon out, while strict matching rejects a non-daemon
+# process), so the repair line points at re-arming the watcher unless a daemon
+# really owns it here.
 afk=0
 fm_afk_daemon_owns_supervision "$STATE" "$SCRIPT_DIR" && afk=1
 

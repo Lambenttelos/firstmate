@@ -443,6 +443,34 @@ unit_native_lifecycle() {
   rm -rf "$st"
 }
 
+unit_daemonless_lifecycle() {
+  local st record
+  st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-daemonless.XXXXXX")
+  mkdir -p "$st/state"
+  : > "$st/state/.subsuper-escalations"
+  if FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" "$LAUNCH" start-daemonless >/dev/null 2>&1 \
+    && [ -e "$st/state/.afk" ] \
+    && [ ! -e "$st/state/.subsuper-escalations" ] \
+    && [ ! -e "$st/state/.supervise-daemon.lock" ]; then
+    pass "daemonless lifecycle: away posture set with no daemon and no terminal"
+  else
+    fail "daemonless lifecycle: posture entry did not set state without a daemon"
+  fi
+  record=$(cat "$st/state/.afk-daemon-terminal" 2>/dev/null || printf '')
+  if [ "$record" = "$(printf 'none\t-\tdaemonless')" ]; then
+    pass "daemonless lifecycle: the record names the daemon-free mode"
+  else
+    fail "daemonless lifecycle: unexpected terminal record '$record'"
+  fi
+  FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" "$LAUNCH" stop >/dev/null 2>&1
+  if [ ! -e "$st/state/.afk" ] && [ ! -e "$st/state/.afk-daemon-terminal" ]; then
+    pass "daemonless lifecycle: uniform stop clears the away posture"
+  else
+    fail "daemonless lifecycle: uniform stop retained state"
+  fi
+  rm -rf "$st"
+}
+
 unit_native_entry_preserves_prepared_state() {
   local st
   st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-native-entry.XXXXXX")
@@ -876,6 +904,7 @@ unit_readiness_failure_rolls_back_terminal
 unit_readiness_failure_preserves_unconfirmed_record
 unit_tmux_absence_distinguishes_probe_failure
 unit_native_lifecycle
+unit_daemonless_lifecycle
 unit_native_entry_preserves_prepared_state
 unit_close_failure_preserves_record
 unit_record_publication_atomic

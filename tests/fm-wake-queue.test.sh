@@ -429,6 +429,23 @@ test_interruption_before_and_after_raw_commit() {
   pass "interruptions restore before commitment and never replay after raw commitment"
 }
 
+# The pid helpers are used by read-only reporting commands (fm-session-start.sh
+# before its lock decision), so sourcing them must write nothing; the queue lib
+# keeps its own state-dir initialization.
+test_pid_lib_source_is_side_effect_free() {
+  local dir state
+  dir=$(make_case pid-lib-side-effects)
+  state="$dir/state/not-created-yet"
+  FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_pid_alive "$$"' _ "$ROOT/bin/fm-pid-lib.sh" \
+    || fail "fm-pid-lib.sh did not report this live process as alive"
+  [ -d "$state" ] && fail "sourcing fm-pid-lib.sh created $state"
+  FM_STATE_OVERRIDE="$state" bash -c '. "$1"; :' _ "$ROOT/bin/fm-wake-lib.sh" \
+    || fail "fm-wake-lib.sh failed to source"
+  [ -d "$state" ] || fail "fm-wake-lib.sh no longer initializes its state dir"
+  pass "fm-pid-lib.sh sources without side effects while fm-wake-lib.sh keeps its own"
+}
+
+test_pid_lib_source_is_side_effect_free
 test_concurrent_append_and_drain
 test_signal_catchup_without_running_watcher
 test_stale_enqueue_before_suppressor

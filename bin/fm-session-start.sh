@@ -100,8 +100,6 @@ PRIMARY_HARNESS=$("$SCRIPT_DIR/fm-harness.sh" 2>/dev/null || printf unknown)
 . "$SCRIPT_DIR/fm-backend.sh"
 # shellcheck source=bin/fm-tasks-axi-lib.sh
 . "$SCRIPT_DIR/fm-tasks-axi-lib.sh"
-# shellcheck source=bin/fm-wake-lib.sh
-. "$SCRIPT_DIR/fm-wake-lib.sh"
 # shellcheck source=bin/fm-afk-daemon-lib.sh
 . "$SCRIPT_DIR/fm-afk-daemon-lib.sh"
 
@@ -413,6 +411,18 @@ load /afk and ensure the daemon is running, because the daemon owns watcher
 supervision.
 
 EOF
+elif [ -e "$STATE/.afk" ]; then
+  cat <<EOF
+Away posture is active: batch routine updates, keep the standing routine merge
+authority, and load /afk for away-mode handling. No away-mode daemon is running
+here, so this session's own watcher-arm loop is the supervision mechanism: arm
+and repair it normally.
+Follow the supervision operating instructions block above for harness '$PRIMARY_HARNESS'.
+EOF
+  if [ -f "$CONFIG/x-mode.env" ]; then
+    printf "X mode is active, so the emitted block's cadence instruction applies.\n"
+  fi
+  printf 'This script never starts supervision itself.\n\n'
 elif [ -f "$CONFIG/x-mode.env" ]; then
   cat <<EOF
 Follow the supervision operating instructions block above for harness '$PRIMARY_HARNESS'.

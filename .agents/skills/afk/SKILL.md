@@ -16,7 +16,26 @@ sub-supervisor may triage routine wakes in bash instead of waking firstmate's
 LLM for each one. Escalations still reach the captain, but as one pre-read,
 batched digest rather than per-wake injections.
 
-## What it does
+## Pick the entry path first
+
+Away mode has two first-class entry paths. Decide between them BEFORE running
+anything, from one question: does this session have an injectable supervisor
+pane, meaning a pane the daemon can type escalations into?
+
+- **Yes, there is an injectable supervisor pane** (firstmate runs inside tmux or
+  herdr): use the **daemon entry** below.
+- **No injectable supervisor pane** (the captain runs firstmate outside any such
+  pane, so nothing exists for a daemon to type into): use the **daemon-free
+  entry** below.
+
+Never start a daemon without a pane it can inject into. A daemon with nowhere to
+type talks to nobody: its escalations buffer and are lost silently, a failure
+this fleet has already had. Never manufacture a pane just to satisfy the daemon.
+
+Both entries share the same away posture, the same exit contract, and the same
+approval authority; they differ only in what supervises.
+
+## Daemon entry (injectable supervisor pane)
 
 1. **Enter the lifecycle through `bin/fm-afk-launch.sh`.**
    This owns the durable state write, session-scoped stale-artifact clearing,
@@ -48,26 +67,42 @@ batched digest rather than per-wake injections.
    It exits immediately if the identity-backed daemon lock already names a live process, otherwise it execs `bin/fm-supervise-daemon.sh` in the foreground.
    The daemon is **presence-gated**: it injects escalations only while
    `state/.afk` exists, and stays quiet otherwise.
-   - **Home with no injectable supervisor pane** (the captain's session runs
-     outside any pane the daemon could type into): there is nothing to inject
-     into, so run away mode WITHOUT a daemon.
-     This is a supported configuration, not a degraded one: `state/.afk` then
-     carries the away POSTURE only - batched updates and the standing routine
-     merge authority - while this home's own watcher stays the real supervision
-     mechanism.
-     Say so plainly to the captain instead of manufacturing a terminal for the
-     daemon.
 
-3. **Arm the watcher iff no daemon owns it.**
-   With a daemon, do not separately arm `bin/fm-watch.sh`: the daemon manages the
-   watcher as its child, and the singleton lock no-ops a stray arm harmlessly.
-   Without one, keep arming and repairing this home's own watcher cycle exactly
-   as in normal mode.
-   Supervision ownership is decided by whether an away-mode daemon is actually
-   live for this home, never by the flag alone; `bin/fm-afk-daemon-lib.sh` owns
-   that question and every script asks it there.
+3. **Do not separately arm the watcher.**
+   The daemon manages `bin/fm-watch.sh` as its child, and the singleton lock
+   no-ops a stray arm harmlessly.
 
 4. **Acknowledge** in `AGENTS.md` section 9 language: "Captain, away mode is active; I will batch routine updates and surface only decisions, failures, credentials, or review-ready work until you return."
+
+## Daemon-free entry (no injectable supervisor pane)
+
+This is a supported configuration, not a degraded one.
+`state/.afk` then carries the away POSTURE only (batched updates and the standing routine merge authority), while this home's own watcher stays the real supervision mechanism.
+
+1. **Enter the lifecycle with `bin/fm-afk-launch.sh start-daemonless`.**
+   It is the same lifecycle owner as the daemon paths: it writes `state/.afk`,
+   clears session-scoped stale artifacts, records that no terminal exists, and
+   rolls back on failure.
+   It creates no terminal and starts nothing.
+   Never hand-write `state/.afk`.
+
+2. **Skip the daemon entirely.**
+   Do not run `bin/fm-afk-start.sh`, `start`, or `start-native`, and do not
+   manufacture a pane for a daemon.
+   Say plainly to the captain that away mode is running without the daemon
+   because there is no pane it could reach.
+
+3. **Keep arming and repairing this home's own watcher cycle** exactly as in
+   normal mode, for the whole away stretch, through the emitted primary-harness
+   supervision protocol.
+   That cycle is the supervision mechanism here, so every ordinary wake, arm,
+   and repair rule still applies.
+
+4. **Acknowledge** in the same `AGENTS.md` section 9 language as the daemon entry.
+
+Supervision ownership is decided by whether an away-mode daemon is actually live
+for this home, never by the flag alone; `bin/fm-afk-daemon-lib.sh` owns that
+question and every script asks it there.
 
 ## How to exit afk
 

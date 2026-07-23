@@ -140,20 +140,36 @@ make_fake_ps_claude() {
   make_fake_ps_harness "$fakebin" claude
 }
 
+# real_ps_path <fakebin>: the first ps on PATH that is not the fake itself, so a
+# narrow passthrough never hardcodes a location.
+real_ps_path() {
+  local fakebin=$1 dir
+  local IFS=:
+  for dir in $PATH; do
+    [ "$dir" = "$fakebin" ] && continue
+    [ -x "$dir/ps" ] && { printf '%s\n' "$dir/ps"; return 0; }
+  done
+  return 1
+}
+
 make_fake_ps_harness() {
-  local fakebin=$1 harness=$2
-  # Only the harness-ancestry queries are faked; anything else (notably
-  # fm_pid_identity's `-o lstart= -o command=`) falls through to the real ps, so
-  # a test that records a genuine live-process identity still reads back a match.
-  cat > "$fakebin/ps" <<'SH'
+  local fakebin=$1 harness=$2 real_ps
+  real_ps=$(real_ps_path "$fakebin") || real_ps=""
+  # The harness-ancestry queries are faked, and ONLY fm_pid_identity's
+  # `-o lstart= -o command=` query passes through to the real ps, so a test that
+  # records a genuine live-process identity still reads back a match. Every other
+  # query keeps failing as before, so no other test becomes host-dependent.
+  cat > "$fakebin/ps" <<SH
 #!/usr/bin/env bash
 set -u
-harness=${FM_FAKE_HARNESS:-claude}
-case "$*" in
-  *"comm="*) printf '/usr/local/bin/%s\n' "$harness"; exit 0 ;;
-  *"args="*) printf '%s\n' "$harness"; exit 0 ;;
+harness=\${FM_FAKE_HARNESS:-claude}
+real_ps=$(printf '%q' "$real_ps")
+case "\$*" in
+  *"comm="*) printf '/usr/local/bin/%s\n' "\$harness"; exit 0 ;;
+  *"args="*) printf '%s\n' "\$harness"; exit 0 ;;
+  *"-o lstart="*) [ -n "\$real_ps" ] || exit 1; exec "\$real_ps" "\$@" ;;
 esac
-exec /bin/ps "$@"
+exit 1
 SH
   chmod +x "$fakebin/ps"
   printf '%s\n' "$harness" > "$fakebin/.harness-name"
@@ -813,6 +829,9 @@ EOF
   assert_not_contains "$out" "daemon owns the watcher" "daemon-free away mode still handed watcher ownership to a daemon"
   assert_not_contains "$out" "- Away mode: active" "daemon-free away mode emitted the daemon-owned supervision block"
   assert_contains "$out" "Follow the supervision operating instructions block above" "daemon-free away mode lost the ordinary next step"
+  assert_contains "$out" "Away posture is active" "next step dropped the away-posture cue for a daemon-free home"
+  assert_contains "$out" "load /afk" "next step dropped the /afk cue for a daemon-free home"
+  assert_contains "$out" "own watcher-arm loop is the supervision mechanism" "next step did not name this session's own watcher cycle"
 
   pass "away mode without a live daemon keeps this home arming its own watcher"
 }

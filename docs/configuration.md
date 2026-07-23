@@ -298,7 +298,8 @@ The watcher accepts the shim only when its bytes match the expected generated co
 This section is the single owner of the X-mode cadence contract: an X instance polls every 30 seconds instead of the default 300, only an X instance speeds up because a non-X home has no `config/x-mode.env`, and the session-start supervision operating block includes the cadence instruction when that file exists.
 The active primary-harness supervision protocol owns how that sourced cadence reaches the watcher process.
 Because `bin/fm-watch.sh` reads `FM_CHECK_INTERVAL` only at process start, a cadence transition - opt-in while a watcher is already running, or opt-out - is applied by restarting the home-scoped watcher through the emitted harness protocol; bootstrap deliberately never restarts the watcher itself.
-While away mode is active the daemon owns the watcher and its default cadence applies; away-mode X cadence is a deferred follow-up.
+While an away-mode daemon is actually live for the home it owns the watcher and its default cadence applies, so daemon-owned away-mode X cadence is a deferred follow-up.
+Away mode with no live daemon is the away posture only: the home arms its own watcher through the emitted harness protocol, which sources `config/x-mode.env`, so the 30-second X cadence above applies there exactly as with away mode off (`docs/turnend-guard.md` "Away Mode").
 When the token is removed or empty, the next locked session-start bootstrap step removes those artifacts.
 Steady-state off is silent and writes nothing.
 X mode remains additive to non-X lifecycle behavior: homes without the generated artifacts keep the default watcher cadence and do not run the X poll.
