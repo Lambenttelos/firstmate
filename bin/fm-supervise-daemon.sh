@@ -227,6 +227,12 @@ MAX_DEFER_SECS_DEFAULT=300
 WEDGE_ALARM_TIMEOUT_SECS_DEFAULT=10
 WEDGE_ALARM_LAST_EPOCH=0
 WEDGE_ALARM_NOTIFIER_PID=
+# Paneless undelivered-alarm probe state. A probe that cannot read the outbox
+# burns the whole bounded lock acquire, so housekeeping logs the transition into
+# and out of that state rather than every one-second tick, and backs the next
+# probe off by one max-defer window instead of stalling on every pass.
+OUTBOX_UNREADABLE=0
+OUTBOX_PROBE_NOT_BEFORE=0
 # The captain-relevant verb set and the status classifiers (last_status_line,
 # status_is_captain_relevant, window_to_task, scan_captain_relevant_statuses) now
 # live in bin/fm-classify-lib.sh, shared with the always-on watcher.
@@ -701,8 +707,26 @@ escalate_flush() {  # <state>
   # Single-line wrapper: no embedded newlines (inject_msg also collapses as a
   # safety net, but keeping the source single-line makes the intent explicit).
   msg=$(printf 'Supervisor escalate (%s event(s)): %s (pre-read; re-arm not needed — watcher daemon-managed)' "$n" "$msg")
-  if inject_msg "$msg" "$state"; then : > "$buf"; rm -f "${buf}.since" "$state/.subsuper-inject-wedged"; return 0; fi
+  if inject_msg "$msg" "$state"; then
+    : > "$buf"; rm -f "${buf}.since"
+    # Retiring the undelivered marker means DELIVERY recovered. On the pane path a
+    # confirmed submit really is delivery, so it clears here exactly as before. In
+    # paneless mode a successful inject only APPENDED the record, so clearing here
+    # would let ordinary escalation traffic reset the marker's mtime-based
+    # re-alarm rate limit (the only limit that survives a daemon restart) and
+    # destroy the catch-up evidence bin/fm-afk-return.sh reads, while the records
+    # the marker describes are still unacknowledged. There the clear belongs to
+    # housekeeping (1c), which owns actual reader acknowledgement.
+    paneless_delivery || rm -f "$state/.subsuper-inject-wedged"
+    return 0
+  fi
   return 1
+}
+
+# Paneless delivery is in force for this run: escalations are appended to the
+# durable outbox for firstmate's armed reader instead of typed into a pane.
+paneless_delivery() {
+  [ "${FM_AFK_DELIVERY_MODE:-pane}" = paneless ]
 }
 
 # --- backend-independent active wedge alert ---------------------------------
@@ -1062,7 +1086,9 @@ housekeeping() {  # <state>
        && [ "$(_file_age "$state/.subsuper-inject-wedged")" -ge "$max_defer" ]; then
       if escalate_flush "$state"; then
         log "inject recovered: max-defer flush succeeded after ${oldest}s undelivered"
-        rm -f "$state/.subsuper-inject-wedged"
+        # Same ownership split as escalate_flush: only the pane path's confirmed
+        # submit is delivery, so only it retires the marker here.
+        paneless_delivery || rm -f "$state/.subsuper-inject-wedged"
       else
         inject_wedge_alarm "$state" "$oldest"
       fi
@@ -1078,25 +1104,39 @@ housekeeping() {  # <state>
   # recreates the very undelivered-escalation incident this delivery mode exists
   # to fix. Same alarm, same durable marker, same rate limiting as the pane path,
   # and presence-gated on away mode exactly like every other away-mode behavior.
-  if afk_active "$state" && [ "$max_defer" -gt 0 ] \
-     && [ "${FM_AFK_DELIVERY_MODE:-pane}" = paneless ]; then
+  if afk_active "$state" && [ "$max_defer" -gt 0 ] && paneless_delivery \
+     && [ "$now" -ge "$OUTBOX_PROBE_NOT_BEFORE" ]; then
     outbox_rc=0
     oldest_epoch=$(fm_afk_outbox_oldest_pending_epoch "$state") || outbox_rc=$?
     if [ "$outbox_rc" -ne 0 ]; then
       # An unreadable outbox is not an empty one, so neither alarm nor clear:
-      # leave whatever alarm state exists and retry on the next tick.
-      log "away-mode inbox unreadable this tick; undelivered-escalation alarm state left unchanged"
-    elif [ -n "$oldest_epoch" ]; then
-      oldest=$(( now - oldest_epoch ))
-      if [ "$oldest" -ge "$max_defer" ] \
-         && [ "$(_file_age "$state/.subsuper-inject-wedged")" -ge "$max_defer" ]; then
-        inject_wedge_alarm "$state" "$oldest" paneless
+      # leave whatever alarm state exists and retry later. Each failed attempt
+      # burns the full bounded lock acquire, so back the probe off to one per
+      # max-defer window and log only the transition INTO the unreadable state -
+      # otherwise this line, and that stall, repeat every one-second tick during
+      # precisely the incident the line exists to document.
+      if [ "$OUTBOX_UNREADABLE" -eq 0 ]; then
+        OUTBOX_UNREADABLE=1
+        log "away-mode inbox unreadable; undelivered-escalation alarm state left unchanged until it can be read again"
       fi
-    elif [ ! -s "$state/.subsuper-escalations" ]; then
-      # Everything appended has been acknowledged and nothing is buffered behind a
-      # failed append, so a prior alarm is stale: clear it rather than let a
-      # delivered-then-quiet outbox keep alarming.
-      rm -f "$state/.subsuper-inject-wedged"
+      OUTBOX_PROBE_NOT_BEFORE=$(( now + max_defer ))
+    else
+      if [ "$OUTBOX_UNREADABLE" -eq 1 ]; then
+        OUTBOX_UNREADABLE=0
+        log "away-mode inbox readable again; undelivered-escalation alarm resumed"
+      fi
+      if [ -n "$oldest_epoch" ]; then
+        oldest=$(( now - oldest_epoch ))
+        if [ "$oldest" -ge "$max_defer" ] \
+           && [ "$(_file_age "$state/.subsuper-inject-wedged")" -ge "$max_defer" ]; then
+          inject_wedge_alarm "$state" "$oldest" paneless
+        fi
+      elif [ ! -s "$state/.subsuper-escalations" ]; then
+        # Everything appended has been acknowledged and nothing is buffered behind
+        # a failed append, so a prior alarm is stale: clear it rather than let a
+        # delivered-then-quiet outbox keep alarming.
+        rm -f "$state/.subsuper-inject-wedged"
+      fi
     fi
   fi
 
@@ -1239,13 +1279,13 @@ inject_msg() {  # <message> [state]
   # outbox and let firstmate's armed reader (bin/fm-afk-inbox.sh) pull it. A
   # failed append returns non-zero exactly like a failed inject, so the digest
   # stays buffered for the next tick instead of vanishing.
-  if [ "${FM_AFK_DELIVERY_MODE:-pane}" = paneless ]; then
+  if paneless_delivery; then
     if fm_afk_outbox_append "$state" escalation "$msg"; then
       # Both numbers come from inside the append's own critical section. Re-reading
       # the count here would take the outbox lock again, and a bounded acquire lost
       # to a concurrent reader would log "0 record(s) pending pickup" right after a
       # record that was in fact appended.
-      log "delivered to the away-mode inbox (paneless): record #${FM_AFK_OUTBOX_APPEND_SEQ}, ${FM_AFK_OUTBOX_APPEND_PENDING} record(s) pending pickup"
+      log "delivered to the away-mode inbox (paneless): record #${FM_AFK_OUTBOX_APPEND_SEQ}, ${FM_AFK_OUTBOX_APPEND_PENDING:-unknown} record(s) pending pickup"
       return 0
     fi
     log "inject failed: could not append the digest to the away-mode inbox"

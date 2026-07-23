@@ -306,6 +306,53 @@ test_an_unreadable_outbox_is_never_reported_as_an_empty_one() {
   pass "a failed outbox read is reported as a failure at every level, never as an empty outbox"
 }
 
+# The same invariant one layer deeper. A lock the reader cannot take is only one
+# way a read fails: the outbox file can be present but unreadable (mode 000, an
+# ACL, a bad mount), and `[ -s ]` only STATS it, so the record scan itself must
+# propagate that failure rather than returning an empty result with status 0.
+test_a_present_but_unreadable_outbox_file_is_not_an_empty_one() {
+  local state rc out
+  if [ "$(id -u)" = 0 ]; then
+    pass "skipped: running as root, where mode 000 does not deny a read"
+    return 0
+  fi
+  state=$(make_inbox_case unreadable-file)
+  enter_away "$state"
+  append_digest "$state" "Supervisor escalate (1 event(s)): alpha.status: blocked: needs a token"
+  chmod 000 "$state/.afk-outbox"
+
+  rc=0; out=$(fm_afk_outbox_pending "$state") || rc=$?
+  [ "$rc" -eq "$FM_AFK_OUTBOX_UNREADABLE" ] \
+    || fail "an unreadable outbox FILE must report unreadable, got rc=$rc"
+  [ -z "$out" ] || fail "pending printed records it never read: $out"
+
+  rc=0; out=$(fm_afk_outbox_pending_report "$state") || rc=$?
+  [ "$rc" -eq "$FM_AFK_OUTBOX_UNREADABLE" ] \
+    || fail "pending_report must report unreadable rather than empty evidence, got rc=$rc"
+
+  rc=0; out=$(fm_afk_outbox_deliver "$state") || rc=$?
+  [ "$rc" -eq "$FM_AFK_OUTBOX_DELIVER_UNREADABLE" ] \
+    || fail "deliver must report unreadable for an unreadable outbox file, got rc=$rc"
+
+  # The allocator reads the same file, so it must refuse rather than hand out a
+  # sequence number an existing acknowledgement could already cover.
+  rc=0; fm_afk_outbox_append "$state" escalation "${FM_TEST_MARK}another" || rc=$?
+  [ "$rc" -ne 0 ] || fail "the append allocated a sequence number from an outbox it could not read"
+
+  rc=0; out=$(run_inbox "$state" --once) || rc=$?
+  [ "$rc" -ne 0 ] || fail "the reader exited 0 on an unreadable outbox file: $out"
+  case "$out" in
+    *"afk-inbox: nothing pending"*|*"afk-inbox: idle after"*|*"afk-inbox: delivered "*)
+      fail "the reader printed a healthy status line for a failed read: $out" ;;
+  esac
+
+  chmod 644 "$state/.afk-outbox"
+  [ ! -e "$state/.afk-outbox.ack" ] || fail "a failed read acknowledged records it never delivered"
+  [ "$(fm_afk_outbox_pending_count "$state")" -eq 1 ] \
+    || fail "the record did not stay pending after the failed reads"
+  pass "a present-but-unreadable outbox file fails the read instead of reading as empty"
+}
+
 # The reader's own contract: a genuine read failure exits NON-ZERO with no
 # healthy status line, rather than printing an idle or nothing-pending line that
 # firstmate would read as a quiet, working channel.
@@ -487,6 +534,7 @@ test_reader_reports_an_idle_timeout
 test_records_survive_a_lost_sequence_counter
 test_append_failure_is_reported_rather_than_hanging
 test_an_unreadable_outbox_is_never_reported_as_an_empty_one
+test_a_present_but_unreadable_outbox_file_is_not_an_empty_one
 test_reader_exits_non_zero_when_the_outbox_cannot_be_read
 test_concurrent_readers_never_announce_what_they_did_not_deliver
 test_every_exit_line_carries_a_re_arm_verdict

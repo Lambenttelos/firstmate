@@ -1863,6 +1863,107 @@ test_paneless_undelivered_records_raise_the_same_wedge_alarm() {
   pass "unread paneless records raise the same rate-limited wedge alarm, which clears on acknowledgement"
 }
 
+# Retiring the undelivered marker means DELIVERY recovered. In paneless mode a
+# successful flush only APPENDED a record, so if it cleared the marker, ordinary
+# escalation traffic would reset the mtime-based re-alarm rate limit - the only
+# limit that survives a daemon restart - and destroy the catch-up evidence
+# bin/fm-afk-return.sh reads, while the records the marker describes are still
+# unacknowledged.
+test_paneless_append_does_not_clear_the_undelivered_marker() {
+  local dir state fakebin marker before after sent capture
+  dir=$(make_supercase paneless-marker-survives)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  marker="$state/.subsuper-inject-wedged"
+  sent="$dir/sent.log"; : > "$sent"
+  capture="$dir/pane.txt"; : > "$capture"
+  afk_enter "$state"
+
+  printf '%s\t1\tescalation\t%sSupervisor escalate (1 event(s)): alpha.status: blocked: needs a token\n' \
+    "$(( $(date +%s) - 600 ))" "$FM_INJECT_MARK" > "$state/.afk-outbox"
+  printf 'away-mode escalations WEDGED 600s undelivered\n' > "$marker"
+  touch -t 200001010000 "$marker"
+  before=$(ls -l "$marker")
+
+  escalate_add "$state" "beta.status: done: PR 3"
+  PATH="$fakebin:$PATH" FM_SUPERVISOR_TARGET="" FM_AFK_DELIVERY_MODE=paneless \
+    FM_ESCALATE_BATCH_SECS=0 escalate_flush "$state" \
+    || fail "the paneless flush failed"
+
+  [ -s "$state/.afk-outbox" ] || fail "the paneless flush appended no record"
+  [ -s "$marker" ] || fail "a paneless append deleted the undelivered-escalation marker"
+  grep -F 'WEDGED 600s undelivered' "$marker" >/dev/null \
+    || fail "a paneless append destroyed the marker's catch-up evidence"
+  after=$(ls -l "$marker")
+  [ "$before" = "$after" ] || fail "a paneless append reset the marker's re-alarm rate limit"
+
+  # The pane path keeps its unchanged recovered-delivery semantics: there a
+  # confirmed submit really is delivery, so it still retires the marker.
+  escalate_add "$state" "gamma.status: done: PR 4"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_PANE_ALIVE=1 FM_FAKE_TMUX_SENT="$sent" \
+    FM_FAKE_TMUX_CAPTURE="$capture" FM_AFK_DELIVERY_MODE=pane \
+    FM_ESCALATE_BATCH_SECS=0 escalate_flush "$state" \
+    || fail "the pane flush failed"
+  grep -F 'gamma.status: done: PR 4' "$sent" >/dev/null \
+    || fail "the pane flush did not type the digest"
+  [ ! -e "$marker" ] || fail "a confirmed pane delivery did not retire the undelivered marker"
+  pass "a paneless append never clears the undelivered-escalation marker; a pane delivery still does"
+}
+
+# An outbox that cannot be read is neither alarmed on nor cleared, but each probe
+# burns the full bounded lock acquire. Logging and probing it on every one-second
+# tick would grow the log without bound and stall the loop during exactly the
+# incident the line exists to document.
+test_paneless_unreadable_outbox_logs_once_and_backs_off() {
+  local dir state fakebin daemon_log marker n
+  if [ "$(id -u)" = 0 ]; then
+    pass "skipped: running as root, where mode 000 does not deny a read"
+    return 0
+  fi
+  dir=$(make_supercase paneless-unreadable-backoff)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  marker="$state/.subsuper-inject-wedged"
+  daemon_log="$dir/daemon.log"; : > "$daemon_log"
+  afk_enter "$state"
+
+  printf '%s\t1\tescalation\t%sSupervisor escalate (1 event(s)): alpha.status: blocked: needs a token\n' \
+    "$(( $(date +%s) - 600 ))" "$FM_INJECT_MARK" > "$state/.afk-outbox"
+  chmod 000 "$state/.afk-outbox"
+  OUTBOX_UNREADABLE=0
+  OUTBOX_PROBE_NOT_BEFORE=0
+
+  local i=0
+  while [ "$i" -lt 3 ]; do
+    PATH="$fakebin:$PATH" LOG="$daemon_log" FM_SUPERVISOR_TARGET="" \
+      FM_AFK_DELIVERY_MODE=paneless FM_ESCALATE_BATCH_SECS=99999 FM_MAX_DEFER_SECS=60 \
+      housekeeping "$state"
+    i=$((i + 1))
+  done
+
+  n=$(grep -c 'away-mode inbox unreadable' "$daemon_log")
+  [ "$n" -eq 1 ] || fail "the unreadable-inbox line was logged $n times across three ticks"
+  [ ! -e "$marker" ] || fail "an unreadable inbox alarmed on records it never read"
+  [ "$OUTBOX_PROBE_NOT_BEFORE" -gt "$(date +%s)" ] \
+    || fail "the next probe was not backed off after an unreadable read"
+
+  # Readable again: the transition is logged once and the alarm resumes.
+  chmod 644 "$state/.afk-outbox"
+  OUTBOX_PROBE_NOT_BEFORE=0
+  WEDGE_ALARM_LAST_EPOCH=0
+  PATH="$fakebin:$PATH" LOG="$daemon_log" FM_SUPERVISOR_TARGET="" \
+    FM_AFK_DELIVERY_MODE=paneless FM_ESCALATE_BATCH_SECS=99999 FM_MAX_DEFER_SECS=60 \
+    housekeeping "$state"
+  grep -F 'away-mode inbox readable again' "$daemon_log" >/dev/null \
+    || fail "the recovery out of the unreadable state was not logged"
+  [ -s "$marker" ] || fail "the undelivered alarm did not resume once the inbox was readable"
+
+  rm -f "$marker"
+  OUTBOX_UNREADABLE=0
+  OUTBOX_PROBE_NOT_BEFORE=0
+  pass "an unreadable away-mode inbox logs on transition and backs its probe off instead of stalling every tick"
+}
+
 test_paneless_undelivered_alarm_is_presence_gated_and_age_bounded() {
   local dir state fakebin marker
   dir=$(make_supercase paneless-alarm-gates)
@@ -2028,6 +2129,8 @@ test_inject_msg_defers_on_dead_shell_unknown
 test_delivery_mode_selection_prefers_a_real_pane_and_falls_to_the_inbox
 test_paneless_flush_delivers_through_the_inbox_without_a_pane
 test_paneless_undelivered_records_raise_the_same_wedge_alarm
+test_paneless_append_does_not_clear_the_undelivered_marker
+test_paneless_unreadable_outbox_logs_once_and_backs_off
 test_paneless_undelivered_alarm_is_presence_gated_and_age_bounded
 test_paneless_delivery_stays_presence_gated
 test_pane_delivery_never_writes_the_inbox

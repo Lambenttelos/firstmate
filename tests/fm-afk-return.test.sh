@@ -293,6 +293,44 @@ test_return_refuses_to_clear_an_unreadable_inbox() {
   pass "return catch-up blocks on an unreadable inbox and never deletes records it did not read"
 }
 
+# The same gate against the other way a read fails: the outbox file itself is
+# present but unreadable, so the failure surfaces past the lock in the record scan
+# rather than in the acquire. Preserving the records matters most here, because
+# nothing else on disk holds an escalation the gate never saw.
+test_return_refuses_to_clear_an_unreadable_inbox_file() {
+  local dir gate out rc
+  if [ "$(id -u)" = 0 ]; then
+    pass "skipped: running as root, where mode 000 does not deny a read"
+    return 0
+  fi
+  dir="$TMP_ROOT/paneless-unreadable-file"
+  install_runner "$dir"
+  gate="$dir/home/state/.afk-return-catchup"
+  date +%s > "$dir/home/state/.afk"
+  : > "$dir/home/state/.fake-drain"
+  printf 'paneless\n' > "$dir/home/state/.afk-delivery"
+  printf '1784074271\t1\tescalation\tSupervisor escalate (1 event(s)): omega.status: blocked: needs a token\n' \
+    > "$dir/home/state/.afk-outbox"
+  chmod 000 "$dir/home/state/.afk-outbox"
+
+  set +e
+  out=$(run_return "$dir" begin)
+  rc=$?
+  set -e
+
+  [ "$rc" -eq 3 ] || fail "an unreadable inbox file must block return catch-up (rc=$rc): $out"
+  assert_contains "$out" 'away-mode inbox could not be read' "the read failure was not reported as a blocker: $out"
+  [ -e "$dir/home/state/.afk-outbox" ] \
+    || fail "return deleted an inbox file whose content it never read"
+  [ -e "$gate" ] || fail "the return gate did not stay open after an unreadable inbox file"
+
+  chmod 644 "$dir/home/state/.afk-outbox"
+  out=$(run_return "$dir" check) || fail "return check failed once the inbox was readable again: $out"
+  assert_contains "$out" 'omega.status: blocked: needs a token' "the retry did not report the record it finally read"
+  [ ! -e "$dir/home/state/.afk-outbox" ] || fail "a successful read did not clear the reported inbox"
+  pass "return catch-up blocks on an unreadable inbox FILE and never deletes records it did not read"
+}
+
 test_return_gate_orders_catchup_before_bearings
 test_explicit_reclassification_requires_durable_reason
 test_captain_decision_does_not_masquerade_as_firstmate_blocker
@@ -300,3 +338,4 @@ test_away_reentry_refuses_pending_return_gate
 test_check_retries_recorded_terminal_teardown
 test_return_reports_undelivered_inbox_records
 test_return_refuses_to_clear_an_unreadable_inbox
+test_return_refuses_to_clear_an_unreadable_inbox_file
