@@ -212,6 +212,25 @@ test_disabled_monitor_reports_and_never_classifies() {
   pass "FM_RESOURCE_INTERVAL=0 switches the monitor off with its own exit status"
 }
 
+test_usage_error_never_looks_like_a_status() {
+  local got rc=0
+  got=$("$CHECK" --bogus 2>&1) || rc=$?
+  [ "$rc" = 64 ] || fail "a bad argument must not exit with a status code (0-4), got '$rc'"
+  assert_contains "$got" "unknown argument" "a bad argument should say so"
+  pass "a usage error exits outside the status range, so a typo cannot read as critical"
+}
+
+test_help_prints_the_whole_header_contract() {
+  local got
+  got=$("$CHECK" --help)
+  assert_contains "$got" "fm-resource-check.sh - one kernel-wide reading" "help lost its opening line"
+  assert_contains "$got" "THRESHOLDS" "help lost the thresholds it owns"
+  assert_contains "$got" "CEILING" "help lost the ceiling formula it owns"
+  assert_contains "$got" "FM_RESOURCE_PROC_ROOT" "help was truncated before the end of the header"
+  assert_not_contains "$got" "set -u" "help ran past the header into the script body"
+  pass "--help prints the full header contract, however the header grows"
+}
+
 # --- watcher wiring ---------------------------------------------------------
 
 test_watcher_surfaces_pressure_once_and_queues_it() {
@@ -323,6 +342,8 @@ test_partial_reading_never_passes_as_healthy
 test_interval_knob_is_resolved_in_one_place
 test_interval_is_independent_of_the_watcher_poll_cadence
 test_disabled_monitor_reports_and_never_classifies
+test_usage_error_never_looks_like_a_status
+test_help_prints_the_whole_header_contract
 test_watcher_surfaces_pressure_once_and_queues_it
 test_watcher_absorbs_already_reported_pressure
 test_watcher_stays_quiet_on_a_healthy_host_and_rearms

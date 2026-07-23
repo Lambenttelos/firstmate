@@ -31,6 +31,9 @@
 #                 never-wake-on-an-unreadable-probe rule the secondmate context
 #                 monitor uses.
 #   4  disabled - host-resource monitoring is switched off for this home.
+#   64 usage error. Deliberately NOT the repo's usual 2 for a bad argument: 2 is
+#      already "critical" here, so a mistyped flag would otherwise be read by a
+#      caller as a host in trouble.
 #
 # THRESHOLDS - this header owns them; docs/configuration.md owns the knobs:
 #   load per core     >= 4.0 critical, >= 2.0 degraded
@@ -77,15 +80,18 @@ resolve_interval() {
   esac
 }
 
+# The header comment IS the help text, from the description line down to the last
+# comment before the first executable line. Deriving that range beats hardcoding
+# it, which silently truncates --help the moment the header grows a line.
 usage() {
-  sed -n '5,56p' "$0" | sed 's/^# \{0,1\}//'
+  awk 'NR < 5 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"
 }
 
 case "${1:-}" in
   -h|--help) usage; exit 0 ;;
   --interval) resolve_interval; exit 0 ;;
   '') : ;;
-  *) echo "error: unknown argument '$1'" >&2; exit 2 ;;
+  *) echo "error: unknown argument '$1'" >&2; exit 64 ;;
 esac
 
 [ "$(resolve_interval)" != 0 ] || {

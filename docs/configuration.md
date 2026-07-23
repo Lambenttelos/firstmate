@@ -196,6 +196,33 @@ This is the primary's monitoring knob and is not inherited into secondmate homes
 The primary's watcher reads each live secondmate's usage on its slow-poll cadence (claude only; every other harness reads unknown and is skipped) and wakes firstmate once when the count first crosses the threshold.
 The read mechanism and the evidence behind the claude-only support live in [`docs/secondmate-context-handoff.md`](secondmate-context-handoff.md); the handoff procedure lives in the `secondmate-provisioning` skill; exact flags and paths live in the headers and `--help` of [`bin/fm-secondmate-context.sh`](../bin/fm-secondmate-context.sh) and [`bin/fm-secondmate-handoff.sh`](../bin/fm-secondmate-handoff.sh).
 
+## Host resource monitoring (FM_RESOURCE_INTERVAL)
+
+`FM_RESOURCE_INTERVAL` is the number of seconds between host CPU, memory, and swap sweeps, defaulting to `900`.
+`0` switches host-resource monitoring off for this home, and a malformed value falls back to the default rather than silently disabling the monitor.
+This section is the single owner of that knob; [`bin/fm-resource-check.sh`](../bin/fm-resource-check.sh)'s header and `--help` own the thresholds, the recommended-ceiling formula, the exit statuses, and the `FM_RESOURCE_*` test-injection seam.
+
+The cadence is deliberately separate from the watcher poll cadence (`FM_POLL`) and the slow-check cadence (`FM_CHECK_INTERVAL`).
+Host pressure changes on a scale of minutes, so re-reading it every poll would be pure waste, and tying it to the slow-check sweep would couple it to a cadence X mode drives down to seconds.
+`bin/fm-watch.sh` reads the resolved interval once at process start, the same way it fixes every other cadence for the watcher's lifetime, so a change takes effect at the next watcher cycle.
+
+Readings are kernel-wide, taken from `sysctl` and `vm_stat` on macOS and from `/proc` on Linux, never by enumerating processes.
+Firstmate's own `ps` view is sandboxed to a small subset of the host, so summing per-process usage would silently under-report a loaded machine.
+For the same reason the reading is a host total and never attributes load to a particular crew.
+
+Three callers consult the monitor, and all three only report:
+
+- [`bin/fm-spawn.sh`](../bin/fm-spawn.sh) prints the reading to stderr as a pre-dispatch `warning:` advisory when the host is degraded or critical, and still spawns.
+- [`bin/fm-watch.sh`](../bin/fm-watch.sh) sweeps on this cadence and wakes firstmate with `check: host-resources <reading>` when pressure first gets worse than the level firstmate was last told about, and annotates every heartbeat with the last cached reading.
+- [`bin/fm-session-start.sh`](../bin/fm-session-start.sh) prints one reading in the fleet-state digest, so a session opens knowing whether the machine can take more work.
+
+Nothing in this path pauses, sheds, or kills anything.
+Shedding load is the captain's decision, so the monitor's job ends at reporting the pressure and the crew count the host can support.
+An unknown reading, on a host where no kernel-wide probe answers, and a disabled monitor both stay silent instead of alarming, the same never-wake-on-an-unreadable-probe rule the secondmate context monitor follows.
+
+The watcher keeps its sweep state in `state/.last-resource` (sweep cadence), `state/.resource-status` (latest reading, read by the heartbeat annotation), and `state/.resource-surfaced` (worst level already reported, so recovery to healthy re-arms the monitor silently).
+These are watcher internals; never edit them by hand.
+
 ## Crew dispatch profiles (config/crew-dispatch.json)
 
 `config/crew-dispatch.json` is an optional local, gitignored file containing natural-language rules that firstmate reads before dispatching a crewmate or scout.
@@ -390,6 +417,7 @@ FM_HEARTBEAT=600        # base seconds between heartbeat scans; no-change heartb
 FM_HEARTBEAT_MAX=7200   # heartbeat backoff cap
 FM_CHECK_INTERVAL=300   # seconds between slow checks (authenticated merge polls, custom checks, or X-mode dispatch)
 FM_CHECK_TIMEOUT=30     # seconds allowed per slow check script
+FM_RESOURCE_INTERVAL=900   # seconds between host CPU/memory/swap sweeps; own cadence, NOT tied to FM_POLL or FM_CHECK_INTERVAL; 0 disables the monitor, malformed falls back to the default (see the host resource monitoring section above)
 FM_CODEX_WATCH_CHECKPOINT=180   # seconds per foreground watcher checkpoint in Codex primary supervision
 FM_CREW_STATE_NM_TIMEOUT=10   # seconds allowed per no-mistakes query inside fm-crew-state.sh
 FM_CREW_STATE_RUNS_LIMIT=200  # recent no-mistakes run rows scanned when axi status cannot be attributed to the current code
