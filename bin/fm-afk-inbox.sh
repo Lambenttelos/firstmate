@@ -20,8 +20,12 @@
 #     will ever arrive here),
 #   - away mode ended (state/.afk is gone), or
 #   - --timeout elapsed with nothing pending.
-# Every one of those exits is 0 and prints exactly one status line naming which
-# it was, so firstmate knows whether to re-arm. A genuine failure - an
+#
+# RE-ARM VERDICT. Every one of those exits is 0 and ends with exactly one status
+# line, and every such line ends in either "re-arm to keep listening..." or
+# "- do not re-arm". Firstmate obeys that line rather than re-deriving the state:
+# re-arming after a "do not re-arm" exit is an immediate-exit loop, because those
+# exits mean this channel is not the one delivering. A genuine failure - an
 # unwritable state directory, a delivery that could not be acknowledged - exits
 # non-zero instead of pretending the channel is healthy.
 #
@@ -61,17 +65,22 @@ die() {
   exit 1
 }
 
-# Print and acknowledge everything pending. Returns 0 when something was
-# delivered, 1 when the outbox was empty.
+# Print and acknowledge everything pending, then announce what was delivered.
+# Returns 0 when something was delivered, 1 when the outbox was empty.
+#
+# The count is announced AFTER the records, from what this run actually put on
+# stdout. Announcing a pending count first would let a reader that loses the race
+# to a concurrent reader print "1 away-mode escalation(s)" and then no record at
+# all, which reads to firstmate as a swallowed escalation.
 deliver() {
-  local count rc
-  count=$(fm_afk_outbox_pending_count "$STATE")
-  [ "$count" -gt 0 ] || return 1
-  printf 'afk-inbox: %s away-mode escalation(s)\n' "$count"
-  fm_afk_outbox_deliver "$STATE"
-  rc=$?
+  local rc=0
+  fm_afk_outbox_deliver "$STATE" || rc=$?
   case "$rc" in
-    0) return 0 ;;
+    0)
+      printf 'afk-inbox: delivered %s away-mode escalation(s); re-arm to keep listening while away mode is active\n' \
+        "$FM_AFK_OUTBOX_DELIVERED"
+      return 0
+      ;;
     1) return 1 ;;
     *) die "delivered records could not be acknowledged; they stay pending and will be delivered again" ;;
   esac
@@ -101,10 +110,7 @@ main() {
   # Anything already pending is delivered before any early-exit condition is
   # consulted: a record that exists must reach firstmate even if the away session
   # has since ended or switched to pane delivery.
-  if deliver; then
-    printf 'afk-inbox: delivered; re-arm to keep listening while away mode is active\n'
-    return 0
-  fi
+  deliver && return 0
 
   # A recorded PANE delivery mode means the daemon has a real supervisor pane and
   # nothing will ever be written here, so waiting would be a lie. An ABSENT
@@ -112,33 +118,30 @@ main() {
   # this waits, which is the direction that cannot drop an escalation.
   mode=$(fm_afk_delivery_mode_recorded "$STATE")
   if [ "$mode" = pane ]; then
-    printf 'afk-inbox: away mode is delivering into the supervisor pane; no inbox reader needed\n'
+    printf 'afk-inbox: away mode is delivering into the supervisor pane; no inbox reader needed - do not re-arm\n'
     return 0
   fi
 
   if ! away_mode_active; then
-    printf 'afk-inbox: away mode is not active; nothing to wait for\n'
+    printf 'afk-inbox: away mode is not active; nothing to wait for - do not re-arm\n'
     return 0
   fi
 
   if [ "$ONCE" -eq 1 ]; then
-    printf 'afk-inbox: nothing pending\n'
+    printf 'afk-inbox: nothing pending; re-arm to keep listening while away mode is active\n'
     return 0
   fi
 
   while true; do
     sleep "$POLL"
     waited=$((waited + POLL))
-    if deliver; then
-      printf 'afk-inbox: delivered; re-arm to keep listening while away mode is active\n'
-      return 0
-    fi
+    deliver && return 0
     if ! away_mode_active; then
-      printf 'afk-inbox: away mode ended; nothing pending\n'
+      printf 'afk-inbox: away mode ended; nothing pending - do not re-arm\n'
       return 0
     fi
     if [ "$(fm_afk_delivery_mode_recorded "$STATE")" = pane ]; then
-      printf 'afk-inbox: away mode switched to the supervisor pane; no inbox reader needed\n'
+      printf 'afk-inbox: away mode switched to the supervisor pane; no inbox reader needed - do not re-arm\n'
       return 0
     fi
     if [ "$TIMEOUT" -gt 0 ] && [ "$waited" -ge "$TIMEOUT" ]; then

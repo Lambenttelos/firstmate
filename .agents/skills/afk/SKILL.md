@@ -75,7 +75,9 @@ approval authority; they differ only in what supervises.
    Run `bin/fm-afk-inbox.sh` through the harness's own tracked background mechanism, exactly the way `bin/fm-watch-arm.sh` is armed, and never with a shell `&`.
    It is the delivery channel whenever the daemon has no supervisor pane to type into (see "Delivery channel" below), and it costs nothing when there is one: it prints one line saying the pane is delivering and exits immediately.
    Each completion is an internal escalation, not captain input.
-   Read the digests it printed, act on them, and arm it again while away mode is active; its own exit line says whether it delivered, idled out, or found the away session over.
+   Read the digests it printed and act on them.
+   Then obey its final line for whether to arm it again: every exit ends in either `re-arm to keep listening` or `- do not re-arm`.
+   Re-arming after a `do not re-arm` line is an immediate-exit loop, because that line means the pane is delivering or the away session is over, so nothing will ever arrive here.
 
 4. **Do not separately arm the watcher.**
    The daemon manages `bin/fm-watch.sh` as its child, and the singleton lock

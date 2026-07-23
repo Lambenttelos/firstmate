@@ -74,7 +74,7 @@ test_reader_delivers_pending_records_then_acknowledges_them() {
   append_digest "$state" "Supervisor escalate (1 event(s)): beta.status: blocked: needs a token"
 
   out=$(run_inbox "$state" --once) || fail "reader failed with records pending: $out"
-  assert_contains "$out" "afk-inbox: 2 away-mode escalation(s)" "reader did not announce the pending count"
+  assert_contains "$out" "afk-inbox: delivered 2 away-mode escalation(s)" "reader did not announce what it delivered"
   assert_contains "$out" "alpha.status: done: PR 1" "reader did not print the first digest"
   assert_contains "$out" "beta.status: blocked: needs a token" "reader did not print the second digest"
   assert_contains "$out" "${FM_TEST_MARK}Supervisor escalate" "reader dropped the sentinel marker from the digest"
@@ -235,6 +235,102 @@ test_append_failure_is_reported_rather_than_hanging() {
   pass "an outbox lock held elsewhere fails the append in bounded time instead of hanging"
 }
 
+# Firstmate arms one reader, but a re-arm after a context reset can leave two
+# waiting at once. Records are printed before they are acknowledged, so the loser
+# of that race must simply print NOTHING: announcing a count it did not deliver
+# would read to firstmate as an escalation that was swallowed.
+test_concurrent_readers_never_announce_what_they_did_not_deliver() {
+  local state round out1 out2 combined delivered=0
+  state=$(make_inbox_case concurrent-readers)
+  enter_away "$state"
+
+  for round in 1 2 3 4 5; do
+    FM_STATE_OVERRIDE="$state" "$INBOX" --poll 1 --timeout 6 > "$state/r1.out" 2>&1 &
+    local pid1=$!
+    FM_STATE_OVERRIDE="$state" "$INBOX" --poll 1 --timeout 6 > "$state/r2.out" 2>&1 &
+    local pid2=$!
+    sleep 1
+    append_digest "$state" "Supervisor escalate (1 event(s)): theta$round.status: done: PR $round"
+    wait_pid_exit "$pid1" 200 || fail "reader 1 did not exit in round $round"
+    wait_pid_exit "$pid2" 200 || fail "reader 2 did not exit in round $round"
+
+    out1=$(cat "$state/r1.out")
+    out2=$(cat "$state/r2.out")
+    for combined in "$out1" "$out2"; do
+      case "$combined" in
+        *"away-mode escalation(s)"*)
+          assert_contains "$combined" "theta$round.status" \
+            "a reader announced a delivery without printing any record (round $round): $combined"
+          ;;
+      esac
+    done
+    case "$out1$out2" in
+      *"theta$round.status"*) delivered=$((delivered + 1)) ;;
+    esac
+  done
+
+  [ "$delivered" -eq 5 ] || fail "concurrent readers dropped a record ($delivered/5 rounds delivered)"
+  [ "$(fm_afk_outbox_pending_count "$state")" -eq 0 ] || fail "a record was left unacknowledged after both readers exited"
+  pass "racing readers never announce a delivery they did not print, and no record is dropped"
+}
+
+# Every exit is a completed background task firstmate must react to, so each one
+# has to say whether to arm another reader. An exit that says "do not re-arm" and
+# is re-armed anyway becomes an immediate-exit loop during an unattended away
+# session; an exit that says nothing leaves firstmate guessing.
+test_every_exit_line_carries_a_re_arm_verdict() {
+  local state out last
+  assert_verdict() {  # <output> <expected-verdict> <label>
+    local text=$1 want=$2 label=$3 final
+    final=$(printf '%s\n' "$text" | grep '^afk-inbox: ' | tail -n 1)
+    [ -n "$final" ] || fail "$label produced no afk-inbox status line: $text"
+    case "$want" in
+      rearm)
+        case "$final" in
+          *"re-arm to keep listening"*) return 0 ;;
+        esac
+        fail "$label must tell firstmate to re-arm: $final"
+        ;;
+      stop)
+        case "$final" in
+          *"- do not re-arm") return 0 ;;
+        esac
+        fail "$label must tell firstmate NOT to re-arm: $final"
+        ;;
+    esac
+  }
+
+  state=$(make_inbox_case rearm-verdict)
+  out=$(run_inbox "$state" --once) || fail "reader failed outside away mode: $out"
+  assert_verdict "$out" stop "the away-mode-inactive exit"
+
+  enter_away "$state"
+  out=$(run_inbox "$state" --once) || fail "reader failed with nothing pending: $out"
+  assert_verdict "$out" rearm "the nothing-pending exit"
+
+  out=$(run_inbox "$state" --poll 1 --timeout 1) || fail "reader failed idling out: $out"
+  assert_verdict "$out" rearm "the idle-timeout exit"
+
+  append_digest "$state" "Supervisor escalate (1 event(s)): iota.status: done: PR 7"
+  out=$(run_inbox "$state" --once) || fail "reader failed delivering: $out"
+  assert_verdict "$out" rearm "the delivered exit"
+
+  fm_afk_delivery_mode_record "$state" pane || fail "could not record pane delivery mode"
+  out=$(run_inbox "$state" --once) || fail "reader failed in pane mode: $out"
+  assert_verdict "$out" stop "the pane-delivery exit"
+
+  # A record still pending outranks pane mode: it is delivered, and that exit
+  # must invite a re-arm rather than closing the channel.
+  append_digest "$state" "Supervisor escalate (1 event(s)): kappa.status: blocked: needs a token"
+  out=$(run_inbox "$state" --once) || fail "reader failed delivering a leftover in pane mode: $out"
+  assert_contains "$out" "kappa.status: blocked: needs a token" "a pending record was dropped in pane mode"
+  assert_verdict "$out" rearm "the delivered-in-pane-mode exit"
+
+  last=$out
+  assert_not_contains "$last" "do not re-arm" "a delivering exit must not also tell firstmate to stop"
+  pass "every reader exit ends with exactly one re-arm verdict firstmate can act on"
+}
+
 # The whole point, end to end: a REAL daemon with no terminal backend reachable
 # at all. It must select paneless delivery instead of typing into the legacy
 # firstmate:0 guess, and a captain-relevant status must reach the reader's stdout
@@ -294,4 +390,6 @@ test_reader_exits_when_away_mode_is_over_but_still_delivers_leftovers
 test_reader_reports_an_idle_timeout
 test_records_survive_a_lost_sequence_counter
 test_append_failure_is_reported_rather_than_hanging
+test_concurrent_readers_never_announce_what_they_did_not_deliver
+test_every_exit_line_carries_a_re_arm_verdict
 test_real_daemon_without_a_backend_delivers_to_the_reader

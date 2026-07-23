@@ -34,6 +34,14 @@
 # killed run, which is the correct bias - a killed reader's stdout never reached
 # firstmate.
 #
+# Two readers running at once inherit that same at-least-once bias: each prints
+# before it acknowledges, so an interleaving where both read the same pending
+# records before either acknowledges delivers them twice. That is deliberate.
+# Holding the lock across the print would make it exactly-once but would block
+# the daemon's appends behind whatever is consuming the reader's stdout, and
+# acknowledging first would lose records outright. A duplicated escalation digest
+# is harmless; a dropped one is the incident this whole path exists to fix.
+#
 # LOCKING. Every mutation and every pending read takes the repo's portable lock
 # helper (bin/fm-wake-lib.sh) on state/.afk-outbox.lock, so the daemon may append
 # while a reader waits. flock is absent on macOS and is never used.
@@ -196,6 +204,10 @@ fm_afk_outbox_pending() {  # <state>
   ack=$(fm_afk_outbox_ack_seq "$state")
   awk -F '\t' -v ack="$ack" 'NF >= 4 && $2 ~ /^[0-9]+$/ && $2+0 > ack+0' "$file" 2>/dev/null || true
   fm_lock_release "$lock"
+  # Explicit, rather than inheriting fm_lock_release's status: a release that
+  # ever reported failure would otherwise turn a successful pending read into
+  # "nothing pending" and stall delivery until the next poll.
+  return 0
 }
 
 fm_afk_outbox_pending_count() {  # <state>
@@ -264,11 +276,21 @@ fm_afk_outbox_ack() {  # <state> <seq>
 #
 # Deliberate ordering: print, then acknowledge. A reader killed between the two
 # has not actually delivered anything to firstmate, so re-delivering is correct.
+#
+# Sets FM_AFK_OUTBOX_DELIVERED to how many records actually reached stdout, so a
+# caller can announce the count WITHOUT capturing the records into a variable
+# first. Capturing them would delay every record behind the acknowledgement and
+# reintroduce the loss window the print-then-acknowledge ordering exists to
+# close. The count is 0 on every non-zero return, so a caller that lost the race
+# to a concurrent reader announces nothing rather than an empty delivery.
+# shellcheck disable=SC2034 # Read by callers (fm-afk-inbox.sh) after this returns.
 fm_afk_outbox_deliver() {  # <state>
   local state=$1 pending last
+  FM_AFK_OUTBOX_DELIVERED=0
   pending=$(fm_afk_outbox_pending "$state") || return 1
   [ -n "$pending" ] || return 1
   printf '%s\n' "$pending" | fm_afk_outbox_format
+  FM_AFK_OUTBOX_DELIVERED=$(printf '%s\n' "$pending" | wc -l | tr -d ' ')
   last=$(printf '%s\n' "$pending" | awk -F '\t' 'NF >= 4 && $2+0 > max { max = $2+0 } END { print max+0 }')
   fm_afk_outbox_ack "$state" "$last" || return 2
   return 0

@@ -249,6 +249,25 @@ wait_for_pane_input_pending() {
   return 1
 }
 
+# Block until the supervisor pane has actually RECORDED a submission, rather than
+# sleeping a fixed interval and hoping it landed. A fixed sleep after sending
+# Enter is load-sensitive: on a busy machine the loop script may not have
+# consumed the human's line yet, so the daemon's next housekeeping tick sees a
+# pane it believes is idle and types the digest onto the still-unsubmitted line -
+# which the test then correctly reports as a merge. Waiting on the observable
+# effect makes the ordering deterministic under any load.
+wait_for_log_line() {  # <grep-pattern> [tenths]
+  local pattern=$1 limit=${2:-100} i=0
+  while [ "$i" -lt "$limit" ]; do
+    if grep -q "$pattern" "$LOG_FILE" 2>/dev/null; then
+      return 0
+    fi
+    sleep 0.1
+    i=$((i + 1))
+  done
+  return 1
+}
+
 selfcheck_pane_input_pending
 
 # --- Scenario A: human-partial-input ----------------------------------------
@@ -282,16 +301,16 @@ test_scenario_a() {
     fail "Scenario A: human text and digest were merged into one line"
   fi
 
-  # Now submit the human's text (Enter). The pane goes idle.
+  # Now submit the human's text (Enter). The pane goes idle only once the loop
+  # script has actually consumed that line, so wait for the submission to be
+  # recorded before giving the daemon its retry window - a fixed sleep here races
+  # the daemon under load and produces a spurious "merged into one line" failure.
   "$REAL_TMUX" -L "$SOCKET" send-keys -t "$SUPERVISOR_PANE" Enter
-  sleep 0.5
+  wait_for_log_line 'human draft text' \
+    || fail "Scenario A: human text not in log after submit"
 
   # Wait for the daemon to retry injection (housekeeping tick = 1s).
   sleep 6
-
-  # Assert: human text was submitted alone (as a user message).
-  grep -q 'human draft text' "$LOG_FILE" \
-    || fail "Scenario A: human text not in log after submit"
 
   # Assert: digest arrived after the pane went idle.
   grep -q 'Supervisor escalate' "$LOG_FILE" \
