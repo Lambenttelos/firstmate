@@ -32,6 +32,18 @@ That is the same identity-matched live lock and fresh beacon check used by `bin/
 A stale beacon blocks even if a watcher pid is still live.
 A fresh leftover beacon blocks if the watcher lock is missing, dead, or identity-mismatched.
 
+## Away Mode
+
+Away mode alone does not transfer watcher ownership.
+The guard asks `bin/fm-afk-daemon-lib.sh` whether a live away-mode supervision daemon actually holds this home's `state/.supervise-daemon.lock`, matched strictly against this home's own `bin/fm-supervise-daemon.sh`, so another home's daemon can never satisfy the check.
+
+With away mode on and a live daemon, the daemon owns supervision and the repair instruction still points at `/afk`, unchanged.
+With away mode on and no live daemon, the home's own watcher is the real supervision mechanism: the ordinary live lock and fresh beacon test decides the turn, a healthy watcher keeps the guard silent, and only a genuinely missing or stale watcher blocks, with a repair instruction that names re-arming the watcher for the active harness.
+That daemon-free posture is deliberate for a captain session that runs outside any injectable supervisor pane, because the daemon delivers escalations by typing into such a pane and has nothing to type into there.
+The daemon-free banner also states which condition actually failed, so a fresh beacon whose watcher process is gone is never reported as "no live watcher".
+
+With away mode off, behavior is unchanged.
+
 `FM_STATE_OVERRIDE` wins over `FM_HOME/state`, and `FM_HOME` wins over repo-root `state/`.
 `FM_GUARD_GRACE` controls the beacon freshness window and defaults to 300 seconds.
 If `jq` is missing or hook stdin is empty, the guard fails open and exits 0 because it cannot safely read loop-guard fields.

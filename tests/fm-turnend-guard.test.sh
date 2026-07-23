@@ -94,6 +94,7 @@ install_guard_scripts() {
   cp "$ROOT/bin/fm-primary-scope-lib.sh" "$dir/bin/fm-primary-scope-lib.sh"
   cp "$ROOT/bin/fm-supervision-lib.sh" "$dir/bin/fm-supervision-lib.sh"
   cp "$ROOT/bin/fm-wake-lib.sh" "$dir/bin/fm-wake-lib.sh"
+  cp "$ROOT/bin/fm-afk-daemon-lib.sh" "$dir/bin/fm-afk-daemon-lib.sh"
   mkdir -p "$dir/docs"
   cp -R "$ROOT/docs/supervision-protocols" "$dir/docs/supervision-protocols"
   chmod +x "$dir/bin/fm-turnend-guard.sh" "$dir/bin/fm-turnend-guard-grok.sh" "$dir/bin/fm-operational-input.sh" "$dir/bin/fm-supervision-instructions.sh" "$dir/bin/fm-harness.sh"
@@ -913,6 +914,146 @@ test_grok_hook_invokes_adapter() {
   pass ".grok primary hook: Stop hook invokes the grok adapter"
 }
 
+# --- HOOK: away mode, daemon-owned vs daemon-free ---------------------------
+#
+# Away mode alone never means a daemon owns supervision. A home whose captain
+# session runs outside any injectable supervisor pane runs away mode with NO
+# daemon, and its own watcher stays the real supervision mechanism.
+
+AFK_REASON='Away mode owns watcher supervision; load /afk'
+
+record_daemon_lock() {
+  local dir=$1 pid=$2 identity=$3
+  mkdir -p "$dir/state/.supervise-daemon.lock"
+  printf '%s\n' "$pid" > "$dir/state/.supervise-daemon.lock/pid"
+  printf '%s\n' "$identity" > "$dir/state/.supervise-daemon.lock/pid-identity"
+}
+
+test_hook_afk_without_daemon_silent_with_live_watcher() {
+  local dir pid identity out status
+  dir=$(make_primary_dir "$TMP_ROOT/hook-afk-nodaemon-live")
+  : > "$dir/state/task1.meta"
+  : > "$dir/state/.afk"
+  sleep 60 &
+  pid=$!
+  identity=$(watcher_identity "$dir" "$pid") || {
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    fail "could not identify live watcher holder"
+  }
+  record_watcher_lock "$dir" "$pid" "$identity"
+  touch "$dir/state/.last-watcher-beat"
+  out=$(run_hook "$dir" false); status=$?
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  expect_code 0 "$status" "away mode without a daemon must accept a live watcher with a fresh beacon"
+  [ -z "$out" ] || fail "hook produced output despite healthy daemon-free away-mode supervision: $out"
+  pass "fm-turnend-guard: away mode without a daemon is silent with a live watcher and fresh beacon"
+}
+
+test_hook_afk_without_daemon_blocks_with_rearm_reason() {
+  local dir out status
+  dir=$(make_primary_dir "$TMP_ROOT/hook-afk-nodaemon-missing")
+  : > "$dir/state/task1.meta"
+  : > "$dir/state/.afk"
+  out=$(run_hook "$dir" false); status=$?
+  expect_code 2 "$status" "away mode without a daemon must still block on a missing watcher"
+  assert_contains "$out" "$REQUIRED_REASON" "daemon-free away mode must point at re-arming the watcher"
+  case "$out" in
+    *"$AFK_REASON"*) fail "daemon-free away mode must not point at the /afk daemon: $out" ;;
+  esac
+  pass "fm-turnend-guard: away mode without a daemon blocks and names re-arming the watcher"
+}
+
+test_hook_afk_without_daemon_fresh_beacon_message_is_consistent() {
+  local dir dead out status
+  dir=$(make_primary_dir "$TMP_ROOT/hook-afk-nodaemon-fresh")
+  dead=$(nonexistent_pid)
+  : > "$dir/state/task1.meta"
+  : > "$dir/state/.afk"
+  record_watcher_lock "$dir" "$dead" "dead watcher identity"
+  touch "$dir/state/.last-watcher-beat"
+  out=$(run_hook "$dir" false); status=$?
+  expect_code 2 "$status" "a dead watcher lock must block even in daemon-free away mode"
+  assert_contains "$out" "is no longer holding this home lock" "banner must state the real failure"
+  case "$out" in
+    *"no live watcher holds this home lock"*)
+      fail "banner must not claim no live watcher while printing a fresh beacon age: $out" ;;
+  esac
+  pass "fm-turnend-guard: daemon-free away-mode banner never contradicts a fresh beacon age"
+}
+
+test_hook_afk_with_live_daemon_keeps_daemon_reason() {
+  local dir pid identity out status
+  dir=$(make_primary_dir "$TMP_ROOT/hook-afk-daemon")
+  : > "$dir/state/task1.meta"
+  : > "$dir/state/.afk"
+  sleep 60 &
+  pid=$!
+  identity=$(watcher_identity "$dir" "$pid") || {
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    fail "could not identify live daemon holder"
+  }
+  record_daemon_lock "$dir" "$pid" "$identity"
+  out=$(run_hook "$dir" false); status=$?
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  expect_code 2 "$status" "away mode with a live daemon keeps blocking on a missing watcher"
+  assert_contains "$out" "$AFK_REASON" "a live daemon still owns watcher supervision"
+  assert_contains "$out" "no live watcher holds this home lock" "daemon-owned banner must stay unchanged"
+  pass "fm-turnend-guard: away mode with a live daemon keeps today's daemon-owned behavior"
+}
+
+test_hook_afk_ignores_another_homes_daemon() {
+  local dir other pid identity out status
+  dir=$(make_primary_dir "$TMP_ROOT/hook-afk-other-home")
+  other="$TMP_ROOT/hook-afk-other-home-neighbor"
+  mkdir -p "$other/state"
+  : > "$dir/state/task1.meta"
+  : > "$dir/state/.afk"
+  sleep 60 &
+  pid=$!
+  identity=$(watcher_identity "$dir" "$pid") || {
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    fail "could not identify live daemon holder"
+  }
+  record_daemon_lock "$other" "$pid" "$identity"
+  out=$(run_hook "$dir" false); status=$?
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  expect_code 2 "$status" "another home's daemon must not satisfy this home's daemon check"
+  assert_contains "$out" "$REQUIRED_REASON" "a neighbor daemon leaves this home in the daemon-free case"
+  case "$out" in
+    *"$AFK_REASON"*) fail "another home's daemon must not transfer watcher ownership: $out" ;;
+  esac
+  pass "fm-turnend-guard: another home's away-mode daemon never satisfies this home's check"
+}
+
+test_hook_afk_ignores_another_homes_watcher() {
+  local dir pid identity out status
+  dir=$(make_primary_dir "$TMP_ROOT/hook-afk-other-watcher")
+  : > "$dir/state/task1.meta"
+  : > "$dir/state/.afk"
+  sleep 60 &
+  pid=$!
+  identity=$(watcher_identity "$dir" "$pid") || {
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    fail "could not identify live watcher holder"
+  }
+  record_watcher_lock "$dir" "$pid" "$identity"
+  printf '%s\n' "$TMP_ROOT/some-other-home" > "$dir/state/.watch.lock/fm-home"
+  touch "$dir/state/.last-watcher-beat"
+  out=$(run_hook "$dir" false); status=$?
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  expect_code 2 "$status" "another home's watcher must not satisfy this home's check"
+  assert_contains "$out" "$REQUIRED_REASON" "a foreign watcher lock must still demand a re-arm here"
+  pass "fm-turnend-guard: another home's watcher never satisfies daemon-free away mode"
+}
+
 test_predicate_healthy_no_inflight
 test_predicate_unhealthy_no_beacon
 test_predicate_unhealthy_stale_beacon
@@ -924,6 +1065,12 @@ test_hook_blocks_when_dead_lock_has_fresh_beacon
 test_hook_silent_with_live_lock_and_fresh_beacon
 test_hook_blocks_with_live_lock_and_stale_beacon
 test_hook_blocks_when_unhealthy_in_primary
+test_hook_afk_without_daemon_silent_with_live_watcher
+test_hook_afk_without_daemon_blocks_with_rearm_reason
+test_hook_afk_without_daemon_fresh_beacon_message_is_consistent
+test_hook_afk_with_live_daemon_keeps_daemon_reason
+test_hook_afk_ignores_another_homes_daemon
+test_hook_afk_ignores_another_homes_watcher
 test_hook_blocks_from_fm_home_state
 test_hook_x_mode_reason_sources_cadence
 test_hook_ignores_repo_state_when_fm_home_set

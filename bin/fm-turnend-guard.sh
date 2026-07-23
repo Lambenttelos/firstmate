@@ -81,12 +81,45 @@ fm_primary_scope_matches "$FM_ROOT" "$STATE" || exit 0
 # shellcheck source=bin/fm-wake-lib.sh
 . "$SCRIPT_DIR/fm-wake-lib.sh"
 
+# shellcheck source=bin/fm-afk-daemon-lib.sh
+. "$SCRIPT_DIR/fm-afk-daemon-lib.sh"
+
 fm_supervision_status "$STATE" "$GRACE"
 [ "$FM_SUP_IN_FLIGHT" -gt 0 ] || exit 0
 fm_watcher_healthy "$STATE" "$WATCH" "$GRACE" "$FM_HOME" && exit 0
 
 afk=0
 [ -e "$STATE/.afk" ] && afk=1
+
+# Away mode alone does NOT mean a daemon owns supervision. A home whose captain
+# session runs outside any injectable supervisor pane deliberately runs away mode
+# WITHOUT a daemon: the away posture is on, while this home's own watcher stays
+# the real supervision mechanism. Only a live daemon for THIS home transfers
+# watcher ownership away (bin/fm-afk-daemon-lib.sh; strict matching so another
+# home's daemon can never satisfy this check).
+if [ "$afk" -eq 1 ] \
+  && ! fm_afk_daemon_alive "$STATE/.supervise-daemon.lock" "$SCRIPT_DIR/fm-supervise-daemon.sh" 1; then
+  # Daemon-free away mode: the ordinary live-watcher test above already ran and
+  # failed, so this is a genuinely missing or stale watcher. Point at re-arming
+  # the watcher, not at a daemon that owns nothing here.
+  REASON=$("$SCRIPT_DIR/fm-supervision-instructions.sh" --afk 0 --x-mode "$([ -f "$CONFIG/x-mode.env" ] && echo 1 || echo 0)" --repair-line 2>/dev/null \
+    || printf '%s\n' 'tasks in flight, no live watcher - repair missing watcher supervision according to the session-start operating block before ending the turn')
+  if [ "$FM_SUP_WATCHER_FRESH" = true ]; then
+    detail=$(printf 'the watcher that last beat %s is no longer holding this home lock' "$FM_SUP_BEACON_DESC")
+  else
+    detail=$(printf 'no live watcher holds this home lock (last beat: %s)' "$FM_SUP_BEACON_DESC")
+  fi
+  rule='━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━'
+  {
+    printf '●%s\n' "$rule"
+    printf '●  TURN WOULD END BLIND - SUPERVISION IS OFF\n'
+    printf '●  %s task(s) in flight, away mode is on with no supervision daemon, and %s.\n' "$FM_SUP_IN_FLIGHT" "$detail"
+    printf '●  %s\n' "$REASON"
+    printf '●%s\n' "$rule"
+  } >&2
+  exit 2
+fi
+
 x_mode=0
 [ -f "$CONFIG/x-mode.env" ] && x_mode=1
 REASON=$("$SCRIPT_DIR/fm-supervision-instructions.sh" --afk "$afk" --x-mode "$x_mode" --repair-line 2>/dev/null \
