@@ -729,6 +729,20 @@ paneless_delivery() {
   [ "${FM_AFK_DELIVERY_MODE:-pane}" = paneless ]
 }
 
+# The supervisor pane target for THIS run, or the empty string when no pane is
+# reachable. The single owner of that derivation, so no caller can resurrect a
+# pane the daemon deliberately refused to identify.
+#
+# `${FM_SUPERVISOR_TARGET:-$FM_SUPERVISOR_TARGET_DEFAULT}` is wrong here:
+# fm_super_main sets FM_SUPERVISOR_TARGET to the EMPTY STRING in paneless mode
+# precisely so every pane primitive stays unreachable, and `:-` treats an empty
+# value as unset - which silently hands back the legacy "firstmate:0" guess, the
+# exact unrelated pane the 2026-07-22 incident typed into.
+supervisor_pane_target() {
+  paneless_delivery && return 0
+  printf '%s' "${FM_SUPERVISOR_TARGET:-$FM_SUPERVISOR_TARGET_DEFAULT}"
+}
+
 # --- backend-independent active wedge alert ---------------------------------
 # The tmux status-line flash in inject_wedge_alarm below is a cosmetic,
 # client-side OSD with no cross-backend equivalent, so a wedged non-tmux primary
@@ -968,10 +982,14 @@ wedge_alarm_notify() {  # <summary> <marker>
 # is lost - the buffer and the
 # wake-queue both survive - but the stall stops being invisible.
 #
-# <mode> selects which stall is being reported. `pane` (the default) is the
-# original case: the supervisor pane would not accept a submit. `paneless` is the
-# pull path's equivalent: the digests were appended to the durable outbox
-# successfully but firstmate's armed reader never picked them up.
+# <mode> selects which stall is being reported, and therefore which subsystem the
+# operator is pointed at while reading this during an incident:
+#   pane             (default) the supervisor pane would not accept a submit.
+#   paneless         the digests reached the durable outbox but firstmate's armed
+#                    reader never picked them up.
+#   paneless-append  the pull path could not even store the digest, so it is still
+#                    buffered. Naming the pane here would send diagnosis to a
+#                    subsystem this run does not have.
 inject_wedge_alarm() {  # <state> <age-seconds> [mode]
   local state=$1 age=$2 mode=${3:-pane} marker target backend max_defer now notify=1
   local cause detail
@@ -980,6 +998,10 @@ inject_wedge_alarm() {  # <state> <age-seconds> [mode]
     paneless)
       cause="firstmate's away-mode inbox reader has not picked them up (never armed or never re-armed)"
       detail="Records waiting in the away-mode inbox:"
+      ;;
+    paneless-append)
+      cause="the digest could not be stored in the away-mode inbox (state directory unwritable, or the inbox lock is held)"
+      detail="The away-mode inbox could not accept an escalation. Buffered items:"
       ;;
     *)
       cause="inject could not confirm a submit (supervisor pane busy or wedged)"
@@ -1007,7 +1029,7 @@ inject_wedge_alarm() {  # <state> <age-seconds> [mode]
       cat "$state/.subsuper-escalations" 2>/dev/null
     fi
   } 2>/dev/null > "$marker" || true
-  target="${FM_SUPERVISOR_TARGET:-$FM_SUPERVISOR_TARGET_DEFAULT}"
+  target=$(supervisor_pane_target)
   backend="${FM_SUPERVISOR_BACKEND:-$FM_SUPERVISOR_BACKEND_DEFAULT}"
   # Best-effort status-line flash. tmux's display-message is a client-side OSD
   # with no herdr equivalent; the log line + durable marker above are already
@@ -1089,6 +1111,10 @@ housekeeping() {  # <state>
         # Same ownership split as escalate_flush: only the pane path's confirmed
         # submit is delivery, so only it retires the marker here.
         paneless_delivery || rm -f "$state/.subsuper-inject-wedged"
+      elif paneless_delivery; then
+        # A paneless run reaching here failed to STORE the digest; there is no
+        # supervisor pane to be busy or wedged, so the alarm must not name one.
+        inject_wedge_alarm "$state" "$oldest" paneless-append
       else
         inject_wedge_alarm "$state" "$oldest"
       fi
@@ -1291,7 +1317,7 @@ inject_msg() {  # <message> [state]
     log "inject failed: could not append the digest to the away-mode inbox"
     return 1
   fi
-  target="${FM_SUPERVISOR_TARGET:-$FM_SUPERVISOR_TARGET_DEFAULT}"
+  target=$(supervisor_pane_target)
   # BACKEND-AWARE (previously a raw `tmux display-message` pane-exists probe):
   # dispatches through bin/fm-backend.sh so a herdr supervisor pane is checked
   # via the herdr adapter instead of always assuming tmux. Falls back to tmux

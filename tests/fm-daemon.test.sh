@@ -1964,6 +1964,78 @@ test_paneless_unreadable_outbox_logs_once_and_backs_off() {
   pass "an unreadable away-mode inbox logs on transition and backs its probe off instead of stalling every tick"
 }
 
+# The whole point of paneless mode is that firstmate is never typed at, so the
+# alarm must not derive, probe, or write a pane either. fm_super_main leaves
+# FM_SUPERVISOR_TARGET empty on purpose; a `:-` default would treat that empty
+# value as unset and resurrect the legacy firstmate:0 guess - flashing a status
+# line on whatever unrelated session answers to that name.
+test_paneless_wedge_alarm_never_touches_a_pane() {
+  local dir state fakebin calls alarms marker target
+  dir=$(make_supercase paneless-alarm-no-pane)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  marker="$state/.subsuper-inject-wedged"
+  calls="$dir/tmux-calls.log"; : > "$calls"
+  alarms="$dir/alarms.log"; : > "$alarms"
+  afk_enter "$state"
+
+  target=$(FM_AFK_DELIVERY_MODE=paneless FM_SUPERVISOR_TARGET="" supervisor_pane_target)
+  [ -z "$target" ] || fail "paneless mode resolved a pane target ('$target') the daemon refused to identify"
+  target=$(FM_AFK_DELIVERY_MODE=pane FM_SUPERVISOR_TARGET="" supervisor_pane_target)
+  [ "$target" = "$FM_SUPERVISOR_TARGET_DEFAULT" ] \
+    || fail "pane mode lost its legacy target fallback, got '$target'"
+
+  printf '%s\t1\tescalation\t%sSupervisor escalate (1 event(s)): alpha.status: blocked: needs a token\n' \
+    "$(( $(date +%s) - 600 ))" "$FM_INJECT_MARK" > "$state/.afk-outbox"
+
+  WEDGE_ALARM_LAST_EPOCH=0
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_CALLS="$calls" FM_SUPERVISOR_TARGET="" \
+    FM_SUPERVISOR_BACKEND=tmux FM_AFK_DELIVERY_MODE=paneless \
+    FM_WEDGE_ALARM_LOG="$alarms" inject_wedge_alarm "$state" 600 paneless
+
+  [ -s "$marker" ] || fail "the paneless alarm wrote no durable marker"
+  [ -s "$alarms" ] || fail "the paneless alarm did not reach the non-pane alert channel"
+  [ ! -s "$calls" ] || fail "the paneless alarm ran a pane command: $(cat "$calls")"
+  pass "a paneless wedge alarm alerts through the non-pane channel and writes no pane at all"
+}
+
+# A paneless run that cannot STORE the digest is not a busy or wedged supervisor
+# pane - it has none. The alarm text and the marker heading are read during an
+# incident, so they must name the subsystem that actually failed.
+test_paneless_append_failure_alarms_about_the_inbox_not_a_pane() {
+  local dir state fakebin marker log_file
+  dir=$(make_supercase paneless-append-failed)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  marker="$state/.subsuper-inject-wedged"
+  log_file="$dir/daemon.log"; : > "$log_file"
+  afk_enter "$state"
+
+  # The outbox cannot be written, so the append fails and the digest stays
+  # buffered - the branch that reaches the max-defer escape in paneless mode.
+  escalate_add "$state" "alpha.status: blocked: needs a token"
+  printf '%s\n' "$(( $(date +%s) - 6000 ))" > "$state/.subsuper-escalations.since"
+  mkdir -p "$state/.afk-outbox"
+
+  WEDGE_ALARM_LAST_EPOCH=0
+  PATH="$fakebin:$PATH" LOG="$log_file" FM_SUPERVISOR_TARGET="" \
+    FM_AFK_DELIVERY_MODE=paneless FM_ESCALATE_BATCH_SECS=99999 FM_MAX_DEFER_SECS=60 \
+    FM_AFK_OUTBOX_LOCK_TRIES=2 housekeeping "$state" 2>"$dir/append-errors.log"
+
+  [ -s "$marker" ] || fail "a failed paneless append raised no undelivered-escalation alarm"
+  grep -F 'away-mode inbox' "$marker" >/dev/null \
+    || fail "the marker does not name the away-mode inbox: $(cat "$marker")"
+  grep -F 'supervisor pane' "$marker" >/dev/null \
+    && fail "a paneless run blamed a supervisor pane it does not have: $(cat "$marker")"
+  grep -F 'supervisor pane busy or wedged' "$log_file" >/dev/null \
+    && fail "the logged alarm blamed a supervisor pane in a paneless run: $(cat "$log_file")"
+  grep -F 'alpha.status: blocked: needs a token' "$marker" >/dev/null \
+    || fail "the marker does not carry the still-buffered escalation as evidence"
+
+  rmdir "$state/.afk-outbox"
+  pass "a failed paneless append alarms about the away-mode inbox rather than a nonexistent pane"
+}
+
 test_paneless_undelivered_alarm_is_presence_gated_and_age_bounded() {
   local dir state fakebin marker
   dir=$(make_supercase paneless-alarm-gates)
@@ -2131,6 +2203,8 @@ test_paneless_flush_delivers_through_the_inbox_without_a_pane
 test_paneless_undelivered_records_raise_the_same_wedge_alarm
 test_paneless_append_does_not_clear_the_undelivered_marker
 test_paneless_unreadable_outbox_logs_once_and_backs_off
+test_paneless_wedge_alarm_never_touches_a_pane
+test_paneless_append_failure_alarms_about_the_inbox_not_a_pane
 test_paneless_undelivered_alarm_is_presence_gated_and_age_bounded
 test_paneless_delivery_stays_presence_gated
 test_pane_delivery_never_writes_the_inbox

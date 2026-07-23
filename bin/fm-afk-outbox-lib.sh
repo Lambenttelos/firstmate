@@ -32,7 +32,9 @@
 # mid-print loses nothing: the next reader run delivers the same unacknowledged
 # records. Delivery is exactly-once within a run and at-least-once across a
 # killed run, which is the correct bias - a killed reader's stdout never reached
-# firstmate.
+# firstmate. Acknowledgement also compacts the outbox: records at or below the
+# mark are dropped under the lock by an atomic rewrite, so the file stays
+# proportional to what is still pending instead of growing all session.
 #
 # Two readers running at once inherit that same at-least-once bias: each prints
 # before it acknowledges, so an interleaving where both read the same pending
@@ -117,6 +119,7 @@ fm_afk_outbox_transient_artifact_globs() {
     "$FM_AFK_OUTBOX_LOCK_NAME" \
     "$FM_AFK_OUTBOX_LOCK_NAME.steal" \
     "$FM_AFK_OUTBOX_ACK_NAME.pending.*" \
+    "$FM_AFK_OUTBOX_NAME.compact.*" \
     "$FM_AFK_DELIVERY_MODE_NAME.pending.*"
 }
 
@@ -193,10 +196,30 @@ _fm_afk_outbox_int() {  # <text> -> the integer, or 0
   esac
 }
 
-# The acknowledged high-water mark. 0 means nothing has been acknowledged yet.
+# The acknowledged high-water mark. An ABSENT ack file is a genuine 0: nothing has
+# been acknowledged yet in this away session. A file that is PRESENT but cannot be
+# read, or that holds anything other than a whole number, is a FAILED read and
+# returns FM_AFK_OUTBOX_UNREADABLE with no output.
+#
+# This mark is the only thing that narrows the pending set, so collapsing a failed
+# read into 0 is the same failed-read-is-not-a-value defect as the record scan,
+# inverted: every record of the session would look unacknowledged, the reader would
+# replay every digest it already delivered, the paneless undelivered alarm would
+# fire off the session's first record, and the return gate would file the whole
+# session as never picked up.
 fm_afk_outbox_ack_seq() {  # <state>
-  local state=$1
-  _fm_afk_outbox_int "$(head -n 1 "$(fm_afk_outbox_ack_file "$state")" 2>/dev/null || true)"
+  local file value rc=0
+  file=$(fm_afk_outbox_ack_file "$1")
+  [ -e "$file" ] || { printf '0'; return 0; }
+  value=$(head -n 1 "$file" 2>/dev/null) || rc=$?
+  [ "$rc" -eq 0 ] || return "$FM_AFK_OUTBOX_UNREADABLE"
+  # The mark is written atomically (a sibling renamed over this file), so it is
+  # never legitimately empty or partial while it exists: an empty or non-numeric
+  # value is a damaged mark, not a zero.
+  case "$value" in
+    ''|*[!0-9]*) return "$FM_AFK_OUTBOX_UNREADABLE" ;;
+  esac
+  printf '%s' "$value"
 }
 
 # Highest sequence number present in the outbox itself, 0 when it is empty. A
@@ -221,7 +244,8 @@ _fm_afk_outbox_last_seq() {  # <state>
 _fm_afk_outbox_next_seq() {  # <state>  (call under the outbox lock)
   local state=$1 seq ack last next rc=0
   seq=$(_fm_afk_outbox_int "$(head -n 1 "$(fm_afk_outbox_seq_file "$state")" 2>/dev/null || true)")
-  ack=$(fm_afk_outbox_ack_seq "$state")
+  ack=$(fm_afk_outbox_ack_seq "$state") || rc=$?
+  [ "$rc" -eq 0 ] || return "$rc"
   last=$(_fm_afk_outbox_last_seq "$state") || rc=$?
   [ "$rc" -eq 0 ] || return "$rc"
   next=$seq
@@ -263,15 +287,16 @@ fm_afk_outbox_append() {  # <state> <kind> <digest>
   fi
   if [ "$status" -eq 0 ]; then
     FM_AFK_OUTBOX_APPEND_SEQ=$seq
-    ack=$(fm_afk_outbox_ack_seq "$state")
-    # An awk that fails here leaves the count EMPTY rather than 0. The record is
-    # already persisted, so the append still succeeds; announcing "0 record(s)
-    # pending pickup" for a count that could not be read would misreport a stored
-    # escalation as a dropped one.
-    if pending=$(awk -F '\t' -v ack="$ack" \
-      'NF >= 4 && $2 ~ /^[0-9]+$/ && $2+0 > ack+0 { n++ } END { print n+0 }' \
-      "$(fm_afk_outbox_file "$state")" 2>/dev/null); then
-      FM_AFK_OUTBOX_APPEND_PENDING=$pending
+    # An unreadable acknowledgement mark, or an awk that fails, leaves the count
+    # EMPTY rather than 0. The record is already persisted, so the append still
+    # succeeds; announcing "0 record(s) pending pickup" for a count that could not
+    # be read would misreport a stored escalation as a dropped one.
+    if ack=$(fm_afk_outbox_ack_seq "$state"); then
+      if pending=$(awk -F '\t' -v ack="$ack" \
+        'NF >= 4 && $2 ~ /^[0-9]+$/ && $2+0 > ack+0 { n++ } END { print n+0 }' \
+        "$(fm_afk_outbox_file "$state")" 2>/dev/null); then
+        FM_AFK_OUTBOX_APPEND_PENDING=$pending
+      fi
     fi
   fi
   fm_lock_release "$lock"
@@ -288,7 +313,13 @@ fm_afk_outbox_pending() {  # <state>
   fm_afk_outbox_lock_lib "$state" || return "$FM_AFK_OUTBOX_UNREADABLE"
   lock=$(fm_afk_outbox_lock_file "$state")
   _fm_afk_outbox_lock_acquire "$lock" || return "$FM_AFK_OUTBOX_UNREADABLE"
-  ack=$(fm_afk_outbox_ack_seq "$state")
+  # An acknowledgement mark that could not be read narrows nothing, so it is a
+  # failed read too rather than a licence to treat every record as pending.
+  ack=$(fm_afk_outbox_ack_seq "$state") || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    fm_lock_release "$lock"
+    return "$FM_AFK_OUTBOX_UNREADABLE"
+  fi
   # The record read itself must propagate failure. `[ -s ]` above only STATS the
   # file, so a present-but-unreadable outbox (mode 000, an ACL, a bad mount) or a
   # failing awk reaches here, and swallowing that status would report "the read
@@ -367,9 +398,47 @@ fm_afk_outbox_pending_report() {  # <state>
   printf '%s\n' "$pending" | fm_afk_outbox_format
 }
 
+# Drop records the acknowledgement mark already covers, so the outbox stays
+# proportional to what is PENDING instead of growing for a whole away session -
+# an overnight session would otherwise have the reader's one-second poll re-lock
+# and re-scan hundreds of long-delivered records, and once every record is
+# acknowledged the compacted file is empty, so the poll's `[ -s ]` check answers
+# without taking the lock at all.
+#
+# Safety, which outranks the speedup: only records at or below the mark are ever
+# removed, the rewrite happens under the outbox lock, and it lands by renaming a
+# sibling over the file, so an interrupted compaction leaves every record intact
+# rather than truncating an unacknowledged one. Sequence allocation is unaffected:
+# _fm_afk_outbox_next_seq takes the maximum of the seq counter, the ack mark, and
+# the highest record still present, and both of the first two survive compaction,
+# so a compacted record's number can never be handed out again.
+#
+# Entirely best-effort: any failure leaves the outbox exactly as it was.
+_fm_afk_outbox_compact() {  # <state>
+  local state=$1 file lock ack compact_file
+  file=$(fm_afk_outbox_file "$state")
+  [ -s "$file" ] || return 0
+  fm_afk_outbox_lock_lib "$state" || return 1
+  lock=$(fm_afk_outbox_lock_file "$state")
+  _fm_afk_outbox_lock_acquire "$lock" || return 1
+  ack=$(fm_afk_outbox_ack_seq "$state") || { fm_lock_release "$lock"; return 1; }
+  compact_file=$(mktemp "$state/$FM_AFK_OUTBOX_NAME.compact.XXXXXX") || { fm_lock_release "$lock"; return 1; }
+  # A malformed line has no acknowledgeable sequence number, so it is KEPT: only a
+  # record this mark demonstrably covers may be dropped.
+  if awk -F '\t' -v ack="$ack" \
+    '!(NF >= 4 && $2 ~ /^[0-9]+$/ && $2+0 <= ack+0)' "$file" > "$compact_file" 2>/dev/null; then
+    mv "$compact_file" "$file" 2>/dev/null || rm -f "$compact_file"
+  else
+    rm -f "$compact_file"
+  fi
+  fm_lock_release "$lock"
+  return 0
+}
+
 # Record the acknowledged high-water mark atomically (write a sibling, rename over
 # the ack file), so an interrupted acknowledgement leaves the previous mark intact
-# and the records are simply delivered again.
+# and the records are simply delivered again. Acknowledgement is what makes a
+# record removable, so this is also where the outbox is compacted.
 fm_afk_outbox_ack() {  # <state> <seq>
   local state=$1 seq=$2 ack pending_file
   case "$seq" in
@@ -379,6 +448,9 @@ fm_afk_outbox_ack() {  # <state> <seq>
   pending_file=$(mktemp "$state/.afk-outbox.ack.pending.XXXXXX") || return 1
   printf '%s\n' "$seq" > "$pending_file" || { rm -f "$pending_file"; return 1; }
   mv "$pending_file" "$ack" || { rm -f "$pending_file"; return 1; }
+  # Best-effort: a compaction that cannot run leaves a correct, merely larger
+  # outbox, and must never fail an acknowledgement that already landed.
+  _fm_afk_outbox_compact "$state" || true
 }
 
 # Deliver every unacknowledged record: print the formatted records on stdout

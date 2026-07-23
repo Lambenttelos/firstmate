@@ -353,6 +353,104 @@ test_a_present_but_unreadable_outbox_file_is_not_an_empty_one() {
   pass "a present-but-unreadable outbox file fails the read instead of reading as empty"
 }
 
+# The acknowledgement mark is the ONLY thing that narrows the pending set, so a
+# mark that reads as 0 when it could not actually be read makes every record of
+# the session look unacknowledged: the reader replays digests it already
+# delivered, and the daemon's age alarm fires off the session's first record. An
+# ABSENT mark is still a genuine 0 - that is a fresh away session.
+test_an_unreadable_acknowledgement_mark_is_not_a_zero() {
+  local state rc out
+  if [ "$(id -u)" = 0 ]; then
+    pass "skipped: running as root, where mode 000 does not deny a read"
+    return 0
+  fi
+  state=$(make_inbox_case unreadable-ack)
+  enter_away "$state"
+  append_digest "$state" "Supervisor escalate (1 event(s)): alpha.status: done: PR 1"
+
+  rc=0; out=$(fm_afk_outbox_ack_seq "$state") || rc=$?
+  [ "$rc" -eq 0 ] && [ "$out" = 0 ] \
+    || fail "an absent acknowledgement mark must read as a genuine 0, got rc=$rc out='$out'"
+
+  run_inbox "$state" --once >/dev/null || fail "initial delivery failed"
+  append_digest "$state" "Supervisor escalate (1 event(s)): beta.status: blocked: needs a token"
+  chmod 000 "$state/.afk-outbox.ack"
+
+  rc=0; out=$(fm_afk_outbox_ack_seq "$state") || rc=$?
+  [ "$rc" -eq "$FM_AFK_OUTBOX_UNREADABLE" ] \
+    || fail "an unreadable acknowledgement mark must report unreadable, got rc=$rc"
+  [ -z "$out" ] || fail "ack_seq printed '$out' for a mark it could not read"
+
+  for out in fm_afk_outbox_pending fm_afk_outbox_pending_report fm_afk_outbox_oldest_pending_epoch; do
+    rc=0; "$out" "$state" >/dev/null || rc=$?
+    [ "$rc" -eq "$FM_AFK_OUTBOX_UNREADABLE" ] \
+      || fail "$out must propagate the unreadable acknowledgement mark, got rc=$rc"
+  done
+  rc=0; out=$(fm_afk_outbox_deliver "$state") || rc=$?
+  [ "$rc" -eq "$FM_AFK_OUTBOX_DELIVER_UNREADABLE" ] \
+    || fail "deliver must refuse an unreadable acknowledgement mark rather than replay, got rc=$rc"
+  [ -z "$out" ] || fail "deliver replayed records off an unreadable mark: $out"
+
+  rc=0; fm_afk_outbox_append "$state" escalation "${FM_TEST_MARK}gamma" || rc=$?
+  [ "$rc" -ne 0 ] || fail "the append allocated a sequence number from an unreadable acknowledgement mark"
+
+  rc=0; out=$(run_inbox "$state" --once) || rc=$?
+  [ "$rc" -ne 0 ] || fail "the reader exited 0 on an unreadable acknowledgement mark: $out"
+
+  # A garbled mark is the same failure: it was written atomically, so it is never
+  # legitimately empty or non-numeric while it exists.
+  chmod 644 "$state/.afk-outbox.ack"
+  printf 'not-a-number\n' > "$state/.afk-outbox.ack"
+  rc=0; fm_afk_outbox_ack_seq "$state" >/dev/null || rc=$?
+  [ "$rc" -eq "$FM_AFK_OUTBOX_UNREADABLE" ] || fail "a garbled acknowledgement mark read as a value, rc=$rc"
+
+  printf '1\n' > "$state/.afk-outbox.ack"
+  [ "$(fm_afk_outbox_pending_count "$state")" -eq 1 ] \
+    || fail "the undelivered record did not stay pending across the failed mark reads"
+  pass "an unreadable or garbled acknowledgement mark fails the read instead of replaying every record"
+}
+
+# The outbox must not grow for a whole away session: acknowledged records are
+# dropped so the reader's one-second poll stays proportional to what is pending.
+# Safety outranks the speedup - nothing above the mark may ever be removed, and
+# sequence numbers must never regress into an already-acknowledged range.
+test_acknowledged_records_are_compacted_without_losing_pending_ones() {
+  local state seq
+  state=$(make_inbox_case compaction)
+  enter_away "$state"
+  append_digest "$state" "Supervisor escalate (1 event(s)): alpha.status: done: PR 1"
+  append_digest "$state" "Supervisor escalate (1 event(s)): beta.status: done: PR 2"
+
+  # Acknowledge only the first record, then confirm the second survives untouched.
+  fm_afk_outbox_ack "$state" 1 || fail "could not record the acknowledgement mark"
+  [ "$(wc -l < "$state/.afk-outbox" | tr -d ' ')" -eq 1 ] \
+    || fail "compaction did not drop the acknowledged record: $(cat "$state/.afk-outbox")"
+  grep -F 'beta.status: done: PR 2' "$state/.afk-outbox" >/dev/null \
+    || fail "compaction removed a record above the acknowledgement mark"
+  grep -F 'alpha.status: done: PR 1' "$state/.afk-outbox" >/dev/null \
+    && fail "compaction kept a record the mark already covers"
+  [ "$(fm_afk_outbox_pending_count "$state")" -eq 1 ] \
+    || fail "compaction changed what is pending"
+
+  # A number already handed out must never be reused, even though its record is gone.
+  append_digest "$state" "Supervisor escalate (1 event(s)): gamma.status: done: PR 3"
+  seq=$(awk -F '\t' '$4 ~ /gamma/ { print $2 }' "$state/.afk-outbox")
+  [ "$seq" -eq 3 ] || fail "compaction let the allocator regress: gamma got sequence $seq"
+
+  # Everything acknowledged: the file compacts to empty, so the poll answers from
+  # a stat alone rather than re-locking and re-scanning the session's history.
+  run_inbox "$state" --once >/dev/null || fail "delivery of the remaining records failed"
+  [ ! -s "$state/.afk-outbox" ] || fail "a fully acknowledged outbox was not compacted: $(cat "$state/.afk-outbox")"
+  [ "$(cat "$state/.afk-outbox.ack")" = 3 ] || fail "the acknowledgement mark did not advance"
+
+  append_digest "$state" "Supervisor escalate (1 event(s)): delta.status: done: PR 4"
+  seq=$(awk -F '\t' '$4 ~ /delta/ { print $2 }' "$state/.afk-outbox")
+  [ "$seq" -eq 4 ] || fail "an emptied outbox let the allocator regress: delta got sequence $seq"
+  [ "$(fm_afk_outbox_pending_count "$state")" -eq 1 ] \
+    || fail "the record appended after compaction is not pending"
+  pass "acknowledged records are compacted away while pending ones and sequence numbers are preserved"
+}
+
 # The reader's own contract: a genuine read failure exits NON-ZERO with no
 # healthy status line, rather than printing an idle or nothing-pending line that
 # firstmate would read as a quiet, working channel.
@@ -535,6 +633,8 @@ test_records_survive_a_lost_sequence_counter
 test_append_failure_is_reported_rather_than_hanging
 test_an_unreadable_outbox_is_never_reported_as_an_empty_one
 test_a_present_but_unreadable_outbox_file_is_not_an_empty_one
+test_an_unreadable_acknowledgement_mark_is_not_a_zero
+test_acknowledged_records_are_compacted_without_losing_pending_ones
 test_reader_exits_non_zero_when_the_outbox_cannot_be_read
 test_concurrent_readers_never_announce_what_they_did_not_deliver
 test_every_exit_line_carries_a_re_arm_verdict
