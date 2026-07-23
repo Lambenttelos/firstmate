@@ -63,7 +63,9 @@
 #     writes state/.subsuper-inject-wedged and attempts a configurable active
 #     alert if submit still cannot be confirmed. Paneless delivery gets the same
 #     alarm off the age of the oldest unacknowledged outbox record, because there
-#     the append itself always succeeds and could otherwise never look wedged.
+#     the append itself always succeeds and could otherwise never look wedged -
+#     gated on the reader's liveness beacon so an armed reader waiting through a
+#     long firstmate turn is never mistaken for one that was never armed.
 #   - Cheap heartbeat catch-all: every HEARTBEAT_SCAN_SECS the daemon greps all
 #     state/*.status for a captain-relevant line the per-wake classifier might
 #     have missed (e.g. a status verb outside CAPTAIN_RE) and escalates it.
@@ -124,6 +126,13 @@
 #                                   undelivered before one normal flush attempt;
 #                                   if that cannot confirm a submit, a wedge
 #                                   alarm fires (default 300; 0 disables)
+#          FM_AFK_INBOX_BEACON_STALE_SECS seconds without a stamp on
+#                                   state/.afk-inbox.beat before the paneless
+#                                   undelivered alarm treats firstmate's inbox
+#                                   reader as gone (default 60; invalid/zero uses
+#                                   the default). The alarm needs an overdue
+#                                   record AND a stale beacon, so an armed reader
+#                                   waiting through a long turn never alarms.
 #          FM_WEDGE_ALARM_CHANNEL   override config/wedge-alarm with a single
 #                                   active-alert directive for that wedge alarm
 #                                   (off|auto|osascript|herdr|command:<cmd>). An
@@ -233,6 +242,13 @@ WEDGE_ALARM_NOTIFIER_PID=
 # probe off by one max-defer window instead of stalling on every pass.
 OUTBOX_UNREADABLE=0
 OUTBOX_PROBE_NOT_BEFORE=0
+# How stale bin/fm-afk-inbox.sh's liveness beacon must be before the paneless
+# undelivered alarm treats the reader as gone. The reader re-stamps it every poll
+# iteration (default one second), so this only has to clear normal scheduling
+# jitter; keeping it far below MAX_DEFER_SECS_DEFAULT keeps the alarm bounded -
+# a reader that dies is reported within roughly one max-defer window, never
+# silently.
+INBOX_BEACON_STALE_SECS_DEFAULT=60
 # The captain-relevant verb set and the status classifiers (last_status_line,
 # status_is_captain_relevant, window_to_task, scan_captain_relevant_statuses) now
 # live in bin/fm-classify-lib.sh, shared with the always-on watcher.
@@ -729,6 +745,19 @@ paneless_delivery() {
   [ "${FM_AFK_DELIVERY_MODE:-pane}" = paneless ]
 }
 
+# Seconds without a reader beacon stamp before the paneless undelivered alarm
+# treats firstmate's inbox reader as gone. A non-numeric or zero override falls
+# back to the default rather than disabling the staleness check, because a
+# staleness window of zero would make every armed reader look dead and restore
+# the false alarm this gate exists to remove.
+inbox_beacon_stale_secs() {
+  local secs=${FM_AFK_INBOX_BEACON_STALE_SECS:-$INBOX_BEACON_STALE_SECS_DEFAULT}
+  case "$secs" in
+    ''|*[!0-9]*|0) secs=$INBOX_BEACON_STALE_SECS_DEFAULT ;;
+  esac
+  printf '%s' "$secs"
+}
+
 # The supervisor pane target for THIS run, or the empty string when no pane is
 # reachable. The single owner of that derivation, so no caller can resurrect a
 # pane the daemon deliberately refused to identify.
@@ -1024,7 +1053,14 @@ inject_wedge_alarm() {  # <state> <age-seconds> [mode]
     printf 'fm away-mode inject WEDGED: %ss undelivered as of %s\n' "$age" "$(date '+%Y-%m-%dT%H:%M:%S%z')"
     printf '%s\n' "$detail"
     if [ "$mode" = paneless ]; then
-      fm_afk_outbox_pending_report "$state" 2>/dev/null
+      # A discarded status here would render the heading followed by NOTHING when
+      # the bounded acquire loses to the reader, so the captain - and
+      # bin/fm-afk-return.sh, which surfaces this marker as catch-up evidence -
+      # would read an alarm that lists zero records. That is the same
+      # failed-read-looks-empty presentation this delivery path removes
+      # everywhere else, so say what happened instead.
+      fm_afk_outbox_pending_report "$state" 2>/dev/null \
+        || printf '(the away-mode inbox could not be read while writing this alarm; its records are still pending)\n'
     else
       cat "$state/.subsuper-escalations" 2>/dev/null
     fi
@@ -1069,9 +1105,12 @@ _oldest_line_age() {  # <buf> -> seconds since the oldest buffered item first ar
 #     attempt one normal delivery; if it cannot confirm, raise the wedge alarm.
 #     Never silently defer forever.
 #  1c) paneless undelivered escape: in pull delivery the append always succeeds,
-#     so (1b) can never fire. Alarm instead on the AGE of the oldest
-#     unacknowledged outbox record, through the same wedge alarm and marker, and
-#     clear that alarm once the reader has acknowledged everything.
+#     so (1b) can never fire. Alarm instead when the oldest unacknowledged outbox
+#     record is older than MAX_DEFER_SECS *and* the reader's liveness beacon is
+#     absent or stale, through the same wedge alarm and marker, and clear that
+#     alarm once the reader has acknowledged everything. Both conditions are
+#     required: age alone cannot tell a reader that was never armed from a
+#     firstmate that is armed and mid-turn.
 #  2) stale recheck: for each pending stale marker past STALE_ESCALATE_SECS,
 #     re-peek the pane; still idle -> escalate (wedge); resumed -> clear marker.
 #  2b) pause re-surface: for each declared-pause marker past PAUSE_RESURFACE_SECS,
@@ -1153,7 +1192,17 @@ housekeeping() {  # <state>
       fi
       if [ -n "$oldest_epoch" ]; then
         oldest=$(( now - oldest_epoch ))
+        # The alarm must answer "is anyone going to read this?", not "how old is
+        # the oldest record?". Age alone cannot separate a reader that was never
+        # armed from a firstmate that is armed and simply mid-turn, and agent
+        # turns longer than the max-defer window are routine, so age alone would
+        # alarm the captain on the healthy path. An armed reader stamps
+        # state/.afk-inbox.beat every poll iteration, so only a beacon that is
+        # ABSENT or stale means nothing has claimed the outbox. Raising the
+        # threshold instead was rejected on purpose: that trades a false alarm for
+        # a silent gap, which is the failure this delivery mode exists to remove.
         if [ "$oldest" -ge "$max_defer" ] \
+           && [ "$(_file_age "$(fm_afk_inbox_beacon_file "$state")")" -ge "$(inbox_beacon_stale_secs)" ] \
            && [ "$(_file_age "$state/.subsuper-inject-wedged")" -ge "$max_defer" ]; then
           inject_wedge_alarm "$state" "$oldest" paneless
         fi

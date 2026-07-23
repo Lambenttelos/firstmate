@@ -8,8 +8,9 @@
 #     - prints "afk: daemon already running pid=<pid>" then exits 0 when that
 #       lock is held by a live daemon (a REFRESH: no stale-artifact clear);
 #     - otherwise clears any prior away session's stale escalation artifacts
-#       (fm_afk_clear_stale_artifacts) for a direct, non-prepared start, then
-#       execs bin/fm-supervise-daemon.sh in the foreground. A prepared start was
+#       (fm_afk_clear_stale_artifacts) for a direct, non-prepared start - naming
+#       on stderr, never aborting on, any it cannot clear - then execs
+#       bin/fm-supervise-daemon.sh in the foreground. A prepared start was
 #       already cleared transactionally by bin/fm-afk-launch.sh.
 #
 # This file is sourceable: its BASH_SOURCE guard keeps main from running, while
@@ -87,11 +88,15 @@ fm_afk_session_artifact_names() {
   fm_afk_outbox_artifact_names
 }
 
+# Every failure NAMES the artifact it could not clear on stderr in addition to
+# returning non-zero, so no caller can turn a clearing problem into a silent stop.
 fm_afk_clear_stale_artifacts() {  # <state-dir>
   local state=$1 name status=0
   while IFS= read -r name; do
     [ -n "$name" ] || continue
-    rm -f "$state/$name" 2>/dev/null || status=1
+    rm -f "$state/$name" 2>/dev/null && continue
+    printf 'afk: could not clear stale away-mode artifact %s\n' "$state/$name" >&2
+    status=1
   done < <(fm_afk_session_artifact_names)
   fm_afk_outbox_clear_transient "$state" || status=1
   return "$status"
@@ -145,8 +150,19 @@ fm_afk_start_main() {
 
   # Fresh start: clear the previous away session's stale delivery artifacts
   # before the new daemon can surface them (fix for the leaked-artifact defect).
+  #
+  # Deliberately NOT fatal, and deliberately not a bare call under `set -e`: a
+  # single artifact that will not delete - most likely a leftover outbox lock -
+  # would otherwise abort right here, so `exec` below never runs and away mode
+  # comes up with no sub-supervisor and no diagnostic at all. Coming up with a
+  # supervisor and a stale artifact is strictly better than coming up with
+  # neither, and the portable lock helper already recovers a stale lock through
+  # its dead-pid steal. The clearing helpers name each artifact they could not
+  # clear on stderr, so the problem is reported rather than swallowed.
   if [ "${FM_AFK_STATE_PREPARED:-0}" != 1 ]; then
-    fm_afk_clear_stale_artifacts "$FM_AFK_STATE"
+    if ! fm_afk_clear_stale_artifacts "$FM_AFK_STATE"; then
+      echo "afk: continuing into daemon startup despite the stale away-mode artifact(s) named above" >&2
+    fi
   fi
 
   echo "afk: starting supervise daemon in foreground; keep this command as a tracked background session"

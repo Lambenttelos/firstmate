@@ -41,6 +41,14 @@ enter_away() {  # <state>
   date +%s > "$1/.afk"
 }
 
+# Portable mtime in epoch seconds; BSD and GNU stat disagree on the flag, the
+# same split bin/fm-watch.sh decides once rather than probing per call.
+if stat -f %m . >/dev/null 2>&1; then
+  fm_test_mtime() { stat -f %m "$1"; }
+else
+  fm_test_mtime() { stat -c %Y "$1"; }
+fi
+
 append_digest() {  # <state> <text>
   fm_afk_outbox_append "$1" escalation "${FM_TEST_MARK}$2" \
     || fail "could not append an away-mode delivery record"
@@ -135,6 +143,35 @@ test_reader_wakes_on_a_record_written_while_it_waits() {
   assert_contains "$out" "epsilon.status: done: PR 9" "blocked reader did not deliver the record written while it waited"
   assert_contains "$out" "re-arm to keep listening" "delivery did not tell firstmate to re-arm"
   pass "a record appended while the reader waits wakes it and is delivered"
+}
+
+# The daemon's undelivered alarm keys off this beacon to tell an armed reader
+# blocking through a long firstmate turn from a reader that was never armed, so
+# it has to be stamped on every poll iteration - not only at arm time - or a long
+# quiet wait would read as dead and alarm the away captain on the healthy path.
+test_reader_stamps_its_liveness_beacon_while_it_waits() {
+  local state beacon pid first second
+  state=$(make_inbox_case reader-beacon)
+  enter_away "$state"
+  beacon=$(fm_afk_inbox_beacon_file "$state")
+  [ ! -e "$beacon" ] || fail "a beacon existed before any reader was armed"
+
+  FM_STATE_OVERRIDE="$state" "$INBOX" --poll 1 --timeout 30 > "$state/reader.out" 2>&1 &
+  pid=$!
+  sleep 1
+  [ -e "$beacon" ] || fail "an armed reader stamped no liveness beacon"
+  first=$(fm_test_mtime "$beacon")
+
+  # Nothing at all happens for a few seconds: the beacon must keep advancing
+  # anyway, because a quiet wait is exactly what a long firstmate turn looks like.
+  sleep 3
+  second=$(fm_test_mtime "$beacon")
+  [ "$second" -gt "$first" ] || fail "the beacon stopped advancing during a quiet wait ($first -> $second)"
+
+  append_digest "$state" "Supervisor escalate (1 event(s)): theta.status: done: PR 7"
+  wait_pid_exit "$pid" 200
+  [ "$(fm_test_mtime "$beacon")" -ge "$second" ] || fail "the beacon regressed after an acknowledgement"
+  pass "the reader stamps its liveness beacon on every poll and after acknowledging"
 }
 
 test_reader_exits_immediately_when_the_daemon_uses_the_pane() {
@@ -626,6 +663,7 @@ test_real_daemon_without_a_backend_delivers_to_the_reader() {
 test_reader_delivers_pending_records_then_acknowledges_them
 test_killed_reader_loses_nothing
 test_reader_wakes_on_a_record_written_while_it_waits
+test_reader_stamps_its_liveness_beacon_while_it_waits
 test_reader_exits_immediately_when_the_daemon_uses_the_pane
 test_reader_exits_when_away_mode_is_over_but_still_delivers_leftovers
 test_reader_reports_an_idle_timeout

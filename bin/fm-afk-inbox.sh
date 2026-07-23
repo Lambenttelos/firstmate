@@ -31,6 +31,15 @@
 # channel is healthy. In particular, a failed read is never reported as an empty
 # outbox: it never gets an idle or nothing-pending line.
 #
+# LIVENESS. While it waits, this reader stamps state/.afk-inbox.beat on every
+# poll iteration and on every acknowledgement, the same way bin/fm-watch.sh
+# stamps state/.last-watcher-beat. The daemon's paneless undelivered-escalation
+# alarm reads that beacon so it can tell "nobody is going to read this" from
+# "firstmate is armed and simply mid-turn"; without it, any turn longer than the
+# max-defer window would alarm the captain on the healthy path. The beacon is
+# session-scoped and cleared on fresh away entry, so a previous session's stamp
+# can never make a reader that is not running look alive.
+#
 # Concurrency: the outbox library takes the repo's portable lock (flock is absent
 # on macOS) for every append and every pending read, so this reader is safe to
 # run while the daemon is writing. Killing the reader mid-wait or mid-print loses
@@ -82,6 +91,9 @@ deliver() {
   fm_afk_outbox_deliver "$STATE" || rc=$?
   case "$rc" in
     0)
+      # Acknowledgement is the strongest possible liveness proof, so re-stamp the
+      # beacon right after one.
+      fm_afk_inbox_beacon_touch "$STATE" || true
       printf 'afk-inbox: delivered %s away-mode escalation(s); re-arm to keep listening while away mode is active\n' \
         "$FM_AFK_OUTBOX_DELIVERED"
       return 0
@@ -115,6 +127,11 @@ main() {
 
   mkdir -p "$STATE" || die "cannot create state directory $STATE"
 
+  # Stamp the liveness beacon before anything else, so a firstmate that arms this
+  # reader and then runs a long turn is visibly ALIVE to the daemon's paneless
+  # undelivered-escalation alarm from the moment it arms.
+  fm_afk_inbox_beacon_touch "$STATE" || true
+
   # Anything already pending is delivered before any early-exit condition is
   # consulted: a record that exists must reach firstmate even if the away session
   # has since ended or switched to pane delivery.
@@ -143,6 +160,10 @@ main() {
   while true; do
     sleep "$POLL"
     waited=$((waited + POLL))
+    # Every iteration, not only at arm time: a blocking wait with no traffic at
+    # all must still read as alive, otherwise the daemon would alarm about an
+    # armed and perfectly healthy reader.
+    fm_afk_inbox_beacon_touch "$STATE" || true
     deliver && return 0
     if ! away_mode_active; then
       printf 'afk-inbox: away mode ended; nothing pending - do not re-arm\n'

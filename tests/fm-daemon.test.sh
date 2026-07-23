@@ -94,6 +94,33 @@ test_afk_start_bringup_claim_dropped_by_daemon() {
   pass "the daemon drops the away-entry bring-up claim once the lock is authoritative"
 }
 
+# Clearing a prior away session's artifacts is best-effort housekeeping, not a
+# precondition for supervision. A bare call in this `set -eu` script would exit
+# right here on the first artifact that will not delete, so `exec` never runs and
+# away mode comes up with no sub-supervisor and no diagnostic at all - the silent
+# failure class away-mode pull delivery exists to remove. Coming up with a
+# supervisor and a stale artifact is strictly better than coming up with neither.
+test_afk_start_reports_unclearable_artifacts_and_still_starts() {
+  local dir state out status
+  dir=$(make_supercase afk-start-unclearable-artifact)
+  state="$dir/state"
+  # rm -f cannot remove a directory, so this stands in for any artifact that
+  # refuses to clear (a leftover outbox lock, a bad mount, a denied unlink).
+  mkdir -p "$state/.afk-outbox.seq"
+
+  out=$(FM_STATE_OVERRIDE="$state" FM_SUPERVISOR_BACKEND=unsupported "$AFK_START" 2>&1)
+  status=$?
+
+  [ "$status" -ne 0 ] || fail "fm-afk-start.sh should still reach daemon startup and fail there on an unsupported backend"
+  assert_contains "$out" ".afk-outbox.seq" "fm-afk-start.sh did not name the artifact it could not clear"
+  assert_contains "$out" "could not clear stale away-mode artifact" "fm-afk-start.sh cleared silently"
+  assert_contains "$out" "starting supervise daemon" "fm-afk-start.sh aborted instead of starting the supervisor"
+  assert_contains "$out" "does not support supervisor backend 'unsupported'" "daemon startup was never reached"
+
+  rmdir "$state/.afk-outbox.seq" 2>/dev/null || true
+  pass "an artifact that cannot be cleared is named and away mode still comes up with a supervisor"
+}
+
 test_daemon_state_root_uses_fm_home() {
   local dir home override out
   dir=$(make_supercase daemon-fm-home)
@@ -2062,6 +2089,96 @@ test_paneless_undelivered_alarm_is_presence_gated_and_age_bounded() {
   pass "the paneless undelivered alarm stays presence-gated on away mode and bounded by max-defer"
 }
 
+# The undelivered alarm must answer "is anyone going to read this?", not "how old
+# is the oldest record?". Firstmate arms the reader and then runs a turn; agent
+# turns longer than the max-defer window are routine, so an age-only alarm would
+# notify the away captain on the healthy path. The reader stamps its liveness
+# beacon every poll iteration, so an armed reader is visibly alive even through a
+# long, completely quiet wait.
+#
+# Both directions are asserted on purpose: an assertion that only proves the
+# healthy path stays silent would also pass with the alarm deleted outright.
+test_paneless_alarm_needs_a_stale_reader_beacon_not_just_age() {
+  local dir state fakebin marker beacon alarms
+  dir=$(make_supercase paneless-alarm-beacon)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  marker="$state/.subsuper-inject-wedged"
+  beacon=$(fm_afk_inbox_beacon_file "$state")
+  alarms="$dir/alarms.log"; : > "$alarms"
+  afk_enter "$state"
+
+  # A record long past max-defer, and an ARMED reader blocking with nothing to do.
+  printf '%s\t1\tescalation\t%sSupervisor escalate (1 event(s)): alpha.status: blocked: needs a token\n' \
+    "$(( $(date +%s) - 6000 ))" "$FM_INJECT_MARK" > "$state/.afk-outbox"
+  fm_afk_inbox_beacon_touch "$state" || fail "the reader beacon could not be stamped"
+
+  WEDGE_ALARM_LAST_EPOCH=0
+  PATH="$fakebin:$PATH" FM_SUPERVISOR_TARGET="" FM_AFK_DELIVERY_MODE=paneless \
+    FM_ESCALATE_BATCH_SECS=99999 FM_MAX_DEFER_SECS=60 \
+    FM_AFK_INBOX_BEACON_STALE_SECS=600 FM_WEDGE_ALARM_LOG="$alarms" housekeeping "$state"
+  [ ! -e "$marker" ] || fail "a long firstmate turn with an armed reader raised an undelivered alarm"
+  [ ! -s "$alarms" ] || fail "a long firstmate turn with an armed reader alerted the away captain"
+
+  # The same armed reader, now DEAD: its beacon stops being stamped and goes
+  # stale within the bounded staleness window, so the alarm fires.
+  sleep 2
+  WEDGE_ALARM_LAST_EPOCH=0
+  PATH="$fakebin:$PATH" FM_SUPERVISOR_TARGET="" FM_AFK_DELIVERY_MODE=paneless \
+    FM_ESCALATE_BATCH_SECS=99999 FM_MAX_DEFER_SECS=60 \
+    FM_AFK_INBOX_BEACON_STALE_SECS=1 FM_WEDGE_ALARM_LOG="$alarms" housekeeping "$state"
+  [ -s "$marker" ] || fail "a dead reader's stale beacon did not raise the undelivered alarm within its bound"
+  [ -s "$alarms" ] || fail "a dead reader's stale beacon did not reach the active-alert channel"
+
+  # A reader that was NEVER armed leaves no beacon at all, which is the strongest
+  # form of "nobody is going to read this" and must alarm too.
+  rm -f "$marker" "$beacon"
+  : > "$alarms"
+  WEDGE_ALARM_LAST_EPOCH=0
+  PATH="$fakebin:$PATH" FM_SUPERVISOR_TARGET="" FM_AFK_DELIVERY_MODE=paneless \
+    FM_ESCALATE_BATCH_SECS=99999 FM_MAX_DEFER_SECS=60 \
+    FM_AFK_INBOX_BEACON_STALE_SECS=600 FM_WEDGE_ALARM_LOG="$alarms" housekeeping "$state"
+  [ -s "$marker" ] || fail "an outbox no reader was ever armed for raised no undelivered alarm"
+  [ -s "$alarms" ] || fail "an outbox no reader was ever armed for did not alert the away captain"
+
+  rm -f "$marker"
+  pass "the paneless undelivered alarm stays silent for an armed reader and fires within a bound for a missing or dead one"
+}
+
+# The marker is read during an incident, by the captain and by
+# bin/fm-afk-return.sh's catch-up gate. A listing heading followed by nothing is
+# the failed-read-looks-empty presentation this delivery path removes everywhere
+# else, so an unreadable inbox has to say so.
+test_paneless_marker_says_so_when_the_inbox_cannot_be_read() {
+  local dir state fakebin marker alarms
+  if [ "$(id -u)" = 0 ]; then
+    pass "skipped: running as root, where mode 000 does not deny a read"
+    return 0
+  fi
+  dir=$(make_supercase paneless-marker-unreadable)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  marker="$state/.subsuper-inject-wedged"
+  alarms="$dir/alarms.log"; : > "$alarms"
+  afk_enter "$state"
+
+  printf '%s\t1\tescalation\t%sSupervisor escalate (1 event(s)): alpha.status: blocked: needs a token\n' \
+    "$(( $(date +%s) - 6000 ))" "$FM_INJECT_MARK" > "$state/.afk-outbox"
+  chmod 000 "$state/.afk-outbox"
+
+  WEDGE_ALARM_LAST_EPOCH=0
+  PATH="$fakebin:$PATH" FM_SUPERVISOR_TARGET="" FM_AFK_DELIVERY_MODE=paneless \
+    FM_WEDGE_ALARM_LOG="$alarms" inject_wedge_alarm "$state" 6000 paneless
+
+  [ -s "$marker" ] || fail "the paneless alarm wrote no durable marker"
+  grep -F 'could not be read' "$marker" >/dev/null \
+    || fail "the marker listed zero records instead of reporting the failed read: $(cat "$marker")"
+
+  chmod 644 "$state/.afk-outbox"
+  rm -f "$marker"
+  pass "an alarm whose inbox read failed says so instead of listing zero records"
+}
+
 test_paneless_delivery_stays_presence_gated() {
   local dir state fakebin sent
   dir=$(make_supercase paneless-afk-off)
@@ -2102,6 +2219,7 @@ test_pane_delivery_never_writes_the_inbox() {
 
 test_afk_start_refuses_when_flag_cannot_be_written
 test_afk_start_ignores_stale_pidfile_without_lock
+test_afk_start_reports_unclearable_artifacts_and_still_starts
 test_afk_start_reclaims_stale_daemon_lock_reused_pid
 test_afk_start_bringup_claim_dropped_by_daemon
 test_daemon_state_root_uses_fm_home
@@ -2206,5 +2324,7 @@ test_paneless_unreadable_outbox_logs_once_and_backs_off
 test_paneless_wedge_alarm_never_touches_a_pane
 test_paneless_append_failure_alarms_about_the_inbox_not_a_pane
 test_paneless_undelivered_alarm_is_presence_gated_and_age_bounded
+test_paneless_alarm_needs_a_stale_reader_beacon_not_just_age
+test_paneless_marker_says_so_when_the_inbox_cannot_be_read
 test_paneless_delivery_stays_presence_gated
 test_pane_delivery_never_writes_the_inbox

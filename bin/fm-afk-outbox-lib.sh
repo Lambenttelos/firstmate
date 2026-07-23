@@ -59,6 +59,7 @@ FM_AFK_OUTBOX_ACK_NAME=".afk-outbox.ack"
 FM_AFK_OUTBOX_SEQ_NAME=".afk-outbox.seq"
 FM_AFK_OUTBOX_LOCK_NAME=".afk-outbox.lock"
 FM_AFK_DELIVERY_MODE_NAME=".afk-delivery"
+FM_AFK_INBOX_BEACON_NAME=".afk-inbox.beat"
 
 # A read that FAILED - the lock helper is unusable, the bounded lock acquire gave
 # up, or the record scan itself could not read the file - reports this status,
@@ -90,6 +91,33 @@ fm_afk_delivery_mode_file() {  # <state>
   printf '%s/%s' "$1" "$FM_AFK_DELIVERY_MODE_NAME"
 }
 
+fm_afk_inbox_beacon_file() {  # <state>
+  printf '%s/%s' "$1" "$FM_AFK_INBOX_BEACON_NAME"
+}
+
+# The reader's liveness beacon, in the same shape as the watcher's
+# state/.last-watcher-beat: bin/fm-afk-inbox.sh touches it on every poll
+# iteration while it blocks, and again on every acknowledgement, so a long quiet
+# wait with no traffic still reads as ALIVE.
+#
+# The daemon's paneless undelivered-escalation alarm must answer "is anyone going
+# to read this?", not "how old is the oldest record?". Age alone cannot tell a
+# reader that was never armed from a firstmate that is simply mid-turn, and agent
+# turns longer than the max-defer window are routine, so age alone alarms on the
+# healthy path. Age AND a stale-or-absent beacon means nothing has claimed the
+# outbox, which is the condition worth waking the captain for.
+#
+# Best-effort: a beacon that cannot be written leaves it looking absent, which
+# alarms rather than staying silent - the direction that cannot hide an
+# undelivered escalation.
+fm_afk_inbox_beacon_touch() {  # <state>
+  local state=$1 file
+  file=$(fm_afk_inbox_beacon_file "$state")
+  # `touch`, not a truncating redirect: an already-empty beacon truncated again
+  # is not guaranteed to have its mtime updated, and the mtime IS the signal.
+  touch "$file" 2>/dev/null || return 1
+}
+
 # Session-scoped away-mode delivery artifacts owned by this library, one name per
 # line. bin/fm-afk-start.sh folds them into the single session-artifact list that
 # fresh-entry clearing and the launcher's transactional rollback both iterate, so
@@ -109,24 +137,36 @@ fm_afk_outbox_artifact_names() {
 }
 
 # Process-scoped scratch this library can leave behind, one shell glob per line:
-# the portable lock (plus its steal sibling) and the mktemp files that an
-# acknowledgement or a delivery-mode record uses for its atomic rename. A mid-ack
-# kill leaves those temp files behind, and the lock is only recovered lazily by
-# the portable helper's dead-pid steal, so a fresh away entry clears them here
-# rather than inheriting another session's scratch.
+# the portable lock (plus its steal sibling), the mktemp files that an
+# acknowledgement, a compaction, or a delivery-mode record uses for its atomic
+# rename, and the reader's liveness beacon. A mid-ack kill leaves those temp files
+# behind, and the lock is only recovered lazily by the portable helper's dead-pid
+# steal, so a fresh away entry clears them here rather than inheriting another
+# session's scratch.
+#
+# The beacon belongs in THIS list rather than the durable one above for the same
+# reason the lock does: it is a liveness signal about a running process, so it can
+# never be meaningfully backed up and restored. A beacon restored onto a
+# rolled-back start would make a reader that is not running look alive and hide an
+# undelivered escalation; clearing it merely makes the alarm fire sooner.
 fm_afk_outbox_transient_artifact_globs() {
   printf '%s\n' \
     "$FM_AFK_OUTBOX_LOCK_NAME" \
     "$FM_AFK_OUTBOX_LOCK_NAME.steal" \
     "$FM_AFK_OUTBOX_ACK_NAME.pending.*" \
     "$FM_AFK_OUTBOX_NAME.compact.*" \
-    "$FM_AFK_DELIVERY_MODE_NAME.pending.*"
+    "$FM_AFK_DELIVERY_MODE_NAME.pending.*" \
+    "$FM_AFK_INBOX_BEACON_NAME"
 }
 
 # Remove one transient artifact glob. The lock is a directory or a symlink to an
 # owner directory rather than a plain file, so it is retired through the portable
 # lock helper's own removal path when that helper is loaded, and torn out
 # wholesale otherwise.
+#
+# Every failure NAMES the artifact it could not clear on stderr as well as
+# returning non-zero, so a caller that only sees the status can still report
+# something actionable instead of a silent stop.
 fm_afk_outbox_clear_transient() {  # <state>
   local state=$1 glob path status=0
   while IFS= read -r glob; do
@@ -135,13 +175,16 @@ fm_afk_outbox_clear_transient() {  # <state>
       [ -e "$path" ] || [ -L "$path" ] || continue
       if [ -d "$path" ] || [ -L "$path" ]; then
         if declare -F fm_lock_remove_path >/dev/null 2>&1; then
-          fm_lock_remove_path "$path" 2>/dev/null || rm -rf "$path" 2>/dev/null || status=1
-        else
-          rm -rf "$path" 2>/dev/null || status=1
+          fm_lock_remove_path "$path" 2>/dev/null && continue
         fi
+        rm -rf "$path" 2>/dev/null && continue
+        printf 'afk: could not clear stale away-mode artifact %s\n' "$path" >&2
+        status=1
         continue
       fi
-      rm -f "$path" 2>/dev/null || status=1
+      rm -f "$path" 2>/dev/null && continue
+      printf 'afk: could not clear stale away-mode artifact %s\n' "$path" >&2
+      status=1
     done
   done < <(fm_afk_outbox_transient_artifact_globs)
   return "$status"
