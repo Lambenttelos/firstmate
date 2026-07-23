@@ -185,7 +185,7 @@ nonexistent_pid() {
 
 watcher_identity() {
   local dir=$1 pid=$2
-  FM_STATE_OVERRIDE="$dir/state" bash -c '. "$1"; fm_pid_identity "$2"' _ "$dir/bin/fm-wake-lib.sh" "$pid"
+  FM_STATE_OVERRIDE="$dir/state" bash -c '. "$1"; fm_pid_identity "$2"' _ "$dir/bin/fm-pid-lib.sh" "$pid"
 }
 
 record_watcher_lock() {
@@ -1057,7 +1057,7 @@ test_hook_afk_strict_rejects_bare_daemon_command() {
   FM_STATE_OVERRIDE="$dir/state" bash -c '
     . "$1"; . "$2"
     fm_afk_daemon_alive "$3" "$4" 0
-  ' _ "$dir/bin/fm-wake-lib.sh" "$dir/bin/fm-afk-daemon-lib.sh" \
+  ' _ "$dir/bin/fm-pid-lib.sh" "$dir/bin/fm-afk-daemon-lib.sh" \
     "$dir/state/.supervise-daemon.lock" "$dir/bin/fm-supervise-daemon.sh" && accepted=1
   kill "$pid" 2>/dev/null || true
   wait "$pid" 2>/dev/null || true

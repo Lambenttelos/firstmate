@@ -827,7 +827,10 @@ EOF
 
   assert_contains "$out" "away posture only" "AFK digest did not report the daemon-free away posture"
   assert_not_contains "$out" "daemon owns the watcher" "daemon-free away mode still handed watcher ownership to a daemon"
-  assert_not_contains "$out" "- Away mode: active" "daemon-free away mode emitted the daemon-owned supervision block"
+  assert_contains "$out" "- Away mode: active posture only" "supervision block did not report the daemon-free away posture"
+  assert_contains "$out" "- Supervision ownership: this session owns it" "supervision block did not hand ownership to this session"
+  assert_not_contains "$out" "- Away mode: inactive" "supervision block contradicted the away posture reported alongside it"
+  assert_not_contains "$out" "keep normal harness supervision paused" "daemon-free away mode emitted the daemon-owned supervision block"
   assert_contains "$out" "Follow the supervision operating instructions block above" "daemon-free away mode lost the ordinary next step"
   assert_contains "$out" "Away posture is active" "next step dropped the away-posture cue for a daemon-free home"
   assert_contains "$out" "load /afk" "next step dropped the /afk cue for a daemon-free home"

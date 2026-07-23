@@ -50,6 +50,19 @@ wait_live() {
   return 0
 }
 
+# Wait up to <limit> 0.1s ticks for <pid> to leave the process table; 0 once it
+# is gone, 1 if it is still there. Bounded like every other wait here, so a pid
+# that never gets reaped fails the case instead of spinning the suite.
+wait_gone() {
+  local pid=$1 limit=${2:-40} i=0
+  while [ "$i" -lt "$limit" ]; do
+    kill -0 "$pid" 2>/dev/null || return 0
+    sleep 0.1
+    i=$((i + 1))
+  done
+  return 1
+}
+
 wait_numeric_file() {
   local file=$1 limit=${2:-30} i=0 value
   while [ "$i" -lt "$limit" ]; do
@@ -1402,7 +1415,7 @@ test_afk_with_dead_daemon_lock_keeps_normal_triage() {
   date '+%s' > "$state/.afk"
   dead=$(start_fake_afk_daemon "$state") || fail "could not hold the away-mode daemon lock"
   kill "$dead" 2>/dev/null || true
-  while kill -0 "$dead" 2>/dev/null; do :; done
+  wait_gone "$dead" 40 || fail "the killed away-mode daemon lock holder never left the process table"
   export FM_FAKE_CREW_STATE='state: working · source: run-step · validating (running)'
   watch_bg "$state" "$fakebin" "$out"
   pid=$!

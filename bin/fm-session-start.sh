@@ -307,6 +307,8 @@ fi
 # ordinary supervision instructions (bin/fm-afk-daemon-lib.sh).
 AFK_PRESENT=0
 fm_afk_daemon_owns_supervision "$STATE" "$SCRIPT_DIR" && AFK_PRESENT=1
+AWAY_POSTURE=0
+[ -e "$STATE/.afk" ] && AWAY_POSTURE=1
 X_MODE_PRESENT=0
 [ -f "$CONFIG/x-mode.env" ] && X_MODE_PRESENT=1
 
@@ -327,6 +329,7 @@ fi
   --harness "$PRIMARY_HARNESS" \
   --read-only "$READ_ONLY" \
   --afk "$AFK_PRESENT" \
+  --away-posture "$AWAY_POSTURE" \
   --x-mode "$X_MODE_PRESENT"
 
 # --- 4. context digest -----------------------------------------------------
@@ -385,7 +388,7 @@ done
 [ "$ORPHAN_STATUS_FOUND" -eq 1 ] || printf '(none)\n'
 
 subsection "AFK"
-if [ -e "$STATE/.afk" ]; then
+if [ "$AWAY_POSTURE" -eq 1 ]; then
   if [ "$AFK_PRESENT" -eq 1 ]; then
     printf 'present - away-mode supervision is active; the daemon owns the watcher.\n'
   else
@@ -411,7 +414,7 @@ load /afk and ensure the daemon is running, because the daemon owns watcher
 supervision.
 
 EOF
-elif [ -e "$STATE/.afk" ]; then
+elif [ "$AWAY_POSTURE" -eq 1 ]; then
   cat <<EOF
 Away posture is active: batch routine updates, keep the standing routine merge
 authority, and load /afk for away-mode handling. No away-mode daemon is running

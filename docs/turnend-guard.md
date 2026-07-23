@@ -48,6 +48,10 @@ It is a first-class configuration, so the watcher also keeps its own normal tria
 With away mode off, behavior is unchanged.
 
 On every path the banner states which condition actually failed, so a fresh beacon whose watcher process is gone is never reported as "no live watcher".
+The pull-based banner in `bin/fm-guard.sh` carries the same daemon-free context, so a lapsed watcher in that posture is never described as if away mode were off.
+
+`bin/fm-supervision-instructions.sh` takes the two concepts as two arguments: `--afk` is supervision ownership by a live daemon, and `--away-posture` is the `state/.afk` flag on its own.
+Away posture with no daemon renders as posture only and states that this session owns supervision, so the emitted protocol's "away mode is not active" precondition reads as met rather than as excluding the very home it was emitted for.
 
 `FM_STATE_OVERRIDE` wins over `FM_HOME/state`, and `FM_HOME` wins over repo-root `state/`.
 `FM_GUARD_GRACE` controls the beacon freshness window and defaults to 300 seconds.

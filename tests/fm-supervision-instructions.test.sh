@@ -42,6 +42,30 @@ test_conditional_stanzas() {
   pass "renderer includes read-only, afk, and effective x-mode current-state stanzas"
 }
 
+# Away POSTURE and supervision OWNERSHIP are separate inputs. A home running the
+# away posture without a daemon must never be rendered as "away mode inactive",
+# and must be told the emitted protocol below applies to it.
+test_away_posture_without_daemon() {
+  local home config out
+  home="$TMP_ROOT/posture-home"
+  config="$TMP_ROOT/posture-config"
+  mkdir -p "$home/state" "$home/config" "$config"
+  out=$(FM_HOME="$home" FM_CONFIG_OVERRIDE="$config" "$RENDER" --harness codex --afk 0 --away-posture 1)
+  assert_contains "$out" "- Away mode: active posture only" "daemon-free away posture rendered as something else"
+  assert_contains "$out" "no away-mode supervision daemon is running here" "daemon-free away posture did not say the daemon is absent"
+  assert_contains "$out" "- Supervision ownership: this session owns it" "daemon-free away posture did not hand supervision to this session"
+  assert_contains "$out" "precondition in the protocol below is met" "daemon-free away posture left the snippet precondition unresolved"
+  assert_not_contains "$out" "- Away mode: inactive." "daemon-free away posture contradicted itself with an inactive away mode"
+
+  out=$(FM_HOME="$home" FM_CONFIG_OVERRIDE="$config" "$RENDER" --harness codex --afk 1 --away-posture 1)
+  assert_contains "$out" "while the daemon owns the watcher" "a live daemon must keep the daemon-owned away wording"
+  assert_not_contains "$out" "posture only" "a live daemon must not render the daemon-free posture wording"
+
+  out=$(FM_HOME="$home" FM_CONFIG_OVERRIDE="$config" "$RENDER" --harness codex --afk 0 --away-posture 0)
+  assert_contains "$out" "- Away mode: inactive." "away mode off lost its inactive stanza"
+  pass "renderer separates the away posture from supervision ownership"
+}
+
 test_repair_lines() {
   local home out
   home="$TMP_ROOT/repair-home"
@@ -157,6 +181,7 @@ test_pi_snippet_uses_effective_extension_path() {
 test_selected_harness_block_only
 test_unknown_fallback
 test_conditional_stanzas
+test_away_posture_without_daemon
 test_repair_lines
 test_cross_harness_ordinary_continuation_and_repair_matrix
 test_grok_is_background_notify

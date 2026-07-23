@@ -240,6 +240,61 @@ test_read_only_never_mutates_stale_banner_state_files() {
   pass "fm-guard stale banner: read-only never mutates stale-banner state files"
 }
 
+# hold_afk_daemon_lock <home>: hold this home's away-mode daemon lock with a real
+# live process and print its pid. The recorded pid identity is what the strict
+# ownership check matches, so the holder need not be the daemon script itself.
+hold_afk_daemon_lock() {
+  local home=$1 pid identity
+  sleep 120 >/dev/null 2>&1 &
+  pid=$!
+  identity=$(bash -c '. "$1"; fm_pid_identity "$2"' _ "$ROOT/bin/fm-pid-lib.sh" "$pid") || {
+    kill "$pid" 2>/dev/null || true
+    return 1
+  }
+  mkdir -p "$home/state/.supervise-daemon.lock"
+  printf '%s\n' "$pid" > "$home/state/.supervise-daemon.lock/pid"
+  printf '%s\n' "$identity" > "$home/state/.supervise-daemon.lock/pid-identity"
+  printf '%s\n' "$pid"
+}
+
+# A live daemon really does own supervision, so the banner keeps naming the
+# daemon as the repair path and says nothing about a daemon-free away mode.
+test_banner_with_live_daemon_names_the_daemon() {
+  local dir home pid out
+  dir=$(make_guard_case afk-live-daemon)
+  home=$(case_home "$dir")
+  date '+%s' > "$home/state/.afk"
+  pid=$(hold_afk_daemon_lock "$home") || fail "could not hold the away-mode daemon lock"
+  out=$(run_guard_case "$dir")
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  assert_contains "$out" "task(s) in flight, but no watcher has a fresh beacon" \
+    "a daemon-owned home must keep the original banner situation line"
+  assert_contains "$out" "load /afk and ensure the daemon is running" \
+    "a daemon-owned home must keep the daemon repair line"
+  assert_not_contains "$out" "away mode is on with no supervision daemon" \
+    "a daemon-owned home must not claim the daemon-free away context"
+  pass "fm-guard stale banner: a live daemon keeps the daemon-owned banner and repair line"
+}
+
+# Away mode with no live daemon is the away POSTURE only; the banner must say so
+# and point at re-arming this session's own watcher, never at starting a daemon
+# that has no pane to reach.
+test_banner_without_daemon_names_the_watcher() {
+  local dir home out
+  dir=$(make_guard_case afk-no-daemon)
+  home=$(case_home "$dir")
+  date '+%s' > "$home/state/.afk"
+  out=$(run_guard_case "$dir")
+  assert_contains "$out" "away mode is on with no supervision daemon" \
+    "a daemon-free away home must say why the daemon is not the repair path"
+  assert_contains "$out" "repair missing watcher supervision" \
+    "a daemon-free away home must be told to re-arm its own watcher"
+  assert_not_contains "$out" "ensure the daemon is running" \
+    "a daemon-free away home must not be sent to start a daemon"
+  pass "fm-guard stale banner: daemon-free away mode names the watcher repair path"
+}
+
 test_first_stale_call_prints_full_banner
 test_repeated_same_episode_prints_reminder_only
 test_healthy_recovery_rearms_next_stale_episode
@@ -250,3 +305,5 @@ test_read_only_before_writable_does_not_consume_full_banner
 test_read_only_during_episode_observes_without_mutating_marker
 test_healthy_read_only_does_not_clear_marker
 test_read_only_never_mutates_stale_banner_state_files
+test_banner_with_live_daemon_names_the_daemon
+test_banner_without_daemon_names_the_watcher

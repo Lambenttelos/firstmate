@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
 # Render the primary-harness supervision operating block for session start and
 # the short repair line used by guards and turn-end hooks.
+#
+# Away POSTURE and supervision OWNERSHIP are two different things and take two
+# different arguments. --afk means a live away-mode daemon owns the watcher for
+# this home; --away-posture means state/.afk is set. A home whose captain session
+# runs outside any injectable supervisor pane runs the away posture with no
+# daemon, so it reports "--away-posture 1 --afk 0" and keeps this session's own
+# watcher as the real supervision mechanism.
 set -eu
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -13,16 +20,24 @@ DOC_DIR="$REPO_ROOT/docs/supervision-protocols"
 HARNESS=
 READ_ONLY=0
 AFK=0
+AWAY_POSTURE=0
 X_MODE=0
 REPAIR_LINE=0
 QUEUE_PENDING=0
 
 usage() {
   cat <<'EOF'
-Usage: fm-supervision-instructions.sh [--harness <name>] [--read-only 0|1] [--afk 0|1] [--x-mode 0|1] [--repair-line] [--queue-pending 0|1]
+Usage: fm-supervision-instructions.sh [--harness <name>] [--read-only 0|1] [--afk 0|1]
+                                     [--away-posture 0|1] [--x-mode 0|1] [--repair-line]
+                                     [--queue-pending 0|1]
 
 Print the current primary harness's supervision operating instructions.
 With --repair-line, print one concise repair instruction for guard and hook messages.
+
+--afk reports supervision OWNERSHIP: 1 only when a live away-mode daemon owns this
+home's watcher. --away-posture reports the away POSTURE (state/.afk) on its own.
+Away posture with no daemon means this session still owns supervision, so the
+emitted protocol below applies in full.
 EOF
 }
 
@@ -48,6 +63,11 @@ while [ "$#" -gt 0 ]; do
     --afk)
       [ "$#" -gt 1 ] || { echo "error: --afk requires 0 or 1" >&2; exit 2; }
       AFK=$(bool_value "$2")
+      shift 2
+      ;;
+    --away-posture)
+      [ "$#" -gt 1 ] || { echo "error: --away-posture requires 0 or 1" >&2; exit 2; }
+      AWAY_POSTURE=$(bool_value "$2")
       shift 2
       ;;
     --x-mode)
@@ -194,6 +214,9 @@ else
 fi
 if [ "$AFK" -eq 1 ]; then
   printf '%s\n' '- Away mode: active; load /afk and keep normal harness supervision paused while the daemon owns the watcher.'
+elif [ "$AWAY_POSTURE" -eq 1 ]; then
+  printf '%s\n' '- Away mode: active posture only; load /afk for away handling, but no away-mode supervision daemon is running here.'
+  printf '%s\n' '- Supervision ownership: this session owns it, so the "away mode is not active" precondition in the protocol below is met and it applies in full.'
 else
   printf '%s\n' '- Away mode: inactive.'
 fi
