@@ -471,6 +471,40 @@ unit_daemonless_lifecycle() {
   rm -rf "$st"
 }
 
+# A daemon-free entry must never adopt a live daemon: it refuses loudly, names
+# the daemon, launches nothing, and leaves the away posture exactly as found.
+unit_daemonless_refuses_live_daemon() {
+  local st sleeper_pid err record_before record_after
+  st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-daemonless-live.XXXXXX")
+  mkdir -p "$st/state/.supervise-daemon.lock"
+  sleep 120 >/dev/null 2>&1 &
+  sleeper_pid=$!
+  printf '%s' "$sleeper_pid" > "$st/state/.supervise-daemon.lock/pid"
+  ( . "$ROOT/bin/fm-pid-lib.sh"; fm_pid_identity "$sleeper_pid" > "$st/state/.supervise-daemon.lock/pid-identity" )
+  printf 'tmux\tfm-afk-daemon\t-\n' > "$st/state/.afk-daemon-terminal"
+  record_before=$(cat "$st/state/.afk-daemon-terminal")
+  err="$st/refuse.err"
+  if FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" "$LAUNCH" start-daemonless >/dev/null 2>"$err"; then
+    fail "daemonless refusal: start-daemonless accepted an already-live daemon"
+  else
+    pass "daemonless refusal: start-daemonless refuses while a daemon is live"
+  fi
+  if grep -q "already live for this home (pid $sleeper_pid)" "$err"; then
+    pass "daemonless refusal: the message names the live daemon"
+  else
+    fail "daemonless refusal: message did not name the live daemon: $(cat "$err")"
+  fi
+  record_after=$(cat "$st/state/.afk-daemon-terminal" 2>/dev/null || printf '')
+  if [ ! -e "$st/state/.afk" ] && [ "$record_after" = "$record_before" ]; then
+    pass "daemonless refusal: away-mode flag and terminal record left untouched"
+  else
+    fail "daemonless refusal: refusal mutated away-mode state"
+  fi
+  kill "$sleeper_pid" 2>/dev/null || true
+  wait "$sleeper_pid" 2>/dev/null || true
+  rm -rf "$st"
+}
+
 unit_native_entry_preserves_prepared_state() {
   local st
   st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-native-entry.XXXXXX")
@@ -905,6 +939,7 @@ unit_readiness_failure_preserves_unconfirmed_record
 unit_tmux_absence_distinguishes_probe_failure
 unit_native_lifecycle
 unit_daemonless_lifecycle
+unit_daemonless_refuses_live_daemon
 unit_native_entry_preserves_prepared_state
 unit_close_failure_preserves_record
 unit_record_publication_atomic

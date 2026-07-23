@@ -34,7 +34,13 @@
 #                              a home whose captain session has no injectable
 #                              supervisor pane. Writes the same durable lifecycle
 #                              state, creates no terminal, and starts nothing;
-#                              this home keeps arming its own watcher.
+#                              this home keeps arming its own watcher. It is the
+#                              one start path that REFUSES (non-zero, nothing
+#                              written) when a live away-mode daemon already
+#                              holds this home's lock, because two supervisors
+#                              both believing they own escalation delivery is a
+#                              hazard: stop that daemon first, or choose the
+#                              daemon entry path deliberately.
 #   fm-afk-launch.sh stop      Correct-ordered exit: SIGTERM the daemon so its
 #                              cleanup flushes WHILE state/.afk is still present,
 #                              wait for it, close the recorded terminal by exact
@@ -129,7 +135,7 @@ fm_afk_launch_lock_release() {
 }
 
 fm_afk_launch_usage() {
-  sed -n '2,43p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '2,49p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 # The command run inside the created terminal. Real launch runs the shared
@@ -519,18 +525,37 @@ fm_afk_launch_start_native() {
 # captain session has no injectable supervisor pane enters away mode here and
 # keeps arming its own watcher (.agents/skills/afk/SKILL.md).
 fm_afk_launch_start_daemonless() {
-  fm_afk_launch_start_no_terminal daemonless
+  fm_afk_launch_start_no_terminal daemonless refuse-live-daemon
 }
 
-# <record-extra>: shared no-terminal lifecycle entry.
+# A daemon-free entry can never adopt an already-live daemon: two supervisors
+# both believing they own escalation delivery duplicate or drop injections, and
+# an orphaned daemon whose recorded pane is gone types at nobody. Report it and
+# leave every artifact exactly as found.
+fm_afk_launch_refuse_live_daemon() {
+  local pid
+  pid=$(daemon_lock_pid 2>/dev/null) || pid=""
+  fm_afk_launch_log "refusing daemon-free away entry: an away-mode daemon is already live for this home (pid ${pid:-unknown})"
+  if fm_afk_launch_record_read >/dev/null 2>&1; then
+    fm_afk_launch_log "that daemon's recorded supervisor terminal: $FM_AFK_REC_BACKEND $FM_AFK_REC_TARGET"
+  fi
+  fm_afk_launch_log "stop it first with bin/fm-afk-launch.sh stop, then re-enter, or choose the daemon entry path with bin/fm-afk-launch.sh start"
+}
+
+# <record-extra>: shared no-terminal lifecycle entry. A second argument of
+# refuse-live-daemon turns the shared already-running refresh into a refusal.
 fm_afk_launch_start_no_terminal() {
-  local mode=$1 backup artifact had_afk=0 result=0
+  local mode=$1 on_live=${2:-refresh} backup artifact had_afk=0 result=0
   mkdir -p "$FM_AFK_LAUNCH_STATE" || return 1
   if [ -e "$FM_AFK_LAUNCH_STATE/.afk-return-catchup" ]; then
     fm_afk_launch_log "return catch-up is still pending; run bin/fm-afk-return.sh check before re-entering away mode"
     return 1
   fi
   if daemon_lock_held_by_live_daemon; then
+    if [ "$on_live" = refuse-live-daemon ]; then
+      fm_afk_launch_refuse_live_daemon
+      return 1
+    fi
     fm_afk_launch_record_validate_if_present || return 1
     fm_afk_launch_flag_write || return 1
     fm_afk_launch_log "daemon already running; refreshed away-mode flag"

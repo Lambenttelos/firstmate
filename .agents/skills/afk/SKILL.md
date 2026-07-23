@@ -85,6 +85,9 @@ This is a supported configuration, not a degraded one.
    rolls back on failure.
    It creates no terminal and starts nothing.
    Never hand-write `state/.afk`.
+   It refuses with a non-zero status, and changes nothing, when an away-mode daemon is already live for this home, naming that daemon's process id.
+   Handle that refusal deliberately: either stop the live daemon with `bin/fm-afk-launch.sh stop` and re-run the daemon-free entry, or decide this session really does have an injectable supervisor pane and use the daemon entry instead.
+   Never work around the refusal by hand-writing the flag.
 
 2. **Skip the daemon entirely.**
    Do not run `bin/fm-afk-start.sh`, `start`, or `start-native`, and do not
@@ -106,13 +109,18 @@ question and every script asks it there.
 
 ## How to exit afk
 
+Both entry paths exit the same way, through `bin/fm-afk-return.sh`, and differ only in what that shutdown has to stop.
+After a daemon entry it stops the daemon, so per-wake responsiveness comes back when the daemon is gone.
+After a daemon-free entry there is no daemon to stop and per-wake responsiveness was never handed away: exit clears the away posture and this session simply keeps its own watcher-arm supervision running.
+Every other part of the return contract, including the durable catch-up gate, is identical on both paths.
+
 No `/back` is needed. The first genuine message is the return signal:
 
 - A message **without** the current operational prefix or a legacy bare marker, and **not** starting with `/afk` -> the captain is back.
   Run `bin/fm-afk-return.sh` before acting on the message that brought the captain back.
   That script owns correct-ordered daemon shutdown, durable wake draining, escalation and wedge evidence, and the return-catch-up gate.
   If it reports a firstmate-actionable `blocked:` event, remediate it immediately through the normal lifecycle, or explicitly reclassify it with a durable reason and close its decision key with `resolved [key=...]`, then run `bin/fm-afk-return.sh check`.
-  Once the daemon stops, resume full per-wake responsiveness through the emitted primary-harness supervision protocol while blocker handling proceeds, so the gate never creates a blind wait.
+  Once the daemon stops, or immediately when the daemon-free entry left none to stop, resume full per-wake responsiveness through the emitted primary-harness supervision protocol while blocker handling proceeds, so the gate never creates a blind wait.
   Do not answer a Bearings request or perform any other ordinary captain work until the check exits successfully.
 - A message **with** the current operational prefix (`FM_OPERATIONAL_PREFIX`, U+2063 INVISIBLE SEPARATOR followed by `FIRSTMATE_OP: `), or a legacy bare `FM_INJECT_MARK` daemon escalation -> stay afk and process it.
 - Re-invoking `/afk` while already away -> stay afk (refresh the flag); this

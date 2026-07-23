@@ -777,7 +777,7 @@ hold_afk_daemon_lock() {
   local home=$1 pid identity
   sleep 120 >/dev/null 2>&1 &
   pid=$!
-  identity=$(bash -c '. "$1"; fm_pid_identity "$2"' _ "$ROOT/bin/fm-wake-lib.sh" "$pid") || {
+  identity=$(bash -c '. "$1"; fm_pid_identity "$2"' _ "$ROOT/bin/fm-pid-lib.sh" "$pid") || {
     kill "$pid" 2>/dev/null || true
     return 1
   }
