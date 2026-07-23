@@ -15,6 +15,9 @@ tradeoff **consented** and **explicit**: the captain is stepping away, so the
 sub-supervisor may triage routine wakes in bash instead of waking firstmate's
 LLM for each one. Escalations still reach the captain, but as one pre-read,
 batched digest rather than per-wake injections.
+Where no pane exists for the daemon to inject into, the same away posture is
+entered without a daemon and this home's own watcher keeps supervising; pick the
+entry path first.
 
 ## Pick the entry path first
 
