@@ -9,6 +9,7 @@ const ARM_RETIRE_TIMEOUT_MS = positiveInteger("FM_WATCH_ARM_RETIRE_TIMEOUT_MS", 
 const REARM_RETRY_BASE_MS = positiveInteger("FM_WATCH_REARM_RETRY_BASE_MS", 250);
 const REARM_RETRY_MAX_MS = positiveInteger("FM_WATCH_REARM_RETRY_MAX_MS", 4000);
 const REARM_RETRY_LIMIT = positiveInteger("FM_WATCH_REARM_RETRY_LIMIT", 5);
+const OWNER_PROBE_TIMEOUT_MS = positiveInteger("FM_AFK_DAEMON_STATE_TIMEOUT_MS", 5000);
 
 let child = null;
 let armStatus = "idle";
@@ -43,13 +44,22 @@ function waitForArmReady(armChild) {
 }
 
 function runProcess(command, args, options = {}) {
+  const { timeoutMs, ...spawnOptions } = options;
   return new Promise((resolve) => {
     const proc = spawn(command, args, {
       stdio: ["ignore", "pipe", "pipe"],
-      ...options,
+      ...spawnOptions,
     });
     let stdout = "";
     let stderr = "";
+    if (timeoutMs) {
+      const timer = setTimeout(() => {
+        proc.kill("SIGKILL");
+        resolve({ code: 124, stdout, stderr: `${stderr}\ntimed out after ${timeoutMs}ms` });
+      }, timeoutMs);
+      timer.unref();
+      proc.on("close", () => clearTimeout(timer));
+    }
     proc.stdout.on("data", (chunk) => {
       stdout += chunk.toString();
     });
@@ -101,14 +111,18 @@ async function isPrimaryRoot(root, home) {
 // daemon, and its own watcher stays the real supervision mechanism - this plugin
 // owns arming it, so gating on the bare state/.afk flag would leave that home
 // unsupervised. bin/fm-afk-daemon-lib.sh stays the single owner of the question;
-// bin/fm-afk-daemon-state.sh is its CLI. When the owner cannot answer at all,
-// keep the pre-daemon-free behavior and let the bare flag suppress arming.
+// bin/fm-afk-daemon-state.sh is its CLI. When the owner cannot answer at all -
+// an unknown word, or a probe that hangs past OWNER_PROBE_TIMEOUT_MS - keep the
+// pre-daemon-free behavior: away mode is on (proved below), so treat it as
+// daemon-owned and do not arm. The bounded timeout keeps a wedged bash/ps from
+// stalling the idle path forever.
 // Away mode off is the same "free" answer the owner gives, and it is the common
 // case on the session.idle hot path, so answer it here instead of spawning a
 // shell per idle event. Every away-mode-on case still goes to the owner.
 async function daemonOwnsSupervision(paths) {
   if (!existsSync(`${paths.state}/.afk`)) return false;
   const result = await runProcess("bash", [`${paths.root}/bin/fm-afk-daemon-state.sh`], {
+    timeoutMs: OWNER_PROBE_TIMEOUT_MS,
     cwd: paths.root,
     env: {
       ...process.env,
@@ -121,7 +135,7 @@ async function daemonOwnsSupervision(paths) {
   const state = result.stdout.trim().split(/\r?\n/).pop() ?? "";
   if (state === "owned" || state === "undetermined") return true;
   if (state === "free") return false;
-  return existsSync(`${paths.state}/.afk`);
+  return true;
 }
 
 async function shouldArm(paths) {

@@ -174,6 +174,11 @@ FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 # shellcheck source=bin/fm-supervisor-target-lib.sh
 . "$FM_DAEMON_DIR/fm-supervisor-target-lib.sh"
 
+# Away-mode daemon lock and bring-up-marker helpers, shared with the away entry
+# paths and every supervision-ownership consumer.
+# shellcheck source=bin/fm-afk-daemon-lib.sh
+. "$FM_DAEMON_DIR/fm-afk-daemon-lib.sh"
+
 # --- tunables ---------------------------------------------------------------
 # Supervisor backends this daemon knows how to inject into today. zellij, orca,
 # and cmux are real backends elsewhere in firstmate (bin/fm-backend.sh) but this
@@ -1309,6 +1314,11 @@ fm_super_main() {
   fi
   echo "$$" > "$PIDFILE"
   fm_pid_identity "${BASHPID:-$$}" > "$LOCK/pid-identity" 2>/dev/null || true
+  # The lock is now the authority for "a daemon supervises this home", so drop
+  # the away-entry bring-up claim (bin/fm-afk-daemon-lib.sh "DAEMON BRING-UP").
+  # Dropped here rather than after startup validation, so a daemon that refuses
+  # to start below leaves ownership free instead of latched.
+  fm_afk_daemon_pending_clear "$STATE" || true
 
   # --- auto-discover the supervisor BACKEND (tmux vs herdr) first -----------
   # Priority: FM_SUPERVISOR_BACKEND override > $TMUX_PANE (tmux) > $HERDR_ENV=1

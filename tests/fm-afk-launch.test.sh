@@ -179,6 +179,11 @@ unit_failed_start_rolls_back_state() {
   else
     fail "failed start: left false away state or discarded delivery artifacts"
   fi
+  if [ ! -e "$st/state/.supervise-daemon.starting" ]; then
+    pass "failed start: the daemon-starting claim is dropped, so ownership is not latched"
+  else
+    fail "failed start: left a daemon-starting claim behind"
+  fi
   rm -rf "$st"
 }
 
@@ -502,6 +507,94 @@ unit_daemonless_refuses_live_daemon() {
   fi
   kill "$sleeper_pid" 2>/dev/null || true
   wait "$sleeper_pid" 2>/dev/null || true
+  rm -rf "$st"
+}
+
+# The daemon takes its lock only after it starts, so a daemon entry states the
+# intent first: during the whole bring-up window ownership must read owned, or a
+# second watcher arms against the daemon's own watcher child and the guards cry
+# supervision lapse in the middle of a healthy start.
+unit_bringup_window_reads_daemon_owned() {
+  local st state
+  st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-bringup.XXXXXX")
+  mkdir -p "$st/state"
+  FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" "$LAUNCH" start-native >/dev/null 2>&1
+  if [ -e "$st/state/.supervise-daemon.starting" ] && [ -e "$st/state/.afk" ]; then
+    pass "bring-up window: a daemon entry records the daemon-starting claim"
+  else
+    fail "bring-up window: no daemon-starting claim after a daemon entry"
+  fi
+  state=$(FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" "$ROOT/bin/fm-afk-daemon-state.sh" 2>/dev/null || true)
+  if [ "$state" = owned ]; then
+    pass "bring-up window: ownership reads owned before the daemon holds its lock"
+  else
+    fail "bring-up window: ownership read '$state' while the daemon was coming up"
+  fi
+  FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" "$LAUNCH" stop >/dev/null 2>&1
+  if [ ! -e "$st/state/.supervise-daemon.starting" ]; then
+    pass "bring-up window: stop drops the daemon-starting claim"
+  else
+    fail "bring-up window: stop left the daemon-starting claim behind"
+  fi
+  rm -rf "$st"
+}
+
+# The claim is bounded: a start that never completes must decay to daemon-free
+# rather than latch ownership and leave the home with nothing arming a watcher.
+unit_bringup_claim_expires() {
+  local st state
+  st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-bringup-expiry.XXXXXX")
+  mkdir -p "$st/state"
+  date '+%s' > "$st/state/.afk"
+  printf '%s\n' "$(( $(date '+%s') - 3600 ))" > "$st/state/.supervise-daemon.starting"
+  state=$(FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" "$ROOT/bin/fm-afk-daemon-state.sh" 2>/dev/null || true)
+  if [ "$state" = free ]; then
+    pass "bring-up expiry: an aged claim decays to daemon-free"
+  else
+    fail "bring-up expiry: an aged claim still read '$state'"
+  fi
+  printf 'not-a-stamp\n' > "$st/state/.supervise-daemon.starting"
+  state=$(FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" "$ROOT/bin/fm-afk-daemon-state.sh" 2>/dev/null || true)
+  if [ "$state" = free ]; then
+    pass "bring-up expiry: an unusable claim decays to daemon-free"
+  else
+    fail "bring-up expiry: an unusable claim read '$state'"
+  fi
+  rm -rf "$st"
+}
+
+# A genuinely daemon-free away home must be untouched by the marker: it claims
+# nothing, drops a decayed claim, and still reads free.
+unit_daemonless_entry_claims_nothing() {
+  local st state
+  st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-daemonless-claim.XXXXXX")
+  mkdir -p "$st/state"
+  printf '%s\n' "$(( $(date '+%s') - 3600 ))" > "$st/state/.supervise-daemon.starting"
+  FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" "$LAUNCH" start-daemonless >/dev/null 2>&1
+  state=$(FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" "$ROOT/bin/fm-afk-daemon-state.sh" 2>/dev/null || true)
+  if [ ! -e "$st/state/.supervise-daemon.starting" ] && [ "$state" = free ]; then
+    pass "daemonless claim: the daemon-free posture records no claim and reads free"
+  else
+    fail "daemonless claim: daemon-free entry left ownership at '$state'"
+  fi
+  rm -rf "$st"
+}
+
+# A daemon still coming up is a daemon, so the daemon-free entry refuses it for
+# the same reason it refuses a live one: two supervisors is the hazard.
+unit_daemonless_refuses_starting_daemon() {
+  local st err
+  st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-daemonless-starting.XXXXXX")
+  mkdir -p "$st/state"
+  date '+%s' > "$st/state/.supervise-daemon.starting"
+  err="$st/refuse.err"
+  if FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" "$LAUNCH" start-daemonless >/dev/null 2>"$err"; then
+    fail "daemonless refusal: start-daemonless accepted a daemon that is still starting"
+  elif grep -q "is starting for this home" "$err" && [ ! -e "$st/state/.afk" ]; then
+    pass "daemonless refusal: start-daemonless refuses while a daemon is coming up"
+  else
+    fail "daemonless refusal: unclear refusal or mutated state: $(cat "$err")"
+  fi
   rm -rf "$st"
 }
 
@@ -940,6 +1033,10 @@ unit_tmux_absence_distinguishes_probe_failure
 unit_native_lifecycle
 unit_daemonless_lifecycle
 unit_daemonless_refuses_live_daemon
+unit_bringup_window_reads_daemon_owned
+unit_bringup_claim_expires
+unit_daemonless_entry_claims_nothing
+unit_daemonless_refuses_starting_daemon
 unit_native_entry_preserves_prepared_state
 unit_close_failure_preserves_record
 unit_record_publication_atomic

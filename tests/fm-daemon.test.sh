@@ -75,6 +75,25 @@ test_afk_start_reclaims_stale_daemon_lock_reused_pid() {
   pass "fm-afk-start.sh reclaims stale daemon locks whose live pid identity no longer matches"
 }
 
+# The away entry claims the bring-up window with state/.supervise-daemon.starting
+# so nothing reads the home as unsupervised before the daemon holds its lock. The
+# daemon must drop that claim as it takes the lock, and drop it even when startup
+# validation then refuses, so a failed start decays to daemon-free instead of
+# latching ownership.
+test_afk_start_bringup_claim_dropped_by_daemon() {
+  local dir state out status
+  dir=$(make_supercase afk-start-bringup-claim)
+  state="$dir/state"
+
+  out=$(FM_STATE_OVERRIDE="$state" FM_SUPERVISOR_BACKEND=unsupported "$AFK_START" 2>&1)
+  status=$?
+
+  [ "$status" -ne 0 ] || fail "fm-afk-start.sh should fail on an unsupported supervisor backend"
+  assert_contains "$out" "starting supervise daemon" "fm-afk-start.sh did not attempt daemon startup"
+  assert_absent "$state/.supervise-daemon.starting" "the daemon left the bring-up claim in place after taking the lock and refusing to start"
+  pass "the daemon drops the away-entry bring-up claim once the lock is authoritative"
+}
+
 test_daemon_state_root_uses_fm_home() {
   local dir home override out
   dir=$(make_supercase daemon-fm-home)
@@ -1727,6 +1746,7 @@ test_inject_msg_defers_on_dead_shell_unknown() {
 test_afk_start_refuses_when_flag_cannot_be_written
 test_afk_start_ignores_stale_pidfile_without_lock
 test_afk_start_reclaims_stale_daemon_lock_reused_pid
+test_afk_start_bringup_claim_dropped_by_daemon
 test_daemon_state_root_uses_fm_home
 test_classify_routine_signal_self
 test_classify_terminal_signal_escalates

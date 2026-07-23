@@ -40,6 +40,9 @@ Home scoping comes from that per-home lock path and the pid identity recorded be
 `fm_afk_daemon_supervision_state` reports the three outcomes behind that boolean - `owned`, `free`, and `undetermined` - and an `undetermined` probe counts as owned.
 Only an absent lock, or a holder confidently read as dead or as some other process, reads as daemon-free, so a lock whose holder cannot be probed at all never lets the watcher triage alongside a live daemon.
 `bin/fm-afk-daemon-state.sh` is the CLI over that state, so the OpenCode auto-arm plugin asks the same owner instead of reading the flag itself.
+The daemon takes its lock only after it starts, so the away entry paths state their intent first: `bin/fm-afk-launch.sh start` and `start-native`, and a direct `bin/fm-afk-start.sh`, write `state/.supervise-daemon.starting` before `state/.afk`, and an unexpired marker reads as `owned` so the bring-up window is never mistaken for a daemon-free home.
+The claim is bounded rather than a timing guess: the daemon clears it as it takes the lock, the launcher clears it on a failed start and on `stop`, `start-daemonless` clears it and refuses to enter while one is live, and a marker older than `FM_AFK_DAEMON_PENDING_TTL` seconds (default 300) is ignored.
+A home that never had a daemon writes no marker, so the daemon-free posture below is unaffected.
 Strict matching adds no cross-home discrimination, because scripts come from the shared tracked code root; it only rejects a live process that is not this repo's `bin/fm-supervise-daemon.sh` when no pid identity was recorded.
 The turn-end guard, the watcher's triage gate in `bin/fm-watch.sh`, the pull-based banner in `bin/fm-guard.sh`, and the session-start digest all ask that one function rather than reading the flag.
 

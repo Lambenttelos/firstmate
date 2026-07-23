@@ -69,15 +69,8 @@ fm_afk_clear_stale_artifacts() {  # <state-dir>
 }
 
 # Daemon-lock liveness lives in bin/fm-afk-daemon-lib.sh so the turn-end guard
-# can ask the same question; these stay as this script's thin, lock-bound names.
-daemon_lock_owner() {
-  fm_afk_daemon_lock_owner "$FM_AFK_LOCK"
-}
-
-daemon_pid_matches() {
-  fm_afk_daemon_pid_matches "$1" "$2" "$FM_AFK_DAEMON"
-}
-
+# can ask the same question; these stay as this script's thin, lock-bound names,
+# shared with bin/fm-afk-launch.sh, which sources this file.
 daemon_lock_pid() {
   fm_afk_daemon_lock_pid "$FM_AFK_LOCK"
 }
@@ -97,7 +90,17 @@ fm_afk_start_main() {
   if [ "${FM_AFK_STATE_PREPARED:-0}" = 1 ]; then
     [ -f "$FM_AFK_STATE/.afk" ] || { echo "afk: launcher-prepared state is missing" >&2; return 1; }
   else
-    date '+%s' > "$FM_AFK_STATE/.afk"
+    # Claim the bring-up window before away mode is visible, so nothing reads
+    # this home as unsupervised while the daemon is still starting
+    # (bin/fm-afk-daemon-lib.sh "DAEMON BRING-UP"). The daemon drops the claim
+    # as it takes the lock.
+    fm_afk_daemon_pending_mark "$FM_AFK_STATE" ||
+      echo "afk: could not record the daemon-starting marker; this home may briefly look unsupervised" >&2
+    if ! date '+%s' > "$FM_AFK_STATE/.afk"; then
+      fm_afk_daemon_pending_clear "$FM_AFK_STATE" || true
+      echo "afk: failed to write the away-mode flag" >&2
+      return 1
+    fi
   fi
 
   local pid
@@ -121,8 +124,8 @@ fm_afk_start_main() {
   exec "$FM_AFK_DAEMON"
 }
 
-# Run only when executed, not when sourced (tests source fm_afk_clear_stale_artifacts
-# and the lock helpers directly).
+# Run only when executed, not when sourced (bin/fm-afk-launch.sh and tests source
+# fm_afk_clear_stale_artifacts and the thin daemon-lock wrappers).
 if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
   fm_afk_start_main "$@"
 fi

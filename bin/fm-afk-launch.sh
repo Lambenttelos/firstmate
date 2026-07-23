@@ -36,8 +36,8 @@
 #                              state, creates no terminal, and starts nothing;
 #                              this home keeps arming its own watcher. It is the
 #                              one start path that REFUSES (non-zero, nothing
-#                              written) when a live away-mode daemon already
-#                              holds this home's lock, because two supervisors
+#                              written) when an away-mode daemon holds this
+#                              home's lock or is coming up, because two supervisors
 #                              both believing they own escalation delivery is a
 #                              hazard: stop that daemon first, or choose the
 #                              daemon entry path deliberately.
@@ -496,6 +496,7 @@ fm_afk_launch_start() {
     fi
   fi
   if [ "$result" -eq 0 ]; then
+    fm_afk_launch_mark_daemon_starting
     if ! fm_afk_launch_flag_write; then
       fm_afk_launch_log "failed to write away-mode flag"
       result=1
@@ -513,6 +514,7 @@ fm_afk_launch_start() {
     esac
   fi
   if [ "$result" -ne 0 ]; then
+    fm_afk_daemon_pending_clear "$FM_AFK_LAUNCH_STATE" || fm_afk_launch_log "failed to clear the daemon-starting marker after a failed start"
     fm_afk_launch_restore_backup "$backup" "$had_afk" || result=1
   else
     rm -rf "$backup" || result=1
@@ -530,6 +532,15 @@ fm_afk_launch_start_native() {
 # keeps arming its own watcher (.agents/skills/afk/SKILL.md).
 fm_afk_launch_start_daemonless() {
   fm_afk_launch_start_no_terminal daemonless refuse-live-daemon
+}
+
+# State the bring-up intent before state/.afk exists, so the window between away
+# entry and the daemon taking its lock never reads as daemon-free supervision
+# (bin/fm-afk-daemon-lib.sh "DAEMON BRING-UP"). Best effort: an unwritable marker
+# only costs the window, so it must not fail an otherwise good away entry.
+fm_afk_launch_mark_daemon_starting() {
+  fm_afk_daemon_pending_mark "$FM_AFK_LAUNCH_STATE" ||
+    fm_afk_launch_log "could not record the daemon-starting marker; this home may briefly look unsupervised while the daemon comes up"
 }
 
 # A daemon-free entry can never adopt an already-live daemon: two supervisors
@@ -565,6 +576,13 @@ fm_afk_launch_start_no_terminal() {
     fm_afk_launch_log "daemon already running; refreshed away-mode flag"
     return 0
   fi
+  # A daemon still coming up is a daemon: refusing here keeps the daemon-free
+  # entry from racing an in-flight start into two supervisors.
+  if [ "$on_live" = refuse-live-daemon ] && fm_afk_daemon_pending_active "$FM_AFK_LAUNCH_STATE"; then
+    fm_afk_launch_log "refusing daemon-free away entry: an away-mode daemon is starting for this home"
+    fm_afk_launch_log "wait for it, or stop it with bin/fm-afk-launch.sh stop, then re-enter"
+    return 1
+  fi
   backup=$(mktemp -d "$FM_AFK_LAUNCH_STATE/.afk-launch-backup.XXXXXX") || return 1
   if [ -f "$FM_AFK_LAUNCH_STATE/.afk" ]; then
     had_afk=1
@@ -580,14 +598,25 @@ fm_afk_launch_start_no_terminal() {
     if ! fm_afk_clear_stale_artifacts "$FM_AFK_LAUNCH_STATE"; then
       fm_afk_launch_log "failed to clear stale away-mode artifacts"
       result=1
-    elif ! fm_afk_launch_flag_write; then
-      result=1
+    else
+      # native expects a daemon next and claims the bring-up window; daemonless
+      # declares that no daemon runs here at all, so it drops any decayed claim.
+      if [ "$mode" = native ]; then
+        fm_afk_launch_mark_daemon_starting
+      else
+        fm_afk_daemon_pending_clear "$FM_AFK_LAUNCH_STATE" ||
+          fm_afk_launch_log "failed to clear a stale daemon-starting marker"
+      fi
+      fm_afk_launch_flag_write || result=1
     fi
   fi
   if [ "$result" -eq 0 ]; then
     fm_afk_launch_record_write none - "$mode" || result=1
   fi
   if [ "$result" -ne 0 ]; then
+    if [ "$mode" = native ]; then
+      fm_afk_daemon_pending_clear "$FM_AFK_LAUNCH_STATE" || fm_afk_launch_log "failed to clear the daemon-starting marker after a failed start"
+    fi
     fm_afk_launch_restore_backup "$backup" "$had_afk" || result=1
   else
     rm -rf "$backup" || result=1
@@ -636,7 +665,11 @@ fm_afk_launch_stop() {
   if [ "$read_result" -eq 0 ]; then
     fm_afk_launch_close_recorded || result=1
   fi
-  # (3) Clear the away-mode flag LAST.
+  # (3) Drop any bring-up claim, then clear the away-mode flag LAST.
+  if ! fm_afk_daemon_pending_clear "$FM_AFK_LAUNCH_STATE"; then
+    fm_afk_launch_log "failed to clear the daemon-starting marker"
+    result=1
+  fi
   if ! rm -f "$FM_AFK_LAUNCH_STATE/.afk"; then
     fm_afk_launch_log "failed to clear away-mode flag"
     result=1

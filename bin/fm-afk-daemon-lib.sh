@@ -36,11 +36,70 @@
 # for the start-vs-refresh decision, where the safe direction is the opposite
 # one.
 #
+# DAEMON BRING-UP: the lock is taken by the daemon itself, so between away-mode
+# entry and that acquisition the lock is genuinely absent while a daemon IS
+# expected. Reading that window as daemon-free would arm a second watcher whose
+# state/.watch.lock then blocks the daemon's own watcher child, and would print a
+# supervision-lapse banner during a healthy start. The entry paths therefore
+# state their intent: they write state/.supervise-daemon.starting BEFORE
+# state/.afk, and fm_afk_daemon_supervision_state treats a live marker as
+# daemon-owned. Intent, not elapsed-time guessing - but it is bounded, because a
+# start that never completes must not latch ownership forever: the daemon clears
+# the marker as it takes the lock, bin/fm-afk-launch.sh clears it on a failed
+# start and on stop, the daemon-free entry path clears it (and refuses while one
+# is live), and a marker older than FM_AFK_DAEMON_PENDING_TTL seconds is ignored.
+#
 # Sources bin/fm-pid-lib.sh for fm_pid_alive and fm_pid_identity.
 
 FM_AFK_DAEMON_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=bin/fm-pid-lib.sh
 . "$FM_AFK_DAEMON_LIB_DIR/fm-pid-lib.sh"
+
+: "${FM_AFK_DAEMON_PENDING_TTL:=300}"
+
+# fm_afk_daemon_pending_path <state-dir>
+# The daemon-starting intent marker for this home.
+fm_afk_daemon_pending_path() {
+  printf '%s\n' "$1/.supervise-daemon.starting"
+}
+
+# fm_afk_daemon_pending_mark <state-dir>
+# Record "a daemon is being started for this home right now", stamped so the
+# claim expires on its own. Written atomically so a reader never sees a partial
+# stamp, which would read as an unusable marker and reopen the window.
+fm_afk_daemon_pending_mark() {
+  local state=$1 marker pending
+  marker=$(fm_afk_daemon_pending_path "$state")
+  mkdir -p "$state" || return 1
+  pending="$marker.pending.$$"
+  date '+%s' > "$pending" 2>/dev/null || { rm -f "$pending" 2>/dev/null; return 1; }
+  mv "$pending" "$marker" || { rm -f "$pending" 2>/dev/null; return 1; }
+}
+
+# fm_afk_daemon_pending_clear <state-dir>
+# Drop the marker: the daemon holds the lock now, the start failed, away mode
+# ended, or this home deliberately runs away mode with no daemon.
+fm_afk_daemon_pending_clear() {
+  rm -f "$(fm_afk_daemon_pending_path "$1")" 2>/dev/null || return 1
+}
+
+# fm_afk_daemon_pending_active <state-dir>
+# True while an unexpired daemon-start intent is recorded. An unreadable or
+# non-numeric stamp is NOT active: the marker exists to close a bounded bring-up
+# window, so an unusable one must decay to daemon-free rather than latch
+# ownership. A stamp in the future (clock skew) still counts as active.
+fm_afk_daemon_pending_active() {
+  local marker stamp now
+  marker=$(fm_afk_daemon_pending_path "$1")
+  [ -f "$marker" ] || return 1
+  stamp=$(cat "$marker" 2>/dev/null || true)
+  case "$stamp" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  now=$(date '+%s' 2>/dev/null) || return 1
+  [ "$stamp" -gt "$now" ] && return 0
+  [ $((now - stamp)) -lt "$FM_AFK_DAEMON_PENDING_TTL" ]
+}
 
 # fm_afk_daemon_lock_owner <lock-path>
 # Print the owner directory backing the lock (the symlink target for a linked
@@ -154,9 +213,12 @@ fm_afk_daemon_alive() {
 
 # fm_afk_daemon_supervision_state <state-dir> <bin-dir>
 # Print which of the three supervision-ownership states this home is in:
-#   free         - away mode is off, or no daemon holds this home's lock, or the
-#                  holder is confidently dead or confidently another process
-#   owned        - away mode is on and a live daemon for THIS home holds the lock
+#   free         - away mode is off, or no daemon holds this home's lock and no
+#                  unexpired daemon-start intent is recorded, or the holder is
+#                  confidently dead or confidently another process
+#   owned        - away mode is on and a live daemon for THIS home holds the
+#                  lock, or a daemon is on its way up for this home (an
+#                  unexpired state/.supervise-daemon.starting marker)
 #   undetermined - away mode is on and the lock is held, but the liveness probe
 #                  itself could not complete
 # Away mode alone is only the away POSTURE: a home whose captain session runs
@@ -174,7 +236,13 @@ fm_afk_daemon_supervision_state() {
   case "$liveness" in
     live) printf 'owned\n' ;;
     undetermined) printf 'undetermined\n' ;;
-    *) printf 'free\n' ;;
+    *)
+      if fm_afk_daemon_pending_active "$state"; then
+        printf 'owned\n'
+      else
+        printf 'free\n'
+      fi
+      ;;
   esac
 }
 
