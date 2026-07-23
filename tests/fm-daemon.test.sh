@@ -1816,6 +1816,79 @@ test_paneless_flush_delivers_through_the_inbox_without_a_pane() {
   pass "paneless delivery writes one durable record per digest, needs no pane, and reaches the reader"
 }
 
+# Appending to the outbox always succeeds, so the escalation buffer always clears
+# and the pane path's max-defer wedge alarm can never fire in paneless mode.
+# Without an age-based alarm on the oldest UNACKNOWLEDGED record, records pile up
+# unread whenever firstmate's reader was never armed or re-armed, which silently
+# recreates the exact incident this delivery mode exists to fix.
+test_paneless_undelivered_records_raise_the_same_wedge_alarm() {
+  local dir state fakebin marker alarms
+  dir=$(make_supercase paneless-undelivered)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  marker="$state/.subsuper-inject-wedged"
+  alarms="$dir/alarms.log"; : > "$alarms"
+  afk_enter "$state"
+
+  # One record appended 600s ago and never acknowledged: the reader is not armed.
+  printf '%s\t1\tescalation\t%sSupervisor escalate (1 event(s)): alpha.status: blocked: needs a token\n' \
+    "$(( $(date +%s) - 600 ))" "$FM_INJECT_MARK" > "$state/.afk-outbox"
+
+  # The in-process notify throttle is shared across every test in this file, so
+  # clear it: this test asserts on the alarm's own rate limiting, not a neighbor's.
+  WEDGE_ALARM_LAST_EPOCH=0
+  PATH="$fakebin:$PATH" FM_SUPERVISOR_TARGET="" FM_AFK_DELIVERY_MODE=paneless \
+    FM_ESCALATE_BATCH_SECS=99999 FM_MAX_DEFER_SECS=60 \
+    FM_WEDGE_ALARM_LOG="$alarms" housekeeping "$state"
+
+  [ -s "$marker" ] || fail "an unread paneless outbox raised no undelivered-escalation alarm"
+  grep -F 'alpha.status: blocked: needs a token' "$marker" >/dev/null \
+    || fail "the alarm marker does not name the records still waiting in the inbox"
+  [ -s "$alarms" ] || fail "the paneless alarm did not reach the same active-alert channel"
+  [ -s "$state/.afk-outbox" ] || fail "the alarm consumed the undelivered records"
+
+  # Same tick shape again inside the rate-limit window: no second alert.
+  : > "$alarms"
+  PATH="$fakebin:$PATH" FM_SUPERVISOR_TARGET="" FM_AFK_DELIVERY_MODE=paneless \
+    FM_ESCALATE_BATCH_SECS=99999 FM_MAX_DEFER_SECS=60 \
+    FM_WEDGE_ALARM_LOG="$alarms" housekeeping "$state"
+  [ ! -s "$alarms" ] || fail "the paneless alarm re-fired inside its own rate-limit window"
+
+  # Acknowledged by the reader: the alarm is stale and must clear, so a
+  # delivered-then-quiet outbox does not keep alarming.
+  printf '1\n' > "$state/.afk-outbox.ack"
+  PATH="$fakebin:$PATH" FM_SUPERVISOR_TARGET="" FM_AFK_DELIVERY_MODE=paneless \
+    FM_ESCALATE_BATCH_SECS=99999 FM_MAX_DEFER_SECS=60 housekeeping "$state"
+  [ ! -e "$marker" ] || fail "the paneless alarm survived the reader acknowledging every record"
+  pass "unread paneless records raise the same rate-limited wedge alarm, which clears on acknowledgement"
+}
+
+test_paneless_undelivered_alarm_is_presence_gated_and_age_bounded() {
+  local dir state fakebin marker
+  dir=$(make_supercase paneless-alarm-gates)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  marker="$state/.subsuper-inject-wedged"
+
+  # (1) A young unacknowledged record is not a wedge: the reader has not had time.
+  afk_enter "$state"
+  printf '%s\t1\tescalation\t%sSupervisor escalate (1 event(s)): beta.status: done: PR 2\n' \
+    "$(date +%s)" "$FM_INJECT_MARK" > "$state/.afk-outbox"
+  PATH="$fakebin:$PATH" FM_SUPERVISOR_TARGET="" FM_AFK_DELIVERY_MODE=paneless \
+    FM_ESCALATE_BATCH_SECS=99999 FM_MAX_DEFER_SECS=600 housekeeping "$state"
+  [ ! -e "$marker" ] || fail "a record younger than max-defer raised an undelivered alarm"
+
+  # (2) The same overdue record raises nothing while away mode is off, exactly
+  # like every other away-mode behavior.
+  printf '%s\t1\tescalation\t%sSupervisor escalate (1 event(s)): beta.status: done: PR 2\n' \
+    "$(( $(date +%s) - 6000 ))" "$FM_INJECT_MARK" > "$state/.afk-outbox"
+  rm -f "$state/.afk"
+  PATH="$fakebin:$PATH" FM_SUPERVISOR_TARGET="" FM_AFK_DELIVERY_MODE=paneless \
+    FM_ESCALATE_BATCH_SECS=99999 FM_MAX_DEFER_SECS=600 housekeeping "$state"
+  [ ! -e "$marker" ] || fail "the undelivered alarm fired while away mode was inactive"
+  pass "the paneless undelivered alarm stays presence-gated on away mode and bounded by max-defer"
+}
+
 test_paneless_delivery_stays_presence_gated() {
   local dir state fakebin sent
   dir=$(make_supercase paneless-afk-off)
@@ -1954,5 +2027,7 @@ test_inject_msg_herdr_submits_through_backend_dispatch
 test_inject_msg_defers_on_dead_shell_unknown
 test_delivery_mode_selection_prefers_a_real_pane_and_falls_to_the_inbox
 test_paneless_flush_delivers_through_the_inbox_without_a_pane
+test_paneless_undelivered_records_raise_the_same_wedge_alarm
+test_paneless_undelivered_alarm_is_presence_gated_and_age_bounded
 test_paneless_delivery_stays_presence_gated
 test_pane_delivery_never_writes_the_inbox

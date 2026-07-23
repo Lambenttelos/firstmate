@@ -82,12 +82,56 @@ fm_afk_delivery_mode_file() {  # <state>
 # line. bin/fm-afk-start.sh folds them into the single session-artifact list that
 # fresh-entry clearing and the launcher's transactional rollback both iterate, so
 # those two sets can never drift apart.
+#
+# These are the DURABLE records: plain files whose content is meaningful, so the
+# launcher can back them up and restore them byte for byte on a rolled-back
+# start. The lock and the mktemp siblings are listed separately below, because
+# they are process-scoped scratch that must be cleared with the same list but can
+# never be meaningfully backed up or restored.
 fm_afk_outbox_artifact_names() {
   printf '%s\n' \
     "$FM_AFK_OUTBOX_NAME" \
     "$FM_AFK_OUTBOX_ACK_NAME" \
     "$FM_AFK_OUTBOX_SEQ_NAME" \
     "$FM_AFK_DELIVERY_MODE_NAME"
+}
+
+# Process-scoped scratch this library can leave behind, one shell glob per line:
+# the portable lock (plus its steal sibling) and the mktemp files that an
+# acknowledgement or a delivery-mode record uses for its atomic rename. A mid-ack
+# kill leaves those temp files behind, and the lock is only recovered lazily by
+# the portable helper's dead-pid steal, so a fresh away entry clears them here
+# rather than inheriting another session's scratch.
+fm_afk_outbox_transient_artifact_globs() {
+  printf '%s\n' \
+    "$FM_AFK_OUTBOX_LOCK_NAME" \
+    "$FM_AFK_OUTBOX_LOCK_NAME.steal" \
+    "$FM_AFK_OUTBOX_ACK_NAME.pending.*" \
+    "$FM_AFK_DELIVERY_MODE_NAME.pending.*"
+}
+
+# Remove one transient artifact glob. The lock is a directory or a symlink to an
+# owner directory rather than a plain file, so it is retired through the portable
+# lock helper's own removal path when that helper is loaded, and torn out
+# wholesale otherwise.
+fm_afk_outbox_clear_transient() {  # <state>
+  local state=$1 glob path status=0
+  while IFS= read -r glob; do
+    [ -n "$glob" ] || continue
+    for path in "$state"/$glob; do
+      [ -e "$path" ] || [ -L "$path" ] || continue
+      if [ -d "$path" ] || [ -L "$path" ]; then
+        if declare -F fm_lock_remove_path >/dev/null 2>&1; then
+          fm_lock_remove_path "$path" 2>/dev/null || rm -rf "$path" 2>/dev/null || status=1
+        else
+          rm -rf "$path" 2>/dev/null || status=1
+        fi
+        continue
+      fi
+      rm -f "$path" 2>/dev/null || status=1
+    done
+  done < <(fm_afk_outbox_transient_artifact_globs)
+  return "$status"
 }
 
 # Collapse the field separators so one digest can never become two records. The
@@ -172,8 +216,19 @@ _fm_afk_outbox_next_seq() {  # <state>  (call under the outbox lock)
 
 # Append one delivery record. Returns non-zero if the record could not be
 # persisted, so the daemon keeps the digest buffered instead of losing it.
+#
+# On success this sets FM_AFK_OUTBOX_APPEND_SEQ to the sequence number it
+# allocated and FM_AFK_OUTBOX_APPEND_PENDING to the pending count as observed
+# INSIDE the critical section. A caller that instead re-read the count after the
+# lock was released could lose the race to a concurrent reader, fail the bounded
+# acquire, and announce "0 record(s) pending pickup" immediately after a record
+# it successfully appended - which reads as a dropped escalation during exactly
+# the incident that log line exists to diagnose.
+# shellcheck disable=SC2034 # Read by callers (fm-supervise-daemon.sh) after this returns.
 fm_afk_outbox_append() {  # <state> <kind> <digest>
-  local state=$1 kind=$2 digest=$3 clean_kind clean_digest seq lock status=0
+  local state=$1 kind=$2 digest=$3 clean_kind clean_digest seq lock status=0 ack
+  FM_AFK_OUTBOX_APPEND_SEQ=0
+  FM_AFK_OUTBOX_APPEND_PENDING=0
   mkdir -p "$state" || return 1
   clean_kind=$(printf '%s' "$kind" | fm_afk_outbox_clean_field)
   clean_digest=$(printf '%s' "$digest" | fm_afk_outbox_clean_field)
@@ -188,19 +243,34 @@ fm_afk_outbox_append() {  # <state> <kind> <digest>
     printf '%s\t%s\t%s\t%s\n' "$(date +%s)" "$seq" "$clean_kind" "$clean_digest" \
       >> "$(fm_afk_outbox_file "$state")" || status=1
   fi
+  if [ "$status" -eq 0 ]; then
+    FM_AFK_OUTBOX_APPEND_SEQ=$seq
+    ack=$(fm_afk_outbox_ack_seq "$state")
+    FM_AFK_OUTBOX_APPEND_PENDING=$(awk -F '\t' -v ack="$ack" \
+      'NF >= 4 && $2 ~ /^[0-9]+$/ && $2+0 > ack+0 { n++ } END { print n+0 }' \
+      "$(fm_afk_outbox_file "$state")" 2>/dev/null || printf '0')
+  fi
   fm_lock_release "$lock"
   return "$status"
 }
 
+# A pending read that FAILED - the lock helper is unusable, or the bounded lock
+# acquire gave up - reports this status, distinct from a read that succeeded and
+# found nothing. The two must never be conflated: "the outbox could not be read"
+# announced as "the outbox is empty" turns a real delivery failure into a healthy
+# idle exit, and lets the return catch-up gate delete escalations it never read.
+FM_AFK_OUTBOX_UNREADABLE=2
+
 # Raw unacknowledged records, oldest first. Read under the lock so a concurrent
-# append is never observed half-written.
+# append is never observed half-written. Returns 0 with possibly-empty output
+# when the read succeeded, FM_AFK_OUTBOX_UNREADABLE when it did not.
 fm_afk_outbox_pending() {  # <state>
   local state=$1 lock ack file
   file=$(fm_afk_outbox_file "$state")
   [ -s "$file" ] || return 0
-  fm_afk_outbox_lock_lib "$state" || return 1
+  fm_afk_outbox_lock_lib "$state" || return "$FM_AFK_OUTBOX_UNREADABLE"
   lock=$(fm_afk_outbox_lock_file "$state")
-  _fm_afk_outbox_lock_acquire "$lock" || return 1
+  _fm_afk_outbox_lock_acquire "$lock" || return "$FM_AFK_OUTBOX_UNREADABLE"
   ack=$(fm_afk_outbox_ack_seq "$state")
   awk -F '\t' -v ack="$ack" 'NF >= 4 && $2 ~ /^[0-9]+$/ && $2+0 > ack+0' "$file" 2>/dev/null || true
   fm_lock_release "$lock"
@@ -210,11 +280,27 @@ fm_afk_outbox_pending() {  # <state>
   return 0
 }
 
+# The count of unacknowledged records, or FM_AFK_OUTBOX_UNREADABLE with no output
+# when the read failed. A caller that prints this must check the status: printing
+# a bare 0 for an unreadable outbox reads as a dropped escalation.
 fm_afk_outbox_pending_count() {  # <state>
-  local pending
-  pending=$(fm_afk_outbox_pending "$1")
+  local pending rc=0
+  pending=$(fm_afk_outbox_pending "$1") || rc=$?
+  [ "$rc" -eq 0 ] || return "$rc"
   [ -n "$pending" ] || { printf '0'; return 0; }
   printf '%s' "$(printf '%s\n' "$pending" | wc -l | tr -d ' ')"
+}
+
+# Epoch of the OLDEST unacknowledged record, empty when nothing is pending, and
+# FM_AFK_OUTBOX_UNREADABLE when the read failed. The daemon's paneless
+# undelivered-escalation alarm keys off this age.
+fm_afk_outbox_oldest_pending_epoch() {  # <state>
+  local pending rc=0
+  pending=$(fm_afk_outbox_pending "$1") || rc=$?
+  [ "$rc" -eq 0 ] || return "$rc"
+  [ -n "$pending" ] || return 0
+  printf '%s\n' "$pending" \
+    | awk -F '\t' '$1 ~ /^[0-9]+$/ { if (oldest == "" || $1+0 < oldest) oldest = $1+0 } END { if (oldest != "") print oldest }'
 }
 
 # Portable epoch rendering. awk's strftime is a gawk extension that the macOS awk
@@ -246,10 +332,12 @@ fm_afk_outbox_format() {  # <raw-records-on-stdin>
 
 # Formatted pending records WITHOUT acknowledging them. Used by the return
 # catch-up gate, which reports leftovers as evidence rather than consuming them
-# as a delivery.
+# as a delivery. Returns FM_AFK_OUTBOX_UNREADABLE when the read failed, so the
+# gate can refuse to clear an outbox whose content it never saw.
 fm_afk_outbox_pending_report() {  # <state>
-  local pending
-  pending=$(fm_afk_outbox_pending "$1") || return 1
+  local pending rc=0
+  pending=$(fm_afk_outbox_pending "$1") || rc=$?
+  [ "$rc" -eq 0 ] || return "$rc"
   [ -n "$pending" ] || return 0
   printf '%s\n' "$pending" | fm_afk_outbox_format
 }
@@ -272,7 +360,10 @@ fm_afk_outbox_ack() {  # <state> <seq>
 # FIRST, then acknowledge them. Returns 0 when at least one record was delivered,
 # 1 when there was nothing pending, 2 when records were printed but could not be
 # acknowledged (the caller reports that loudly; the records stay pending and are
-# delivered again rather than lost).
+# delivered again rather than lost), and FM_AFK_OUTBOX_DELIVER_UNREADABLE when
+# the pending read itself failed. That last status is deliberately NOT 1: an
+# outbox that could not be read is not an outbox that is empty, and a caller that
+# conflated them would announce a healthy idle exit during a real failure.
 #
 # Deliberate ordering: print, then acknowledge. A reader killed between the two
 # has not actually delivered anything to firstmate, so re-delivering is correct.
@@ -283,11 +374,14 @@ fm_afk_outbox_ack() {  # <state> <seq>
 # reintroduce the loss window the print-then-acknowledge ordering exists to
 # close. The count is 0 on every non-zero return, so a caller that lost the race
 # to a concurrent reader announces nothing rather than an empty delivery.
+FM_AFK_OUTBOX_DELIVER_UNREADABLE=3
+
 # shellcheck disable=SC2034 # Read by callers (fm-afk-inbox.sh) after this returns.
 fm_afk_outbox_deliver() {  # <state>
-  local state=$1 pending last
+  local state=$1 pending last rc=0
   FM_AFK_OUTBOX_DELIVERED=0
-  pending=$(fm_afk_outbox_pending "$state") || return 1
+  pending=$(fm_afk_outbox_pending "$state") || rc=$?
+  [ "$rc" -eq 0 ] || return "$FM_AFK_OUTBOX_DELIVER_UNREADABLE"
   [ -n "$pending" ] || return 1
   printf '%s\n' "$pending" | fm_afk_outbox_format
   FM_AFK_OUTBOX_DELIVERED=$(printf '%s\n' "$pending" | wc -l | tr -d ' ')

@@ -26,8 +26,10 @@
 # "- do not re-arm". Firstmate obeys that line rather than re-deriving the state:
 # re-arming after a "do not re-arm" exit is an immediate-exit loop, because those
 # exits mean this channel is not the one delivering. A genuine failure - an
-# unwritable state directory, a delivery that could not be acknowledged - exits
-# non-zero instead of pretending the channel is healthy.
+# unwritable state directory, an outbox that could not be READ at all, a delivery
+# that could not be acknowledged - exits non-zero instead of pretending the
+# channel is healthy. In particular, a failed read is never reported as an empty
+# outbox: it never gets an idle or nothing-pending line.
 #
 # Concurrency: the outbox library takes the repo's portable lock (flock is absent
 # on macOS) for every append and every pending read, so this reader is safe to
@@ -66,7 +68,10 @@ die() {
 }
 
 # Print and acknowledge everything pending, then announce what was delivered.
-# Returns 0 when something was delivered, 1 when the outbox was empty.
+# Returns 0 when something was delivered, 1 when the outbox was genuinely empty.
+# An outbox that could NOT be read is a failure, never an empty one: reporting it
+# as "nothing pending" would print a healthy re-arm line and exit 0 while records
+# sit undelivered, which is the incident this whole channel exists to prevent.
 #
 # The count is announced AFTER the records, from what this run actually put on
 # stdout. Announcing a pending count first would let a reader that loses the race
@@ -82,6 +87,9 @@ deliver() {
       return 0
       ;;
     1) return 1 ;;
+    "$FM_AFK_OUTBOX_DELIVER_UNREADABLE")
+      die "the away-mode inbox could not be read (state directory unwritable, or the outbox lock is held); nothing was delivered and any records stay pending"
+      ;;
     *) die "delivered records could not be acknowledged; they stay pending and will be delivered again" ;;
   esac
 }

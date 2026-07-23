@@ -61,7 +61,9 @@
 #     Buffered escalation delivery also has a max-defer alarm: if a digest stays
 #     undelivered past FM_MAX_DEFER_SECS, the daemon retries a normal flush and
 #     writes state/.subsuper-inject-wedged and attempts a configurable active
-#     alert if submit still cannot be confirmed.
+#     alert if submit still cannot be confirmed. Paneless delivery gets the same
+#     alarm off the age of the oldest unacknowledged outbox record, because there
+#     the append itself always succeeds and could otherwise never look wedged.
 #   - Cheap heartbeat catch-all: every HEARTBEAT_SCAN_SECS the daemon greps all
 #     state/*.status for a captain-relevant line the per-wake classifier might
 #     have missed (e.g. a status verb outside CAPTAIN_RE) and escalates it.
@@ -941,9 +943,25 @@ wedge_alarm_notify() {  # <summary> <marker>
 # configurable backend-independent active alert (wedge_alarm_notify). Nothing
 # is lost - the buffer and the
 # wake-queue both survive - but the stall stops being invisible.
-inject_wedge_alarm() {  # <state> <age-seconds>
-  local state=$1 age=$2 marker target backend max_defer now notify=1
+#
+# <mode> selects which stall is being reported. `pane` (the default) is the
+# original case: the supervisor pane would not accept a submit. `paneless` is the
+# pull path's equivalent: the digests were appended to the durable outbox
+# successfully but firstmate's armed reader never picked them up.
+inject_wedge_alarm() {  # <state> <age-seconds> [mode]
+  local state=$1 age=$2 mode=${3:-pane} marker target backend max_defer now notify=1
+  local cause detail
   marker="$state/.subsuper-inject-wedged"
+  case "$mode" in
+    paneless)
+      cause="firstmate's away-mode inbox reader has not picked them up (never armed or never re-armed)"
+      detail="Records waiting in the away-mode inbox:"
+      ;;
+    *)
+      cause="inject could not confirm a submit (supervisor pane busy or wedged)"
+      detail="The supervisor pane could not accept an escalation. Buffered items:"
+      ;;
+  esac
   max_defer="${FM_MAX_DEFER_SECS:-$MAX_DEFER_SECS_DEFAULT}"
   # Re-alarm at most once per max-defer window so a long wedge does not spam.
   if [ "$(_file_age "$marker")" -lt "$max_defer" ]; then
@@ -954,12 +972,16 @@ inject_wedge_alarm() {  # <state> <age-seconds>
     notify=0
   else
     WEDGE_ALARM_LAST_EPOCH=$now
-    log "ERROR: away-mode escalation undelivered ${age}s; inject could not confirm a submit (supervisor pane busy or wedged). Buffer + wake-queue preserved; alarm marker written."
+    log "ERROR: away-mode escalation undelivered ${age}s; ${cause}. Buffer + wake-queue preserved; alarm marker written."
   fi
   {
     printf 'fm away-mode inject WEDGED: %ss undelivered as of %s\n' "$age" "$(date '+%Y-%m-%dT%H:%M:%S%z')"
-    printf 'The supervisor pane could not accept an escalation. Buffered items:\n'
-    cat "$state/.subsuper-escalations" 2>/dev/null
+    printf '%s\n' "$detail"
+    if [ "$mode" = paneless ]; then
+      fm_afk_outbox_pending_report "$state" 2>/dev/null
+    else
+      cat "$state/.subsuper-escalations" 2>/dev/null
+    fi
   } 2>/dev/null > "$marker" || true
   target="${FM_SUPERVISOR_TARGET:-$FM_SUPERVISOR_TARGET_DEFAULT}"
   backend="${FM_SUPERVISOR_BACKEND:-$FM_SUPERVISOR_BACKEND_DEFAULT}"
@@ -967,7 +989,9 @@ inject_wedge_alarm() {  # <state> <age-seconds>
   # with no herdr equivalent; the log line + durable marker above are already
   # the primary, backend-independent signal, so a non-tmux backend just skips
   # this cosmetic extra rather than attempting an unsupported call.
-  if [ "$backend" = tmux ]; then
+  # Paneless mode leaves the target deliberately empty so no pane primitive is
+  # reachable, so there is nothing to flash there either.
+  if [ "$backend" = tmux ] && [ -n "$target" ]; then
     tmux display-message -t "$target" "fm: away-mode escalations WEDGED ${age}s — see $marker" 2>/dev/null || true
   fi
   # Backend-independent active alert. Unlike the tmux flash above (skipped on
@@ -998,6 +1022,10 @@ _oldest_line_age() {  # <buf> -> seconds since the oldest buffered item first ar
 #  1b) max-defer escape: if the buffer is STILL undelivered past MAX_DEFER_SECS,
 #     attempt one normal delivery; if it cannot confirm, raise the wedge alarm.
 #     Never silently defer forever.
+#  1c) paneless undelivered escape: in pull delivery the append always succeeds,
+#     so (1b) can never fire. Alarm instead on the AGE of the oldest
+#     unacknowledged outbox record, through the same wedge alarm and marker, and
+#     clear that alarm once the reader has acknowledged everything.
 #  2) stale recheck: for each pending stale marker past STALE_ESCALATE_SECS,
 #     re-peek the pane; still idle -> escalate (wedge); resumed -> clear marker.
 #  2b) pause re-surface: for each declared-pause marker past PAUSE_RESURFACE_SECS,
@@ -1007,6 +1035,7 @@ _oldest_line_age() {  # <buf> -> seconds since the oldest buffered item first ar
 #     captain-relevant line the per-wake classifier missed and escalate it.
 housekeeping() {  # <state>
   local state=$1 now due f key task win marker age last max_defer oldest pause_secs
+  local oldest_epoch outbox_rc
   now=$(_now)
   migrate_watcher_pause_markers "$state"
 
@@ -1037,6 +1066,37 @@ housekeeping() {  # <state>
       else
         inject_wedge_alarm "$state" "$oldest"
       fi
+    fi
+  fi
+
+  # (1c) PANELESS undelivered escape. Appending to the outbox always succeeds, so
+  # in paneless mode the escalation buffer always clears and (1b) above - which
+  # keys off that buffer - can never fire. Without this age check, records
+  # accumulate unread whenever firstmate's reader was never armed or re-armed (a
+  # harness restart, a turn that ignored the reader's re-arm line, or paneless
+  # selected while firstmate actually had a reachable pane), which silently
+  # recreates the very undelivered-escalation incident this delivery mode exists
+  # to fix. Same alarm, same durable marker, same rate limiting as the pane path,
+  # and presence-gated on away mode exactly like every other away-mode behavior.
+  if afk_active "$state" && [ "$max_defer" -gt 0 ] \
+     && [ "${FM_AFK_DELIVERY_MODE:-pane}" = paneless ]; then
+    outbox_rc=0
+    oldest_epoch=$(fm_afk_outbox_oldest_pending_epoch "$state") || outbox_rc=$?
+    if [ "$outbox_rc" -ne 0 ]; then
+      # An unreadable outbox is not an empty one, so neither alarm nor clear:
+      # leave whatever alarm state exists and retry on the next tick.
+      log "away-mode inbox unreadable this tick; undelivered-escalation alarm state left unchanged"
+    elif [ -n "$oldest_epoch" ]; then
+      oldest=$(( now - oldest_epoch ))
+      if [ "$oldest" -ge "$max_defer" ] \
+         && [ "$(_file_age "$state/.subsuper-inject-wedged")" -ge "$max_defer" ]; then
+        inject_wedge_alarm "$state" "$oldest" paneless
+      fi
+    elif [ ! -s "$state/.subsuper-escalations" ]; then
+      # Everything appended has been acknowledged and nothing is buffered behind a
+      # failed append, so a prior alarm is stale: clear it rather than let a
+      # delivered-then-quiet outbox keep alarming.
+      rm -f "$state/.subsuper-inject-wedged"
     fi
   fi
 
@@ -1181,7 +1241,11 @@ inject_msg() {  # <message> [state]
   # stays buffered for the next tick instead of vanishing.
   if [ "${FM_AFK_DELIVERY_MODE:-pane}" = paneless ]; then
     if fm_afk_outbox_append "$state" escalation "$msg"; then
-      log "delivered to the away-mode inbox (paneless): $(fm_afk_outbox_pending_count "$state") record(s) pending pickup"
+      # Both numbers come from inside the append's own critical section. Re-reading
+      # the count here would take the outbox lock again, and a bounded acquire lost
+      # to a concurrent reader would log "0 record(s) pending pickup" right after a
+      # record that was in fact appended.
+      log "delivered to the away-mode inbox (paneless): record #${FM_AFK_OUTBOX_APPEND_SEQ}, ${FM_AFK_OUTBOX_APPEND_PENDING} record(s) pending pickup"
       return 0
     fi
     log "inject failed: could not append the digest to the away-mode inbox"

@@ -133,6 +133,7 @@ clear_delivery_artifacts() {
     [ -n "$name" ] || continue
     rm -f "$STATE/$name"
   done < <(fm_afk_outbox_artifact_names)
+  fm_afk_outbox_clear_transient "$STATE" || true
 }
 
 return_guard() {
@@ -149,7 +150,7 @@ return_guard() {
 }
 
 return_reconcile() {
-  local evidence blockers drained wedge escalations outbox lifecycle_ok=1
+  local evidence blockers drained wedge escalations outbox outbox_rc lifecycle_ok=1
   evidence=$(mktemp "$STATE/.afk-return-evidence.XXXXXX") || return 1
   blockers=$(mktemp "$STATE/.afk-return-blockers.XXXXXX") || { rm -f "$evidence"; return 1; }
   preserve_evidence "$evidence"
@@ -179,8 +180,20 @@ return_reconcile() {
   # Paneless away sessions deliver through the pull outbox, so an escalation the
   # reader never picked up lives there rather than in the escalation buffer. It
   # is the same catch-up evidence and is reported the same way.
-  outbox=$(fm_afk_outbox_pending_report "$STATE" 2>/dev/null || true)
-  append_evidence escalation "$outbox" "$evidence"
+  #
+  # A read that FAILS is a blocker, not an empty outbox. Swallowing it would file
+  # no escalation evidence at all and then let clear_delivery_artifacts delete the
+  # outbox below, permanently losing undelivered escalations this gate never
+  # actually saw. Clearing is allowed only after a read that genuinely succeeded
+  # and whose content is now retained above as catch-up evidence.
+  outbox_rc=0
+  outbox=$(fm_afk_outbox_pending_report "$STATE" 2>/dev/null) || outbox_rc=$?
+  if [ "$outbox_rc" -ne 0 ]; then
+    lifecycle_ok=0
+    append_evidence lifecycle 'away-mode inbox could not be read; undelivered escalations may remain and are preserved on disk - retry catch-up before ordinary work' "$evidence"
+  else
+    append_evidence escalation "$outbox" "$evidence"
+  fi
 
   scan_open_blockers > "$blockers"
   if [ "$lifecycle_ok" -ne 1 ] || [ -s "$blockers" ]; then

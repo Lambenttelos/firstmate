@@ -355,6 +355,10 @@ fm_afk_launch_restore_backup() {  # <backup> <had-afk>
     [ -n "$artifact" ] || continue
     rm -f "$FM_AFK_LAUNCH_STATE/$artifact" || result=1
   done < <(fm_afk_session_artifact_names)
+  # The paneless path's lock and mktemp scratch belong to the aborted start, so a
+  # rollback drops them rather than restoring them; only the durable records above
+  # are meaningful to put back.
+  fm_afk_outbox_clear_transient "$FM_AFK_LAUNCH_STATE" || result=1
   if [ "$had_afk" -eq 1 ]; then
     cp "$backup/.afk" "$FM_AFK_LAUNCH_STATE/.afk" || result=1
   fi

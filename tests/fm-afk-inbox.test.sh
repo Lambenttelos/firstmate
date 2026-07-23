@@ -235,6 +235,102 @@ test_append_failure_is_reported_rather_than_hanging() {
   pass "an outbox lock held elsewhere fails the append in bounded time instead of hanging"
 }
 
+# Hold the outbox lock in a live background process for <secs>, so a bounded
+# acquire in the foreground genuinely fails. Sets OUTBOX_LOCK_HOLDER rather than
+# printing the pid: a command substitution would keep the caller waiting on the
+# background process's inherited stdout until it exited, releasing the very lock
+# the test needs held.
+OUTBOX_LOCK_HOLDER=
+hold_outbox_lock() {  # <state> <secs>
+  local state=$1 secs=$2 lock i=0
+  lock="$state/$FM_AFK_OUTBOX_LOCK_NAME"
+  bash -c '
+    # shellcheck disable=SC1090
+    . "$1/bin/fm-wake-lib.sh"
+    fm_lock_acquire_wait "$2"
+    sleep "$3"
+  ' _ "$ROOT" "$lock" "$secs" >/dev/null 2>&1 &
+  OUTBOX_LOCK_HOLDER=$!
+  while [ ! -e "$lock" ]; do
+    [ "$i" -lt 100 ] || fail "the background lock holder never took the outbox lock"
+    sleep 0.1
+    i=$((i + 1))
+  done
+}
+
+release_outbox_lock() {
+  [ -n "$OUTBOX_LOCK_HOLDER" ] || return 0
+  kill "$OUTBOX_LOCK_HOLDER" 2>/dev/null || true
+  wait "$OUTBOX_LOCK_HOLDER" 2>/dev/null || true
+  OUTBOX_LOCK_HOLDER=
+}
+
+# A read that FAILED must never look like a read that FOUND NOTHING. Conflating
+# them announces a healthy idle exit while records sit undelivered, which is the
+# incident the whole pull path exists to prevent, and it lets the return gate
+# delete an outbox it never actually read.
+test_an_unreadable_outbox_is_never_reported_as_an_empty_one() {
+  local state rc out
+  state=$(make_inbox_case unreadable-not-empty)
+  enter_away "$state"
+  append_digest "$state" "Supervisor escalate (1 event(s)): alpha.status: blocked: needs a token"
+
+  hold_outbox_lock "$state" 10
+
+  rc=0; FM_AFK_OUTBOX_LOCK_TRIES=2 fm_afk_outbox_pending "$state" >/dev/null || rc=$?
+  [ "$rc" -eq "$FM_AFK_OUTBOX_UNREADABLE" ] \
+    || fail "a pending read that could not take the lock must report unreadable, got rc=$rc"
+
+  rc=0; out=$(FM_AFK_OUTBOX_LOCK_TRIES=2 fm_afk_outbox_pending_count "$state") || rc=$?
+  [ "$rc" -eq "$FM_AFK_OUTBOX_UNREADABLE" ] \
+    || fail "pending_count must report unreadable rather than a count, got rc=$rc"
+  [ -z "$out" ] || fail "pending_count printed '$out' for an outbox it could not read"
+
+  rc=0; out=$(FM_AFK_OUTBOX_LOCK_TRIES=2 fm_afk_outbox_pending_report "$state") || rc=$?
+  [ "$rc" -eq "$FM_AFK_OUTBOX_UNREADABLE" ] \
+    || fail "pending_report must report unreadable rather than empty evidence, got rc=$rc"
+
+  rc=0; out=$(FM_AFK_OUTBOX_LOCK_TRIES=2 fm_afk_outbox_oldest_pending_epoch "$state") || rc=$?
+  [ "$rc" -eq "$FM_AFK_OUTBOX_UNREADABLE" ] \
+    || fail "oldest_pending_epoch must report unreadable rather than 'nothing pending', got rc=$rc"
+
+  rc=0; out=$(FM_AFK_OUTBOX_LOCK_TRIES=2 fm_afk_outbox_deliver "$state") || rc=$?
+  [ "$rc" -eq "$FM_AFK_OUTBOX_DELIVER_UNREADABLE" ] \
+    || fail "deliver must distinguish an unreadable outbox from an empty one, got rc=$rc"
+  [ -z "$out" ] || fail "deliver printed records it never read: $out"
+
+  release_outbox_lock
+  [ ! -e "$state/.afk-outbox.ack" ] || fail "a failed read acknowledged records it never delivered"
+  [ "$(fm_afk_outbox_pending_count "$state")" -eq 1 ] \
+    || fail "the record did not stay pending after the failed reads"
+  pass "a failed outbox read is reported as a failure at every level, never as an empty outbox"
+}
+
+# The reader's own contract: a genuine read failure exits NON-ZERO with no
+# healthy status line, rather than printing an idle or nothing-pending line that
+# firstmate would read as a quiet, working channel.
+test_reader_exits_non_zero_when_the_outbox_cannot_be_read() {
+  local state rc out
+  state=$(make_inbox_case reader-unreadable)
+  enter_away "$state"
+  append_digest "$state" "Supervisor escalate (1 event(s)): beta.status: done: PR 2"
+
+  hold_outbox_lock "$state" 10
+  rc=0
+  out=$(FM_AFK_OUTBOX_LOCK_TRIES=2 run_inbox "$state" --once) || rc=$?
+  release_outbox_lock
+
+  [ "$rc" -ne 0 ] || fail "the reader exited 0 on an unreadable outbox: $out"
+  assert_contains "$out" "could not be read" "the reader did not name the read failure: $out"
+  case "$out" in
+    *"afk-inbox: nothing pending"*|*"afk-inbox: idle after"*|*"afk-inbox: delivered "*)
+      fail "the reader printed a healthy status line for a failed read: $out" ;;
+  esac
+  [ "$(fm_afk_outbox_pending_count "$state")" -eq 1 ] \
+    || fail "the undelivered record did not stay pending after the failed read"
+  pass "the reader exits non-zero on an unreadable outbox and leaves the records pending"
+}
+
 # Firstmate arms one reader, but a re-arm after a context reset can leave two
 # waiting at once. Records are printed before they are acknowledged, so the loser
 # of that race must simply print NOTHING: announcing a count it did not deliver
@@ -390,6 +486,8 @@ test_reader_exits_when_away_mode_is_over_but_still_delivers_leftovers
 test_reader_reports_an_idle_timeout
 test_records_survive_a_lost_sequence_counter
 test_append_failure_is_reported_rather_than_hanging
+test_an_unreadable_outbox_is_never_reported_as_an_empty_one
+test_reader_exits_non_zero_when_the_outbox_cannot_be_read
 test_concurrent_readers_never_announce_what_they_did_not_deliver
 test_every_exit_line_carries_a_re_arm_verdict
 test_real_daemon_without_a_backend_delivers_to_the_reader

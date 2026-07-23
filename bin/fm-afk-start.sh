@@ -66,11 +66,19 @@ fm_afk_start_usage() {
 # NOT called on a refresh (daemon already alive), so the current session's own
 # buffered escalations are preserved.
 #
-# fm_afk_session_artifact_names lists every one of those artifacts, one name per
-# line, covering both delivery modes: the pane path's escalation buffer and wedge
-# marker, and the paneless path's outbox, acknowledgement, sequence counter, and
-# recorded delivery mode. Clearing here and the launcher's transactional backup
-# and rollback both iterate this one list, so the two sets cannot drift apart.
+# fm_afk_session_artifact_names lists every one of those DURABLE artifacts, one
+# name per line, covering both delivery modes: the pane path's escalation buffer
+# and wedge marker, and the paneless path's outbox, acknowledgement, sequence
+# counter, and recorded delivery mode. Clearing here and the launcher's
+# transactional backup and rollback both iterate this one list, so the two sets
+# cannot drift apart.
+#
+# The paneless path also leaves process-scoped scratch - its portable lock and
+# the mktemp siblings used for atomic acknowledgement and delivery-mode renames.
+# Those are cleared by fm_afk_clear_stale_artifacts too (through the outbox
+# library's own owning list), but deliberately stay out of the durable list: a
+# lock directory cannot be backed up and restored, and restoring one from a
+# rolled-back start would hand the new session another session's lock.
 fm_afk_session_artifact_names() {
   printf '%s\n' \
     .subsuper-escalations \
@@ -85,6 +93,7 @@ fm_afk_clear_stale_artifacts() {  # <state-dir>
     [ -n "$name" ] || continue
     rm -f "$state/$name" 2>/dev/null || status=1
   done < <(fm_afk_session_artifact_names)
+  fm_afk_outbox_clear_transient "$state" || status=1
   return "$status"
 }
 
