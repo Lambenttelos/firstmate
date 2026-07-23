@@ -108,6 +108,9 @@
 # Per-harness turn-end hooks are installed automatically; some live outside the worktree.
 # grok uses a firstmate-owned global hook under ${GROK_HOME:-$HOME/.grok}/hooks
 # plus a gitignored .fm-grok-turnend worktree pointer and a state token.
+# Before dispatching it prints the host-resource reading from bin/fm-resource-check.sh
+# to stderr as a `warning:` advisory when the host is degraded or critical; that
+# is a report, never a refusal, and nothing is stopped automatically.
 # On success prints: spawned <id> harness=<name> kind=<ship|scout|secondmate> mode=<mode> yolo=<on|off> window=<backend-target> worktree=<path>
 # mode/yolo are resolved per-project from data/projects.md for ship/scout tasks;
 # secondmate spawns record mode=secondmate, yolo=off, home=, and projects=.
@@ -148,6 +151,22 @@ fm_refuse_if_gate_agent
 # Skip the watcher guard when re-exec'd for one pair of a batch (FM_SPAWN_NO_GUARD is
 # set by the batch loop below), so the guard runs once for the batch, not once per pair.
 [ -n "${FM_SPAWN_NO_GUARD:-}" ] || "$FM_ROOT/bin/fm-guard.sh" || true
+# Host-resource advisory before dispatch: adding a crew to an already-thrashing
+# host is how a healthy fleet turns into a scatter of phantom test failures. This
+# REPORTS and never refuses or sheds - whether to stop work is the captain's
+# call, not this script's. Same batch gate as the guard above, so a batch warns
+# once rather than once per pair. A healthy, unknown or disabled reading is silent.
+if [ -z "${FM_SPAWN_NO_GUARD:-}" ]; then
+  RESOURCE_OUT=$("$FM_ROOT/bin/fm-resource-check.sh" 2>/dev/null) && RESOURCE_RC=0 || RESOURCE_RC=$?
+  case "$RESOURCE_RC" in
+    1|2)
+      printf '%s\n' "$RESOURCE_OUT" | while IFS= read -r resource_line; do
+        printf 'warning: %s\n' "$resource_line" >&2
+      done
+      printf 'warning: the host is under resource pressure; consider finishing or stopping heavy work before adding another crew (nothing is stopped automatically).\n' >&2
+      ;;
+  esac
+fi
 KIND=ship
 HARNESS_ARG=
 MODEL=

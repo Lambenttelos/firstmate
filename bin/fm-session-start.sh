@@ -38,8 +38,11 @@
 #                       always safe, always runs.
 #   5. fleet digest   - a compact data/backlog.md identity/metadata listing,
 #                       every state/*.meta, a bounded state/*.status tail,
-#                       state/.afk, and a cheap per-task endpoint-liveness read:
-#                       read-only, always runs.
+#                       one host CPU/memory/swap reading with the concurrent-crew
+#                       ceiling it supports (bin/fm-resource-check.sh, so the
+#                       session opens knowing whether the machine can take more
+#                       work), state/.afk, and a cheap per-task endpoint-liveness
+#                       read: read-only, always runs.
 #   6. closing reminder - prints the context-specific watcher next step; this
 #                       script points back to the emitted harness supervision
 #                       block and deliberately never arms the watcher itself.
@@ -378,6 +381,14 @@ for status in "$STATE"/*.status; do
   print_status_tail "$status"
 done
 [ "$ORPHAN_STATUS_FOUND" -eq 1 ] || printf '(none)\n'
+
+subsection "Host resources"
+RESOURCE_OUT=$("$SCRIPT_DIR/fm-resource-check.sh" 2>/dev/null) || true
+if [ -n "$RESOURCE_OUT" ]; then
+  printf '%s\n' "$RESOURCE_OUT"
+else
+  printf 'unavailable\n'
+fi
 
 subsection "AFK"
 if [ -e "$STATE/.afk" ]; then

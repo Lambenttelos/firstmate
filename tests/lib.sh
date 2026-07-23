@@ -34,6 +34,14 @@ FM_TEST_LIB_SOURCED=1
 # strips this to verify real refusal.
 export FM_GATE_REFUSE_BYPASS=1
 
+# Switch host-resource monitoring off for the suite (bin/fm-resource-check.sh).
+# Its readings come from the REAL machine the tests run on, so leaving it on
+# would let an unrelated loaded host inject a spawn advisory or a resource wake
+# into any test that drives fm-spawn or the watcher. tests/fm-resource-check.test.sh
+# re-enables it explicitly with injected readings, which is the only place the
+# monitor's own behavior is asserted.
+export FM_RESOURCE_INTERVAL=0
+
 # Resolve the repo root from this library's own location. Consumed by sourcing
 # test files, not by this library, so it reads as "unused" here.
 # shellcheck disable=SC2034
