@@ -22,9 +22,10 @@
 # RECORD FORMAT (one line per flushed digest, append only):
 #   <epoch>\t<seq>\t<kind>\t<digest>
 # <seq> is a strictly increasing integer allocated from state/.afk-outbox.seq.
-# <digest> is the exact single-line text the pane path would have typed, sentinel
-# marker (FM_INJECT_MARK) included, with any tab, CR, or LF replaced by a space so
-# one record stays one line.
+# <digest> is the exact single-line text the pane path would have typed, its
+# in-band operational envelope included, with any tab, CR, or LF replaced by a
+# space so one record stays one line.
+# bin/fm-operational-input.sh owns that envelope; this library only carries it.
 #
 # ACKNOWLEDGEMENT. state/.afk-outbox.ack holds the highest acknowledged <seq>.
 # Only the READER writes it, and only after those records are already on its
