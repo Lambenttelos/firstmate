@@ -118,8 +118,11 @@ set -eu
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# The header comment IS the help text, from the line after the shebang down to
+# the last comment before the first executable line. Deriving that range beats
+# hardcoding it, which silently truncates --help the moment the header grows.
 usage() {
-  sed -n '2,78p' "$0" | sed 's/^# \{0,1\}//'
+  awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"
 }
 
 case "${1:-}" in

@@ -209,11 +209,12 @@ Host pressure changes on a scale of minutes, so re-reading it every poll would b
 Readings are kernel-wide, taken from `sysctl` and `vm_stat` on macOS and from `/proc` on Linux, never by enumerating processes.
 Firstmate's own `ps` view is sandboxed to a small subset of the host, so summing per-process usage would silently under-report a loaded machine.
 For the same reason the reading is a host total and never attributes load to a particular crew.
+The crew count in the reading is the number of crews whose agent is actually running, not the number of recorded tasks, so a task that has stopped but has not been cleaned up yet no longer inflates the count or the shed advice.
 
 Three callers consult the monitor, and all three only report:
 
 - [`bin/fm-spawn.sh`](../bin/fm-spawn.sh) prints the reading to stderr as a pre-dispatch `warning:` advisory when the host is degraded or critical, and still spawns.
-- [`bin/fm-watch.sh`](../bin/fm-watch.sh) sweeps on this cadence and wakes firstmate with `check: host-resources <reading>` when pressure first gets worse than the level firstmate was last told about, and annotates every heartbeat with the last cached reading.
+- [`bin/fm-watch.sh`](../bin/fm-watch.sh) sweeps on this cadence and wakes firstmate with `check: host-resources <reading>` when pressure first gets worse than the level firstmate was last told about, and annotates a heartbeat with the last cached reading while the monitor is enabled and that reading is still recent.
 - [`bin/fm-session-start.sh`](../bin/fm-session-start.sh) prints one reading in the fleet-state digest, so a session opens knowing whether the machine can take more work.
 
 Nothing in this path pauses, sheds, or kills anything.

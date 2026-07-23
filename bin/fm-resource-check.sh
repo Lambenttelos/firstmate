@@ -48,9 +48,14 @@
 #              kernel is already swapping.
 #   by CPU:    the current live-crew count adjusted by load per core (+3 under
 #              1.0, +1 under 2.0, -1 under 4.0, halved at or above 4.0), floor 1.
-# Live crews are counted from state/*.meta. An IDLE agent is cheap; concurrent
-# test and browser runs are what exhaust a host, so the SHED line names those
-# first.
+# Live crews are the RUNNING ones: every state/*.meta is probed with
+# bin/fm-backend.sh's fm_backend_agent_alive and only a CONFIDENT `dead` verdict
+# is excluded, so a meta whose agent has exited but which has not been torn down
+# yet stops inflating the count and the shed advice. An ambiguous or unreadable
+# probe counts that one crew as live rather than discarding the whole reading,
+# and each probe is bounded by FM_RESOURCE_PROBE_TIMEOUT seconds (default 5) so a
+# wedged backend cannot hang the sweep. An IDLE agent is cheap; concurrent test
+# and browser runs are what exhaust a host, so the SHED line names those first.
 #
 # Every reading can be injected for tests via FM_RESOURCE_CORES,
 # FM_RESOURCE_RAM_GB, FM_RESOURCE_LOAD1, FM_RESOURCE_AVAIL_MB,
@@ -84,7 +89,9 @@ resolve_interval() {
 # comment before the first executable line. Deriving that range beats hardcoding
 # it, which silently truncates --help the moment the header grows a line.
 usage() {
-  awk 'NR < 5 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"
+  awk '!started { if ($0 ~ /^# fm-resource-check\.sh /) started = 1; else next }
+       /^#/ { sub(/^# ?/, ""); print; next }
+       { exit }' "$0"
 }
 
 case "${1:-}" in
@@ -189,16 +196,55 @@ read_swap_total_mb() {
   printf '%s' "$v"
 }
 
+# probe_verdict: fm_backend_agent_alive for one endpoint, bounded and tolerant.
+# The probe runs in a child so a wedged backend cannot hang the sweep, and
+# anything that is not a confident alive/dead answer degrades to unknown for that
+# one crew rather than spoiling the whole reading.
+PROBE_TIMEOUT=${FM_RESOURCE_PROBE_TIMEOUT:-5}
+probe_verdict() {  # <backend> <target>
+  local out pid slices=0 verdict
+  out="${TMPDIR:-/tmp}/fm-resource-probe.$$.$RANDOM"
+  ( fm_backend_agent_alive "$1" "$2" 2>/dev/null || printf 'unknown' ) > "$out" 2>/dev/null &
+  pid=$!
+  while kill -0 "$pid" 2>/dev/null; do
+    if [ "$slices" -ge $(( PROBE_TIMEOUT * 5 )) ]; then
+      kill -TERM "$pid" 2>/dev/null || true
+      break
+    fi
+    sleep 0.2
+    slices=$((slices + 1))
+  done
+  wait "$pid" 2>/dev/null || true
+  verdict=$(cat "$out" 2>/dev/null || true)
+  rm -f "$out" 2>/dev/null || true
+  case "$verdict" in alive|dead) printf '%s' "$verdict" ;; *) printf 'unknown' ;; esac
+}
+
 read_live_crews() {
-  local v meta n=0
+  local v meta backend target n=0
   v=${FM_RESOURCE_LIVE:-}
-  if [ -z "$v" ]; then
+  if [ -n "$v" ]; then
+    printf '%s' "$v"
+    return 0
+  fi
+  # shellcheck source=bin/fm-backend.sh
+  . "$FM_ROOT/bin/fm-backend.sh" 2>/dev/null || {
     for meta in "$STATE"/*.meta; do
       [ -f "$meta" ] && n=$((n + 1))
     done
-    v=$n
-  fi
-  printf '%s' "$v"
+    printf '%s' "$n"
+    return 0
+  }
+  for meta in "$STATE"/*.meta; do
+    [ -f "$meta" ] || continue
+    backend=$(fm_backend_of_meta "$meta")
+    target=$(fm_backend_target_of_meta "$meta")
+    if [ -n "$target" ] && [ "$(probe_verdict "$backend" "$target")" = dead ]; then
+      continue
+    fi
+    n=$((n + 1))
+  done
+  printf '%s' "$n"
 }
 
 CORES=$(read_cores)
@@ -247,7 +293,7 @@ BY_CPU=$(awk -v l="$LOAD_PER_CORE_EXACT" -v n="$LIVE" 'BEGIN{
   if (l < 1.0) print n+3;
   else if (l < 2.0) print n+1;
   else if (l < 4.0) print (n-1 < 1 ? 1 : n-1);
-  else print (n > 3 ? int(n/2) : 2)}')
+  else { h = int(n/2); print (h < 1 ? 1 : h) }}')
 if [ "$BY_MEM" -lt "$BY_CPU" ]; then CEILING=$BY_MEM; else CEILING=$BY_CPU; fi
 [ "$CEILING" -ge 1 ] || CEILING=1
 

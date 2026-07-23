@@ -40,8 +40,9 @@
 #                          Report-only: nothing is paused, shed or killed here.
 #   heartbeat              fleet-scan backstop found an unsurfaced captain-relevant
 #                          status, unless afk is active. Carries a
-#                          "(host resources degraded|critical)" annotation when the
-#                          last sweep found the host under pressure
+#                          "(host resources degraded|critical)" annotation when a
+#                          recent sweep found the host under pressure; a disabled
+#                          monitor or a stale cached reading annotates nothing
 # For normal supervision, resume the session-start primary-harness protocol
 # after each printed reason. Direct duplicate invocations of this script still
 # no-op through the watcher singleton lock.
@@ -133,8 +134,18 @@ CHECK_TIMEOUT=${FM_CHECK_TIMEOUT:-30}     # seconds allowed per *.check.sh
 # CHECK_INTERVAL down to 30s. bin/fm-resource-check.sh owns the knob, its default
 # and its disabled (0) form; this reads the resolved value once at start, the
 # same way every other cadence here is fixed for the process lifetime.
-RESOURCE_INTERVAL=$("$SCRIPT_DIR/fm-resource-check.sh" --interval 2>/dev/null || printf '0')
-case "$RESOURCE_INTERVAL" in ''|*[!0-9]*) RESOURCE_INTERVAL=0 ;; esac
+# An unrunnable or unparseable resolver falls back to that default rather than
+# silently switching the monitor off for this watcher's whole lifetime; the
+# fallback is logged once at startup so the condition is visible.
+RESOURCE_INTERVAL_DEFAULT=900
+RESOURCE_INTERVAL_FELL_BACK=
+RESOURCE_INTERVAL=$("$SCRIPT_DIR/fm-resource-check.sh" --interval 2>/dev/null || printf '')
+case "$RESOURCE_INTERVAL" in
+  ''|*[!0-9]*)
+    RESOURCE_INTERVAL_FELL_BACK=$RESOURCE_INTERVAL
+    RESOURCE_INTERVAL=$RESOURCE_INTERVAL_DEFAULT
+    ;;
+esac
 SIGNAL_GRACE=${FM_SIGNAL_GRACE:-30}   # seconds to linger after a signal so trailing
                                       # signals (a status write, then the same turn's
                                       # turn-end hook) coalesce into one wake
@@ -902,6 +913,9 @@ fm_pid_identity "$WATCHER_PID" > "$WATCH_LOCK/pid-identity" 2>/dev/null || true
 
 [ -e "$STATE/.last-heartbeat" ] || touch "$STATE/.last-heartbeat"
 
+[ -z "$RESOURCE_INTERVAL_FELL_BACK" ] || triage_log \
+  "host-resource cadence unresolved ('$RESOURCE_INTERVAL_FELL_BACK'), using default ${RESOURCE_INTERVAL}s"
+
 while :; do
   # Self-eviction: if the singleton lock no longer names this process, a second
   # watcher has taken over (e.g. a transient duplicate from a racy arm). Stand
@@ -1240,12 +1254,18 @@ EOF
     # Every heartbeat carries the host's latest known pressure, so a fleet review
     # is never done against a machine whose state firstmate cannot see. The value
     # is the one resource_sweep already cached, so annotating costs no probe; a
-    # healthy, unknown or disabled host annotates nothing.
+    # healthy, unknown or disabled host annotates nothing. .resource-status is
+    # only ever written, never cleared, so a disabled monitor and a reading older
+    # than two sweeps are both ignored rather than annotating the heartbeat with
+    # pressure that may have gone away long ago.
     hb_reason=heartbeat
-    case "$(cat "$STATE/.resource-status" 2>/dev/null || true)" in
-      degraded) hb_reason='heartbeat (host resources degraded)' ;;
-      critical) hb_reason='heartbeat (host resources critical)' ;;
-    esac
+    if [ "$RESOURCE_INTERVAL" -gt 0 ] \
+      && [ "$(age_of "$STATE/.resource-status")" -lt $(( RESOURCE_INTERVAL * 2 )) ]; then
+      case "$(cat "$STATE/.resource-status" 2>/dev/null || true)" in
+        degraded) hb_reason='heartbeat (host resources degraded)' ;;
+        critical) hb_reason='heartbeat (host resources critical)' ;;
+      esac
+    fi
     if afk_present; then
       fm_wake_append heartbeat heartbeat "$hb_reason" || exit 1
       touch "$STATE/.last-heartbeat"
