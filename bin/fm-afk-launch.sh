@@ -350,18 +350,20 @@ fm_afk_launch_reconcile() {
 
 fm_afk_launch_restore_backup() {  # <backup> <had-afk>
   local backup=$1 had_afk=$2 artifact result=0
-  rm -f "$FM_AFK_LAUNCH_STATE/.afk" \
-    "$FM_AFK_LAUNCH_STATE/.subsuper-escalations" \
-    "$FM_AFK_LAUNCH_STATE/.subsuper-escalations.since" \
-    "$FM_AFK_LAUNCH_STATE/.subsuper-inject-wedged" || result=1
+  rm -f "$FM_AFK_LAUNCH_STATE/.afk" || result=1
+  while IFS= read -r artifact; do
+    [ -n "$artifact" ] || continue
+    rm -f "$FM_AFK_LAUNCH_STATE/$artifact" || result=1
+  done < <(fm_afk_session_artifact_names)
   if [ "$had_afk" -eq 1 ]; then
     cp "$backup/.afk" "$FM_AFK_LAUNCH_STATE/.afk" || result=1
   fi
-  for artifact in .subsuper-escalations .subsuper-escalations.since .subsuper-inject-wedged; do
+  while IFS= read -r artifact; do
+    [ -n "$artifact" ] || continue
     if [ -e "$backup/$artifact" ]; then
       cp -p "$backup/$artifact" "$FM_AFK_LAUNCH_STATE/$artifact" || result=1
     fi
-  done
+  done < <(fm_afk_session_artifact_names)
   if [ "$result" -eq 0 ]; then
     rm -rf "$backup" || return 1
   else
@@ -480,11 +482,12 @@ fm_afk_launch_start() {
     had_afk=1
     cp "$FM_AFK_LAUNCH_STATE/.afk" "$backup/.afk" || { rm -rf "$backup"; return 1; }
   fi
-  for artifact in .subsuper-escalations .subsuper-escalations.since .subsuper-inject-wedged; do
+  while IFS= read -r artifact; do
+    [ -n "$artifact" ] || continue
     if [ -e "$FM_AFK_LAUNCH_STATE/$artifact" ]; then
       cp -p "$FM_AFK_LAUNCH_STATE/$artifact" "$backup/$artifact" || { rm -rf "$backup"; return 1; }
     fi
-  done
+  done < <(fm_afk_session_artifact_names)
   if ! fm_afk_launch_reconcile; then
     result=1
   else
@@ -588,11 +591,12 @@ fm_afk_launch_start_no_terminal() {
     had_afk=1
     cp "$FM_AFK_LAUNCH_STATE/.afk" "$backup/.afk" || { rm -rf "$backup"; return 1; }
   fi
-  for artifact in .subsuper-escalations .subsuper-escalations.since .subsuper-inject-wedged; do
+  while IFS= read -r artifact; do
+    [ -n "$artifact" ] || continue
     if [ -e "$FM_AFK_LAUNCH_STATE/$artifact" ]; then
       cp -p "$FM_AFK_LAUNCH_STATE/$artifact" "$backup/$artifact" || { rm -rf "$backup"; return 1; }
     fi
-  done
+  done < <(fm_afk_session_artifact_names)
   fm_afk_launch_reconcile || result=1
   if [ "$result" -eq 0 ]; then
     if ! fm_afk_clear_stale_artifacts "$FM_AFK_LAUNCH_STATE"; then

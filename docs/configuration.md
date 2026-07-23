@@ -90,8 +90,23 @@ It currently supports only `tmux` and `herdr` supervisor panes.
 Set `FM_SUPERVISOR_BACKEND=tmux|herdr` and `FM_SUPERVISOR_TARGET=<target>` to override both axes explicitly; for herdr the target is `"<session>:<pane-id>"`.
 Without overrides, backend detection uses `$TMUX_PANE` first, then `HERDR_ENV=1` with `HERDR_PANE_ID`, then falls back to `tmux`.
 That keeps a tmux pane nested inside herdr on the tmux transport, matching the runtime backend's innermost-first rule.
-Target detection uses `FM_SUPERVISOR_TARGET`, then `$TMUX_PANE`, then `"${HERDR_SESSION:-default}:${HERDR_PANE_ID}"` under herdr, then the legacy `firstmate:0` tmux fallback with a warning.
+Target detection uses `FM_SUPERVISOR_TARGET`, then `$TMUX_PANE`, then `"${HERDR_SESSION:-default}:${HERDR_PANE_ID}"` under herdr.
+When none of those identifies firstmate's pane, the daemon no longer injects into the legacy `firstmate:0` guess; it selects paneless delivery instead, as the next section describes.
 Selecting any other supervisor backend, including `zellij`, `orca`, or `cmux`, refuses at daemon startup instead of trying tmux injection primitives against a non-tmux pane.
+
+## Away-mode paneless delivery (FM_AFK_DELIVERY / state/.afk-outbox)
+
+The sub-supervisor delivers escalation digests one of two ways, chosen once at daemon startup and logged with its reason.
+Pane delivery types the digest into firstmate's own pane and is unchanged whenever the discovery above positively identifies that pane.
+Paneless delivery is selected when nothing identified it - a primary firstmate running outside every supported terminal backend, such as a session launched from the desktop app - and appends each flushed digest to a durable outbox that firstmate pulls from, so escalations no longer depend on a pane that does not exist.
+`FM_AFK_DELIVERY` overrides that choice with `auto` (the default), `pane`, or `paneless`; an unrecognized value warns and behaves as `auto`.
+A supported-but-broken pane, such as an explicit `FM_SUPERVISOR_TARGET` that does not resolve or an unsupported `FM_SUPERVISOR_BACKEND`, still refuses loudly at startup rather than switching channels silently.
+
+Paneless state lives in the effective home's `state/`: `.afk-delivery` records the selected mode, `.afk-outbox` holds the append-only delivery records, `.afk-outbox.ack` holds the acknowledged high-water mark, `.afk-outbox.seq` holds the sequence counter, and `.afk-outbox.lock` serializes the writer against the reader.
+[`bin/fm-afk-outbox-lib.sh`](../bin/fm-afk-outbox-lib.sh) is the single owner of that record format and its acknowledgement contract, including why only the reader may consume a record.
+Firstmate arms [`bin/fm-afk-inbox.sh`](../bin/fm-afk-inbox.sh) as its own harness-tracked background task the way it arms the watcher; that script's header and `--help` own its flags, its exit lines, and the `FM_AFK_INBOX_TIMEOUT` and `FM_AFK_INBOX_POLL` knobs.
+All of these are session-scoped delivery state: `bin/fm-afk-start.sh` clears them on a fresh away entry, and `bin/fm-afk-return.sh` reports any unacknowledged record as return catch-up evidence before clearing it.
+The [`afk`](../.agents/skills/afk/SKILL.md) skill owns the operating procedure.
 
 ## Away-mode wedge alarm channels (config/wedge-alarm)
 

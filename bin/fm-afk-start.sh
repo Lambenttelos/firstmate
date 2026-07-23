@@ -43,6 +43,10 @@ FM_AFK_DAEMON="$FM_AFK_START_DIR/fm-supervise-daemon.sh"
 . "$FM_AFK_START_DIR/fm-wake-lib.sh"
 # shellcheck source=bin/fm-afk-daemon-lib.sh
 . "$FM_AFK_START_DIR/fm-afk-daemon-lib.sh"
+# Paneless-delivery artifact names (bin/fm-afk-outbox-lib.sh owns the outbox
+# record and acknowledgement contract itself).
+# shellcheck source=bin/fm-afk-outbox-lib.sh
+. "$FM_AFK_START_DIR/fm-afk-outbox-lib.sh"
 
 fm_afk_start_usage() {
   sed -n '2,14p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
@@ -61,11 +65,27 @@ fm_afk_start_usage() {
 # lifecycle" and bin/fm-supervise-daemon.sh's escalate_add/inject_wedge_alarm).
 # NOT called on a refresh (daemon already alive), so the current session's own
 # buffered escalations are preserved.
+#
+# fm_afk_session_artifact_names lists every one of those artifacts, one name per
+# line, covering both delivery modes: the pane path's escalation buffer and wedge
+# marker, and the paneless path's outbox, acknowledgement, sequence counter, and
+# recorded delivery mode. Clearing here and the launcher's transactional backup
+# and rollback both iterate this one list, so the two sets cannot drift apart.
+fm_afk_session_artifact_names() {
+  printf '%s\n' \
+    .subsuper-escalations \
+    .subsuper-escalations.since \
+    .subsuper-inject-wedged
+  fm_afk_outbox_artifact_names
+}
+
 fm_afk_clear_stale_artifacts() {  # <state-dir>
-  local state=$1
-  rm -f "$state/.subsuper-escalations" \
-        "$state/.subsuper-escalations.since" \
-        "$state/.subsuper-inject-wedged" 2>/dev/null
+  local state=$1 name status=0
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    rm -f "$state/$name" 2>/dev/null || status=1
+  done < <(fm_afk_session_artifact_names)
+  return "$status"
 }
 
 # Daemon-lock liveness lives in bin/fm-afk-daemon-lib.sh so the turn-end guard

@@ -120,10 +120,19 @@ print_blockers() {  # <file>
 }
 
 clear_delivery_artifacts() {
+  local name
   rm -f \
     "$STATE/.subsuper-escalations" \
     "$STATE/.subsuper-escalations.since" \
     "$STATE/.subsuper-inject-wedged"
+  # Paneless delivery keeps its undelivered digests in the outbox instead of the
+  # escalation buffer; both are session-scoped delivery artifacts, and both are
+  # cleared only after return_reconcile has already retained their content as
+  # catch-up evidence.
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    rm -f "$STATE/$name"
+  done < <(fm_afk_outbox_artifact_names)
 }
 
 return_guard() {
@@ -140,7 +149,7 @@ return_guard() {
 }
 
 return_reconcile() {
-  local evidence blockers drained wedge escalations lifecycle_ok=1
+  local evidence blockers drained wedge escalations outbox lifecycle_ok=1
   evidence=$(mktemp "$STATE/.afk-return-evidence.XXXXXX") || return 1
   blockers=$(mktemp "$STATE/.afk-return-blockers.XXXXXX") || { rm -f "$evidence"; return 1; }
   preserve_evidence "$evidence"
@@ -167,6 +176,11 @@ return_reconcile() {
     escalations=$(cat "$STATE/.subsuper-escalations" 2>/dev/null || true)
     append_evidence escalation "$escalations" "$evidence"
   fi
+  # Paneless away sessions deliver through the pull outbox, so an escalation the
+  # reader never picked up lives there rather than in the escalation buffer. It
+  # is the same catch-up evidence and is reported the same way.
+  outbox=$(fm_afk_outbox_pending_report "$STATE" 2>/dev/null || true)
+  append_evidence escalation "$outbox" "$evidence"
 
   scan_open_blockers > "$blockers"
   if [ "$lifecycle_ok" -ne 1 ] || [ -s "$blockers" ]; then
@@ -203,6 +217,8 @@ main() {
   . "$SCRIPT_DIR/fm-wake-lib.sh"
   # shellcheck source=bin/fm-classify-lib.sh
   . "$SCRIPT_DIR/fm-classify-lib.sh"
+  # shellcheck source=bin/fm-afk-outbox-lib.sh
+  . "$SCRIPT_DIR/fm-afk-outbox-lib.sh"
 
   mkdir -p "$STATE" || return 1
   fm_lock_acquire_wait "$LOCK"

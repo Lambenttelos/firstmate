@@ -20,6 +20,7 @@ install_runner() {  # <case-dir>
   cp "$ROOT/bin/fm-wake-lib.sh" "$dir/bin/"
   cp "$ROOT/bin/fm-pid-lib.sh" "$dir/bin/"
   cp "$ROOT/bin/fm-classify-lib.sh" "$dir/bin/"
+  cp "$ROOT/bin/fm-afk-outbox-lib.sh" "$dir/bin/"
   cat > "$dir/bin/fm-afk-launch.sh" <<'SH'
 #!/usr/bin/env bash
 [ "${1:-}" = stop ] || exit 2
@@ -210,8 +211,40 @@ test_check_retries_recorded_terminal_teardown() {
   pass "check retries recorded terminal teardown and keeps catch-up gated until success"
 }
 
+# An away session with no supervisor pane delivers through the durable outbox
+# instead of the escalation buffer, so a digest the reader never picked up lives
+# there. Return catch-up must report it as the same evidence and clear it only
+# after the gate closes.
+test_return_reports_undelivered_inbox_records() {
+  local dir gate out
+  dir="$TMP_ROOT/paneless-catchup"
+  install_runner "$dir"
+  gate="$dir/home/state/.afk-return-catchup"
+  date +%s > "$dir/home/state/.afk"
+  : > "$dir/home/state/.fake-drain"
+  printf 'paneless\n' > "$dir/home/state/.afk-delivery"
+  printf '1784074271\t1\tescalation\tSupervisor escalate (1 event(s)): omega.status: done: PR 7\n' \
+    > "$dir/home/state/.afk-outbox"
+  seed_live_blocker "$dir" tmux inbox-blocker
+
+  set +e
+  out=$(run_return "$dir" begin)
+  set -e
+  assert_contains "$out" 'omega.status: done: PR 7' "an undelivered inbox record was not reported at return"
+  grep -F $'evidence\tescalation\t' "$gate" >/dev/null \
+    || fail "the undelivered inbox record was not retained as durable catch-up evidence"
+  [ -s "$dir/home/state/.afk-outbox" ] || fail "return discarded an undelivered record while the gate was still open"
+
+  printf 'resolved [key=inbox-blocker]: refreshed the synthetic token\n' >> "$dir/home/state/repair-task.status"
+  out=$(run_return "$dir" check) || fail "resolved blocker did not clear return catch-up: $out"
+  [ ! -e "$dir/home/state/.afk-outbox" ] || fail "successful check left reported inbox records behind"
+  [ ! -e "$dir/home/state/.afk-delivery" ] || fail "successful check left the recorded delivery mode behind"
+  pass "return catch-up reports undelivered inbox records as evidence and clears them only after the gate closes"
+}
+
 test_return_gate_orders_catchup_before_bearings
 test_explicit_reclassification_requires_durable_reason
 test_captain_decision_does_not_masquerade_as_firstmate_blocker
 test_away_reentry_refuses_pending_return_gate
 test_check_retries_recorded_terminal_teardown
+test_return_reports_undelivered_inbox_records

@@ -20,9 +20,20 @@
 # state/.subsuper-escalations and are flushed on the next "while you were out"
 # catch-up or when afk is re-entered.
 #
+# DELIVERY MODES. Escalations reach firstmate one of two ways, chosen once at
+# startup by afk_delivery_mode_select and logged with its reason. PANE mode types
+# the digest into firstmate's own pane (the original path, unchanged whenever a
+# real supervisor pane is identified). PANELESS mode - selected when nothing
+# positively identified that pane, e.g. a primary firstmate running outside every
+# supported terminal backend - appends the same marked, single-line digest to a
+# durable outbox that firstmate's armed reader pulls (bin/fm-afk-outbox-lib.sh
+# owns the record and acknowledgement contract; bin/fm-afk-inbox.sh is the
+# reader). A supported-but-broken pane still refuses loudly at startup.
+#
 # IN-BAND OPERATIONAL INPUT. bin/fm-operational-input.sh constructs every
 # current daemon injection as the typed away-supervisor kind after the stable
-# FM_OPERATIONAL_PREFIX. A human cannot type its leading U+2063 from a normal
+# FM_OPERATIONAL_PREFIX, on both delivery modes. A human cannot type its leading
+# U+2063 from a normal
 # keyboard at the start of a message, and Herdr transports it as text.
 # Firstmate's contract: a message that starts with the current prefix, or a
 # legacy bare-marker daemon escalation, is internal (stay afk); an unmarked
@@ -81,6 +92,13 @@
 #                                   supported as supervisor backends; the daemon
 #                                   refuses loudly at startup rather than trying
 #                                   tmux primitives against a non-tmux pane.
+#          FM_AFK_DELIVERY          delivery mode: auto (default), pane, or
+#                                   paneless. auto picks pane whenever the
+#                                   supervisor target came from a real signal
+#                                   (override, $TMUX_PANE, herdr env) and
+#                                   paneless when only the legacy firstmate:0
+#                                   fallback remained. An unrecognized value
+#                                   warns and behaves as auto.
 #          FM_INJECT_SKIP           |-prefixes force-self-handle bypassing
 #                                   classification (default "heartbeat"); empty
 #                                   disables. Use sparingly: it overrides the
@@ -178,6 +196,13 @@ FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 # paths and every supervision-ownership consumer.
 # shellcheck source=bin/fm-afk-daemon-lib.sh
 . "$FM_DAEMON_DIR/fm-afk-daemon-lib.sh"
+
+# Paneless (pull) delivery: the durable outbox record and acknowledgement
+# contract used when no supervisor pane can be identified. Owned by
+# bin/fm-afk-outbox-lib.sh and shared with its reader (bin/fm-afk-inbox.sh), the
+# away launcher, and the return catch-up gate.
+# shellcheck source=bin/fm-afk-outbox-lib.sh
+. "$FM_DAEMON_DIR/fm-afk-outbox-lib.sh"
 
 # --- tunables ---------------------------------------------------------------
 # Supervisor backends this daemon knows how to inject into today. zellij, orca,
@@ -322,6 +347,43 @@ _collapse_newlines() {  # <text>
 # bin/fm-supervisor-target-lib.sh (sourced above). fm_super_main below calls
 # them exactly as before; the away launcher reuses the identical resolution to
 # pass the captain pane in as FM_SUPERVISOR_TARGET.
+
+# --- delivery-mode selection (PURE: reads env, no side effects) --------------
+# Two delivery modes, chosen once at startup and logged with the reason:
+#   pane     - type the digest into firstmate's own pane (the original path,
+#              unchanged whenever a real supervisor pane is identified).
+#   paneless - append the digest to the durable outbox and let firstmate's armed
+#              reader (bin/fm-afk-inbox.sh) pull it. No pane is touched at all.
+#
+# Why paneless exists: supervisor-target discovery ends in a legacy "firstmate:0"
+# fallback that is a GUESS, not evidence. A primary firstmate running outside
+# every supported terminal backend (a desktop-app session) reaches that guess,
+# types into whatever unrelated pane answers to it, never gets a confirmed
+# submit, and buffers forever - the 2026-07-22 incident bin/fm-afk-outbox-lib.sh
+# describes. Choosing the pull channel when NOTHING positively identified
+# firstmate's pane is the honest reading of that state.
+#
+# This is only for supported-backend-ABSENT. A supported-but-BROKEN supervisor
+# pane - an explicit FM_SUPERVISOR_TARGET that does not resolve, or an
+# unsupported FM_SUPERVISOR_BACKEND - still refuses loudly at startup, because
+# there the captain named a pane and the daemon must not quietly stop using it.
+#
+# Returns 2 (with the auto-selected mode still printed) when FM_AFK_DELIVERY
+# holds an unrecognized value, so the caller can warn about the typo without
+# taking away mode down over it.
+afk_delivery_mode_select() {  # <target-source>
+  local target_source=$1 override="${FM_AFK_DELIVERY:-auto}" auto=pane rc=0
+  case "$target_source" in
+    FALLBACK*) auto=paneless ;;
+  esac
+  case "$override" in
+    pane|paneless) printf '%s' "$override"; return 0 ;;
+    ''|auto|default) ;;
+    *) rc=2 ;;
+  esac
+  printf '%s' "$auto"
+  return "$rc"
+}
 
 # --- classification helpers (PURE: no side effects, testable) ---------------
 # last_status_line, status_is_captain_relevant, window_to_task, and
@@ -1112,6 +1174,19 @@ inject_msg() {  # <message> [state]
   msg=$(_collapse_newlines "$msg")
   fm_operational_input_encode away-supervisor "$msg" encoded || return 1
   msg=$encoded
+  # (2b) PANELESS delivery: no pane was ever identified, so there is nothing to
+  # type into. Append the identical marked, single-line digest to the durable
+  # outbox and let firstmate's armed reader (bin/fm-afk-inbox.sh) pull it. A
+  # failed append returns non-zero exactly like a failed inject, so the digest
+  # stays buffered for the next tick instead of vanishing.
+  if [ "${FM_AFK_DELIVERY_MODE:-pane}" = paneless ]; then
+    if fm_afk_outbox_append "$state" escalation "$msg"; then
+      log "delivered to the away-mode inbox (paneless): $(fm_afk_outbox_pending_count "$state") record(s) pending pickup"
+      return 0
+    fi
+    log "inject failed: could not append the digest to the away-mode inbox"
+    return 1
+  fi
   target="${FM_SUPERVISOR_TARGET:-$FM_SUPERVISOR_TARGET_DEFAULT}"
   # BACKEND-AWARE (previously a raw `tmux display-message` pane-exists probe):
   # dispatches through bin/fm-backend.sh so a herdr supervisor pane is checked
@@ -1373,30 +1448,61 @@ fm_super_main() {
       target_source="FALLBACK(firstmate:0)"
     fi
   fi
-  if discovered=$(discover_supervisor_target); then
-    : # resolved cleanly
-  else
-    echo "warn: could not auto-discover supervisor pane (no FM_SUPERVISOR_TARGET, TMUX_PANE, or HERDR_ENV/HERDR_PANE_ID); falling back to '$discovered' — verify this is firstmate's pane" >&2
-  fi
-  FM_SUPERVISOR_TARGET="$discovered"
-  local TARGET="$FM_SUPERVISOR_TARGET"
 
-  # --- validate supervisor target at startup (a missing target is a typo) ---
-  # Dispatches through bin/fm-backend.sh instead of a raw `tmux display-message`
-  # probe, so a herdr supervisor pane is checked via the herdr adapter; for
-  # backend=tmux this runs the exact same `tmux display-message -p -t "$TARGET"
-  # '#{pane_id}'` call as before.
-  if ! fm_backend_target_exists "$BACKEND" "$TARGET"; then
-    echo "error: supervisor target '$TARGET' does not resolve to a $BACKEND pane; set FM_SUPERVISOR_TARGET" >&2
-    log "startup failed: target '$TARGET' not found (backend=$BACKEND)"
-    fm_lock_release "$LOCK" 2>/dev/null || true
-    rm -f "$PIDFILE" 2>/dev/null || true
-    exit 1
+  # --- choose the delivery mode before touching any pane --------------------
+  # A FALLBACK target source means nothing identified firstmate's own pane, so
+  # the legacy firstmate:0 guess is NOT used as an injection target: paneless
+  # pull delivery is selected instead (afk_delivery_mode_select above owns the
+  # rule and the reasoning). Both the mode and the reason are logged, and the
+  # mode is recorded durably so the reader and firstmate can tell a paneless away
+  # session from a pane one without re-deriving this discovery.
+  local DELIVERY delivery_rc=0
+  DELIVERY=$(afk_delivery_mode_select "$target_source") || delivery_rc=$?
+  if [ "$delivery_rc" -eq 2 ]; then
+    echo "warn: ignoring unrecognized FM_AFK_DELIVERY='${FM_AFK_DELIVERY:-}' (expected auto, pane, or paneless); using '$DELIVERY'" >&2
   fi
+  FM_AFK_DELIVERY_MODE="$DELIVERY"
+
+  local TARGET=""
+  if [ "$DELIVERY" = paneless ]; then
+    # Deliberately leave FM_SUPERVISOR_TARGET empty: with no identified pane,
+    # every pane primitive stays unreachable for the rest of this run, so the
+    # daemon cannot type an escalation into an unrelated terminal.
+    FM_SUPERVISOR_TARGET=""
+    echo "info: no supervisor pane identified (target_source=$target_source); away-mode escalations will be delivered through the pull inbox - arm bin/fm-afk-inbox.sh as a tracked background task" >&2
+    log "delivery mode: paneless (reason: no supervisor pane identified; target_source=$target_source, backend_source=$backend_source)"
+  else
+    if discovered=$(discover_supervisor_target); then
+      : # resolved cleanly
+    else
+      echo "warn: could not auto-discover supervisor pane (no FM_SUPERVISOR_TARGET, TMUX_PANE, or HERDR_ENV/HERDR_PANE_ID); falling back to '$discovered' — verify this is firstmate's pane" >&2
+    fi
+    FM_SUPERVISOR_TARGET="$discovered"
+    TARGET="$FM_SUPERVISOR_TARGET"
+    log "delivery mode: pane (reason: supervisor pane identified; target_source=$target_source)"
+
+    # --- validate supervisor target at startup (a missing target is a typo) ---
+    # Dispatches through bin/fm-backend.sh instead of a raw `tmux display-message`
+    # probe, so a herdr supervisor pane is checked via the herdr adapter; for
+    # backend=tmux this runs the exact same `tmux display-message -p -t "$TARGET"
+    # '#{pane_id}'` call as before. A named-but-absent pane is a supported-but-
+    # broken pane, so it still refuses loudly rather than silently switching
+    # channels.
+    if ! fm_backend_target_exists "$BACKEND" "$TARGET"; then
+      echo "error: supervisor target '$TARGET' does not resolve to a $BACKEND pane; set FM_SUPERVISOR_TARGET" >&2
+      log "startup failed: target '$TARGET' not found (backend=$BACKEND)"
+      fm_lock_release "$LOCK" 2>/dev/null || true
+      rm -f "$PIDFILE" 2>/dev/null || true
+      exit 1
+    fi
+  fi
+
+  fm_afk_delivery_mode_record "$STATE" "$DELIVERY" \
+    || log "warn: could not record the delivery mode in $(fm_afk_delivery_mode_file "$STATE")"
 
   local afk_status="off"
   afk_active "$STATE" && afk_status="on"
-  log "daemon starting (pid $$); target=$TARGET; target_source=$target_source; backend=$BACKEND; backend_source=$backend_source; afk=$afk_status; inject_skip='${FM_INJECT_SKIP:-$INJECT_SKIP_DEFAULT}'; stale_escalate=${FM_STALE_ESCALATE_SECS:-$STALE_ESCALATE_SECS_DEFAULT}s; batch=${FM_ESCALATE_BATCH_SECS:-$ESCALATE_BATCH_SECS_DEFAULT}s"
+  log "daemon starting (pid $$); delivery=$DELIVERY; target=${TARGET:-none}; target_source=$target_source; backend=$BACKEND; backend_source=$backend_source; afk=$afk_status; inject_skip='${FM_INJECT_SKIP:-$INJECT_SKIP_DEFAULT}'; stale_escalate=${FM_STALE_ESCALATE_SECS:-$STALE_ESCALATE_SECS_DEFAULT}s; batch=${FM_ESCALATE_BATCH_SECS:-$ESCALATE_BATCH_SECS_DEFAULT}s"
   migrate_watcher_pause_markers "$STATE"
 
   # --- shutdown: flush buffered escalations, reap child, release lock -------
@@ -1454,7 +1560,10 @@ fm_super_main() {
     # has nowhere to go, and firstmate itself is the consumer of escalations.
     # Catch-up signals persist in state/*.status and flow on the next run, so
     # this delays rather than loses work.
-    if ! fm_backend_target_exists "$BACKEND" "$TARGET"; then
+    # Paneless delivery has no pane to lose: the outbox is always reachable, so
+    # this guard is skipped entirely rather than backing off against a target
+    # that was never used.
+    if [ "$DELIVERY" != paneless ] && ! fm_backend_target_exists "$BACKEND" "$TARGET"; then
       log "warn: supervisor target '$TARGET' gone; backing off ${INJECT_FAIL_SLEEP}s, will retry"
       # Flush is pointless with no pane; preserve any buffered escalations.
       sleep "$INJECT_FAIL_SLEEP"

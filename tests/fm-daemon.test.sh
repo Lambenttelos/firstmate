@@ -1743,6 +1743,117 @@ test_inject_msg_defers_on_dead_shell_unknown() {
   pass "inject_msg: defers on a dead-shell/unreadable composer (unknown), never typing the escalation into a shell"
 }
 
+# --- paneless (pull) delivery ------------------------------------------------
+# The 2026-07-22 incident: a primary firstmate outside every supported terminal
+# backend fell through to the legacy firstmate:0 GUESS, typed into an unrelated
+# idle shell pane, never confirmed a submit, and buffered for ~80 minutes. The
+# daemon now reads that state honestly and delivers through the durable outbox
+# instead. The record/acknowledgement contract and its reader are covered in
+# tests/fm-afk-inbox.test.sh; these cover the daemon's own mode choice and
+# dispatch, including that the pane path is untouched.
+
+test_delivery_mode_selection_prefers_a_real_pane_and_falls_to_the_inbox() {
+  local source mode rc
+  for source in FM_SUPERVISOR_TARGET TMUX_PANE 'HERDR_ENV(HERDR_PANE_ID)'; do
+    mode=$(afk_delivery_mode_select "$source") \
+      || fail "a positively identified supervisor pane ($source) must not be an error"
+    [ "$mode" = pane ] || fail "target source $source should keep pane delivery, got '$mode'"
+  done
+
+  mode=$(afk_delivery_mode_select 'FALLBACK(firstmate:0)') || fail "fallback selection should not error"
+  [ "$mode" = paneless ] \
+    || fail "the legacy firstmate:0 fallback must select the pull inbox rather than typing into a guessed pane, got '$mode'"
+
+  mode=$(FM_AFK_DELIVERY=pane afk_delivery_mode_select 'FALLBACK(firstmate:0)')
+  [ "$mode" = pane ] || fail "an explicit FM_AFK_DELIVERY=pane must win over auto-selection"
+  mode=$(FM_AFK_DELIVERY=paneless afk_delivery_mode_select TMUX_PANE)
+  [ "$mode" = paneless ] || fail "an explicit FM_AFK_DELIVERY=paneless must win over a discovered pane"
+
+  rc=0
+  mode=$(FM_AFK_DELIVERY=sometimes afk_delivery_mode_select 'FALLBACK(firstmate:0)') || rc=$?
+  [ "$rc" -eq 2 ] || fail "an unrecognized FM_AFK_DELIVERY value must be reported to the caller (rc=$rc)"
+  [ "$mode" = paneless ] || fail "an unrecognized FM_AFK_DELIVERY value must still resolve automatically, got '$mode'"
+  pass "delivery mode: a discovered pane keeps the pane path, an unidentified one selects the inbox, overrides win"
+}
+
+test_paneless_flush_delivers_through_the_inbox_without_a_pane() {
+  local dir state fakebin sent records digest out
+  dir=$(make_supercase paneless-flush)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  sent="$dir/sent.log"; : > "$sent"
+  escalate_add "$state" "alpha.status: done: PR 1"
+  escalate_add "$state" "beta.status: blocked: needs a token"
+  afk_enter "$state"
+
+  # No pane at all: the fake tmux reports every pane gone and no target is set,
+  # so a delivery that still succeeds proves the pull path needs no pane.
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_PANE_ALIVE=0 FM_FAKE_TMUX_SENT="$sent" \
+    FM_SUPERVISOR_TARGET="" FM_AFK_DELIVERY_MODE=paneless FM_ESCALATE_BATCH_SECS=0 \
+    escalate_flush "$state" || fail "paneless escalate_flush failed with no supervisor pane"
+
+  [ -s "$sent" ] && fail "paneless delivery typed into a pane"
+  [ -s "$state/.afk-outbox" ] || fail "paneless delivery wrote no durable record"
+  records=$(wc -l < "$state/.afk-outbox" | tr -d ' ')
+  [ "$records" -eq 1 ] || fail "expected one record per flushed digest, got $records"
+  digest=$(cut -f4 "$state/.afk-outbox")
+  case "$digest" in
+    "$FM_INJECT_MARK"*) : ;;
+    *) fail "the delivered record dropped the sentinel marker: $digest" ;;
+  esac
+  case "$digest" in
+    *"alpha.status: done: PR 1 | beta.status: blocked: needs a token"*) : ;;
+    *) fail "the delivered record is not the same single-line batched digest: $digest" ;;
+  esac
+  [ -s "$state/.subsuper-escalations" ] && fail "buffer not cleared after a delivered record"
+  [ -e "$state/.subsuper-escalations.since" ] && fail "first-append sidecar not cleared after delivery"
+  [ -e "$state/.subsuper-inject-wedged" ] && fail "paneless delivery raised a wedge alarm"
+
+  # End to end: the armed reader picks the record up and acknowledges it.
+  out=$(FM_STATE_OVERRIDE="$state" "$ROOT/bin/fm-afk-inbox.sh" --once 2>&1) \
+    || fail "the inbox reader failed to pick up the delivered record: $out"
+  assert_contains "$out" "alpha.status: done: PR 1" "the reader did not surface the delivered digest"
+  pass "paneless delivery writes one durable record per digest, needs no pane, and reaches the reader"
+}
+
+test_paneless_delivery_stays_presence_gated() {
+  local dir state fakebin sent
+  dir=$(make_supercase paneless-afk-off)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  sent="$dir/sent.log"; : > "$sent"
+  escalate_add "$state" "done: PR 1"
+  # afk flag deliberately NOT set.
+  if PATH="$fakebin:$PATH" FM_SUPERVISOR_TARGET="" FM_AFK_DELIVERY_MODE=paneless \
+    FM_ESCALATE_BATCH_SECS=0 escalate_flush "$state"; then
+    fail "paneless escalate_flush succeeded while afk inactive"
+  fi
+  [ -e "$state/.afk-outbox" ] && fail "paneless delivery wrote a record while afk inactive"
+  [ -s "$state/.subsuper-escalations" ] || fail "buffer not preserved when afk inactive"
+  pass "paneless delivery honors the same away-mode presence gate as the pane path"
+}
+
+test_pane_delivery_never_writes_the_inbox() {
+  local dir state fakebin sent capture
+  dir=$(make_supercase pane-mode-no-inbox)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  sent="$dir/sent.log"; : > "$sent"
+  capture="$dir/pane.txt"; : > "$capture"
+  escalate_add "$state" "alpha.status: done: PR 1"
+  afk_enter "$state"
+
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_PANE_ALIVE=1 FM_FAKE_TMUX_SENT="$sent" \
+    FM_FAKE_TMUX_CAPTURE="$capture" FM_ESCALATE_BATCH_SECS=0 escalate_flush "$state" \
+    || fail "pane escalate_flush failed"
+
+  grep -F 'alpha.status: done: PR 1' "$sent" >/dev/null || fail "pane delivery did not type the digest"
+  [ "$(grep -c '\[ENTER\]' "$sent")" -eq 1 ] || fail "pane delivery did not submit exactly once"
+  [ -e "$state/.afk-outbox" ] && fail "pane delivery also wrote a pull-delivery record"
+  [ -e "$state/.afk-outbox.ack" ] && fail "pane delivery created an acknowledgement file"
+  pass "an identified supervisor pane still delivers by typing and writes nothing to the inbox"
+}
+
 test_afk_start_refuses_when_flag_cannot_be_written
 test_afk_start_ignores_stale_pidfile_without_lock
 test_afk_start_reclaims_stale_daemon_lock_reused_pid
@@ -1841,3 +1952,7 @@ test_inject_msg_herdr_composer_guard_defers
 test_inject_msg_herdr_pane_gone_defers
 test_inject_msg_herdr_submits_through_backend_dispatch
 test_inject_msg_defers_on_dead_shell_unknown
+test_delivery_mode_selection_prefers_a_real_pane_and_falls_to_the_inbox
+test_paneless_flush_delivers_through_the_inbox_without_a_pane
+test_paneless_delivery_stays_presence_gated
+test_pane_delivery_never_writes_the_inbox
