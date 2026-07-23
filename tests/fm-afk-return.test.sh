@@ -281,7 +281,9 @@ test_return_refuses_to_clear_an_unreadable_inbox() {
   wait "$holder" 2>/dev/null || true
 
   [ "$rc" -eq 3 ] || fail "an unreadable inbox must block return catch-up (rc=$rc): $out"
-  assert_contains "$out" 'away-mode inbox could not be read' "the read failure was not reported as a blocker: $out"
+  # The gate gets one pass and then deletes the outbox, so a lock timeout that a
+  # retrying reader would survive is still a blocker here, named for what it was.
+  assert_contains "$out" 'away-mode inbox lock could not be acquired' "the read failure was not reported as a blocker: $out"
   [ -s "$dir/home/state/.afk-outbox" ] \
     || fail "return deleted an inbox whose content it never read"
   [ -e "$gate" ] || fail "the return gate did not stay open after an unreadable inbox"

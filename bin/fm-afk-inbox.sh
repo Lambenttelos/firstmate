@@ -31,6 +31,15 @@
 # channel is healthy. In particular, a failed read is never reported as an empty
 # outbox: it never gets an idle or nothing-pending line.
 #
+# LOCK CONTENTION. The outbox lock is held for short mutations by the daemon and
+# by any other reader, so a bounded acquire that simply times out is a transient
+# condition, not a broken channel: this reader stays alive, prints no status line,
+# acknowledges nothing, and tries again on the next poll. That retry is BOUNDED -
+# after FM_AFK_INBOX_LOCK_TIMEOUT_MAX consecutive timeouts (default 12, so roughly
+# a minute of a lock nobody releases) it exits non-zero naming the lock file it
+# could not acquire, because a channel that spins forever is the same silence this
+# path exists to remove. Any successful read resets the count.
+#
 # LIVENESS. This reader stamps state/.afk-inbox.beat as its first action when it
 # arms, on every poll iteration while it waits, and on every acknowledgement, the
 # same way bin/fm-watch.sh stamps state/.last-watcher-beat. The daemon's paneless
@@ -52,6 +61,8 @@
 #                     FM_AFK_INBOX_TIMEOUT; 0 waits until away mode ends)
 #   --poll <secs>     seconds between checks (default 1, or FM_AFK_INBOX_POLL)
 #   --once            check once and exit without waiting
+#   FM_AFK_INBOX_LOCK_TIMEOUT_MAX  consecutive outbox-lock timeouts tolerated
+#                     before exiting non-zero (default 12)
 #   FM_STATE_OVERRIDE alternate state dir (testing)
 set -u
 
@@ -71,6 +82,9 @@ usage() {
 TIMEOUT=${FM_AFK_INBOX_TIMEOUT:-3600}
 POLL=${FM_AFK_INBOX_POLL:-1}
 ONCE=0
+LOCK_TIMEOUT_MAX=${FM_AFK_INBOX_LOCK_TIMEOUT_MAX:-12}
+case "$LOCK_TIMEOUT_MAX" in ''|*[!0-9]*|0) LOCK_TIMEOUT_MAX=12 ;; esac
+LOCK_TIMEOUTS=0
 
 die() {
   printf 'fm-afk-inbox: %s\n' "$*" >&2
@@ -78,7 +92,10 @@ die() {
 }
 
 # Print and acknowledge everything pending, then announce what was delivered.
-# Returns 0 when something was delivered, 1 when the outbox was genuinely empty.
+# Returns 0 when something was delivered, 1 when the outbox was genuinely empty,
+# and 2 when the bounded outbox-lock acquire timed out - a retryable failure that
+# is emphatically NOT an empty read, so it prints nothing and the caller must go
+# round the poll again rather than take any nothing-pending exit.
 # An outbox that could NOT be read is a failure, never an empty one: reporting it
 # as "nothing pending" would print a healthy re-arm line and exit 0 while records
 # sit undelivered, which is the incident this whole channel exists to prevent.
@@ -92,6 +109,7 @@ deliver() {
   fm_afk_outbox_deliver "$STATE" || rc=$?
   case "$rc" in
     0)
+      LOCK_TIMEOUTS=0
       # Acknowledgement is the strongest possible liveness proof, so re-stamp the
       # beacon right after one.
       fm_afk_inbox_beacon_touch "$STATE" || true
@@ -99,7 +117,8 @@ deliver() {
         "$FM_AFK_OUTBOX_DELIVERED"
       return 0
       ;;
-    1) return 1 ;;
+    1) LOCK_TIMEOUTS=0; return 1 ;;
+    "$FM_AFK_OUTBOX_DELIVER_LOCK_TIMEOUT") return 2 ;;
     "$FM_AFK_OUTBOX_DELIVER_UNREADABLE")
       die "the away-mode inbox could not be read (state directory unwritable, or the outbox lock is held); nothing was delivered and any records stay pending"
       ;;
@@ -111,8 +130,20 @@ away_mode_active() {
   [ -e "$STATE/.afk" ]
 }
 
+# Count one lock-acquire timeout and stop the run once the bound is spent. The
+# bound exists so a lock nobody ever releases ends in a loud non-zero exit that
+# NAMES the lock, instead of a reader that looks armed forever while records sit
+# undelivered. Nothing is acknowledged or removed on this path: the records stay
+# pending for the next reader.
+note_lock_timeout() {
+  LOCK_TIMEOUTS=$((LOCK_TIMEOUTS + 1))
+  if [ "$LOCK_TIMEOUTS" -ge "$LOCK_TIMEOUT_MAX" ]; then
+    die "the away-mode inbox lock $(fm_afk_outbox_lock_file "$STATE") could not be acquired in $LOCK_TIMEOUTS consecutive attempts; nothing was delivered and any records stay pending"
+  fi
+}
+
 main() {
-  local waited=0 mode
+  local waited=0 mode deliver_rc=0
 
   while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -136,26 +167,39 @@ main() {
   # Anything already pending is delivered before any early-exit condition is
   # consulted: a record that exists must reach firstmate even if the away session
   # has since ended or switched to pane delivery.
-  deliver && return 0
+  deliver_rc=0
+  deliver || deliver_rc=$?
+  [ "$deliver_rc" -eq 0 ] && return 0
 
-  # A recorded PANE delivery mode means the daemon has a real supervisor pane and
-  # nothing will ever be written here, so waiting would be a lie. An ABSENT
-  # marker is not treated as pane delivery: no daemon has recorded a mode yet, so
-  # this waits, which is the direction that cannot drop an escalation.
-  mode=$(fm_afk_delivery_mode_recorded "$STATE")
-  if [ "$mode" = pane ]; then
-    printf 'afk-inbox: away mode is delivering into the supervisor pane; no inbox reader needed - do not re-arm\n'
-    return 0
-  fi
+  # A lock-acquire timeout read NOTHING, so none of the early exits below may run
+  # off it: each of them announces an outbox this run never actually looked into.
+  # A single-shot run has no next poll to retry on, so its only honest outcome is
+  # the loud non-zero exit; a blocking run falls through to the poll loop with the
+  # timeout counted.
+  if [ "$deliver_rc" -eq 2 ]; then
+    [ "$ONCE" -eq 0 ] \
+      || die "the away-mode inbox lock $(fm_afk_outbox_lock_file "$STATE") could not be acquired; nothing was delivered and any records stay pending"
+    LOCK_TIMEOUTS=1
+  else
+    # A recorded PANE delivery mode means the daemon has a real supervisor pane and
+    # nothing will ever be written here, so waiting would be a lie. An ABSENT
+    # marker is not treated as pane delivery: no daemon has recorded a mode yet, so
+    # this waits, which is the direction that cannot drop an escalation.
+    mode=$(fm_afk_delivery_mode_recorded "$STATE")
+    if [ "$mode" = pane ]; then
+      printf 'afk-inbox: away mode is delivering into the supervisor pane; no inbox reader needed - do not re-arm\n'
+      return 0
+    fi
 
-  if ! away_mode_active; then
-    printf 'afk-inbox: away mode is not active; nothing to wait for - do not re-arm\n'
-    return 0
-  fi
+    if ! away_mode_active; then
+      printf 'afk-inbox: away mode is not active; nothing to wait for - do not re-arm\n'
+      return 0
+    fi
 
-  if [ "$ONCE" -eq 1 ]; then
-    printf 'afk-inbox: nothing pending; re-arm to keep listening while away mode is active\n'
-    return 0
+    if [ "$ONCE" -eq 1 ]; then
+      printf 'afk-inbox: nothing pending; re-arm to keep listening while away mode is active\n'
+      return 0
+    fi
   fi
 
   while true; do
@@ -165,7 +209,16 @@ main() {
     # all must still read as alive, otherwise the daemon would alarm about an
     # armed and perfectly healthy reader.
     fm_afk_inbox_beacon_touch "$STATE" || true
-    deliver && return 0
+    deliver_rc=0
+    deliver || deliver_rc=$?
+    [ "$deliver_rc" -eq 0 ] && return 0
+    # A timeout is a failed read, so every exit below it - all of which assert
+    # something about an outbox this iteration never saw - is skipped and the wait
+    # simply continues. note_lock_timeout ends the run once the bound is spent.
+    if [ "$deliver_rc" -eq 2 ]; then
+      note_lock_timeout
+      continue
+    fi
     if ! away_mode_active; then
       printf 'afk-inbox: away mode ended; nothing pending - do not re-arm\n'
       return 0

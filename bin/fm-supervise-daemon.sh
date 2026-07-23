@@ -1207,15 +1207,20 @@ housekeeping() {  # <state>
     outbox_rc=0
     oldest_epoch=$(fm_afk_outbox_oldest_pending_epoch "$state") || outbox_rc=$?
     if [ "$outbox_rc" -ne 0 ]; then
-      # An unreadable outbox is not an empty one, so neither alarm nor clear:
-      # leave whatever alarm state exists and retry later. Each failed attempt
-      # burns the full bounded lock acquire, so back the probe off to one per
-      # max-defer window and log only the transition INTO the unreadable state -
-      # otherwise this line, and that stall, repeat every one-second tick during
-      # precisely the incident the line exists to document.
+      # An outbox that could not be read is not an empty one, so neither alarm nor
+      # clear: leave whatever alarm state exists and retry later. Each failed
+      # attempt burns the full bounded lock acquire, so back the probe off to one
+      # per max-defer window and log only the transition INTO the failed-read
+      # state - otherwise this line, and that stall, repeat on every
+      # HOUSEKEEPING_TICK_DEFAULT tick during precisely the incident the line
+      # exists to document.
       if [ "$OUTBOX_UNREADABLE" -eq 0 ]; then
         OUTBOX_UNREADABLE=1
-        log "away-mode inbox unreadable; undelivered-escalation alarm state left unchanged until it can be read again"
+        if [ "$outbox_rc" -eq "$FM_AFK_OUTBOX_LOCK_TIMEOUT" ]; then
+          log "away-mode inbox lock could not be acquired; undelivered-escalation alarm state left unchanged until the outbox can be read again"
+        else
+          log "away-mode inbox unreadable; undelivered-escalation alarm state left unchanged until it can be read again"
+        fi
       fi
       OUTBOX_PROBE_NOT_BEFORE=$(( now + max_defer ))
     else

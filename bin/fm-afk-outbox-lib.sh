@@ -62,15 +62,22 @@ FM_AFK_OUTBOX_LOCK_NAME=".afk-outbox.lock"
 FM_AFK_DELIVERY_MODE_NAME=".afk-delivery"
 FM_AFK_INBOX_BEACON_NAME=".afk-inbox.beat"
 
-# A read that FAILED - the lock helper is unusable, the bounded lock acquire gave
-# up, or the record scan itself could not read the file - reports this status,
-# distinct from a read that succeeded and found nothing. The two must never be
-# conflated: "the outbox could not be read" announced as "the outbox is empty"
-# turns a real delivery failure into a healthy idle exit, and lets the return
-# catch-up gate delete escalations it never read. Only a genuinely successful
-# read may be reported as nothing, and only a genuinely successful read may ever
-# permit deletion.
+# A read that FAILED - the lock helper is unusable, or the record scan itself
+# could not read the file - reports this status, distinct from a read that
+# succeeded and found nothing. The two must never be conflated: "the outbox could
+# not be read" announced as "the outbox is empty" turns a real delivery failure
+# into a healthy idle exit, and lets the return catch-up gate delete escalations
+# it never read. Only a genuinely successful read may be reported as nothing, and
+# only a genuinely successful read may ever permit deletion.
 FM_AFK_OUTBOX_UNREADABLE=2
+
+# A read whose only failure was the BOUNDED lock acquire giving up reports this
+# status instead. The outbox itself is intact and the next attempt will usually
+# get the lock, so a caller that can retry - the blocking reader - must stay alive
+# rather than tearing the delivery channel down over a lock the daemon happened to
+# hold. Everything the unreadable status forbids still applies here unchanged: a
+# timeout is never an empty read, never acknowledges, and never permits deletion.
+FM_AFK_OUTBOX_LOCK_TIMEOUT=4
 
 fm_afk_outbox_file() {  # <state>
   printf '%s/%s' "$1" "$FM_AFK_OUTBOX_NAME"
@@ -382,7 +389,9 @@ fm_afk_outbox_pending() {  # <state>
   [ -s "$file" ] || return 0
   fm_afk_outbox_lock_lib "$state" || return "$FM_AFK_OUTBOX_UNREADABLE"
   lock=$(fm_afk_outbox_lock_file "$state")
-  _fm_afk_outbox_lock_acquire "$lock" || return "$FM_AFK_OUTBOX_UNREADABLE"
+  # A bounded acquire that timed out gets its own status: the outbox is readable,
+  # somebody else simply held the lock, so a reader may retry instead of dying.
+  _fm_afk_outbox_lock_acquire "$lock" || return "$FM_AFK_OUTBOX_LOCK_TIMEOUT"
   # An acknowledgement mark that could not be read narrows nothing, so it is a
   # failed read too rather than a licence to treat every record as pending.
   ack=$(fm_afk_outbox_ack_seq "$state") || rc=$?
@@ -516,7 +525,9 @@ fm_afk_outbox_ack() {  # <state> <seq>
     ''|*[!0-9]*) return 1 ;;
   esac
   ack=$(fm_afk_outbox_ack_file "$state")
-  pending_file=$(mktemp "$state/.afk-outbox.ack.pending.XXXXXX") || return 1
+  # Built from the same constant fm_afk_outbox_transient_artifact_globs derives
+  # its cleanup glob from, so a rename can never orphan the temp files.
+  pending_file=$(mktemp "$state/$FM_AFK_OUTBOX_ACK_NAME.pending.XXXXXX") || return 1
   printf '%s\n' "$seq" > "$pending_file" || { rm -f "$pending_file"; return 1; }
   mv "$pending_file" "$ack" || { rm -f "$pending_file"; return 1; }
   # Best-effort: a compaction that cannot run leaves a correct, merely larger
@@ -528,10 +539,13 @@ fm_afk_outbox_ack() {  # <state> <seq>
 # FIRST, then acknowledge them. Returns 0 when at least one record was delivered,
 # 1 when there was nothing pending, 2 when records were printed but could not be
 # acknowledged (the caller reports that loudly; the records stay pending and are
-# delivered again rather than lost), and FM_AFK_OUTBOX_DELIVER_UNREADABLE when
-# the pending read itself failed. That last status is deliberately NOT 1: an
-# outbox that could not be read is not an outbox that is empty, and a caller that
-# conflated them would announce a healthy idle exit during a real failure.
+# delivered again rather than lost), FM_AFK_OUTBOX_DELIVER_UNREADABLE when the
+# pending read itself failed, and FM_AFK_OUTBOX_DELIVER_LOCK_TIMEOUT when that
+# read failed only because the bounded lock acquire gave up. Neither of those two
+# is 1: an outbox that could not be read is not an outbox that is empty, and a
+# caller that conflated them would announce a healthy idle exit during a real
+# failure. They stay distinct from each other because a lock timeout is worth
+# retrying and an unreadable outbox is not.
 #
 # Deliberate ordering: print, then acknowledge. A reader killed between the two
 # has not actually delivered anything to firstmate, so re-delivering is correct.
@@ -543,12 +557,16 @@ fm_afk_outbox_ack() {  # <state> <seq>
 # close. The count is 0 on every non-zero return, so a caller that lost the race
 # to a concurrent reader announces nothing rather than an empty delivery.
 FM_AFK_OUTBOX_DELIVER_UNREADABLE=3
+FM_AFK_OUTBOX_DELIVER_LOCK_TIMEOUT=5
 
 # shellcheck disable=SC2034 # Read by callers (fm-afk-inbox.sh) after this returns.
 fm_afk_outbox_deliver() {  # <state>
   local state=$1 pending last rc=0
   FM_AFK_OUTBOX_DELIVERED=0
   pending=$(fm_afk_outbox_pending "$state") || rc=$?
+  if [ "$rc" -eq "$FM_AFK_OUTBOX_LOCK_TIMEOUT" ]; then
+    return "$FM_AFK_OUTBOX_DELIVER_LOCK_TIMEOUT"
+  fi
   [ "$rc" -eq 0 ] || return "$FM_AFK_OUTBOX_DELIVER_UNREADABLE"
   [ -n "$pending" ] || return 1
   printf '%s\n' "$pending" | fm_afk_outbox_format
@@ -569,7 +587,7 @@ fm_afk_delivery_mode_record() {  # <state> <mode>
   esac
   mkdir -p "$state" || return 1
   file=$(fm_afk_delivery_mode_file "$state")
-  pending_file=$(mktemp "$state/.afk-delivery.pending.XXXXXX") || return 1
+  pending_file=$(mktemp "$state/$FM_AFK_DELIVERY_MODE_NAME.pending.XXXXXX") || return 1
   printf '%s\n' "$mode" > "$pending_file" || { rm -f "$pending_file"; return 1; }
   mv "$pending_file" "$file" || { rm -f "$pending_file"; return 1; }
 }

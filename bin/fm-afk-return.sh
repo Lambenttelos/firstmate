@@ -188,7 +188,13 @@ return_reconcile() {
   # and whose content is now retained above as catch-up evidence.
   outbox_rc=0
   outbox=$(fm_afk_outbox_pending_report "$STATE" 2>/dev/null) || outbox_rc=$?
-  if [ "$outbox_rc" -ne 0 ]; then
+  if [ "$outbox_rc" -eq "$FM_AFK_OUTBOX_LOCK_TIMEOUT" ]; then
+    # A lock timeout is retryable for the blocking reader, but this gate gets one
+    # pass and then deletes the outbox, so it is exactly as conservative here as
+    # any other failed read: blocker, nothing cleared, nothing acknowledged.
+    lifecycle_ok=0
+    append_evidence lifecycle 'away-mode inbox lock could not be acquired; undelivered escalations may remain and are preserved on disk - retry catch-up before ordinary work' "$evidence"
+  elif [ "$outbox_rc" -ne 0 ]; then
     lifecycle_ok=0
     append_evidence lifecycle 'away-mode inbox could not be read; undelivered escalations may remain and are preserved on disk - retry catch-up before ordinary work' "$evidence"
   else

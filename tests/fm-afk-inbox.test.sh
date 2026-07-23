@@ -315,25 +315,25 @@ test_an_unreadable_outbox_is_never_reported_as_an_empty_one() {
   hold_outbox_lock "$state" 10
 
   rc=0; FM_AFK_OUTBOX_LOCK_TRIES=2 fm_afk_outbox_pending "$state" >/dev/null || rc=$?
-  [ "$rc" -eq "$FM_AFK_OUTBOX_UNREADABLE" ] \
-    || fail "a pending read that could not take the lock must report unreadable, got rc=$rc"
+  [ "$rc" -eq "$FM_AFK_OUTBOX_LOCK_TIMEOUT" ] \
+    || fail "a pending read that could not take the lock must report the lock timeout, got rc=$rc"
 
   rc=0; out=$(FM_AFK_OUTBOX_LOCK_TRIES=2 fm_afk_outbox_pending_count "$state") || rc=$?
-  [ "$rc" -eq "$FM_AFK_OUTBOX_UNREADABLE" ] \
-    || fail "pending_count must report unreadable rather than a count, got rc=$rc"
+  [ "$rc" -eq "$FM_AFK_OUTBOX_LOCK_TIMEOUT" ] \
+    || fail "pending_count must report the lock timeout rather than a count, got rc=$rc"
   [ -z "$out" ] || fail "pending_count printed '$out' for an outbox it could not read"
 
   rc=0; out=$(FM_AFK_OUTBOX_LOCK_TRIES=2 fm_afk_outbox_pending_report "$state") || rc=$?
-  [ "$rc" -eq "$FM_AFK_OUTBOX_UNREADABLE" ] \
-    || fail "pending_report must report unreadable rather than empty evidence, got rc=$rc"
+  [ "$rc" -eq "$FM_AFK_OUTBOX_LOCK_TIMEOUT" ] \
+    || fail "pending_report must report the lock timeout rather than empty evidence, got rc=$rc"
 
   rc=0; out=$(FM_AFK_OUTBOX_LOCK_TRIES=2 fm_afk_outbox_oldest_pending_epoch "$state") || rc=$?
-  [ "$rc" -eq "$FM_AFK_OUTBOX_UNREADABLE" ] \
-    || fail "oldest_pending_epoch must report unreadable rather than 'nothing pending', got rc=$rc"
+  [ "$rc" -eq "$FM_AFK_OUTBOX_LOCK_TIMEOUT" ] \
+    || fail "oldest_pending_epoch must report the lock timeout rather than 'nothing pending', got rc=$rc"
 
   rc=0; out=$(FM_AFK_OUTBOX_LOCK_TRIES=2 fm_afk_outbox_deliver "$state") || rc=$?
-  [ "$rc" -eq "$FM_AFK_OUTBOX_DELIVER_UNREADABLE" ] \
-    || fail "deliver must distinguish an unreadable outbox from an empty one, got rc=$rc"
+  [ "$rc" -eq "$FM_AFK_OUTBOX_DELIVER_LOCK_TIMEOUT" ] \
+    || fail "deliver must distinguish a lock timeout from an empty outbox, got rc=$rc"
   [ -z "$out" ] || fail "deliver printed records it never read: $out"
 
   release_outbox_lock
@@ -552,8 +552,10 @@ test_reader_exits_non_zero_when_the_outbox_cannot_be_read() {
   out=$(FM_AFK_OUTBOX_LOCK_TRIES=2 run_inbox "$state" --once) || rc=$?
   release_outbox_lock
 
-  [ "$rc" -ne 0 ] || fail "the reader exited 0 on an unreadable outbox: $out"
-  assert_contains "$out" "could not be read" "the reader did not name the read failure: $out"
+  # A single-shot run has no next poll to retry the acquire on, so its only honest
+  # outcome is the same loud non-zero exit any other failed read gets.
+  [ "$rc" -ne 0 ] || fail "the reader exited 0 on an outbox it could not read: $out"
+  assert_contains "$out" "could not be acquired" "the reader did not name the read failure: $out"
   case "$out" in
     *"afk-inbox: nothing pending"*|*"afk-inbox: idle after"*|*"afk-inbox: delivered "*)
       fail "the reader printed a healthy status line for a failed read: $out" ;;
@@ -710,6 +712,101 @@ test_real_daemon_without_a_backend_delivers_to_the_reader() {
   pass "a real daemon with no terminal backend delivers escalations to the reader, unbuffered and without a wedge alarm"
 }
 
+# A lock timeout is transient by nature: the daemon holds the outbox lock for
+# short mutations, and another reader or the return gate can hold it too. Dying on
+# one would take down the very delivery channel this path exists to provide, so
+# the reader must keep waiting and deliver as soon as the lock frees.
+test_a_transient_lock_timeout_keeps_the_reader_alive() {
+  local state pid rc out
+  state=$(make_inbox_case transient-lock)
+  enter_away "$state"
+  append_digest "$state" "Supervisor escalate (1 event(s)): mu.status: blocked: needs a token"
+
+  hold_outbox_lock "$state" 4
+  FM_STATE_OVERRIDE="$state" FM_AFK_OUTBOX_LOCK_TRIES=2 \
+    "$INBOX" --poll 1 --timeout 60 > "$state/reader.out" 2>&1 &
+  pid=$!
+  sleep 2
+  kill -0 "$pid" 2>/dev/null || fail "the reader died on a transient lock timeout: $(cat "$state/reader.out")"
+
+  release_outbox_lock
+  wait_pid_exit "$pid" 200
+  rc=$?
+  out=$(cat "$state/reader.out")
+  [ "$rc" -eq 0 ] || fail "the reader did not exit cleanly once the lock freed (rc=$rc): $out"
+  assert_contains "$out" "mu.status: blocked: needs a token" "the record was not delivered after the lock freed"
+  assert_not_contains "$out" "nothing pending" "a lock timeout was reported as an empty outbox"
+  pass "a lock timeout that clears is retried and delivered rather than killing the reader"
+}
+
+# Retrying has to be BOUNDED. A lock nobody ever releases must end in a loud
+# non-zero exit that names the lock, not a reader that looks armed forever while
+# records sit undelivered - that silence is what this whole path removes.
+test_a_lock_that_never_clears_ends_the_reader_within_its_bound() {
+  local state pid rc out started elapsed
+  state=$(make_inbox_case wedged-lock)
+  enter_away "$state"
+  append_digest "$state" "Supervisor escalate (1 event(s)): nu.status: failed: CI red"
+
+  hold_outbox_lock "$state" 60
+  started=$(date +%s)
+  FM_STATE_OVERRIDE="$state" FM_AFK_OUTBOX_LOCK_TRIES=2 FM_AFK_INBOX_LOCK_TIMEOUT_MAX=3 \
+    "$INBOX" --poll 1 --timeout 60 > "$state/reader.out" 2>&1 &
+  pid=$!
+  wait_pid_exit "$pid" 200
+  rc=$?
+  elapsed=$(( $(date +%s) - started ))
+  out=$(cat "$state/reader.out")
+  release_outbox_lock
+
+  [ "$rc" -eq 1 ] || fail "a lock that never clears must exit non-zero within the stated bound (rc=$rc): $out"
+  [ "$elapsed" -lt 20 ] || fail "the reader took ${elapsed}s to give up on a wedged lock"
+  assert_contains "$out" "$FM_AFK_OUTBOX_LOCK_NAME" "the give-up message did not name the lock it could not acquire"
+  case "$out" in
+    *"afk-inbox: nothing pending"*|*"afk-inbox: idle after"*|*"afk-inbox: delivered "*)
+      fail "the reader printed a healthy status line for a wedged lock: $out" ;;
+  esac
+  [ ! -e "$state/.afk-outbox.ack" ] || fail "a timed-out read acknowledged records it never delivered"
+  [ "$(fm_afk_outbox_pending_count "$state")" -eq 1 ] \
+    || fail "the record did not stay pending after the reader gave up"
+  pass "a lock that never clears ends the reader non-zero within its bound, outbox intact"
+}
+
+# The mktemp templates and the cleanup globs must come from the SAME constants, or
+# renaming one silently orphans temp files that fresh-entry clearing and the
+# launcher's rollback no longer remove.
+test_transient_temp_templates_track_their_artifact_constants() {
+  local state template glob matched
+  state=$(make_inbox_case temp-template-constants)
+  (
+    mktemp() { printf '%s\n' "${*##*/}" >> "$state/mktemp.args"; command mktemp "$@"; }
+    FM_AFK_OUTBOX_ACK_NAME=".renamed-ack"
+    FM_AFK_DELIVERY_MODE_NAME=".renamed-delivery"
+    fm_afk_outbox_ack "$state" 1 || exit 1
+    fm_afk_delivery_mode_record "$state" paneless || exit 1
+    FM_AFK_OUTBOX_ACK_NAME=".renamed-ack" FM_AFK_DELIVERY_MODE_NAME=".renamed-delivery" \
+      fm_afk_outbox_transient_artifact_globs > "$state/globs"
+  ) || fail "the renamed-constant probe failed"
+
+  [ -s "$state/mktemp.args" ] || fail "no temp template was recorded"
+  [ -e "$state/.renamed-ack" ] || fail "the acknowledgement mark did not follow its renamed constant"
+  [ -e "$state/.renamed-delivery" ] || fail "the delivery-mode record did not follow its renamed constant"
+
+  while IFS= read -r template; do
+    matched=0
+    while IFS= read -r glob; do
+      [ -n "$glob" ] || continue
+      # shellcheck disable=SC2254 # $glob is a pattern on purpose.
+      case "$template" in
+        $glob) matched=1; break ;;
+      esac
+    done < "$state/globs"
+    [ "$matched" -eq 1 ] \
+      || fail "temp template '$template' matches no cleanup glob; the templates and the globs have drifted apart"
+  done < "$state/mktemp.args"
+  pass "every temp template is derived from the same constant as its cleanup glob"
+}
+
 test_reader_delivers_pending_records_then_acknowledges_them
 test_killed_reader_loses_nothing
 test_reader_wakes_on_a_record_written_while_it_waits
@@ -727,4 +824,7 @@ test_acknowledged_records_are_compacted_without_losing_pending_ones
 test_reader_exits_non_zero_when_the_outbox_cannot_be_read
 test_concurrent_readers_never_announce_what_they_did_not_deliver
 test_every_exit_line_carries_a_re_arm_verdict
+test_a_transient_lock_timeout_keeps_the_reader_alive
+test_a_lock_that_never_clears_ends_the_reader_within_its_bound
+test_transient_temp_templates_track_their_artifact_constants
 test_real_daemon_without_a_backend_delivers_to_the_reader
