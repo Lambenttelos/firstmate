@@ -31,12 +31,13 @@
 # channel is healthy. In particular, a failed read is never reported as an empty
 # outbox: it never gets an idle or nothing-pending line.
 #
-# LIVENESS. While it waits, this reader stamps state/.afk-inbox.beat on every
-# poll iteration and on every acknowledgement, the same way bin/fm-watch.sh
-# stamps state/.last-watcher-beat. The daemon's paneless undelivered-escalation
-# alarm reads that beacon so it can tell "nobody is going to read this" from
-# "firstmate is armed and simply mid-turn"; without it, any turn longer than the
-# max-defer window would alarm the captain on the healthy path. The beacon is
+# LIVENESS. This reader stamps state/.afk-inbox.beat as its first action when it
+# arms, on every poll iteration while it waits, and on every acknowledgement, the
+# same way bin/fm-watch.sh stamps state/.last-watcher-beat. The daemon's paneless
+# undelivered-escalation alarm reads that beacon so it can tell "nobody is going
+# to read this" from "firstmate is armed and simply mid-turn"; without it, any
+# turn longer than the max-defer window would alarm the captain on the healthy
+# path. The daemon owns how stale the stamp must be. The beacon is
 # session-scoped and cleared on fresh away entry, so a previous session's stamp
 # can never make a reader that is not running look alive.
 #

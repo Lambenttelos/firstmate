@@ -109,7 +109,10 @@ All of these are session-scoped delivery state: `bin/fm-afk-start.sh` clears the
 A read of the outbox that fails is never treated as an outbox that is empty: the reader exits non-zero rather than printing a healthy idle line, and return catch-up reports the failure as a blocker and leaves the records on disk instead of deleting escalations it never read.
 Because appending to the outbox always succeeds, the pane path's max-defer wedge alarm cannot detect a stall here, so the daemon raises that same alarm from the age of the oldest unacknowledged record when it exceeds `FM_MAX_DEFER_SECS`, and clears it once the reader has acknowledged everything.
 That alarm also requires the reader's liveness beacon to be absent or stale, because age alone cannot tell a reader that was never armed from a firstmate that is armed and simply mid-turn, and agent turns longer than the max-defer window are routine.
-The reader stamps `.afk-inbox.beat` on every poll iteration and every acknowledgement, and `FM_AFK_INBOX_BEACON_STALE_SECS` (default 60; invalid or zero uses the default) sets how stale it must be, so a missing or dead reader is still reported within a bounded time rather than silently.
+The reader stamps `.afk-inbox.beat` when it arms, on every poll iteration, and on every acknowledgement, and `FM_AFK_INBOX_BEACON_STALE_SECS` sets how stale it must be.
+Its default is twice `FM_MAX_DEFER_SECS` (600 seconds at defaults; an invalid or zero value uses that derived default) because the window it must survive is one firstmate turn rather than one poll interval: the reader exits as soon as it delivers, so nothing stamps the beacon while firstmate processes the digests and only re-arms it at the end of that turn.
+A reader that is never re-armed, or a firstmate that died, is therefore still reported within that window of its last sign of life rather than silently, and raising `FM_MAX_DEFER_SECS` instead is the wrong fix because that trades the false alarm for a silent gap.
+An alarm whose own inbox read then finds every record already acknowledged records that recovery in the marker and raises no alert, while an inbox that could not be read still alarms.
 The [`afk`](../.agents/skills/afk/SKILL.md) skill owns the operating procedure.
 
 ## Away-mode wedge alarm channels (config/wedge-alarm)
