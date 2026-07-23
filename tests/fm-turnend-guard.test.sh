@@ -994,6 +994,20 @@ test_supervision_state_free_with_dead_holder() {
   pass "fm-afk-daemon-lib: a confidently dead lock holder reads daemon-free"
 }
 
+# A lock link whose owner directory is gone holds nothing and can never become
+# probeable again, so it must read as free rather than latching daemon-owned
+# over a home whose own watcher is the real supervision mechanism.
+test_supervision_state_free_with_dangling_lock() {
+  local dir state
+  dir=$(make_primary_dir "$TMP_ROOT/state-dangling-lock")
+  : > "$dir/state/.afk"
+  ln -s "$dir/state/.supervise-daemon.lock.d" "$dir/state/.supervise-daemon.lock"
+  state=$(daemon_supervision_state "$dir")
+  [ "$state" = free ] || fail "a lock link with no owner directory must read as free, got '$state'"
+  daemon_owns_supervision "$dir" && fail "a lock link with no owner directory must not own supervision"
+  pass "fm-afk-daemon-lib: a dangling daemon lock reads daemon-free"
+}
+
 test_supervision_state_undetermined_without_pid() {
   local dir state
   dir=$(make_primary_dir "$TMP_ROOT/state-unreadable-pid")
@@ -1210,6 +1224,7 @@ test_hook_blocks_when_unhealthy_in_primary
 test_supervision_state_free_without_lock
 test_supervision_state_owned_with_live_daemon
 test_supervision_state_free_with_dead_holder
+test_supervision_state_free_with_dangling_lock
 test_supervision_state_undetermined_without_pid
 test_supervision_state_undetermined_when_probe_fails
 test_hook_afk_without_daemon_silent_with_live_watcher

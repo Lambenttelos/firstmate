@@ -27,10 +27,14 @@
 # needed could be swallowed permanently while the captain is away. So
 # fm_afk_daemon_supervision_state reports undetermined for an unprobeable lock
 # and fm_afk_daemon_owns_supervision treats it as still daemon-owned. Only a
-# genuinely absent lock, or a holder confidently read as dead or as some other
-# process, reads as daemon-free. The boolean fm_afk_daemon_alive keeps its
-# narrower "confidently live" meaning for the start-vs-refresh decision, where
-# the safe direction is the opposite one.
+# genuinely absent or torn-down lock, or a holder confidently read as dead or as
+# some other process, reads as daemon-free. A lock link whose owner directory is
+# already gone belongs in that torn-down group rather than in undetermined: its
+# pid record is unrecoverable, so undetermined would latch daemon-owned forever
+# and leave a daemon-free away-mode home with nothing arming its own watcher.
+# The boolean fm_afk_daemon_alive keeps its narrower "confidently live" meaning
+# for the start-vs-refresh decision, where the safe direction is the opposite
+# one.
 #
 # Sources bin/fm-pid-lib.sh for fm_pid_alive and fm_pid_identity.
 
@@ -40,16 +44,21 @@ FM_AFK_DAEMON_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # fm_afk_daemon_lock_owner <lock-path>
 # Print the owner directory backing the lock (the symlink target for a linked
-# lock, the directory itself for a plain directory lock). Non-zero when no lock.
+# lock, the directory itself for a plain directory lock). Non-zero when no lock,
+# including a dangling link whose owner directory is already gone: the lock
+# protocol discards the owner as it releases, so a link with no owner behind it
+# holds nothing.
 fm_afk_daemon_lock_owner() {
   local lock=$1 owner
   if [ -L "$lock" ]; then
     owner=$(readlink "$lock" 2>/dev/null) || return 1
     [ -n "$owner" ] || return 1
     case "$owner" in
-      /*) printf '%s\n' "$owner" ;;
-      *) printf '%s/%s\n' "$(dirname "$lock")" "$owner" ;;
+      /*) ;;
+      *) owner="$(dirname "$lock")/$owner" ;;
     esac
+    [ -d "$owner" ] || return 1
+    printf '%s\n' "$owner"
     return 0
   fi
   [ -d "$lock" ] || return 1
@@ -112,8 +121,8 @@ fm_afk_daemon_pid_matches() {
 
 # fm_afk_daemon_liveness <lock-path> <daemon-path> [strict]
 # Print live, dead, or undetermined for this home's away-mode daemon lock. An
-# absent lock is dead (nothing holds it); a held lock whose pid or holder cannot
-# be read at all is undetermined.
+# absent lock, or a lock whose owner directory is gone, is dead (nothing holds
+# it); a held lock whose pid or holder cannot be read at all is undetermined.
 fm_afk_daemon_liveness() {
   local lock=$1 daemon=$2 strict=${3:-0} owner pid
   if ! owner=$(fm_afk_daemon_lock_owner "$lock"); then

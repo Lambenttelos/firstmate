@@ -103,7 +103,11 @@ async function isPrimaryRoot(root, home) {
 // unsupervised. bin/fm-afk-daemon-lib.sh stays the single owner of the question;
 // bin/fm-afk-daemon-state.sh is its CLI. When the owner cannot answer at all,
 // keep the pre-daemon-free behavior and let the bare flag suppress arming.
+// Away mode off is the same "free" answer the owner gives, and it is the common
+// case on the session.idle hot path, so answer it here instead of spawning a
+// shell per idle event. Every away-mode-on case still goes to the owner.
 async function daemonOwnsSupervision(paths) {
+  if (!existsSync(`${paths.state}/.afk`)) return false;
   const result = await runProcess("bash", [`${paths.root}/bin/fm-afk-daemon-state.sh`], {
     cwd: paths.root,
     env: {
