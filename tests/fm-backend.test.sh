@@ -112,9 +112,12 @@ BASE_REF=$(resolve_base_ref) \
 # tmux-only conformance run the tmux adapter's behavior is what is under test,
 # and that is unchanged by any later (e.g. non-tmux backend) addition to
 # fm-backend.sh's own dispatch surface.
-OLD_BIN_UNCHANGED_SIBLINGS="fm-gate-refuse-lib.sh fm-guard.sh fm-lock-lib.sh fm-tasks-axi-lib.sh fm-pr-lib.sh fm-tangle-lib.sh fm-tmux-lib.sh fm-composer-lib.sh fm-wake-lib.sh fm-classify-lib.sh fm-supervision-lib.sh fm-ff-lib.sh fm-config-inherit-lib.sh fm-project-mode.sh fm-harness.sh fm-crew-state.sh fm-decision-hold.sh fm-backend.sh"
+OLD_BIN_UNCHANGED_SIBLINGS="fm-gate-refuse-lib.sh fm-guard.sh fm-lock-lib.sh fm-tasks-axi-lib.sh fm-pr-lib.sh fm-tangle-lib.sh fm-tmux-lib.sh fm-composer-lib.sh fm-wake-lib.sh fm-classify-lib.sh fm-supervision-lib.sh fm-ff-lib.sh fm-config-inherit-lib.sh fm-project-mode.sh fm-harness.sh fm-crew-state.sh fm-decision-hold.sh fm-backend.sh fm-transition-lib.sh fm-x-lib.sh fm-check-lib.sh fm-secondmate-context-lib.sh"
 # A pull-request merge may add a new main-only dependency that the branch's older baseline does not have yet.
-OLD_BIN_OPTIONAL_SIBLINGS="fm-pending-reply-lib.sh"
+# fm-operational-input.sh is the current owner fm-marker-lib.sh sources; an
+# older baseline whose marker lib still carried that content itself does not
+# have the file, so it is copied when present rather than required.
+OLD_BIN_OPTIONAL_SIBLINGS="fm-pending-reply-lib.sh fm-operational-input.sh"
 OLD_BIN_REFACTORED="fm-send.sh fm-peek.sh fm-watch.sh fm-spawn.sh fm-teardown.sh fm-marker-lib.sh"
 
 build_old_bin() {  # <name> -> echoes root dir (root/bin/<script> is the entry point)
@@ -135,6 +138,31 @@ build_old_bin() {  # <name> -> echoes root dir (root/bin/<script> is the entry p
     chmod +x "$bin/$f"
   done
   printf '%s\n' "$root"
+}
+
+# Sibling scripts the shim's own files source, by basename. A shim that is
+# missing one does not report a missing file: the old entrypoint aborts at
+# source time under set -eu, the conformance case sees exit 1 against the real
+# script's exit 0, and the failure reads as a behavior divergence that does not
+# exist. Naming the absent sibling directly is the difference between a
+# one-line list fix and re-deriving this from a bare exit code.
+old_bin_sourced_siblings() {  # <bin-dir>
+  sed -n 's/^[[:space:]]*\.[[:space:]]*"\$[A-Za-z_][A-Za-z0-9_]*\(\/bin\)\{0,1\}\/\(fm-[A-Za-z0-9-]*\.sh\)".*/\2/p' \
+    "$1"/*.sh | sort -u
+}
+
+test_old_bin_shim_is_complete() {
+  local root bin dep missing=""
+  root=$(build_old_bin shim-completeness)
+  bin="$root/bin"
+  while IFS= read -r dep; do
+    [ -n "$dep" ] || continue
+    [ -f "$bin/$dep" ] || missing="$missing $dep"
+  done <<EOF
+$(old_bin_sourced_siblings "$bin")
+EOF
+  [ -z "$missing" ] || fail "the pre-refactor bin/ shim is missing sibling scripts its own files source:$missing"$'\n'"add each to OLD_BIN_UNCHANGED_SIBLINGS or OLD_BIN_OPTIONAL_SIBLINGS in this file"
+  pass "the pre-refactor bin/ shim carries every sibling its scripts source"
 }
 
 # --- fm-backend.sh unit tests ------------------------------------------------
@@ -1072,6 +1100,7 @@ test_spawn_autodetect_nesting_resolves_tmux_silently() {
   pass "fm-spawn.sh: auto-detect resolves nested tmux-in-herdr to tmux and stays silent end to end"
 }
 
+test_old_bin_shim_is_complete
 test_backend_name_precedence
 test_backend_detect_precedence
 test_backend_detect_cmux_fallback_bundle_id
