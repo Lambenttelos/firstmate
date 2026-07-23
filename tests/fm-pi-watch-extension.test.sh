@@ -1221,6 +1221,113 @@ EOF
   pass "OpenCode watcher plugin requires session lock ownership"
 }
 
+# Away mode alone is only the away posture. bin/fm-afk-daemon-lib.sh owns the
+# ownership question for the whole repo and the plugin asks it through
+# bin/fm-afk-daemon-state.sh, so an OpenCode home in daemon-free away mode still
+# gets its watcher armed while a daemon-owned home keeps today's behavior.
+install_opencode_afk_fixture() {
+  local repo=$1 home=$2
+  mkdir -p "$repo/bin" "$home/state" "$home/config"
+  git init -q "$repo"
+  : > "$repo/AGENTS.md"
+  : > "$home/state/task.meta"
+  : > "$home/state/.afk"
+  cp "$ROOT/bin/fm-afk-daemon-state.sh" "$repo/bin/fm-afk-daemon-state.sh"
+  cp "$ROOT/bin/fm-afk-daemon-lib.sh" "$repo/bin/fm-afk-daemon-lib.sh"
+  cp "$ROOT/bin/fm-pid-lib.sh" "$repo/bin/fm-pid-lib.sh"
+  chmod +x "$repo/bin/fm-afk-daemon-state.sh"
+  cat > "$repo/bin/fm-watch-arm.sh" <<'SH'
+#!/usr/bin/env bash
+printf 'arm\n' >> "${FM_ARM_LOG:?}"
+printf 'watcher: healthy pid=1 (beacon 0s)\n'
+SH
+  chmod +x "$repo/bin/fm-watch-arm.sh"
+}
+
+test_opencode_plugin_arms_in_daemon_free_afk() {
+  local plugin repo home log out status
+  plugin="$ROOT/.opencode/plugins/fm-primary-watch-arm.js"
+  repo="$TMP_ROOT/opencode-afk-free-root"
+  home="$TMP_ROOT/opencode-afk-free-home"
+  log="$TMP_ROOT/opencode-afk-free.log"
+  install_opencode_afk_fixture "$repo" "$home"
+  out=$(PLUGIN="$plugin" WORKTREE="$repo" FM_HOME="$home" FM_ARM_LOG="$log" node 2>&1 <<'EOF'
+import { existsSync, writeFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+const mod = await import(pathToFileURL(process.env.PLUGIN).href);
+const client = { session: { promptAsync: async () => {} } };
+const hooks = await mod.FmPrimaryWatchArm({
+  client,
+  directory: process.env.WORKTREE,
+  worktree: process.env.WORKTREE,
+});
+writeFileSync(`${process.env.FM_HOME}/state/.lock`, `${process.pid}\n`);
+await hooks.event({ event: { type: "session.idle", properties: { sessionID: "session-test" } } });
+for (let i = 0; i < 250 && !existsSync(process.env.FM_ARM_LOG); i += 1) {
+  await new Promise((resolve) => setTimeout(resolve, 20));
+}
+if (!existsSync(process.env.FM_ARM_LOG)) {
+  console.error("watch arm did not run in daemon-free away mode");
+  process.exit(1);
+}
+EOF
+)
+  status=$?
+  expect_code 0 "$status" "OpenCode watch plugin must arm in daemon-free away mode"
+  [ -z "$out" ] || fail "OpenCode daemon-free away test printed output: $out"
+  pass "OpenCode watcher plugin arms in daemon-free away mode"
+}
+
+test_opencode_plugin_skips_arm_when_daemon_owns_supervision() {
+  local plugin repo home log pid identity out status
+  plugin="$ROOT/.opencode/plugins/fm-primary-watch-arm.js"
+  repo="$TMP_ROOT/opencode-afk-owned-root"
+  home="$TMP_ROOT/opencode-afk-owned-home"
+  log="$TMP_ROOT/opencode-afk-owned.log"
+  install_opencode_afk_fixture "$repo" "$home"
+  sleep 60 &
+  pid=$!
+  identity=$(bash -c '. "$1"; fm_pid_identity "$2"' _ "$repo/bin/fm-pid-lib.sh" "$pid") || {
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    fail "could not identify the live daemon holder"
+  }
+  mkdir -p "$home/state/.supervise-daemon.lock"
+  printf '%s\n' "$pid" > "$home/state/.supervise-daemon.lock/pid"
+  printf '%s\n' "$identity" > "$home/state/.supervise-daemon.lock/pid-identity"
+  out=$(PLUGIN="$plugin" WORKTREE="$repo" FM_HOME="$home" FM_ARM_LOG="$log" node 2>&1 <<'EOF'
+import { existsSync, writeFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+const mod = await import(pathToFileURL(process.env.PLUGIN).href);
+const client = { session: { promptAsync: async () => {} } };
+await mod.FmPrimaryWatchArm({
+  client,
+  directory: process.env.WORKTREE,
+  worktree: process.env.WORKTREE,
+});
+writeFileSync(`${process.env.FM_HOME}/state/.lock`, `${process.pid}\n`);
+const status = await globalThis.__firstmateOpenCodeWatchArm.ensureArmed("session-test", client);
+await new Promise((resolve) => setTimeout(resolve, 120));
+if (status !== "not-needed") {
+  console.error(`expected not-needed, got ${status}`);
+  process.exit(1);
+}
+if (existsSync(process.env.FM_ARM_LOG)) {
+  console.error("watch arm ran while a live daemon owned supervision");
+  process.exit(1);
+}
+EOF
+)
+  status=$?
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  expect_code 0 "$status" "OpenCode watch plugin must not arm while a live daemon owns supervision"
+  [ -z "$out" ] || fail "OpenCode daemon-owned away test printed output: $out"
+  pass "OpenCode watcher plugin leaves supervision to a live away-mode daemon"
+}
+
 test_opencode_watch_arm_coordinator_respects_primary_scope() {
   local plugin base repo home log out status
   plugin="$ROOT/.opencode/plugins/fm-primary-watch-arm.js"
@@ -2019,6 +2126,8 @@ test_opencode_plugin_package_boundary_is_explicit_esm
 test_opencode_primary_watch_plugin_uses_effective_state_home
 test_opencode_primary_watch_plugin_sources_effective_config
 test_opencode_primary_watch_plugin_requires_session_lock
+test_opencode_plugin_arms_in_daemon_free_afk
+test_opencode_plugin_skips_arm_when_daemon_owns_supervision
 test_opencode_watch_arm_coordinator_respects_primary_scope
 test_opencode_primary_watch_plugin_rearms_after_wake
 test_opencode_pre_ready_actionable_close_preserves_its_successor

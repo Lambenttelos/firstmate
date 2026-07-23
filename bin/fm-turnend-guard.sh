@@ -107,10 +107,7 @@ if [ "$FM_SUP_WATCHER_FRESH" = true ]; then
 else
   detail=$(printf 'no live watcher holds this home lock (last beat: %s)' "$FM_SUP_BEACON_DESC")
 fi
-situation=$(printf '%s task(s) in flight, but %s' "$FM_SUP_IN_FLIGHT" "$detail")
-if [ "$afk" -eq 0 ] && [ -e "$STATE/.afk" ]; then
-  situation=$(printf '%s task(s) in flight, away mode is on with no supervision daemon, and %s' "$FM_SUP_IN_FLIGHT" "$detail")
-fi
+situation=$(fm_afk_posture_situation "$STATE" "$afk" "$FM_SUP_IN_FLIGHT" "$detail")
 
 x_mode=0
 [ -f "$CONFIG/x-mode.env" ] && x_mode=1

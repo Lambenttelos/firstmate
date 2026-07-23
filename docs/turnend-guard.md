@@ -37,6 +37,9 @@ A fresh leftover beacon blocks if the watcher lock is missing, dead, or identity
 Away mode alone does not transfer watcher ownership.
 `bin/fm-afk-daemon-lib.sh` owns the question for the whole repo: `fm_afk_daemon_owns_supervision <state-dir> <bin-dir>` is true only when `state/.afk` exists AND a live away-mode supervision daemon actually holds this home's `state/.supervise-daemon.lock`.
 Home scoping comes from that per-home lock path and the pid identity recorded beside it, so another home's daemon can never satisfy the check.
+`fm_afk_daemon_supervision_state` reports the three outcomes behind that boolean - `owned`, `free`, and `undetermined` - and an `undetermined` probe counts as owned.
+Only an absent lock, or a holder confidently read as dead or as some other process, reads as daemon-free, so a lock whose holder cannot be probed at all never lets the watcher triage alongside a live daemon.
+`bin/fm-afk-daemon-state.sh` is the CLI over that state, so the OpenCode auto-arm plugin asks the same owner instead of reading the flag itself.
 Strict matching adds no cross-home discrimination, because scripts come from the shared tracked code root; it only rejects a live process that is not this repo's `bin/fm-supervise-daemon.sh` when no pid identity was recorded.
 The turn-end guard, the watcher's triage gate in `bin/fm-watch.sh`, the pull-based banner in `bin/fm-guard.sh`, and the session-start digest all ask that one function rather than reading the flag.
 

@@ -930,6 +930,109 @@ record_daemon_lock() {
   printf '%s\n' "$identity" > "$dir/state/.supervise-daemon.lock/pid-identity"
 }
 
+# --- OWNERSHIP STATE: bin/fm-afk-daemon-lib.sh ------------------------------
+#
+# fm_afk_daemon_supervision_state has three outcomes, and the fail direction
+# matters: an unprobeable lock must read as still daemon-owned so the watcher
+# never runs its own triage alongside a live daemon.
+
+daemon_supervision_state() {  # <dir> [path] [proc-root]
+  local dir=$1 path_override=${2:-$PATH} proc_override=${3:-}
+  PATH="$path_override" FM_PROC_ROOT_OVERRIDE="$proc_override" \
+    bash -c '. "$1"; fm_afk_daemon_supervision_state "$2" "$3"' \
+    _ "$dir/bin/fm-afk-daemon-lib.sh" "$dir/state" "$dir/bin"
+}
+
+daemon_owns_supervision() {  # <dir> [path] [proc-root]
+  local dir=$1 path_override=${2:-$PATH} proc_override=${3:-}
+  PATH="$path_override" FM_PROC_ROOT_OVERRIDE="$proc_override" \
+    bash -c '. "$1"; fm_afk_daemon_owns_supervision "$2" "$3"' \
+    _ "$dir/bin/fm-afk-daemon-lib.sh" "$dir/state" "$dir/bin"
+}
+
+test_supervision_state_free_without_lock() {
+  local dir state
+  dir=$(make_primary_dir "$TMP_ROOT/state-no-lock")
+  : > "$dir/state/.afk"
+  state=$(daemon_supervision_state "$dir")
+  [ "$state" = free ] || fail "away mode with no daemon lock must read as free, got '$state'"
+  daemon_owns_supervision "$dir" && fail "no daemon lock must not read as daemon-owned"
+  pass "fm-afk-daemon-lib: away mode with no daemon lock reads daemon-free"
+}
+
+test_supervision_state_owned_with_live_daemon() {
+  local dir pid identity state owned
+  dir=$(make_primary_dir "$TMP_ROOT/state-live-daemon")
+  : > "$dir/state/.afk"
+  sleep 60 &
+  pid=$!
+  identity=$(watcher_identity "$dir" "$pid") || {
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    fail "could not identify live daemon holder"
+  }
+  record_daemon_lock "$dir" "$pid" "$identity"
+  state=$(daemon_supervision_state "$dir")
+  owned=0
+  daemon_owns_supervision "$dir" && owned=1
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  [ "$state" = owned ] || fail "a live identity-matched daemon must read as owned, got '$state'"
+  [ "$owned" -eq 1 ] || fail "a live identity-matched daemon must own supervision"
+  pass "fm-afk-daemon-lib: a live identity-matched daemon reads daemon-owned"
+}
+
+test_supervision_state_free_with_dead_holder() {
+  local dir dead state
+  dir=$(make_primary_dir "$TMP_ROOT/state-dead-daemon")
+  : > "$dir/state/.afk"
+  dead=$(nonexistent_pid)
+  record_daemon_lock "$dir" "$dead" "linux-starttime=1 cmdline-hex=00"
+  state=$(daemon_supervision_state "$dir")
+  [ "$state" = free ] || fail "a confidently dead holder must read as free, got '$state'"
+  daemon_owns_supervision "$dir" && fail "a confidently dead holder must not own supervision"
+  pass "fm-afk-daemon-lib: a confidently dead lock holder reads daemon-free"
+}
+
+test_supervision_state_undetermined_without_pid() {
+  local dir state
+  dir=$(make_primary_dir "$TMP_ROOT/state-unreadable-pid")
+  : > "$dir/state/.afk"
+  mkdir -p "$dir/state/.supervise-daemon.lock"
+  state=$(daemon_supervision_state "$dir")
+  [ "$state" = undetermined ] || fail "a held lock with no readable pid must read as undetermined, got '$state'"
+  daemon_owns_supervision "$dir" || fail "an undetermined probe must keep supervision daemon-owned"
+  pass "fm-afk-daemon-lib: a held lock with an unreadable pid stays daemon-owned"
+}
+
+# The identity probe itself fails here (no /proc to read, ps shimmed to fail)
+# while the holder is genuinely alive - the transient hiccup that must never be
+# mistaken for a departed daemon.
+test_supervision_state_undetermined_when_probe_fails() {
+  local dir pid fakebin proc_root state owned
+  dir=$(make_primary_dir "$TMP_ROOT/state-probe-fails")
+  : > "$dir/state/.afk"
+  fakebin=$(fm_fakebin "$dir")
+  proc_root="$dir/empty-proc"
+  mkdir -p "$proc_root"
+  cat > "$fakebin/ps" <<'SH'
+#!/usr/bin/env bash
+exit 1
+SH
+  chmod +x "$fakebin/ps"
+  sleep 60 &
+  pid=$!
+  record_daemon_lock "$dir" "$pid" "recorded-identity-that-cannot-be-reread"
+  state=$(daemon_supervision_state "$dir" "$fakebin:$PATH" "$proc_root")
+  owned=0
+  daemon_owns_supervision "$dir" "$fakebin:$PATH" "$proc_root" && owned=1
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  [ "$state" = undetermined ] || fail "a failed liveness probe must read as undetermined, got '$state'"
+  [ "$owned" -eq 1 ] || fail "a failed liveness probe must keep supervision daemon-owned"
+  pass "fm-afk-daemon-lib: a failed liveness probe stays daemon-owned"
+}
+
 test_hook_afk_without_daemon_silent_with_live_watcher() {
   local dir pid identity out status
   dir=$(make_primary_dir "$TMP_ROOT/hook-afk-nodaemon-live")
@@ -1104,6 +1207,11 @@ test_hook_blocks_when_dead_lock_has_fresh_beacon
 test_hook_silent_with_live_lock_and_fresh_beacon
 test_hook_blocks_with_live_lock_and_stale_beacon
 test_hook_blocks_when_unhealthy_in_primary
+test_supervision_state_free_without_lock
+test_supervision_state_owned_with_live_daemon
+test_supervision_state_free_with_dead_holder
+test_supervision_state_undetermined_without_pid
+test_supervision_state_undetermined_when_probe_fails
 test_hook_afk_without_daemon_silent_with_live_watcher
 test_hook_afk_without_daemon_blocks_with_rearm_reason
 test_hook_afk_without_daemon_fresh_beacon_message_is_consistent

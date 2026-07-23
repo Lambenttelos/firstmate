@@ -96,8 +96,32 @@ async function isPrimaryRoot(root, home) {
   return gitDir.stdout.trim() === commonDir.stdout.trim();
 }
 
-function shouldArm(paths) {
-  if (existsSync(`${paths.state}/.afk`)) return false;
+// Away mode alone is only the away posture. A home whose captain session runs
+// outside any injectable supervisor pane deliberately runs away mode with NO
+// daemon, and its own watcher stays the real supervision mechanism - this plugin
+// owns arming it, so gating on the bare state/.afk flag would leave that home
+// unsupervised. bin/fm-afk-daemon-lib.sh stays the single owner of the question;
+// bin/fm-afk-daemon-state.sh is its CLI. When the owner cannot answer at all,
+// keep the pre-daemon-free behavior and let the bare flag suppress arming.
+async function daemonOwnsSupervision(paths) {
+  const result = await runProcess("bash", [`${paths.root}/bin/fm-afk-daemon-state.sh`], {
+    cwd: paths.root,
+    env: {
+      ...process.env,
+      FM_HOME: paths.home,
+      FM_ROOT_OVERRIDE: paths.root,
+      FM_STATE_OVERRIDE: paths.state,
+      FM_CONFIG_OVERRIDE: paths.config,
+    },
+  });
+  const state = result.stdout.trim().split(/\r?\n/).pop() ?? "";
+  if (state === "owned" || state === "undetermined") return true;
+  if (state === "free") return false;
+  return existsSync(`${paths.state}/.afk`);
+}
+
+async function shouldArm(paths) {
+  if (await daemonOwnsSupervision(paths)) return false;
   if (existsSync(`${paths.config}/x-mode.env`)) return true;
   try {
     return readdirSync(paths.state).some((name) => name.endsWith(".meta"));
@@ -379,7 +403,7 @@ async function beginArm(paths, sessionID, client, predecessorArmPid) {
   if (!(await sessionOwnsLock(paths))) return { status: "read-only", armChild: null };
   if (child) return { status: "existing", armChild: child };
   if (retryTimer) return { status: "retrying", armChild: null };
-  if (!shouldArm(paths)) return { status: "not-needed", armChild: null };
+  if (!(await shouldArm(paths))) return { status: "not-needed", armChild: null };
   return { status: "spawned", armChild: spawnArm(paths, sessionID, client, predecessorArmPid) };
 }
 

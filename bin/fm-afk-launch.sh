@@ -337,7 +337,11 @@ fm_afk_launch_reconcile() {
   fm_afk_launch_record_read
   read_result=$?
   if [ "$read_result" -eq 0 ]; then
-    fm_afk_launch_log "reconciling leaked daemon terminal ${FM_AFK_REC_BACKEND}:${FM_AFK_REC_TARGET}"
+    # A "none" record never owned a terminal (a daemon-free or native entry), so
+    # clearing it leaks nothing and must not be reported as a leak.
+    if [ "$FM_AFK_REC_BACKEND" != none ]; then
+      fm_afk_launch_log "reconciling leaked daemon terminal ${FM_AFK_REC_BACKEND}:${FM_AFK_REC_TARGET}"
+    fi
     fm_afk_launch_close_recorded
   elif [ "$read_result" -eq 2 ]; then
     return 1
