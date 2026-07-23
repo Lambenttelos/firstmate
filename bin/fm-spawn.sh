@@ -815,8 +815,26 @@ real_path_or_raw() {  # <path>
 # herdr-sm-spaces-k4). Both branches converge on the same $T ("target") string
 # that every downstream operation (send/capture/kill) already treats as opaque
 # per-backend routing (fm_backend_resolve_selector).
+# Physical path of a checkout's shared git directory. git-common-dir is the
+# object store every worktree of one clone shares, so two checkouts agree here
+# if and only if they belong to the SAME clone. `rev-parse --git-common-dir`
+# may answer relative to its -C directory (and older git has no
+# --path-format=absolute), so resolve it here rather than trusting the raw
+# string.
+git_common_dir_real() {  # <dir>
+  local dir=$1 common
+  common=$(git -C "$dir" rev-parse --git-common-dir 2>/dev/null) || return 1
+  [ -n "$common" ] || return 1
+  case "$common" in
+    /*) ;;
+    *) common="$dir/$common" ;;
+  esac
+  (cd "$common" 2>/dev/null && pwd -P) || return 1
+}
+
 validate_spawn_worktree() {  # <source> <inspect-target>
   local source=$1 inspect_target=$2 wt_real proj_real wt_top wt_top_real
+  local wt_common proj_common
   wt_real=
   if ! wt_real=$(cd "$WT" 2>/dev/null && pwd -P); then
     wt_real=
@@ -829,6 +847,23 @@ validate_spawn_worktree() {  # <source> <inspect-target>
   fi
   if [ -z "$wt_real" ] || [ -z "$wt_top_real" ] || [ "$wt_real" != "$wt_top_real" ] || [ "$wt_real" = "$proj_real" ]; then
     echo "error: $source did not yield an isolated worktree (resolved '$WT'; worktree root '${wt_top:-none}'; primary '$PROJ_ABS'); refusing to launch to avoid tangling the primary checkout. Inspect target $inspect_target" >&2
+    exit 1
+  fi
+  # Isolation alone is not enough: one treehouse pool can be shared by two
+  # separate clones of the same repo (a main home's projects/<name> and a
+  # secondmate home's projects/<name>), so `treehouse get` can hand back a
+  # perfectly real, perfectly isolated worktree of the WRONG clone. Every check
+  # above passes for such a slot. The crew then commits into another home's
+  # object store, where its branch is invisible to the home that dispatched it,
+  # and every repo-scoped tool it runs - no-mistakes included - resolves to that
+  # foreign clone. Comparing the shared git directory is the only test that
+  # separates the two cases. An indeterminate reading refuses too: a worktree
+  # whose owning clone cannot be established is exactly the state this assertion
+  # exists to keep off the fleet.
+  wt_common=$(git_common_dir_real "$WT" || true)
+  proj_common=$(git_common_dir_real "$PROJ_ABS" || true)
+  if [ -z "$wt_common" ] || [ -z "$proj_common" ] || [ "$wt_common" != "$proj_common" ]; then
+    echo "error: $source yielded a worktree of a different clone (resolved '$WT' belongs to '${wt_common:-unknown}'; project '$PROJ_ABS' belongs to '${proj_common:-unknown}'); refusing to launch so the task cannot commit into another copy of this repo. Inspect target $inspect_target" >&2
     exit 1
   fi
 }
