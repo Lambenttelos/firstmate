@@ -142,6 +142,9 @@ make_fake_ps_claude() {
 
 make_fake_ps_harness() {
   local fakebin=$1 harness=$2
+  # Only the harness-ancestry queries are faked; anything else (notably
+  # fm_pid_identity's `-o lstart= -o command=`) falls through to the real ps, so
+  # a test that records a genuine live-process identity still reads back a match.
   cat > "$fakebin/ps" <<'SH'
 #!/usr/bin/env bash
 set -u
@@ -150,7 +153,7 @@ case "$*" in
   *"comm="*) printf '/usr/local/bin/%s\n' "$harness"; exit 0 ;;
   *"args="*) printf '%s\n' "$harness"; exit 0 ;;
 esac
-exit 1
+exec /bin/ps "$@"
 SH
   chmod +x "$fakebin/ps"
   printf '%s\n' "$harness" > "$fakebin/.harness-name"
@@ -751,9 +754,52 @@ EOF
   pass "session start emits X-mode cadence guidance in the harness supervision block"
 }
 
+# hold_afk_daemon_lock <home>: hold this home's away-mode daemon lock with a real
+# live process and print its pid, so the digest sees a daemon that actually owns
+# supervision. The identity file is what fm_afk_daemon_alive matches.
+hold_afk_daemon_lock() {
+  local home=$1 pid identity
+  sleep 120 >/dev/null 2>&1 &
+  pid=$!
+  identity=$(bash -c '. "$1"; fm_pid_identity "$2"' _ "$ROOT/bin/fm-wake-lib.sh" "$pid") || {
+    kill "$pid" 2>/dev/null || true
+    return 1
+  }
+  mkdir -p "$home/state/.supervise-daemon.lock"
+  printf '%s\n' "$pid" > "$home/state/.supervise-daemon.lock/pid"
+  printf '%s\n' "$identity" > "$home/state/.supervise-daemon.lock/pid-identity"
+  printf '%s\n' "$pid"
+}
+
 test_next_step_afk_delegates_to_daemon() {
-  local rec root home fakebin out
+  local rec root home fakebin out daemon_pid
   rec=$(new_world next-step-afk)
+  IFS='|' read -r root home fakebin <<EOF
+$rec
+EOF
+  make_fake_toolchain "$fakebin"
+  make_fake_ps_claude "$fakebin"
+  : > "$home/state/.afk"
+  daemon_pid=$(hold_afk_daemon_lock "$home") || fail "could not hold the away-mode daemon lock"
+
+  out=$(run_session_start "$home" "$root" "$fakebin:$BASE_PATH")
+  kill "$daemon_pid" 2>/dev/null || true
+
+  assert_contains "$out" "away-mode supervision is active" "AFK digest did not report away mode"
+  assert_contains "$out" "Away mode is active" "next step did not switch to AFK guidance"
+  assert_contains "$out" "daemon owns the watcher" "next step did not delegate watcher ownership to the daemon"
+  assert_contains "$out" "- Away mode: active" "supervision block did not include active AFK state"
+  assert_not_contains "$out" "  bin/fm-watch-arm.sh" "AFK next step still told the agent to arm the watcher directly"
+
+  pass "next step delegates watcher ownership to the AFK daemon"
+}
+
+# Away mode with no daemon is the away POSTURE only, so the digest must keep the
+# ordinary supervision guidance instead of telling the agent to defer to a daemon
+# that is not running here.
+test_next_step_afk_without_daemon_keeps_own_watcher() {
+  local rec root home fakebin out
+  rec=$(new_world next-step-afk-no-daemon)
   IFS='|' read -r root home fakebin <<EOF
 $rec
 EOF
@@ -763,13 +809,12 @@ EOF
 
   out=$(run_session_start "$home" "$root" "$fakebin:$BASE_PATH")
 
-  assert_contains "$out" "away-mode supervision is active" "AFK digest did not report away mode"
-  assert_contains "$out" "Away mode is active" "next step did not switch to AFK guidance"
-  assert_contains "$out" "daemon owns the watcher" "next step did not delegate watcher ownership to the daemon"
-  assert_contains "$out" "- Away mode: active" "supervision block did not include active AFK state"
-  assert_not_contains "$out" "  bin/fm-watch-arm.sh" "AFK next step still told the agent to arm the watcher directly"
+  assert_contains "$out" "away posture only" "AFK digest did not report the daemon-free away posture"
+  assert_not_contains "$out" "daemon owns the watcher" "daemon-free away mode still handed watcher ownership to a daemon"
+  assert_not_contains "$out" "- Away mode: active" "daemon-free away mode emitted the daemon-owned supervision block"
+  assert_contains "$out" "Follow the supervision operating instructions block above" "daemon-free away mode lost the ordinary next step"
 
-  pass "next step delegates watcher ownership to the AFK daemon"
+  pass "away mode without a live daemon keeps this home arming its own watcher"
 }
 
 test_supervision_block_exactly_one_and_pi_diagnostic() {
@@ -918,6 +963,7 @@ test_backlog_compact_tasks_axi_unavailable_uses_manual_fallback
 test_fleet_digest_empty_fleet
 test_next_step_sources_x_mode_cadence
 test_next_step_afk_delegates_to_daemon
+test_next_step_afk_without_daemon_keeps_own_watcher
 test_supervision_block_exactly_one_and_pi_diagnostic
 test_pi_diagnostic_rejects_stale_loaded_marker
 test_pi_diagnostic_accepts_prelock_loaded_marker

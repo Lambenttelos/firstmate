@@ -40,6 +40,8 @@ STALE_BANNER_MARKER="$STATE/.guard-watcher-stale-banner"
 . "$SCRIPT_DIR/fm-tangle-lib.sh"
 # shellcheck source=bin/fm-supervision-lib.sh
 . "$SCRIPT_DIR/fm-supervision-lib.sh"
+# shellcheck source=bin/fm-afk-daemon-lib.sh
+. "$SCRIPT_DIR/fm-afk-daemon-lib.sh"
 
 # Deterministic episode key from beacon state: same continuous stale beacon
 # (or continuous absence) shares a key; a recovered-then-restale beacon gets a
@@ -171,8 +173,11 @@ if [ "$watcher_fresh" = false ]; then
     print_full_banner=1
   fi
   if [ "$print_full_banner" -eq 1 ]; then
+    # Away mode alone is only the away posture; watcher ownership moves to the
+    # daemon only while one is actually live for this home, so a daemon-free away
+    # mode still gets the ordinary re-arm instruction.
     afk=0
-    [ -e "$STATE/.afk" ] && afk=1
+    fm_afk_daemon_owns_supervision "$STATE" "$SCRIPT_DIR" && afk=1
     queue_arg=0
     "$queue_pending" && queue_arg=1
     x_mode=0

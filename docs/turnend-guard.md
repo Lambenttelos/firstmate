@@ -35,14 +35,17 @@ A fresh leftover beacon blocks if the watcher lock is missing, dead, or identity
 ## Away Mode
 
 Away mode alone does not transfer watcher ownership.
-The guard asks `bin/fm-afk-daemon-lib.sh` whether a live away-mode supervision daemon actually holds this home's `state/.supervise-daemon.lock`, matched strictly against this home's own `bin/fm-supervise-daemon.sh`, so another home's daemon can never satisfy the check.
+`bin/fm-afk-daemon-lib.sh` owns the question for the whole repo: `fm_afk_daemon_owns_supervision <state-dir> <bin-dir>` is true only when `state/.afk` exists AND a live away-mode supervision daemon actually holds this home's `state/.supervise-daemon.lock`, matched strictly against this home's own `bin/fm-supervise-daemon.sh`, so another home's daemon can never satisfy the check.
+The turn-end guard, the watcher's triage gate in `bin/fm-watch.sh`, the pull-based banner in `bin/fm-guard.sh`, and the session-start digest all ask that one function rather than reading the flag.
 
 With away mode on and a live daemon, the daemon owns supervision and the repair instruction still points at `/afk`, unchanged.
 With away mode on and no live daemon, the home's own watcher is the real supervision mechanism: the ordinary live lock and fresh beacon test decides the turn, a healthy watcher keeps the guard silent, and only a genuinely missing or stale watcher blocks, with a repair instruction that names re-arming the watcher for the active harness.
 That daemon-free posture is deliberate for a captain session that runs outside any injectable supervisor pane, because the daemon delivers escalations by typing into such a pane and has nothing to type into there.
-The daemon-free banner also states which condition actually failed, so a fresh beacon whose watcher process is gone is never reported as "no live watcher".
+It is a first-class configuration, so the watcher also keeps its own normal triage there and absorbs benign wakes instead of handing every wake to a daemon that never runs.
 
 With away mode off, behavior is unchanged.
+
+On every path the banner states which condition actually failed, so a fresh beacon whose watcher process is gone is never reported as "no live watcher".
 
 `FM_STATE_OVERRIDE` wins over `FM_HOME/state`, and `FM_HOME` wins over repo-root `state/`.
 `FM_GUARD_GRACE` controls the beacon freshness window and defaults to 300 seconds.

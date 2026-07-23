@@ -1031,6 +1031,44 @@ test_hook_afk_ignores_another_homes_daemon() {
   pass "fm-turnend-guard: another home's away-mode daemon never satisfies this home's check"
 }
 
+# No pid-identity file in the lock owner, so fm_afk_daemon_pid_matches must fall
+# back to the process command line. That fallback is the only place `strict`
+# changes anything: the guard passes strict=1 and accepts only THIS home's own
+# daemon path, while fm-afk-start.sh's looser default still accepts a bare
+# fm-supervise-daemon.sh command from inside the home it already runs in.
+test_hook_afk_strict_rejects_bare_daemon_command() {
+  local dir foreign pid out status accepted
+  dir=$(make_primary_dir "$TMP_ROOT/hook-afk-strict-fallback")
+  foreign="$TMP_ROOT/hook-afk-strict-fallback-foreign"
+  mkdir -p "$foreign"
+  printf '#!/usr/bin/env bash\nsleep 60\n' > "$foreign/fm-supervise-daemon.sh"
+  chmod +x "$foreign/fm-supervise-daemon.sh"
+  : > "$dir/state/task1.meta"
+  : > "$dir/state/.afk"
+  bash "$foreign/fm-supervise-daemon.sh" &
+  pid=$!
+  mkdir -p "$dir/state/.supervise-daemon.lock"
+  printf '%s\n' "$pid" > "$dir/state/.supervise-daemon.lock/pid"
+  out=$(run_hook "$dir" false); status=$?
+  # The same pid and lock, read WITHOUT strict matching, is accepted - so the
+  # rejection below can only come from strict mode, not from a dead process.
+  accepted=0
+  FM_STATE_OVERRIDE="$dir/state" bash -c '
+    . "$1"; . "$2"
+    fm_afk_daemon_alive "$3" "$4" 0
+  ' _ "$dir/bin/fm-wake-lib.sh" "$dir/bin/fm-afk-daemon-lib.sh" \
+    "$dir/state/.supervise-daemon.lock" "$dir/bin/fm-supervise-daemon.sh" && accepted=1
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  [ "$accepted" -eq 1 ] || fail "the loose command-line fallback should accept a bare fm-supervise-daemon.sh command"
+  expect_code 2 "$status" "a bare fm-supervise-daemon.sh command must not satisfy the strict daemon check"
+  assert_contains "$out" "$REQUIRED_REASON" "strict rejection must leave this home in the daemon-free case"
+  case "$out" in
+    *"$AFK_REASON"*) fail "strict matching must not accept a foreign daemon path: $out" ;;
+  esac
+  pass "fm-turnend-guard: strict matching rejects a bare fm-supervise-daemon.sh the loose fallback accepts"
+}
+
 test_hook_afk_ignores_another_homes_watcher() {
   local dir pid identity out status
   dir=$(make_primary_dir "$TMP_ROOT/hook-afk-other-watcher")
@@ -1070,6 +1108,7 @@ test_hook_afk_without_daemon_blocks_with_rearm_reason
 test_hook_afk_without_daemon_fresh_beacon_message_is_consistent
 test_hook_afk_with_live_daemon_keeps_daemon_reason
 test_hook_afk_ignores_another_homes_daemon
+test_hook_afk_strict_rejects_bare_daemon_command
 test_hook_afk_ignores_another_homes_watcher
 test_hook_blocks_from_fm_home_state
 test_hook_x_mode_reason_sources_cadence

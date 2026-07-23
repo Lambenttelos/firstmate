@@ -24,6 +24,9 @@ WATCH="$ROOT/bin/fm-watch.sh"
 DRAIN="$ROOT/bin/fm-wake-drain.sh"
 DAEMON="$ROOT/bin/fm-supervise-daemon.sh"
 
+# shellcheck source=bin/fm-wake-lib.sh
+. "$ROOT/bin/fm-wake-lib.sh"
+
 # Source the daemon's pure functions (its main loop is guarded out under sourcing).
 if [ -z "${FM_TEST_DAEMON_SOURCED:-}" ]; then
   export FM_TEST_DAEMON_SOURCED=1
@@ -43,6 +46,12 @@ run_watcher_once() {
   local state=$1 fakebin=$2 out=$3
   mkdir -p "$state"
   date '+%s' > "$state/.afk"
+  # Away mode alone no longer transfers triage: the watcher hands every wake off
+  # only while a daemon is actually live for this home. This suite stands in for
+  # that daemon, so it holds the daemon lock with its own live pid.
+  mkdir -p "$state/.supervise-daemon.lock"
+  printf '%s\n' "$$" > "$state/.supervise-daemon.lock/pid"
+  fm_pid_identity "$$" > "$state/.supervise-daemon.lock/pid-identity"
   PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_POLL=1 FM_SIGNAL_GRACE=1 \
     FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
   wait_for_exit "$!" 50

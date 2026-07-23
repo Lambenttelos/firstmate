@@ -48,9 +48,24 @@ batched digest rather than per-wake injections.
    It exits immediately if the identity-backed daemon lock already names a live process, otherwise it execs `bin/fm-supervise-daemon.sh` in the foreground.
    The daemon is **presence-gated**: it injects escalations only while
    `state/.afk` exists, and stays quiet otherwise.
+   - **Home with no injectable supervisor pane** (the captain's session runs
+     outside any pane the daemon could type into): there is nothing to inject
+     into, so run away mode WITHOUT a daemon.
+     This is a supported configuration, not a degraded one: `state/.afk` then
+     carries the away POSTURE only - batched updates and the standing routine
+     merge authority - while this home's own watcher stays the real supervision
+     mechanism.
+     Say so plainly to the captain instead of manufacturing a terminal for the
+     daemon.
 
-3. **Do not separately arm `fm-watch.sh`.** The daemon manages the watcher as
-   its child; the singleton lock no-ops a stray arm harmlessly.
+3. **Arm the watcher iff no daemon owns it.**
+   With a daemon, do not separately arm `bin/fm-watch.sh`: the daemon manages the
+   watcher as its child, and the singleton lock no-ops a stray arm harmlessly.
+   Without one, keep arming and repairing this home's own watcher cycle exactly
+   as in normal mode.
+   Supervision ownership is decided by whether an away-mode daemon is actually
+   live for this home, never by the flag alone; `bin/fm-afk-daemon-lib.sh` owns
+   that question and every script asks it there.
 
 4. **Acknowledge** in `AGENTS.md` section 9 language: "Captain, away mode is active; I will batch routine updates and surface only decisions, failures, credentials, or review-ready work until you return."
 
@@ -150,7 +165,8 @@ wake reason in bash, and self-handles the routine majority without consuming a
 firstmate turn.
 Captain-relevant events, plus a bounded recheck of a declared external wait that remains idle, escalate to firstmate's context as one pre-read, single-line, batched digest.
 The classification predicates (the captain-relevant verb set, declared-pause vocabulary, signal/stale tests, and fleet-scan) live in the shared `bin/fm-classify-lib.sh`, the same library the always-on watcher uses for its own triage when afk is off, so the two modes apply one identical policy.
-While `state/.afk` exists the daemon owns the watcher, so the watcher reverts to one-shot and lets the daemon do the triage - the two never run their triage at the same time.
+While a daemon is actually live for this home it owns the watcher, so the watcher reverts to one-shot and lets the daemon do the triage - the two never run their triage at the same time.
+In daemon-free away mode nothing would ever pick a one-shot wake up, so the watcher keeps its own normal triage and absorbs benign wakes exactly as with away mode off.
 
 Classify each wake this way:
 

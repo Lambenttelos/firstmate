@@ -4,9 +4,11 @@
 #
 # One owner for the question "is an away-mode supervision daemon actually
 # running for THIS home?". bin/fm-afk-start.sh (and through it
-# bin/fm-afk-launch.sh) uses it to decide start-vs-refresh; bin/fm-turnend-guard.sh
-# uses it to tell the daemon-owned away mode apart from the daemon-free away mode
-# in which the home's own watcher is still the real supervision mechanism.
+# bin/fm-afk-launch.sh) uses it to decide start-vs-refresh; every script that
+# must tell the daemon-owned away mode apart from the daemon-free away mode - the
+# turn-end guard, the watcher's triage gate, the pull-based guard banner, and the
+# session-start digest - asks fm_afk_daemon_owns_supervision below rather than
+# reading state/.afk directly.
 #
 # Home scoping comes from the lock path itself (state/.supervise-daemon.lock
 # lives in one home's state dir) plus, in strict mode, an exact match on that
@@ -75,4 +77,16 @@ fm_afk_daemon_alive() {
   pid=$(cat "$owner/pid" 2>/dev/null || true)
   fm_pid_alive "$pid" || return 1
   fm_afk_daemon_pid_matches "$pid" "$owner" "$daemon" "$strict"
+}
+
+# fm_afk_daemon_owns_supervision <state-dir> <bin-dir>
+# True exactly when away mode is on AND a live daemon for THIS home is actually
+# running supervision. Away mode alone is only the away POSTURE: a home whose
+# captain session runs outside any injectable supervisor pane deliberately runs
+# away mode with no daemon, and its own watcher stays the real supervision
+# mechanism. Strict matching keeps another home's daemon from ever answering yes.
+fm_afk_daemon_owns_supervision() {
+  local state=$1 bindir=$2
+  [ -e "$state/.afk" ] || return 1
+  fm_afk_daemon_alive "$state/.supervise-daemon.lock" "$bindir/fm-supervise-daemon.sh" 1
 }

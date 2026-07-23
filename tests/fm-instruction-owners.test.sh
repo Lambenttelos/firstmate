@@ -205,7 +205,7 @@ test_compressed_agents_retains_authority_and_supervision_safety() {
     'A status line is a wake event, not current state' \
     'keep exactly one live supervision cycle' \
     'Never broadly kill watchers' \
-    'While `state/.afk` exists, the daemon owns supervision' \
+    'While a live away-mode daemon runs for this home, the daemon owns supervision' \
     'post the final completion follow-up before teardown'; do
     assert_grep "$phrase" "$AGENTS" "compressed AGENTS.md lost safety phrase '$phrase'"
   done

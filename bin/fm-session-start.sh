@@ -100,6 +100,10 @@ PRIMARY_HARNESS=$("$SCRIPT_DIR/fm-harness.sh" 2>/dev/null || printf unknown)
 . "$SCRIPT_DIR/fm-backend.sh"
 # shellcheck source=bin/fm-tasks-axi-lib.sh
 . "$SCRIPT_DIR/fm-tasks-axi-lib.sh"
+# shellcheck source=bin/fm-wake-lib.sh
+. "$SCRIPT_DIR/fm-wake-lib.sh"
+# shellcheck source=bin/fm-afk-daemon-lib.sh
+. "$SCRIPT_DIR/fm-afk-daemon-lib.sh"
 
 STATUS_TAIL=${FM_SESSION_START_STATUS_TAIL:-5}
 case "$STATUS_TAIL" in ''|*[!0-9]*) STATUS_TAIL=5 ;; esac
@@ -300,8 +304,11 @@ else
 fi
 
 # --- 4. supervision operating instructions ----------------------------------
+# Watcher ownership moves to the away-mode daemon only while one is actually live
+# for this home; away mode with no daemon is the away posture only and keeps the
+# ordinary supervision instructions (bin/fm-afk-daemon-lib.sh).
 AFK_PRESENT=0
-[ -e "$STATE/.afk" ] && AFK_PRESENT=1
+fm_afk_daemon_owns_supervision "$STATE" "$SCRIPT_DIR" && AFK_PRESENT=1
 X_MODE_PRESENT=0
 [ -f "$CONFIG/x-mode.env" ] && X_MODE_PRESENT=1
 
@@ -381,7 +388,11 @@ done
 
 subsection "AFK"
 if [ -e "$STATE/.afk" ]; then
-  printf 'present - away-mode supervision is active; the daemon owns the watcher.\n'
+  if [ "$AFK_PRESENT" -eq 1 ]; then
+    printf 'present - away-mode supervision is active; the daemon owns the watcher.\n'
+  else
+    printf 'present - away posture only; no away-mode daemon is running here, so this home keeps arming and repairing its own watcher.\n'
+  fi
 else
   printf 'absent\n'
 fi
