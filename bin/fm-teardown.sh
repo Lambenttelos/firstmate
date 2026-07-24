@@ -32,6 +32,10 @@
 # A gh lookup error falls back to the content check; if that is also inconclusive,
 # teardown refuses rather than risk discarding unlanded work.
 # Uncommitted changes are never landed.
+# direct-push projects additionally require positive proof that the task branch
+# exists on origin (git ls-remote origin refs/heads/<branch>), because that mode
+# has no PR or merge confirmation and the no-mistakes pipeline's internal
+# validation remote never counts as landed. An ls-remote failure refuses too.
 # local-only projects additionally accept work merged into the local default
 # branch (firstmate performs that merge after configured approval) as a fallback
 # for the common case where there is no remote at all.
@@ -702,7 +706,7 @@ teardown_treehouse_return() {
 }
 
 validate_worktree_teardown_safety() {
-  local dirty_raw dirty unpushed_raw unpushed DEFAULT unmerged_raw unmerged branch
+  local dirty_raw dirty unpushed_raw unpushed DEFAULT unmerged_raw unmerged branch origin_ref
   [ -d "$WT" ] || return 0
   [ "$FORCE" != "--force" ] || return 0
   case "$KIND" in
@@ -767,6 +771,32 @@ validate_worktree_teardown_safety() {
       echo "REFUSED: worktree $WT has work not on any remote and not landed." >&2
       printf 'unpushed commits:\n%s\n' "$unpushed" >&2
       echo "Push the branch, land its PR, or get the captain's explicit OK to discard, then --force." >&2
+      return 1
+    fi
+  fi
+
+  # direct-push has no PR or merge confirmation to catch a skipped push, and the
+  # no-mistakes pipeline's internal validation remote never counts as landed, so
+  # require positive proof that the branch reached origin.
+  if [ "$MODE" = direct-push ]; then
+    branch=${TEARDOWN_WORKTREE_BRANCH_FOR_SAFETY:-}
+    if [ -z "$branch" ]; then
+      branch=$(git -C "$WT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)
+      TEARDOWN_WORKTREE_BRANCH_FOR_SAFETY=$branch
+    fi
+    if ! origin_ref=$(git -C "$WT" ls-remote origin "refs/heads/$branch" 2>/dev/null); then
+      if worktree_safety_blocked_by_lock "the direct-push branch $branch on origin"; then
+        return "$TEARDOWN_WORKTREE_SAFETY_LOCK_BLOCKED"
+      fi
+      echo "REFUSED: cannot confirm direct-push worktree $WT pushed branch $branch to origin." >&2
+      echo "origin could not be queried; the validation remote never counts as landed" >&2
+      echo "Restore access to origin and retry, or get the captain's explicit OK to discard, then --force." >&2
+      return 1
+    fi
+    if [ -z "$origin_ref" ]; then
+      echo "REFUSED: direct-push worktree $WT has validated work that was never pushed to origin." >&2
+      echo "branch $branch is absent from origin; the validation remote never counts as landed" >&2
+      echo "Run git push origin HEAD:$branch first, or get the captain's explicit OK to discard, then --force." >&2
       return 1
     fi
   fi

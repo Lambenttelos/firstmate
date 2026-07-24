@@ -1387,6 +1387,109 @@ test_herdr_projection_teardown_retains_journal_when_close_unconfirmed() {
   pass "herdr projection teardown retains the stale journal and attempts no workspace cleanup when exact-pane close is unconfirmed"
 }
 
+# Give the project a bare "no-mistakes" remote and push the task branch to it,
+# then fetch so the worktree sees refs/remotes/no-mistakes/*. This reproduces the
+# pipeline's internal validation remote, which makes the generic "commits not on a
+# remote" check come back empty even though origin never received the branch.
+add_no_mistakes_internal_remote_with_pushed_branch() {
+  local case_dir=$1
+  git init -q --bare "$case_dir/no-mistakes.git"
+  git -C "$case_dir/project" remote add no-mistakes "$case_dir/no-mistakes.git"
+  git -C "$case_dir/wt" push -q no-mistakes fm/task-x1
+  git -C "$case_dir/project" fetch -q no-mistakes
+}
+
+add_git_ls_remote_failure() {
+  local case_dir=$1
+  cat > "$case_dir/fakebin/git" <<'SH'
+#!/usr/bin/env bash
+real=${REAL_GIT_FOR_TEST:?}
+for arg in "$@"; do
+  if [ "$arg" = ls-remote ]; then
+    echo "fatal: simulated origin failure" >&2
+    exit 128
+  fi
+done
+exec "$real" "$@"
+SH
+  chmod +x "$case_dir/fakebin/git"
+}
+
+test_direct_push_branch_absent_from_origin_refuses() {
+  local case_dir rc
+  case_dir=$(make_case dp-no-origin)
+  write_meta "$case_dir" direct-push ship
+  wt_commit_file "$case_dir" feature.txt hello "validated work"
+  add_no_mistakes_internal_remote_with_pushed_branch "$case_dir"
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 1 "$rc" "dp-no-origin: teardown should refuse when the branch never reached origin"
+  assert_grep "never pushed to origin" "$case_dir/stderr" \
+    "dp-no-origin: teardown did not refuse for the missing origin branch"
+  assert_grep "the validation remote never counts as landed" "$case_dir/stderr" \
+    "dp-no-origin: refusal did not explain the internal validation remote"
+  pass "direct-push worktree whose branch is absent from origin is refused"
+}
+
+test_direct_push_ls_remote_failure_refuses() {
+  local case_dir rc
+  case_dir=$(make_case dp-ls-remote-error)
+  write_meta "$case_dir" direct-push ship
+  wt_commit_file "$case_dir" feature.txt hello "validated work"
+  git -C "$case_dir/wt" push -q origin fm/task-x1
+  git -C "$case_dir/project" fetch -q origin
+  add_git_ls_remote_failure "$case_dir"
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 1 "$rc" "dp-ls-remote-error: teardown should refuse when origin cannot be queried"
+  assert_grep "cannot confirm direct-push worktree" "$case_dir/stderr" \
+    "dp-ls-remote-error: teardown did not fail closed on the origin probe error"
+  pass "direct-push teardown refuses rather than releasing when the origin probe errors"
+}
+
+test_direct_push_branch_on_origin_allows() {
+  local case_dir rc
+  case_dir=$(make_case dp-origin)
+  write_meta "$case_dir" direct-push ship
+  wt_commit_file "$case_dir" feature.txt hello "validated work"
+  git -C "$case_dir/wt" push -q origin fm/task-x1
+  git -C "$case_dir/project" fetch -q origin
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 0 "$rc" "dp-origin: teardown should succeed when the branch is on origin"
+  ! grep -q REFUSED "$case_dir/stderr" || fail "dp-origin: teardown printed a REFUSED line"
+  pass "direct-push worktree whose branch is on origin is torn down"
+}
+
+test_direct_push_force_overrides_missing_origin_branch() {
+  local case_dir rc
+  case_dir=$(make_case dp-force)
+  write_meta "$case_dir" direct-push ship
+  wt_commit_file "$case_dir" feature.txt hello "validated work"
+  add_no_mistakes_internal_remote_with_pushed_branch "$case_dir"
+
+  set +e
+  run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 0 "$rc" "dp-force: --force should still override the origin check"
+  ! grep -q REFUSED "$case_dir/stderr" || fail "dp-force: teardown printed a REFUSED line"
+  pass "direct-push origin check honors the explicit discard escape hatch"
+}
+
 # (z) no-mistakes + branch pushed to origin but unmerged, local remote ref stale ->
 #     ALLOW (release-on-pushed) and record the branch in the merge queue.
 test_pushed_unmerged_releases_and_records_merge_queue() {
@@ -1533,3 +1636,7 @@ test_transient_index_lock_clears_after_first_attempt_and_retry_succeeds
 test_persistent_index_lock_exhausts_retries_and_refuses_loudly
 test_empty_retry_wait_uses_default_without_aborting
 test_fractional_legacy_retry_wait_refuses_without_arithmetic_error
+test_direct_push_branch_absent_from_origin_refuses
+test_direct_push_ls_remote_failure_refuses
+test_direct_push_branch_on_origin_allows
+test_direct_push_force_overrides_missing_origin_branch
