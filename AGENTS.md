@@ -326,6 +326,7 @@ For every actionable wake, follow the ordinary-wake continuation in the emitted 
 No turn ends blind while work is under way, including turns described as holding or waiting.
 
 At the start of every wake-handling turn, drain the durable wake queue before peeking, reading beyond the reason line, steering, or starting work.
+Prefer `bin/fm-wake-brief.sh`, which runs that same drain and returns the woken tasks' status tails, current states, and metadata plus a host reading and an endpoint sweep in one call; arming stays a separate call.
 Session start is the only exception because its one-shot digest already drained while locked or deliberately left the queue untouched in lock-refused read-only mode.
 A status line is a wake event, not current state; use `bin/fm-crew-state.sh` when current state matters, especially before re-escalating an old decision, blocker, or pause.
 A declared `paused:` event means a bounded external wait expected to clear on its own, while `blocked:` means firstmate action is needed.

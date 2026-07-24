@@ -1,7 +1,7 @@
 Mode: Pi extension background wake.
 
 When this session owns supervision and away mode is not active:
-1. Drain first with `bin/fm-wake-drain.sh`.
+1. Drain first with `bin/fm-wake-drain.sh`, or with `bin/fm-wake-brief.sh` to get that same drain plus each woken task's status tail, current state, metadata, one host reading, and an endpoint sweep in one call.
 2. Confirm the Pi primary auto-loaded both project extensions (plain `pi`, after approving project trust once per clone); if not, restart with `-e __FM_PI_TURNEND_EXT__ -e __FM_PI_EXT__` as a trust-free fallback.
 3. First cycle only: make the one required `fm_watch_arm_pi` call.
    Use `/fm-watch-arm-pi` only as a human-entered fallback.
