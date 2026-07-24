@@ -36,8 +36,18 @@
 #   check: <script>: <out> authenticated check output, always actionable
 #   check: rejected unauthenticated state checks: <paths>
 #                          unsafe state checks were refused without execution
+#   check: host-resources <reading>
+#                          the host-resource sweep found CPU/memory/swap pressure
+#                          WORSE than the level firstmate was last told about.
+#                          Report-only: nothing is paused, shed or killed here.
 #   heartbeat              fleet-scan backstop found an unsurfaced captain-relevant
-#                          status, unless a live away-mode daemon owns triage
+#                          status, unless a live away-mode daemon owns triage.
+#                          Becomes "heartbeat: host resources degraded|critical"
+#                          when a recent sweep found the host under pressure; a
+#                          disabled monitor or a stale cached reading annotates
+#                          nothing. The annotation keeps the "heartbeat:" prefix
+#                          every wake consumer matches on, so an annotated
+#                          heartbeat is still recognised as an actionable wake
 # For normal supervision, resume the session-start primary-harness protocol
 # after each printed reason. Direct duplicate invocations of this script still
 # no-op through the watcher singleton lock.
@@ -129,6 +139,30 @@ HEARTBEAT=${FM_HEARTBEAT:-600}        # base seconds between heartbeat scans
 HEARTBEAT_MAX=${FM_HEARTBEAT_MAX:-7200}  # heartbeat backoff cap
 CHECK_INTERVAL=${FM_CHECK_INTERVAL:-600}  # seconds between *.check.sh sweeps (captain default: 10 min)
 CHECK_TIMEOUT=${FM_CHECK_TIMEOUT:-30}     # seconds allowed per *.check.sh
+# Host-resource sweep cadence, on its OWN interval rather than POLL or
+# CHECK_INTERVAL: host pressure moves on a scale of minutes, and X mode drives
+# CHECK_INTERVAL down to 30s. bin/fm-resource-check.sh owns the knob, its default
+# and its disabled (0) form; this reads the resolved value once at start, the
+# same way every other cadence here is fixed for the process lifetime.
+# An unrunnable or unparseable resolver falls back to that default rather than
+# silently switching the monitor off for this watcher's whole lifetime; the
+# fallback is logged once at startup so the condition is visible.
+# Mirror of bin/fm-resource-check.sh's RESOURCE_INTERVAL_DEFAULT, which is the
+# single source of truth for this number; keep the two in step.
+# The flag is kept separate from the offending value, because the case this
+# fallback exists for - a resolver that cannot run at all - yields an EMPTY
+# value, and an emptiness test would suppress exactly that log line.
+RESOURCE_INTERVAL_DEFAULT=900
+RESOURCE_INTERVAL_FELL_BACK=0
+RESOURCE_INTERVAL_RAW=$("$SCRIPT_DIR/fm-resource-check.sh" --interval 2>/dev/null || printf '')
+RESOURCE_INTERVAL=$RESOURCE_INTERVAL_RAW
+case "$RESOURCE_INTERVAL" in
+  ''|*[!0-9]*)
+    RESOURCE_INTERVAL_FELL_BACK=1
+    [ -n "$RESOURCE_INTERVAL_RAW" ] || RESOURCE_INTERVAL_RAW='<empty>'
+    RESOURCE_INTERVAL=$RESOURCE_INTERVAL_DEFAULT
+    ;;
+esac
 SIGNAL_GRACE=${FM_SIGNAL_GRACE:-30}   # seconds to linger after a signal so trailing
                                       # signals (a status write, then the same turn's
                                       # turn-end hook) coalesce into one wake
@@ -335,6 +369,52 @@ secondmate_context_sweep() {
   done <<EOF
 $(recorded_windows)
 EOF
+}
+
+# resource_sweep: the slow-poll HOST monitor. Reads kernel-wide CPU load, memory
+# headroom and swap through bin/fm-resource-check.sh (its own cadence, see
+# RESOURCE_INTERVAL) and wakes firstmate when host pressure first gets WORSE than
+# the level it was last told about, so a thrashing host is reported once instead
+# of nagged about every sweep. It is monitor-and-report only: nothing here pauses,
+# sheds or kills anything, because shedding load is the captain's decision.
+#
+# This sweep is the ONLY caller that runs the check with --sweep, so crew-liveness
+# probing happens once per cadence here and never on a synchronous path.
+# .resource-status caches the latest reading for the heartbeat annotation.
+# .resource-surfaced remembers the worst level already reported; recovery to
+# healthy re-arms it SILENTLY (no wake), so the fleet is only interrupted for
+# pressure it has not already been told about. An unknown or disabled reading
+# leaves both markers untouched and never wakes - the same
+# never-wake-on-an-unreadable-probe rule as secondmate_context_sweep.
+resource_sweep() {
+  local out rc status last rank last_rank reason
+  out=$("$SCRIPT_DIR/fm-resource-check.sh" --sweep 2>/dev/null) && rc=0 || rc=$?
+  case "$rc" in
+    0) status=healthy ;;
+    1) status=degraded ;;
+    2) status=critical ;;
+    *) return 0 ;;
+  esac
+  printf '%s\n' "$status" > "$STATE/.resource-status"
+  last=$(cat "$STATE/.resource-surfaced" 2>/dev/null || printf 'healthy')
+  case "$status" in healthy) rank=0 ;; degraded) rank=1 ;; *) rank=2 ;; esac
+  case "$last" in healthy) last_rank=0 ;; degraded) last_rank=1 ;; critical) last_rank=2 ;; *) last_rank=0 ;; esac
+  if [ "$rank" -eq 0 ]; then
+    [ "$last_rank" -eq 0 ] || triage_log "host resources recovered to healthy (re-armed, no wake)"
+    printf '%s\n' healthy > "$STATE/.resource-surfaced"
+    return 0
+  fi
+  if [ "$rank" -le "$last_rank" ]; then
+    triage_log "absorbed host resources $status (already reported at $last)"
+    return 0
+  fi
+  printf '%s\n' "$status" > "$STATE/.resource-surfaced"
+  # Flatten the reading (and its SHED advice, when present) onto the single line
+  # a wake record holds.
+  reason="check: host-resources $(printf '%s\n' "$out" \
+    | awk '{sub(/^resources: /, ""); printf "%s%s", sep, $0; sep="; "}')"
+  fm_wake_append check host-resources "$reason" || exit 1
+  wake "$reason"
 }
 
 # Exit reporting a wake. Consecutive heartbeats with no other wake in between
@@ -868,6 +948,9 @@ fm_pid_identity "$WATCHER_PID" > "$WATCH_LOCK/pid-identity" 2>/dev/null || true
 
 [ -e "$STATE/.last-heartbeat" ] || touch "$STATE/.last-heartbeat"
 
+[ "$RESOURCE_INTERVAL_FELL_BACK" = 0 ] || triage_log \
+  "host-resource cadence unresolved ('$RESOURCE_INTERVAL_RAW'), using default ${RESOURCE_INTERVAL}s"
+
 while :; do
   POLL_CYCLE=$(( POLL_CYCLE + 1 ))
   # Self-eviction: if the singleton lock no longer names this process, a second
@@ -949,6 +1032,16 @@ while :; do
     # threshold. wake() exits the cycle when it fires (marker prevents re-fire).
     secondmate_context_sweep
     touch "$STATE/.last-check"
+  fi
+
+  # Host-resource sweep, on its own cadence (see RESOURCE_INTERVAL). Time-based
+  # via .last-resource mtime so the cadence survives watcher restarts. Like the
+  # check block above it runs before the signal scan, so a chatty crewmate cannot
+  # starve it; unlike that block it is off entirely when the monitor is disabled.
+  if [ "$RESOURCE_INTERVAL" -gt 0 ] \
+    && [ "$(age_of "$STATE/.last-resource")" -ge "$RESOURCE_INTERVAL" ]; then
+    touch "$STATE/.last-resource"
+    resource_sweep
   fi
 
   # On the first changed signal, linger one grace period and re-scan before
@@ -1194,18 +1287,40 @@ EOF
     # no-change case (advance the schedule and back off exactly as wake() would,
     # without exiting); the away-mode daemon, when present, owns triage and wants
     # every heartbeat.
+    # Every heartbeat carries the host's latest known pressure, so a fleet review
+    # is never done against a machine whose state firstmate cannot see. The value
+    # is the one resource_sweep already cached, so annotating costs no probe; a
+    # healthy or disabled host annotates nothing. An unknown reading, on a host
+    # whose probes stopped answering, deliberately leaves the last known level in
+    # place: going quiet on a machine that was just critical would hide real
+    # pressure, and the age gate below bounds how long that can persist.
+    # .resource-status is only ever written, never cleared, so a disabled monitor
+    # and a reading older than two sweeps are both ignored rather than annotating
+    # the heartbeat with pressure that may have gone away long ago.
+    # The annotated form keeps the
+    # "heartbeat:" prefix, because fm-watch-arm.sh and fm-supervise-daemon.sh both
+    # recognise an actionable heartbeat by that exact prefix; any other shape
+    # would silently stop being a wake precisely while the host is under pressure.
+    hb_reason=heartbeat
+    if [ "$RESOURCE_INTERVAL" -gt 0 ] \
+      && [ "$(age_of "$STATE/.resource-status")" -lt $(( RESOURCE_INTERVAL * 2 )) ]; then
+      case "$(cat "$STATE/.resource-status" 2>/dev/null || true)" in
+        degraded) hb_reason='heartbeat: host resources degraded' ;;
+        critical) hb_reason='heartbeat: host resources critical' ;;
+      esac
+    fi
     if afk_daemon_owns_triage; then
-      fm_wake_append heartbeat heartbeat heartbeat || exit 1
+      fm_wake_append heartbeat heartbeat "$hb_reason" || exit 1
       touch "$STATE/.last-heartbeat"
-      wake "heartbeat"
+      wake "$hb_reason"
     elif heartbeat_scan_finds_actionable; then
       # Backstop: a captain-relevant status the per-wake path absorbed by mistake.
       # Enqueue first, then mark every captain-relevant status surfaced so the next
       # heartbeat does not re-fire them (enqueue-before-suppress preserved).
-      fm_wake_append heartbeat heartbeat heartbeat || exit 1
+      fm_wake_append heartbeat heartbeat "$hb_reason" || exit 1
       touch "$STATE/.last-heartbeat"
       mark_all_captain_relevant_surfaced
-      wake "heartbeat"
+      wake "$hb_reason"
     else
       touch "$STATE/.last-heartbeat"
       echo $(( $(cat "$STATE/.heartbeat-streak" 2>/dev/null || echo 0) + 1 )) > "$STATE/.heartbeat-streak"
