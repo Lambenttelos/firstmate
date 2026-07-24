@@ -49,6 +49,13 @@
 # it carries the AGENTS.md authoring bar (widely useful knowledge only, pointers
 # over copied detail) and has the crewmate add the fm-ensure-agents-md.sh
 # self-governance section when a touched project AGENTS.md lacks it.
+# Every ship and scout scaffold also carries the fleet's shared-machine rules, so a
+# freshly spawned crewmate obeys them without being steered: heavy commands go through
+# bin/fm-heavy-run.sh, test parallelism is capped at VITEST_MAX_WORKERS=2, every test run
+# is announced with TEST START / TEST END status lines, and a live browser reproduction
+# waits for firstmate's go-ahead because at most TWO may run fleet-wide at once.
+# Ship scaffolds additionally require the final report to declare whether the change was
+# built test-first and whether it has end-to-end coverage.
 # Refuses to overwrite an existing brief.
 set -eu
 
@@ -268,6 +275,15 @@ The report is the only thing that survives, so anything worth keeping must be in
    \`$FM_ROOT/bin/fm-heavy-run.sh --task $ID -- <command>\`. It queues the run so the whole fleet
    is not thrashing one machine, then gives you the command's real output and exit status.
    It prints a queued notice while you wait; that is normal, not a hang.
+   Cap test parallelism at \`VITEST_MAX_WORKERS=2\` - never 4: vitest sizes its pool from the CPU
+   count and is the fleet's dominant memory consumer.
+9. Announce every test run in the status file: \`working: TEST START - {what is running, rough scale}\`
+   before it, \`working: TEST END - {outcome}\` after it. Firstmate coordinates the shared machine
+   from those two lines, so a silent suite is a defect.
+10. At most TWO live browser reproductions may run across the whole fleet at once.
+   Before you start one, append \`working: BROWSER WAIT - {what you will drive}\` and STOP until
+   firstmate replies with a go-ahead - the one line in this brief you do wait on.
+   Append \`working: BROWSER END - {outcome}\` the moment it finishes so the slot is released.
 
 # Definition of done
 Write your findings to \`$DATA/$ID/report.md\`.
@@ -424,6 +440,15 @@ $RULE1
    \`$FM_ROOT/bin/fm-heavy-run.sh --task $ID -- <command>\`. It queues the run so the whole fleet
    is not thrashing one machine, then gives you the command's real output and exit status.
    It prints a queued notice while you wait; that is normal, not a hang.
+   Cap test parallelism at \`VITEST_MAX_WORKERS=2\` - never 4: vitest sizes its pool from the CPU
+   count and is the fleet's dominant memory consumer.
+9. Announce every test run in the status file: \`working: TEST START - {what is running, rough scale}\`
+   before it, \`working: TEST END - {outcome}\` after it. Firstmate coordinates the shared machine
+   from those two lines, so a silent suite is a defect.
+10. At most TWO live browser reproductions may run across the whole fleet at once.
+   Before you start one, append \`working: BROWSER WAIT - {what you will drive}\` and STOP until
+   firstmate replies with a go-ahead - the one line in this brief you do wait on.
+   Append \`working: BROWSER END - {outcome}\` the moment it finishes so the slot is released.
 
 # Project memory
 If \`AGENTS.md\` or \`CLAUDE.md\` already exists, or if this task produced durable project-intrinsic knowledge, run \`$FM_ROOT/bin/fm-ensure-agents-md.sh .\` in the worktree.
@@ -431,6 +456,10 @@ Record only project knowledge useful to almost every future session.
 For anything the codebase already shows, prefer a pointer to the authoritative file, command, or doc over copying the detail.
 If you touch a project \`AGENTS.md\` that lacks \`## Maintaining this file\`, add that short self-governance section from \`$FM_ROOT/bin/fm-ensure-agents-md.sh\` in the same pass.
 Keep it proportionate: skip \`AGENTS.md\` edits for trivial tasks that produced no durable project knowledge.
+
+# Test coverage declaration
+Your final report must state plainly whether you built this change test-first and whether it has end-to-end coverage.
+A gap does not block the merge, but name the gap and its reason; the captain reviews every untested product change.
 
 $DOD
 EOF

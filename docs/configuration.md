@@ -330,6 +330,15 @@ The command runs unchanged, its output streams straight through, and the wrapper
 While a run waits its turn it prints a queued notice naming its position, so a waiting crewmate is visibly queued rather than apparently hung.
 The generated crewmate briefs ([`bin/fm-brief.sh`](../bin/fm-brief.sh)) carry that instruction, which is how the runner actually gets adopted.
 
+The same scaffold carries three further shared-machine rules, for the same reason: a rule that only exists as a hand-typed steer does not bind a crewmate that was just spawned.
+
+- Test parallelism is capped at `VITEST_MAX_WORKERS=2`, never 4, because vitest sizes its worker pool from the CPU count and is the fleet's dominant memory consumer.
+- Every test run is announced in the status file, `working: TEST START - ...` before and `working: TEST END - ...` after, which is the signal firstmate coordinates the machine from.
+- At most TWO live browser reproductions may run across the whole fleet at once, so a crewmate announces `working: BROWSER WAIT - ...` and waits for firstmate's go-ahead before starting one, then releases the slot with `working: BROWSER END - ...`.
+
+Ship scaffolds also require the final report to declare whether the change was built test-first and whether it has end-to-end coverage.
+A gap does not block the merge; leaving it unstated does, because the captain reviews every untested product change.
+
 This is deliberately NOT the host-resource monitor.
 That monitor answers "is this machine healthy right now" and only reports; this ceiling answers "how many heavy runs may proceed right now" and actually blocks.
 The two stay uncoupled because a resource reading is momentary and advisory, while the failure mode being prevented - several parked crewmates unblocked at once, all starting a suite before any new reading is taken - needs a hard, stateful count.
