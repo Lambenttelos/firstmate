@@ -103,15 +103,28 @@ fm_afk_stale_artifact_continue_message() {
 
 # Every failure NAMES the artifact it could not clear on stderr in addition to
 # returning non-zero, so no caller can turn a clearing problem into a silent stop.
+#
+# The outbox-owned artifacts are cleared by fm_afk_outbox_clear_session rather
+# than by this loop, because they must be cleared under the outbox lock that
+# guards appends and compaction; this loop owns only the pane path's artifacts,
+# which no lock guards.
 fm_afk_clear_stale_artifacts() {  # <state-dir>
-  local state=$1 name status=0
+  local state=$1 name outbox_names status=0
+  outbox_names=$(fm_afk_outbox_artifact_names)
   while IFS= read -r name; do
     [ -n "$name" ] || continue
+    case "
+$outbox_names
+" in
+      *"
+$name
+"*) continue ;;
+    esac
     rm -f "$state/$name" 2>/dev/null && continue
     printf 'afk: could not clear stale away-mode artifact %s\n' "$state/$name" >&2
     status=1
   done < <(fm_afk_session_artifact_names)
-  fm_afk_outbox_clear_transient "$state" || status=1
+  fm_afk_outbox_clear_session "$state" || status=1
   return "$status"
 }
 

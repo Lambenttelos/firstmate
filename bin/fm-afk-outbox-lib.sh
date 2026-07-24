@@ -232,6 +232,43 @@ fm_afk_outbox_clear_transient() {  # <state>
   return "$status"
 }
 
+# Clear this library's session-scoped artifacts - the durable records AND the
+# process-scoped scratch - as one unit UNDER the outbox lock, so a fresh away
+# entry cannot race a live holder. Appends and compaction both mutate the outbox
+# while holding this lock, and a compaction lands by renaming a sibling over the
+# outbox file: clearing outside the lock would let that rename resurrect a prior
+# session's records over state the new session just cleared, with the ack mark
+# gone, so the new session's reader would replay the prior session's digests as
+# if they were fresh.
+#
+# Holding the lock is also what makes clearing the compaction temp files safe: no
+# compaction can be in flight, so no cleared temp can survive to be renamed.
+# fm_afk_outbox_clear_transient sees THIS process as the lock's live owner and
+# therefore leaves the lock itself alone; the release below retires it.
+#
+# A bounded acquire that times out names the lock on stderr and returns non-zero
+# WITHOUT clearing anything this lock guards: clearing anyway is exactly the race
+# this exists to close. The caller still continues into away mode, per the
+# entry-point contract in bin/fm-afk-start.sh.
+fm_afk_outbox_clear_session() {  # <state>
+  local state=$1 lock name status=0
+  [ -d "$state" ] || return 0
+  lock=$(fm_afk_outbox_lock_file "$state")
+  if ! fm_afk_outbox_lock_lib "$state" || ! _fm_afk_outbox_lock_acquire "$lock"; then
+    printf 'afk: could not clear stale away-mode artifact %s\n' "$lock" >&2
+    return 1
+  fi
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    rm -f "$state/$name" 2>/dev/null && continue
+    printf 'afk: could not clear stale away-mode artifact %s\n' "$state/$name" >&2
+    status=1
+  done < <(fm_afk_outbox_artifact_names)
+  fm_afk_outbox_clear_transient "$state" || status=1
+  fm_lock_release "$lock"
+  return "$status"
+}
+
 # Collapse the field separators so one digest can never become two records. The
 # daemon has already collapsed newlines before it reaches here; this is the
 # record format's own guarantee, independent of that.

@@ -71,6 +71,69 @@ unit_clear_stale() {
 }
 
 # ---------------------------------------------------------------------------
+# UNIT 1b: a compaction in flight cannot resurrect records the fresh entry just
+# cleared. The clearing of the durable outbox records must happen under the same
+# outbox lock that guards appends and compaction, so a compaction's rename of its
+# sibling over the outbox file can never land after the clear.
+# ---------------------------------------------------------------------------
+unit_clear_stale_outbox_under_lock() {
+  local st state holder rc=0
+  st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-clear-lock.XXXXXX")
+  state="$st/state"
+  mkdir -p "$state"
+  printf '100\t1\tescalation\tprior session digest\n' > "$state/.afk-outbox"
+  printf '1\n' > "$state/.afk-outbox.ack"
+  printf '1\n' > "$state/.afk-outbox.seq"
+  printf 'paneless\n' > "$state/.afk-delivery"
+
+  # A compaction in flight: it holds the outbox lock and has already written its
+  # sibling, and it renames that sibling over the outbox only after the fresh
+  # entry has started clearing.
+  bash -c '
+    set -u
+    . "$1/bin/fm-afk-outbox-lib.sh"
+    FM_STATE_OVERRIDE="$2" . "$1/bin/fm-wake-lib.sh"
+    lock=$(fm_afk_outbox_lock_file "$2")
+    fm_lock_try_acquire "$lock" || exit 1
+    printf "100\t1\tescalation\tprior session digest\n" > "$2/.afk-outbox.compact.inflight"
+    : > "$2/holding"
+    sleep 2
+    mv "$2/.afk-outbox.compact.inflight" "$2/.afk-outbox" 2>/dev/null || true
+    fm_lock_release "$lock"
+  ' _ "$ROOT" "$state" &
+  holder=$!
+  while [ ! -e "$state/holding" ]; do sleep 0.05; done
+
+  FM_HOME="$st" FM_STATE_OVERRIDE="$state" \
+    bash -c '. "$1"; fm_afk_clear_stale_artifacts "$2"' _ "$START" "$state" || rc=$?
+  wait "$holder" 2>/dev/null || true
+
+  if [ "$rc" -eq 0 ]; then
+    pass "clear-stale: waiting out a live lock holder is not a clearing failure"
+  else
+    fail "clear-stale: clearing behind a live lock holder reported failure (status $rc)"
+  fi
+  if [ ! -e "$state/.afk-outbox" ]; then
+    pass "clear-stale: a compaction in flight cannot resurrect cleared outbox records"
+  else
+    fail "clear-stale: the prior session's records came back over the new session's state"
+  fi
+  if [ ! -e "$state/.afk-outbox.ack" ] && [ ! -e "$state/.afk-outbox.seq" ] \
+     && [ ! -e "$state/.afk-delivery" ]; then
+    pass "clear-stale: the durable pull-delivery records are cleared on a fresh entry"
+  else
+    fail "clear-stale: a durable pull-delivery record survived the fresh entry"
+  fi
+  if [ ! -e "$state/.afk-outbox.compact.inflight" ]; then
+    pass "clear-stale: no compaction sibling is left to be renamed over the new session"
+  else
+    fail "clear-stale: a compaction sibling survived clearing"
+  fi
+
+  rm -rf "$st"
+}
+
+# ---------------------------------------------------------------------------
 # UNIT 2: a FRESH entry clears; a REFRESH (daemon already alive) preserves the
 # current session's buffered escalations.
 # ---------------------------------------------------------------------------
@@ -1062,6 +1125,7 @@ e2e_tmux() {
 }
 
 unit_clear_stale
+unit_clear_stale_outbox_under_lock
 unit_fresh_vs_refresh
 unit_stop_ordering
 unit_stop_rejects_reused_pid
