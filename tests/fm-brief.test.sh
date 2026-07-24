@@ -43,6 +43,7 @@ write_registry() {
   mkdir -p "$home/data"
   cat > "$home/data/projects.md" <<'EOF'
 - direct-proj [direct-PR] - fixture for direct-PR mode (added 2026-07-01)
+- push-proj [direct-push] - fixture for direct-push mode (added 2026-07-24)
 - local-proj [local-only] - fixture for local-only mode (added 2026-07-01)
 EOF
 }
@@ -57,7 +58,7 @@ test_ship_modes_generate_clean_briefs() {
   home="$TMP_ROOT/ship-home"
   write_registry "$home"
 
-  for id_proj in "brief-nomistakes-a1:no-registry-proj" "brief-directpr-a2:direct-proj" "brief-localonly-a3:local-proj"; do
+  for id_proj in "brief-nomistakes-a1:no-registry-proj" "brief-directpr-a2:direct-proj" "brief-directpush-a2b:push-proj" "brief-localonly-a3:local-proj"; do
     id=${id_proj%%:*}
     proj=${id_proj##*:}
     FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" "$proj" >/dev/null 2>&1; status=$?
@@ -70,7 +71,45 @@ test_ship_modes_generate_clean_briefs() {
       "$id: brief missing nonterminal working:/setup-complete gate protection"
     assert_no_grep "EOF" "$brief" "$id: brief leaked a heredoc EOF marker (unterminated heredoc)"
   done
-  pass "fm-brief.sh: no-mistakes/direct-PR/local-only briefs generate cleanly"
+  pass "fm-brief.sh: no-mistakes/direct-PR/direct-push/local-only briefs generate cleanly"
+}
+
+# The direct-push DOD must: run the FULL no-mistakes pipeline (so it carries the
+# doctor setup step and the wrong-branch-attach preflight guard), treat skipped
+# PR/CI and a missing NO_MISTAKES_BITBUCKET_EMAIL as expected rather than a
+# blocker, then require an explicit push to origin fm/<id> with no PR-url or
+# checks-green wait. Landing stays with the configured merge authority.
+test_direct_push_dod_semantics() {
+  local home id brief
+  home="$TMP_ROOT/direct-push-home"
+  write_registry "$home"
+  id="brief-directpush-b3"
+  FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" push-proj >/dev/null 2>&1
+  brief="$home/data/$id/brief.md"
+  assert_present "$brief" "direct-push brief was not scaffolded"
+  assert_grep "ships **direct-push**" "$brief" \
+    "direct-push brief did not declare its delivery mode"
+  # Full pipeline, including the doctor setup step and the preflight guard.
+  assert_grep "no-mistakes doctor" "$brief" \
+    "direct-push brief lost the no-mistakes doctor setup step"
+  assert_grep "$ROOT/bin/fm-nm-preflight.sh" "$brief" \
+    "direct-push brief lost the wrong-branch-attach preflight guard"
+  assert_grep "a run ending \`passed\` with those steps skipped is COMPLETE" "$brief" \
+    "direct-push brief did not state skipped PR/CI is complete"
+  assert_grep "missing NO_MISTAKES_BITBUCKET_EMAIL" "$brief" \
+    "direct-push brief did not bake in the NO_MISTAKES_BITBUCKET_EMAIL note"
+  assert_grep "is NOT a blocker" "$brief" \
+    "direct-push brief did not say the bitbucket-email report is not a blocker"
+  # Explicit push to origin and report the head, no PR wait.
+  assert_grep "git push origin HEAD:fm/$id" "$brief" \
+    "direct-push brief did not require the explicit origin push of its branch"
+  assert_grep "Do NOT wait for a PR url or checks-green" "$brief" \
+    "direct-push brief did not forbid waiting on a PR url or CI"
+  assert_grep "The configured merge authority lands the branch on the forge" "$brief" \
+    "direct-push brief lost configured merge authority"
+  assert_no_grep "open a PR" "$brief" \
+    "direct-push brief must not tell the worker to open a PR"
+  pass "fm-brief.sh: direct-push DOD runs the full pipeline then pushes to origin without a PR wait"
 }
 
 test_faster_paths_use_configured_authority_without_stacked_review() {
@@ -374,6 +413,7 @@ test_scout_and_secondmate_scaffold() {
 test_script_parses
 test_help_includes_entire_header
 test_ship_modes_generate_clean_briefs
+test_direct_push_dod_semantics
 test_faster_paths_use_configured_authority_without_stacked_review
 test_no_mistakes_dod_wording
 test_no_mistakes_dod_requires_preflight

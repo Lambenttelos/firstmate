@@ -466,6 +466,8 @@ backlog_refresh_reminder() {
       *)
         if [ "$MODE" = local-only ]; then
           done_cmd="tasks-axi done $ID --note \"local main\""
+        elif [ "$MODE" = direct-push ]; then
+          done_cmd="tasks-axi done $ID --note \"pushed to origin\""
         else
           pr=$PR_URL
           if [ -n "$pr" ]; then
