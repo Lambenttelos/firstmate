@@ -1,7 +1,7 @@
 Mode: Claude background-notify supervision.
 
 When this session owns supervision and away mode is not active:
-1. Drain first with `bin/fm-wake-drain.sh`.
+1. Drain first with `bin/fm-wake-drain.sh`, or with `bin/fm-wake-brief.sh` to get that same drain plus each woken task's status tail, current state, metadata, one host reading, and an endpoint sweep in one call.
 2. Source `__FM_X_MODE_ENV__` first when X mode is active.
 3. First cycle: run `bin/fm-watch-arm.sh` as its own Claude Code background task.
 4. Never bundle the arm command with other commands.

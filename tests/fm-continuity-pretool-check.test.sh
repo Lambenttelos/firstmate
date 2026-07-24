@@ -41,7 +41,7 @@ expect_deny() {
   [ ! -s "$OUT" ] || fail "$label deny wrote stdout: $(cat "$OUT")"
   jq -e '.hookSpecificOutput.hookEventName == "PreToolUse" and .hookSpecificOutput.permissionDecision == "deny"' "$ERR" >/dev/null 2>&1 \
     || fail "$label deny omitted Claude's permission decision: $(cat "$ERR")"
-  [ -n "$expected" ] || expected="[watcher-continuity] tasks are in flight and no live watcher holds this home lock; drain wakes with bin/fm-wake-drain.sh, use fail-closed bin/fm-teardown.sh for completed tasks when needed, then re-arm with bin/fm-watch-arm.sh as a tracked Claude background task before running other fleet commands (blocked: $blocked)"
+  [ -n "$expected" ] || expected="[watcher-continuity] tasks are in flight and no live watcher holds this home lock; drain wakes with bin/fm-wake-drain.sh or bin/fm-wake-brief.sh, use fail-closed bin/fm-teardown.sh for completed tasks when needed, then re-arm with bin/fm-watch-arm.sh as a tracked Claude background task before running other fleet commands (blocked: $blocked)"
   actual=$(jq -r '.systemMessage' "$ERR")
   [ "$actual" = "$expected" ] || fail "$label recovery guidance changed: $actual"
 }
@@ -53,8 +53,13 @@ test_gate_scope_and_recovery_exceptions() {
   expect_allow "ordinary shell command" 'git status --short'
   expect_allow "fleet-script text as data" "rg -n 'bin/fm-send.sh' docs"
   expect_allow "wake drain recovery" 'bin/fm-wake-drain.sh'
+  expect_allow "wake brief recovery" 'bin/fm-wake-brief.sh'
+  expect_allow "wake brief with explicit ids" 'bin/fm-wake-brief.sh task other'
+  expect_allow "nested wake brief recovery" "bash -lc 'bin/fm-wake-brief.sh'"
   expect_allow "watch arm recovery" 'bin/fm-watch-arm.sh'
   expect_allow "drain then arm recovery" 'bin/fm-wake-drain.sh; bin/fm-watch-arm.sh'
+  expect_allow "brief then arm recovery" 'bin/fm-wake-brief.sh; bin/fm-watch-arm.sh'
+  expect_deny "wake brief bundled with unrelated fleet command" 'bin/fm-wake-brief.sh; bin/fm-send.sh task hi' 'fm-send.sh'
   expect_allow "fail-closed teardown recovery" 'bin/fm-teardown.sh task'
   unsafe_teardown_reason='[watcher-continuity] tasks are in flight and no live watcher holds this home lock; during recovery only the ordinary literal bin/fm-teardown.sh is allowed, so drop --force and any shell-expanded arguments and retry the literal invocation (blocked: fm-teardown.sh)'
   expect_deny "forced teardown is not recovery" 'bin/fm-teardown.sh task --force' 'fm-teardown.sh' "$unsafe_teardown_reason"
