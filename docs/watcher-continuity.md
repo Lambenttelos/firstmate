@@ -35,6 +35,10 @@ An actionable child output returns that reason normally.
 A zero/empty child return rechecks the home lock and beacon, attaches to a verified healthy successor when one exists, or emits `watcher: FAILED - cycle ended without an actionable reason` and exits nonzero.
 An attached arm follows verified identity-matched successors and reports the same typed failure if that chain ends without one.
 
+A started child may instead close with a `tick:` line, the env-gated proof-of-life exit described under [Absorbed-wake proof-of-life tick](#absorbed-wake-proof-of-life-tick).
+The arm layer classifies that close as a benign completion: it prints the line, records `reason=tick` in the cycle ledger, and returns success, distinct from both an actionable wake and the empty-cycle failure.
+A tick only ever reaches the session through the owning arm that captured the child's output; an arm merely attached to another home's watcher cannot read that output and just follows the cycle boundary as usual.
+
 The arm layer appends one tab-separated record per observed cycle to `state/.watch-cycle-exits.log`.
 Each record includes arm and watcher PIDs, start and end timestamps, exit code and signal, classified reason, beacon age, lock identity before and after close, and successor disposition.
 The file is size-capped through `FM_WATCH_CYCLE_LOG_MAX_BYTES` and `FM_WATCH_CYCLE_LOG_KEEP_LINES`.
@@ -42,6 +46,29 @@ The file is size-capped through `FM_WATCH_CYCLE_LOG_MAX_BYTES` and `FM_WATCH_CYC
 
 The default 300-second grace is unchanged.
 Only the watcher process touches `state/.last-watcher-beat`; no helper process can make a wedged watcher appear healthy.
+
+## Absorbed-wake proof-of-life tick
+
+By default the watcher absorbs a benign wake silently: it advances the wake's suppressor, logs one line to `state/.watch-triage.log`, and keeps blocking without exiting.
+From the supervising session's view an absorbed wake and a dead watcher are then indistinguishable, because both produce no cycle close.
+
+`FM_WATCH_ABSORB_TICK` makes that liveness provable, and ships default off.
+`docs/configuration.md` owns the knob's default and precedence; this section owns the mechanism.
+When it is unset or any value other than `1`, behavior is byte-identical to today.
+When it is `1`, a benign-absorbed wake ends the cycle with a distinguishable `tick: <note>` reason line and a zero exit instead of absorbing silently.
+
+A tick is deliberately cheap and safe:
+
+- It enqueues no durable wake record, so `bin/fm-wake-drain.sh` finds nothing, and neither the continuity guard nor the turn-end guard sees any actionable work.
+  Those guards continue to key off in-flight tasks and watcher health, both unaffected by a tick.
+- `bin/fm-watch-arm.sh` classifies the `tick:` close as a benign completion, separate from an actionable wake (`signal:`/`stale:`/`check:`/`heartbeat`) and from a failure (nonzero exit), so a live-but-quiet watcher never reads as the empty-cycle failure.
+- It fires at most once per absorbed-wake event, never once per poll.
+  Only two absorb points emit it, and both first advance their suppression state so the same event cannot re-fire: a benign signal whose `.seen-*` signature is written, and an absorbed heartbeat whose schedule and exponential backoff are advanced.
+  Per-poll re-evaluations of an unchanged or churning stale pane deliberately do not tick, so a static or redrawing fleet cannot storm.
+
+On a tick-enabled home the standing convention is a single literal `tick` reply: the session wakes on the proof-of-life close, sees the tick, answers `tick`, and re-arms the watcher exactly as it would after any cycle close.
+The heartbeat's backoff bounds the quiet-fleet cadence (base `FM_HEARTBEAT`, doubling to `FM_HEARTBEAT_MAX`), so a fully idle-but-supervised fleet ticks on that lengthening interval rather than continuously.
+Verified for the Claude native tracked-background path; the Pi, OpenCode, Codex, and Grok adapters are inert while the knob is off and, when it is on, treat a tick close like any other cycle close (re-arm, then deliver the tick text).
 
 ## Regression coverage
 

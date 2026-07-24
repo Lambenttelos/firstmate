@@ -40,6 +40,11 @@
 # loud. A live cycle already present means re-arm attaches - do not start a second
 # watcher.
 #
+# A started child may also close with a "tick:" line: fm-watch.sh's env-gated
+# (FM_WATCH_ABSORB_TICK) proof-of-life exit for a benign-absorbed wake. It is neither
+# an actionable wake nor a failure - the line is printed and the cycle returns success
+# without the empty-cycle FAILED path (see watch_output_is_tick, owned_child_finished).
+#
 # Every observed watcher cycle appends one tab-separated lifecycle record to
 # state/.watch-cycle-exits.log. The arm layer owns that bounded ledger; it records
 # arm/watcher identities, timestamps, exit/signal classification, beacon age,
@@ -299,6 +304,18 @@ watch_output_has_wake() {
   grep -Eq '^(signal:|stale:|check:|heartbeat($|:))' "$out" 2>/dev/null
 }
 
+# A tick close is the env-gated proof-of-life exit (fm-watch.sh's absorb_tick, active
+# only when FM_WATCH_ABSORB_TICK=1 on this home): a clean exit whose only reason line
+# is "tick:". It proves the watcher absorbed a benign wake while alive; it is neither
+# an actionable wake nor a failure, so it is classified separately and returns success
+# without the empty-cycle FAILED path. The tick line is still printed, so the harness
+# surfaces it to the session (the standing "tick" reply). No durable wake record
+# exists, so the wake drain finds nothing and the model just re-arms as usual.
+watch_output_is_tick() {
+  local out=$1
+  ! watch_output_has_wake "$out" && grep -Eq '^tick:' "$out" 2>/dev/null
+}
+
 watch_output_reason_type() {
   local out=$1 line
   line=$(grep -E '^(signal:|stale:|check:|heartbeat($|:))' "$out" 2>/dev/null | head -1 || true)
@@ -419,6 +436,16 @@ child_done=0
 owned_child_finished() {
   local rc=$1 signal reason_type status
   signal=$(cycle_signal_name "$rc")
+  if [ "$rc" -eq 0 ] && watch_output_is_tick "$child_out"; then
+    # Proof-of-life tick: a benign-absorbed wake, not an actionable wake and not a
+    # failure. Print it so the session sees it, record it, and return success.
+    cycle_log_append "$rc" "$signal" tick none
+    print_watch_output "$child_out"
+    rm -f "$child_out" 2>/dev/null || true
+    child=
+    child_out=
+    return 0
+  fi
   if [ "$rc" -eq 0 ] && watch_output_has_wake "$child_out"; then
     reason_type=$(watch_output_reason_type "$child_out")
     cycle_log_append "$rc" "$signal" "$reason_type" none

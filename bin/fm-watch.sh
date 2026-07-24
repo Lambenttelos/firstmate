@@ -429,6 +429,29 @@ wake() {
   exit 0
 }
 
+# Proof-of-life "tick" for a benign-ABSORBED wake. Default OFF: with
+# FM_WATCH_ABSORB_TICK unset or any value other than 1 this is a no-op that RETURNS,
+# so the caller keeps blocking exactly as before and behavior is byte-identical. When
+# set to 1, a benign-absorbed wake instead ENDS the cycle with a distinguishable
+# "tick: <note>" reason line and exit 0, so the arming session can tell a
+# live-but-quiet watcher from a dead one at minimal token cost (the standing rule on a
+# tick-enabled home is a single literal "tick" reply). A tick enqueues NO durable wake
+# record, so bin/fm-wake-drain.sh, the continuity guard, and the turn-end guard see no
+# actionable work; bin/fm-watch-arm.sh classifies the "tick:" line as a benign
+# completion, distinct from an actionable wake (signal/stale/check/heartbeat) and from
+# a failure (nonzero exit). Call ONLY from one-shot absorb points that have already
+# advanced their suppression state (a benign signal whose .seen-* signature is
+# written, an absorbed heartbeat whose schedule and backoff are advanced), never from
+# a per-poll re-evaluation of an unchanged pane, so it fires at most once per
+# absorbed-wake event and never storms on a static fleet. Deliberately does not touch
+# the heartbeat streak or enqueue anything: a tick is not an actionable wake.
+FM_WATCH_ABSORB_TICK=${FM_WATCH_ABSORB_TICK:-0}
+absorb_tick() {  # <note>
+  [ "$FM_WATCH_ABSORB_TICK" = 1 ] || return 0
+  echo "tick: $1"
+  exit 0
+}
+
 # Consecutive wedge-escalation count for a window past FM_WEDGE_DEMAND_INSPECT_COUNT
 # (default 3): a pane that keeps re-wedging on the SAME stale hash - each
 # escalation gets absorbed again as "still validating" one poll later, since the
@@ -1098,6 +1121,9 @@ EOF
 $pending
 EOF
       triage_log "absorbed benign $reason"
+      # Suppressors are advanced above, so this benign signal will not re-fire; a
+      # tick (when enabled) surfaces it once as proof of life instead of exiting.
+      absorb_tick "signal absorbed"
     fi
   fi
 
@@ -1325,6 +1351,10 @@ EOF
       touch "$STATE/.last-heartbeat"
       echo $(( $(cat "$STATE/.heartbeat-streak" 2>/dev/null || echo 0) + 1 )) > "$STATE/.heartbeat-streak"
       triage_log "absorbed heartbeat (no captain-relevant change)"
+      # Schedule and backoff are advanced above, so the next heartbeat is bounded and
+      # further out; a tick (when enabled) makes this quiet-fleet proof of life
+      # visible once per heartbeat cadence instead of only in the debug log.
+      absorb_tick "heartbeat absorbed"
     fi
   fi
 
