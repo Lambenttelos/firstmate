@@ -217,11 +217,12 @@ Persistent secondmates are running agents and real load, so they are counted and
 The reading names the all-agents total and labels the ceiling in agents, so the number the ceiling is compared against is visible on the line and the shed advice reads as a consequence of it.
 A home whose only running agents are persistent secondmates therefore never gets shed advice.
 
-`FM_RESOURCE_SWEEP_BUDGET` is the number of seconds one sweep may spend checking crew liveness in total, defaulting to `30`, and a malformed value falls back to that default rather than disabling the budget.
+`FM_RESOURCE_SWEEP_BUDGET` is the number of seconds one sweep may spend checking crew liveness in total, defaulting to `30`, and `0` or a malformed value falls back to that default rather than disabling the budget.
 It bounds the watcher's poll loop however many crews are recorded and however unresponsive a backend is, since bounding each check on its own would still allow one timeout per recorded crew.
 A check started near the deadline gets only the time the budget has left, so the worst case is the budget plus a sub-second stop grace rather than the budget plus one whole per-check timeout.
 Crews left unchecked when the budget runs out count toward the live total anyway, the same conservative direction an unanswered check already takes, and the reading says "liveness partly unverified" so a partly checked count is never shown as a fully verified one.
 That marker is cached with the count, so a partly checked count keeps the same label on the later synchronous readings that reuse it.
+`FM_RESOURCE_PROBE_TIMEOUT` bounds each individual crew-liveness check inside that budget, defaulting to `5`, with the same fallback for `0` or a malformed value; each check is terminated as a process group, so a wedged backend leaves no stuck process behind.
 
 Three callers consult the monitor, and all three only report:
 
@@ -434,6 +435,8 @@ FM_HEARTBEAT_MAX=7200   # heartbeat backoff cap
 FM_CHECK_INTERVAL=300   # seconds between slow checks (authenticated merge polls, custom checks, or X-mode dispatch)
 FM_CHECK_TIMEOUT=30     # seconds allowed per slow check script
 FM_RESOURCE_INTERVAL=900   # seconds between host CPU/memory/swap sweeps; own cadence, NOT tied to FM_POLL or FM_CHECK_INTERVAL; 0 disables the monitor, malformed falls back to the default (see the host resource monitoring section above)
+FM_RESOURCE_SWEEP_BUDGET=30   # seconds one sweep may spend on crew-liveness checks in total; 0 or malformed falls back to the default
+FM_RESOURCE_PROBE_TIMEOUT=5   # seconds allowed per crew-liveness check inside a sweep; 0 or malformed falls back to the default
 FM_CODEX_WATCH_CHECKPOINT=180   # seconds per foreground watcher checkpoint in Codex primary supervision
 FM_CREW_STATE_NM_TIMEOUT=10   # seconds allowed per no-mistakes query inside fm-crew-state.sh
 FM_CREW_STATE_RUNS_LIMIT=200  # recent no-mistakes run rows scanned when axi status cannot be attributed to the current code
