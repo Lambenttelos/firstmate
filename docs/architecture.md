@@ -195,8 +195,10 @@ For target project repos shipped through their own no-mistakes pipeline, commits
 The firstmate repo itself is the exception: its `.no-mistakes/` directory is local state, stays gitignored, and is rejected by CI if tracked.
 PR-based task merges go through `bin/fm-pr-merge.sh`, which records `pr=` and any available `pr_head=` through `bin/fm-pr-check.sh` before calling `gh-axi pr merge`.
 The helper requires a full `https://github.com/<owner>/<repo>/pull/<n>` URL, invokes `gh-axi pr merge <n> --repo <owner>/<repo>`, defaults to `--squash`, preserves explicit merge-method flags, and rejects malformed URLs or repo override flags before recording merge state; a well-formed GitLab merge request URL (see [docs/gitlab-merge-watch.md](gitlab-merge-watch.md)) is refused too, explicitly, rather than sent to the wrong forge.
-Teardown is fail-closed for ship worktrees: dirty worktrees refuse, and committed work must be landed before the worktree is returned.
-[`bin/fm-teardown.sh`](../bin/fm-teardown.sh)'s header owns the landed-work proofs, PR-discovery fallback, and stale-lock recovery procedure.
+Teardown is fail-closed for ship worktrees: dirty worktrees refuse, and committed work must be either landed or fully pushed to its own origin ref before the worktree is returned.
+Release-on-pushed frees a finished worker's memory slot without waiting for the merge; a commit that is absent from the remote ref, and the no-remote or offline case, still refuse rather than release on an unverifiable claim, and `--force` stays the only discard path.
+Every released-but-unmerged ship branch is recorded in the durable per-repo merge queue so it cannot be silently forgotten - see [merge-queue.md](merge-queue.md) for its format, its content-in-base sweep, and the merge-workers-on-demand contract.
+[`bin/fm-teardown.sh`](../bin/fm-teardown.sh)'s header owns the landed-work proofs, the fully-pushed proof, PR-discovery fallback, and stale-lock recovery procedure.
 
 ## Optional X mode
 

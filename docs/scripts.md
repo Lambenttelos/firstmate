@@ -79,7 +79,8 @@ The shared no-mistakes gate refusal for fleet lifecycle entrypoints is summarize
 | `fm-config-inherit-lib.sh` | Shared primary-to-secondmate inherited local-material propagation and config-reread delivery |
 | `fm-tasks-axi-lib.sh`    | Shared backlog-backend selector and `tasks-axi` compatibility probe                  |
 | `fm-wake-drain.sh`       | Atomically drain queued watcher wakes, emit bounded best-effort status-event annotations, then assert watcher liveness |
-| `fm-wake-lib.sh`         | Shared durable wake queue, portable locks, and watcher identity/health helpers       |
+| `fm-wake-lib.sh`         | Shared durable wake queue and watcher identity/health helpers, layered on `fm-mutex-lib.sh` |
+| `fm-mutex-lib.sh`        | Side-effect-free portable advisory-mutex primitives (`fm_lock_try_acquire` and friends) |
 | `fm-pid-lib.sh`          | Side-effect-free process liveness and pid-identity helpers shared by the wake and daemon libs |
 | `fm-classify-lib.sh`     | Shared captain-relevant and declared-external-wait wake classification vocabulary    |
 | `fm-send.sh`             | Send one verified literal line or supported key through the target's recorded backend |
@@ -93,7 +94,9 @@ The shared no-mistakes gate refusal for fleet lifecycle entrypoints is summarize
 | `fm-pr-check.sh`         | Record validated `pr=` and `pr_head=` values, then atomically arm a static merge poll |
 | `fm-pr-merge.sh`         | Record PR metadata, then merge a task's canonical full GitHub URL                    |
 | `fm-promote.sh`          | Promote a scout task in place to a protected ship task                               |
-| `fm-teardown.sh`         | Fail-closed teardown: return landed ship worktrees, require completed scout deliverables, retire secondmate homes |
+| `fm-teardown.sh`         | Fail-closed teardown: return landed or fully pushed ship worktrees, require completed scout deliverables, retire secondmate homes |
+| `fm-merge-queue.sh`      | Surface, sweep, and prune the durable list of released-but-unmerged ship branches (docs/merge-queue.md) |
+| `fm-merge-queue-lib.sh`  | Own the `data/merge-queue.tsv` format, locked record/remove writes, and the fresh content-in-base merged check |
 | `fm-harness.sh`          | Detect the running harness and resolve crew or secondmate harness, model, and effort |
 | `fm-lock.sh`             | Per-home firstmate session lock                                                      |
 | `fm-x-lib.sh`            | Shared X-mode config, relay, and reply-threading helpers                             |

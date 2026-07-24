@@ -38,6 +38,10 @@
 #   (o) fm-pr-check rerun after HEAD moved                      -> no stale pr_head
 #   (p) fm-pr-check when local HEAD lags                        -> record remote PR head
 #   (q) no-mistakes + NO pr= recorded, PR discovered by branch  -> ALLOW  (yolo/no-CI merge)
+#   (z) no-mistakes + branch pushed, unmerged, stale local ref   -> ALLOW  (release-on-pushed, queued)
+#   (aa) no-mistakes + pushed base + extra unpushed local commit -> REFUSE (unpushed wins)
+#   (bb) no-mistakes + pushed branch but dirty worktree          -> REFUSE (dirty wins)
+#   (cc) no-mistakes + pushed branch but origin unreachable      -> REFUSE (unverifiable)
 #
 # Also covers backlog teardown-lock-race: a git index.lock left in the worktree by a
 # killed crew process (bin/fm-teardown.sh's teardown_treehouse_return).
@@ -493,8 +497,20 @@ run_teardown() {
   FM_ROOT_OVERRIDE="$ROOT" \
   FM_STATE_OVERRIDE="$case_dir/state" \
   FM_CONFIG_OVERRIDE="$case_dir/config" \
+  FM_DATA_OVERRIDE="$case_dir/data" \
   PATH="$case_dir/fakebin:$PATH" \
     "$TEARDOWN" task-x1 "$@"
+}
+
+# Push the worktree's task branch to origin, then delete the LOCAL remote-tracking
+# ref so `git log --not --remotes` still shows the commit as "unpushed" even though
+# the branch is durable on origin. This reproduces the real-world staleness the
+# fresh-fetch release-on-pushed check must handle. Args: case_dir
+push_branch_then_forget_local_ref() {
+  local case_dir=$1
+  git -C "$case_dir/wt" push -q origin fm/task-x1
+  # refs/remotes are shared across worktrees via the common dir; delete once.
+  git -C "$case_dir/project" update-ref -d refs/remotes/origin/fm/task-x1 2>/dev/null || true
 }
 
 test_local_only_fork_remote_allows() {
@@ -1371,7 +1387,121 @@ test_herdr_projection_teardown_retains_journal_when_close_unconfirmed() {
   pass "herdr projection teardown retains the stale journal and attempts no workspace cleanup when exact-pane close is unconfirmed"
 }
 
+# (z) no-mistakes + branch pushed to origin but unmerged, local remote ref stale ->
+#     ALLOW (release-on-pushed) and record the branch in the merge queue.
+test_pushed_unmerged_releases_and_records_merge_queue() {
+  local case_dir rc
+  case_dir=$(make_case pushed-unmerged)
+  write_meta "$case_dir" no-mistakes ship
+  wt_commit_file "$case_dir" feature.txt hello "pushed unmerged work"
+  push_branch_then_forget_local_ref "$case_dir"
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 0 "$rc" "pushed-unmerged: teardown should release a fully pushed branch"
+  ! grep -q REFUSED "$case_dir/stderr" || fail "pushed-unmerged: teardown printed a REFUSED line"
+  grep -F 'fm/task-x1' "$case_dir/data/merge-queue.tsv" >/dev/null \
+    || fail "pushed-unmerged: branch not recorded in the merge queue"
+  grep -E '^task-x1	' "$case_dir/data/merge-queue.tsv" >/dev/null \
+    || fail "pushed-unmerged: merge-queue entry missing task id"
+  pass "no-mistakes worktree fully pushed but unmerged is released and queued for merge"
+}
+
+# (z2) forced teardown of a pushed-but-unmerged branch still records the merge queue:
+#      recording is read-only, and a forced release is exactly when a pushed branch is
+#      most easily lost.
+test_forced_pushed_unmerged_still_records_merge_queue() {
+  local case_dir rc
+  case_dir=$(make_case pushed-unmerged-forced)
+  write_meta "$case_dir" no-mistakes ship
+  wt_commit_file "$case_dir" feature.txt hello "pushed unmerged work"
+  push_branch_then_forget_local_ref "$case_dir"
+
+  set +e
+  run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 0 "$rc" "pushed-unmerged-forced: forced teardown should succeed"
+  grep -E '^task-x1	' "$case_dir/data/merge-queue.tsv" >/dev/null \
+    || fail "pushed-unmerged-forced: forced teardown did not queue the released branch"
+  pass "forced teardown of a pushed-but-unmerged branch is still queued for merge"
+}
+
+# (aa) no-mistakes + pushed base commit + an EXTRA local commit past the origin ref ->
+#      REFUSE (a commit absent from the remote ref is still unpushed).
+test_pushed_with_extra_local_commit_refuses() {
+  local case_dir rc
+  case_dir=$(make_case pushed-extra-commit)
+  write_meta "$case_dir" no-mistakes ship
+  wt_commit_file "$case_dir" feature.txt hello "base pushed work"
+  push_branch_then_forget_local_ref "$case_dir"
+  # A further local commit that was never pushed to origin.
+  wt_commit_file "$case_dir" extra.txt more "unpushed extra commit"
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 1 "$rc" "pushed-extra-commit: teardown should refuse extra unpushed work"
+  grep -q REFUSED "$case_dir/stderr" || fail "pushed-extra-commit: no REFUSED line"
+  [ ! -f "$case_dir/data/merge-queue.tsv" ] \
+    || ! grep -q task-x1 "$case_dir/data/merge-queue.tsv" \
+    || fail "pushed-extra-commit: refused work must not be queued"
+  pass "branch with a local commit absent from its remote ref is refused (safety preserved)"
+}
+
+# (bb) no-mistakes + pushed branch but dirty worktree -> REFUSE (dirty wins over pushed).
+test_pushed_but_dirty_refuses() {
+  local case_dir rc
+  case_dir=$(make_case pushed-dirty)
+  write_meta "$case_dir" no-mistakes ship
+  wt_commit_file "$case_dir" feature.txt hello "pushed work"
+  push_branch_then_forget_local_ref "$case_dir"
+  printf '%s\n' dirty > "$case_dir/wt/uncommitted.txt"
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 1 "$rc" "pushed-dirty: teardown should refuse a dirty worktree even when pushed"
+  grep -q REFUSED "$case_dir/stderr" || fail "pushed-dirty: no REFUSED line"
+  pass "fully pushed branch with a dirty worktree is refused (dirty wins)"
+}
+
+# (cc) no-mistakes + branch pushed but origin unreachable (offline) -> REFUSE rather
+#      than release on an unverifiable claim.
+test_pushed_but_origin_unreachable_refuses() {
+  local case_dir rc
+  case_dir=$(make_case pushed-offline)
+  write_meta "$case_dir" no-mistakes ship
+  wt_commit_file "$case_dir" feature.txt hello "pushed work"
+  push_branch_then_forget_local_ref "$case_dir"
+  # Simulate offline: point origin at a nonexistent path so every fetch fails.
+  git -C "$case_dir/wt" remote set-url origin "$case_dir/no-such-origin.git"
+  git -C "$case_dir/project" remote set-url origin "$case_dir/no-such-origin.git"
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 1 "$rc" "pushed-offline: teardown should refuse when the remote is unverifiable"
+  grep -q REFUSED "$case_dir/stderr" || fail "pushed-offline: no REFUSED line"
+  pass "pushed branch with an unreachable origin is refused (no release on unverifiable claim)"
+}
+
 test_local_only_fork_remote_allows
+test_pushed_unmerged_releases_and_records_merge_queue
+test_forced_pushed_unmerged_still_records_merge_queue
+test_pushed_with_extra_local_commit_refuses
+test_pushed_but_dirty_refuses
+test_pushed_but_origin_unreachable_refuses
 test_teardown_prompts_tasks_axi_done_when_compatible
 test_teardown_manual_backend_prompts_hand_edit_even_when_tasks_axi_present
 test_local_only_truly_unpushed_refuses
