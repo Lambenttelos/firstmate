@@ -60,7 +60,10 @@ When it is `1`, a benign-absorbed wake ends the cycle with a distinguishable `ti
 A tick is deliberately cheap and safe:
 
 - It enqueues no durable wake record, so `bin/fm-wake-drain.sh` finds nothing, and neither the continuity guard nor the turn-end guard sees any actionable work.
-  Because a tick ends the cycle, the turn-end guard has one knob-gated extension: with `FM_WATCH_ABSORB_TICK=1` it keeps requiring a healthy watcher even at zero in-flight tasks, so an idle tick-enabled home cannot go dark after a tick; with the knob unset or any other value its zero-in-flight early return is unchanged ([`turnend-guard.md`](turnend-guard.md)).
+  Because a tick ends the cycle, both guards have one knob-gated extension: with `FM_WATCH_ABSORB_TICK=1` the turn-end guard keeps requiring a healthy watcher even at zero in-flight tasks and the pull-based `bin/fm-guard.sh` banner keeps warning there, so an idle tick-enabled home cannot go dark after a tick; with the knob unset or any other value their zero-in-flight exits are unchanged ([`turnend-guard.md`](turnend-guard.md)).
+  Both guards resolve the knob through the one owner in `bin/fm-supervision-lib.sh`, from the same sources the watcher itself sees: an explicit ambient value wins, otherwise the value comes from `config/x-mode.env`, the environment the arm adapters source before launching the watcher.
+  So a knob set only in that file still guards the home, and a missing, unreadable, or empty file leaves both guards exactly as they are with the knob off.
+  Because zero in-flight work only ever reaches a lapse banner on a tick-enabled home, the shared situation clause says so plainly instead of counting zero tasks (`fm_afk_posture_situation`).
 - `bin/fm-watch-arm.sh` classifies the `tick:` close as a benign completion, separate from an actionable wake (`signal:`/`stale:`/`check:`/`heartbeat`) and from a failure (nonzero exit), so a live-but-quiet watcher never reads as the empty-cycle failure.
 - It fires at most once per absorbed-wake event, never once per poll.
   Only two absorb points emit it, and both first advance their suppression state so the same event cannot re-fire: a benign signal whose `.seen-*` signature is written, and an absorbed heartbeat whose schedule and exponential backoff are advanced.

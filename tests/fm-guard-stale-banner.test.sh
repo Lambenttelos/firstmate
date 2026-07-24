@@ -295,6 +295,89 @@ test_banner_without_daemon_names_the_watcher() {
   pass "fm-guard stale banner: daemon-free away mode names the watcher repair path"
 }
 
+# A tick-enabled home ends its watcher cycle on a benign-absorbed wake with nothing
+# queued, so the pull-based guard must warn there even with no work under way. The
+# knob is resolved from the same sources the watcher sees, so setting it only in
+# config/x-mode.env - the file the arm adapters source before launching the watcher -
+# must be honored, while an ambient value still wins.
+make_idle_guard_case() {
+  local dir
+  dir=$(make_guard_case "$1")
+  rm -f "$(case_home "$dir")"/state/*.meta
+  printf '%s\n' "$dir"
+}
+
+write_tick_env_file() {
+  printf 'FM_WATCH_ABSORB_TICK=%s\n' "$2" > "$(case_home "$1")/config/x-mode.env"
+}
+
+run_guard_case_ambient_tick() {
+  local dir=$1 knob=$2
+  FM_ROOT_OVERRIDE="$(case_root "$dir")" \
+    FM_HOME="$(case_home "$dir")" \
+    FM_GUARD_GRACE=999 \
+    FM_WATCH_ABSORB_TICK="$knob" \
+    "$ROOT/bin/fm-guard.sh" 2>&1
+}
+
+test_guard_idle_home_silent_without_tick_knob() {
+  local dir out
+  dir=$(make_idle_guard_case idle-tick-off)
+  out=$(run_guard_case "$dir")
+  [ -z "$out" ] || fail "guard must stay silent with no work under way and the tick knob off: $out"
+  write_tick_env_file "$dir" 0
+  out=$(run_guard_case "$dir")
+  [ -z "$out" ] || fail "a non-1 tick knob must leave the zero-in-flight exit unchanged: $out"
+  write_tick_env_file "$dir" true
+  out=$(run_guard_case "$dir")
+  [ -z "$out" ] || fail "only the literal 1 may enable idle tick coverage: $out"
+  pass "fm-guard: zero-in-flight exit unchanged unless the tick knob is exactly 1"
+}
+
+test_guard_idle_home_warns_with_tick_knob_from_env_file() {
+  local dir out
+  dir=$(make_idle_guard_case idle-tick-env-file)
+  write_tick_env_file "$dir" 1
+  out=$(run_guard_case "$dir")
+  [ "$(count_text "$out" "WATCHER DOWN - SUPERVISION IS OFF")" -eq 1 ] \
+    || fail "a tick-enabled idle home must warn about its dead watcher: $out"
+  assert_contains "$out" "no work is under way" \
+    "the idle banner must describe the tick posture"
+  assert_contains "$out" "absorbed-wake proof-of-life ticks" \
+    "the idle banner must name why a live watcher is still required"
+  assert_not_contains "$out" "0 task(s) in flight" \
+    "the idle banner must not read as self-contradictory"
+  pass "fm-guard: a tick knob set only in config/x-mode.env warns on an idle home"
+}
+
+test_guard_idle_tick_ambient_value_wins_over_env_file() {
+  local dir out
+  dir=$(make_idle_guard_case idle-tick-ambient)
+  write_tick_env_file "$dir" 1
+  out=$(run_guard_case_ambient_tick "$dir" 0)
+  [ -z "$out" ] || fail "an ambient tick knob must win over config/x-mode.env: $out"
+  rm -f "$(case_home "$dir")/config/x-mode.env"
+  out=$(run_guard_case_ambient_tick "$dir" 1)
+  [ "$(count_text "$out" "WATCHER DOWN - SUPERVISION IS OFF")" -eq 1 ] \
+    || fail "an ambient tick knob alone must enable idle coverage: $out"
+  pass "fm-guard: an ambient tick knob wins over the env file in both directions"
+}
+
+test_guard_idle_tick_unreadable_env_file_changes_nothing() {
+  local dir env_file out
+  dir=$(make_idle_guard_case idle-tick-unreadable)
+  env_file="$(case_home "$dir")/config/x-mode.env"
+  write_tick_env_file "$dir" 1
+  chmod 000 "$env_file"
+  out=$(run_guard_case "$dir")
+  chmod 600 "$env_file"
+  [ -z "$out" ] || fail "an unreadable env file must leave guard behavior unchanged: $out"
+  : > "$env_file"
+  out=$(run_guard_case "$dir")
+  [ -z "$out" ] || fail "an empty env file must leave guard behavior unchanged: $out"
+  pass "fm-guard: an unreadable or empty env file leaves the idle exit unchanged"
+}
+
 test_first_stale_call_prints_full_banner
 test_repeated_same_episode_prints_reminder_only
 test_healthy_recovery_rearms_next_stale_episode
@@ -307,3 +390,7 @@ test_healthy_read_only_does_not_clear_marker
 test_read_only_never_mutates_stale_banner_state_files
 test_banner_with_live_daemon_names_the_daemon
 test_banner_without_daemon_names_the_watcher
+test_guard_idle_home_silent_without_tick_knob
+test_guard_idle_home_warns_with_tick_knob_from_env_file
+test_guard_idle_tick_ambient_value_wins_over_env_file
+test_guard_idle_tick_unreadable_env_file_changes_nothing

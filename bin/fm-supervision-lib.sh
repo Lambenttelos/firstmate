@@ -63,3 +63,30 @@ fm_supervision_unhealthy() {
   fm_supervision_status "$@"
   [ "$FM_SUP_IN_FLIGHT" -gt 0 ] && [ "$FM_SUP_WATCHER_FRESH" = false ]
 }
+
+# fm_watch_absorb_tick_enabled <config-dir>
+# Exit 0 (true) exactly when this home ticks on a benign-absorbed wake, resolved
+# from the same sources the watcher itself sees, so the guards and bin/fm-watch.sh
+# can never disagree: an explicit FM_WATCH_ABSORB_TICK already in the caller's
+# environment wins (an operator export is never overridden), otherwise the value
+# comes from config/x-mode.env, which is the shell environment the arm adapters
+# source before launching the watcher. Only the literal 1 enables it, matching
+# bin/fm-watch.sh. One owner for both bin/fm-guard.sh and bin/fm-turnend-guard.sh.
+# Sourcing happens in a subshell, so a missing, unreadable, empty, or hostile file
+# leaves the caller's environment and behavior untouched and never aborts it.
+fm_watch_absorb_tick_enabled() {
+  local config=${1:-} env_file value
+  if [ -n "${FM_WATCH_ABSORB_TICK+set}" ]; then
+    [ "$FM_WATCH_ABSORB_TICK" = 1 ]
+    return
+  fi
+  [ -n "$config" ] || return 1
+  env_file="$config/x-mode.env"
+  [ -f "$env_file" ] && [ -r "$env_file" ] || return 1
+  value=$(
+    # shellcheck disable=SC1090 # local, gitignored, operator-owned env file
+    . "$env_file" >/dev/null 2>&1
+    printf '%s' "${FM_WATCH_ABSORB_TICK:-}"
+  ) || return 1
+  [ "$value" = 1 ]
+}

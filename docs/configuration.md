@@ -458,7 +458,7 @@ FM_GUARD_CONTINUE_LINE='This is a supervision warning only; the guarded operatio
 FM_POLL=15              # seconds between watcher poll cycles; keep below the beacon grace (FM_WATCHER_STALE_GRACE, default 300) - see the POLL < grace invariant below
 FM_HEARTBEAT=600        # base seconds between heartbeat scans; no-change heartbeats are absorbed while idle
 FM_HEARTBEAT_MAX=7200   # heartbeat backoff cap
-FM_WATCH_ABSORB_TICK=0  # 1 makes a benign-absorbed wake end the cycle with a distinguishable "tick:" proof-of-life line (no wake record); default off = byte-identical silent absorb. See docs/watcher-continuity.md "Absorbed-wake proof-of-life tick"
+FM_WATCH_ABSORB_TICK=0  # 1 makes a benign-absorbed wake end the cycle with a distinguishable "tick:" proof-of-life line (no wake record); default off = byte-identical silent absorb; settable ambiently or in config/x-mode.env, which both guards resolve the same way (ambient wins). See docs/watcher-continuity.md "Absorbed-wake proof-of-life tick"
 FM_CHECK_INTERVAL=300   # seconds between slow checks (authenticated merge polls, custom checks, or X-mode dispatch)
 FM_CHECK_TIMEOUT=30     # seconds allowed per slow check script
 FM_RESOURCE_INTERVAL=900   # seconds between host CPU/memory/swap sweeps; own cadence, NOT tied to FM_POLL or FM_CHECK_INTERVAL; 0 disables the monitor, malformed falls back to the default (see the host resource monitoring section above)
