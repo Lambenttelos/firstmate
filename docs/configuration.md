@@ -210,9 +210,11 @@ Readings are kernel-wide, taken from `sysctl` and `vm_stat` on macOS and from `/
 Firstmate's own `ps` view is sandboxed to a small subset of the host, so summing per-process usage would silently under-report a loaded machine.
 For the same reason the reading is a host total and never attributes load to a particular crew.
 The crew count in the reading is the number of crews whose agent is actually running, not the number of recorded tasks, so a task that has stopped but has not been cleaned up yet no longer inflates the count or the shed advice.
-Only the watcher's sweep pays for that liveness answer, and it caches the verdict, so the count every other caller shows is at most one sweep interval old (`FM_RESOURCE_INTERVAL`, default 900 seconds).
-When no cached verdict is available, or it is older than two sweep intervals, the reading falls back to the count of recorded tasks and says so with "liveness unverified" instead of presenting it as a verified count.
-Persistent secondmates are running agents, so they are counted and reported separately in the reading, and they are excluded from the shed advice because AGENTS.md makes an idle secondmate endpoint healthy and its retirement an explicit decision.
+Only the watcher's sweep pays for that liveness answer, and it caches the verdict, so the count every other caller shows is at most two sweep intervals old (`FM_RESOURCE_INTERVAL`, default 900 seconds, so 1800 seconds at the default).
+Two intervals rather than one is deliberate: the watcher exits on every wake and is re-armed, so a home between arms routinely has no sweep running while the other callers keep reading the cache.
+When no cached verdict is available, or it is older than that, the reading falls back to the count of recorded tasks and says so with "liveness unverified" instead of presenting it as a verified count.
+Persistent secondmates are running agents and real load, so they are counted and reported separately in the reading and they count toward the ceiling and the overage, but the number of crews the shed advice names is capped at the ordinary crews, because AGENTS.md makes an idle secondmate endpoint healthy and its retirement an explicit decision.
+A home whose only running agents are persistent secondmates therefore never gets shed advice.
 
 `FM_RESOURCE_SWEEP_BUDGET` is the number of seconds one sweep may spend checking crew liveness in total, defaulting to `30`, and a malformed value falls back to that default rather than disabling the budget.
 It bounds the watcher's poll loop however many crews are recorded and however unresponsive a backend is, since bounding each check on its own would still allow one timeout per recorded crew.

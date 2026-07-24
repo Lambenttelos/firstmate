@@ -314,9 +314,37 @@ test_persistent_secondmates_are_counted_but_never_shed() {
   expect_code 2 "$RC" "critical exit with a secondmate present"
   assert_contains "$OUT" "live crews 2 + 1 persistent secondmate(s)" \
     "the reading must report crews and persistent secondmates separately"
-  assert_contains "$OUT" "SHED 1 crew(s)" \
-    "the overage must come from ordinary crews only, not from the secondmate"
+  assert_contains "$OUT" "SHED 2 crew(s)" \
+    "the overage must be measured on all running agents against the same ceiling"
   pass "a persistent secondmate is reported in the reading but never in the overage"
+}
+
+test_the_ceiling_and_the_overage_share_one_basis() {
+  local home fakebin i
+  home=$(make_home live-count-basis)
+  fakebin=$(fake_tmux "$TMP_ROOT/live-count-basis-bin")
+  for i in 1 2 3 4; do
+    fm_write_meta "$home/state/crew$i.meta" "window=firstmate:fm-crew$i" "harness=claude"
+    fm_write_meta "$home/state/sm$i.meta" "window=firstmate:fm-sm$i" "harness=claude" \
+      "kind=secondmate"
+  done
+  # 4 crews + 4 secondmates at 4.0 per core with ample memory: 8 running agents,
+  # a CPU-derived ceiling of 4, an overage of 4, capped at the 4 ordinary crews.
+  run_in_home "$home" "$fakebin" --sweep FM_RESOURCE_LOAD1=40
+  expect_code 2 "$RC" "critical exit with crews and secondmates together"
+  assert_contains "$OUT" "live crews 4 + 4 persistent secondmate(s)" \
+    "both kinds of running agent must stay visible"
+  assert_contains "$OUT" "recommended ceiling 4" \
+    "the ceiling must be derived from all running agents"
+  assert_contains "$OUT" "SHED 4 crew(s)" \
+    "secondmates must not suppress shed advice for ordinary crews"
+
+  # The same host with no secondmates: 4 running agents, ceiling 2, overage 2.
+  run_check FM_RESOURCE_LOAD1=40 FM_RESOURCE_LIVE=4
+  expect_code 2 "$RC" "critical exit with four crews and no secondmates"
+  assert_contains "$OUT" "recommended ceiling 2" "4.0x per core halves four crews to two"
+  assert_contains "$OUT" "SHED 2 crew(s)" "the crew-only host must advise shedding two"
+  pass "the ceiling and the overage are computed on the same all-agents basis"
 }
 
 test_a_home_of_only_secondmates_never_advises_shedding() {
@@ -333,6 +361,11 @@ test_a_home_of_only_secondmates_never_advises_shedding() {
     "persistent secondmates must still be visible in the reading"
   assert_not_contains "$OUT" "SHED" \
     "a home whose only running agents are secondmates has nothing to shed"
+
+  run_in_home "$home" "$fakebin" --sweep FM_RESOURCE_LOAD1=40
+  expect_code 2 "$RC" "critical exit with only secondmates and ample memory"
+  assert_not_contains "$OUT" "SHED" \
+    "a CPU-bound overage must still name no shed candidate when no crew is running"
   pass "persistent secondmates alone never produce shed advice, however loaded the host"
 }
 
@@ -720,6 +753,7 @@ test_stale_cached_verdict_degrades_honestly
 test_cached_partial_verdict_stays_labelled_partial
 test_persistent_secondmates_are_counted_but_never_shed
 test_a_home_of_only_secondmates_never_advises_shedding
+test_the_ceiling_and_the_overage_share_one_basis
 test_sweep_without_the_backend_library_labels_its_count
 test_probe_timeout_leaves_no_stuck_backend_process
 test_sweep_probing_is_bounded_as_a_whole

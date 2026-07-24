@@ -44,7 +44,11 @@
 #   available memory  <  1024 MB critical
 # The worst of the three decides the status.
 #
-# CEILING - the smaller of what memory and CPU support:
+# CEILING - the smaller of what memory and CPU support. Both components, and the
+# over-ceiling comparison that triggers the SHED line, are computed on ALL
+# running agents (ordinary crews plus persistent secondmates), so the two sides
+# of that comparison always share one basis; only the shed COUNT is capped at the
+# number of ordinary crews:
 #   by memory: one live crew per 1024 MB of available memory, floor 1. Memory is
 #              the binding constraint on a laptop-class host, and available
 #              memory deliberately excludes anything that only exists because the
@@ -73,19 +77,24 @@
 # cached with the count so a partly probed count is never shown as a fully
 # verified one on any later synchronous reading either.
 #
-# CREWS vs PERSISTENT SECONDMATES - a kind=secondmate meta is a running agent, so
-# it counts toward the reported live figure and toward the CPU ceiling, and the
-# reading labels it separately. It is never a shed candidate (AGENTS.md sections
-# 7 and 8: an idle secondmate endpoint is healthy and retirement is an explicit
-# captain or main-firstmate decision), so the SHED overage and the over-ceiling
-# comparison that triggers it are computed from ORDINARY CREWS ONLY. A home whose
-# only running agents are persistent secondmates never produces shed advice.
+# CREWS vs PERSISTENT SECONDMATES - a kind=secondmate meta is a running agent and
+# real load, so it counts toward the reported live figure, toward the ceiling and
+# toward the overage, and the reading labels it separately. It is never a shed
+# candidate (AGENTS.md sections 7 and 8: an idle secondmate endpoint is healthy
+# and retirement is an explicit captain or main-firstmate decision), so the shed
+# COUNT alone is min(live agents - ceiling, ordinary crews) and no shed line is
+# printed when that is zero or less. A home whose only running agents are
+# persistent secondmates therefore never produces shed advice.
 #
 # Every OTHER caller (bin/fm-spawn.sh before a dispatch, bin/fm-session-start.sh
 # inside its fast digest) READS that cache and never probes, so a wedged backend
-# can never delay a dispatch or a session start. The cached verdict is therefore
-# at most one sweep interval old (FM_RESOURCE_INTERVAL, default 900s); a cache
-# that is missing, unreadable or older than two sweep intervals degrades
+# can never delay a dispatch or a session start. A cached verdict is accepted
+# while it is younger than TWO sweep intervals (FM_RESOURCE_INTERVAL, default
+# 900s, so 1800s at the default), which is the real bound on an unlabelled
+# count: the watcher exits on every wake and is re-armed, so a home between arms
+# routinely has no sweep running while the synchronous callers keep reading the
+# cache, and one interval would degrade them on every ordinary wake. A cache
+# that is missing, unreadable or older than that degrades
 # immediately to the cheap count of recorded state/*.meta files, and the reading
 # then says "liveness unverified" rather than passing recorded work off as a
 # verified count, and a cached count the sweep could only partly probe keeps its
@@ -335,6 +344,22 @@ SWEEP_BUDGET_DEFAULT=30
 SWEEP_BUDGET=${FM_RESOURCE_SWEEP_BUDGET:-$SWEEP_BUDGET_DEFAULT}
 case "$SWEEP_BUDGET" in ''|0|*[!0-9]*) SWEEP_BUDGET=$SWEEP_BUDGET_DEFAULT ;; esac
 
+LIVE_CACHE="$STATE/.resource-live"
+
+# The cache is replaced atomically, through a temp file in the same directory,
+# because the synchronous callers read it with no coordination and must never
+# observe a half-written record.
+write_live_cache() {  # <crews> <secondmates> <partial>
+  local tmp
+  [ -d "$STATE" ] || return 0
+  tmp=$(mktemp "$LIVE_CACHE.XXXXXX" 2>/dev/null) || return 0
+  if printf '%s %s %s\n' "$1" "$2" "$3" > "$tmp" 2>/dev/null; then
+    mv -f "$tmp" "$LIVE_CACHE" 2>/dev/null || rm -f "$tmp" 2>/dev/null || true
+  else
+    rm -f "$tmp" 2>/dev/null || true
+  fi
+}
+
 # sweep_live_crews: the probing path, watcher-only. Caches the count AND whether
 # it was fully probed, so every synchronous caller can read it without touching a
 # backend and still sees an honest label. Crews left unprobed when the total
@@ -368,8 +393,7 @@ sweep_live_crews() {
     fi
   done
   [ -z "$partial" ] || note=$PARTIAL_NOTE
-  [ -d "$STATE" ] \
-    && printf '%s %s %s\n' "$crews" "$smates" "${partial:-0}" > "$LIVE_CACHE" 2>/dev/null
+  write_live_cache "$crews" "$smates" "${partial:-0}"
   printf '%s\t%s\t%s' "$note" "$crews" "$smates"
 }
 
@@ -395,7 +419,6 @@ cached_live_crews() {
   count_metas "$UNVERIFIED_NOTE"
 }
 
-LIVE_CACHE="$STATE/.resource-live"
 read_live_crews() {
   local v
   v=${FM_RESOURCE_LIVE:-}
@@ -475,9 +498,11 @@ printf 'resources: %s | load %s (%sx over %s cores) | avail %s MB of %s GB | swa
   "$STATUS" "$LOAD1" "$LOAD_PER_CORE" "$CORES" "$AVAIL_MB" "$RAM_GB" "$SWAP_PCT" "$SWAP_TOTAL" \
   "$CREWS" "$SECONDMATE_NOTE" "$LIVE_NOTE" "$CEILING"
 
-if [ "$RC" -ne 0 ] && [ "$CREWS" -gt "$CEILING" ]; then
-  printf 'resources: SHED %s crew(s) - stop the heaviest test and browser runs first, they cost far more than an idle agent\n' \
-    "$(( CREWS - CEILING ))"
+if [ "$RC" -ne 0 ] && [ "$LIVE" -gt "$CEILING" ]; then
+  SHED=$(( LIVE - CEILING ))
+  [ "$SHED" -le "$CREWS" ] || SHED=$CREWS
+  [ "$SHED" -lt 1 ] || printf 'resources: SHED %s crew(s) - stop the heaviest test and browser runs first, they cost far more than an idle agent\n' \
+    "$SHED"
 fi
 
 exit "$RC"
