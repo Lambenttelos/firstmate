@@ -2,6 +2,7 @@
 
 The away-mode sub-supervisor (`bin/fm-supervise-daemon.sh`) buffers escalations and injects them into firstmate's own pane.
 When injection cannot confirm a submit past `FM_MAX_DEFER_SECS` (the pane is genuinely busy or wedged, or its Enter is swallowed), `inject_wedge_alarm` raises a loud, rate-limited alarm so the stall never stays invisible.
+Paneless pull delivery (`docs/configuration.md` "Away-mode paneless delivery") raises this same alarm through these channels when the oldest unacknowledged outbox record ages past `FM_MAX_DEFER_SECS` and the reader's liveness beacon is absent or stale.
 
 ## Why an active channel beyond the status-line flash
 
