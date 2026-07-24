@@ -120,7 +120,8 @@ If validation, cloning, no-mistakes initialization, or registry update fails, ge
 
 Secondmate project lists may include remote-backed `no-mistakes`, `direct-PR`, and `direct-push` projects only.
 `local-only` projects stay with the main firstmate.
-For `no-mistakes` projects, seeding initializes only projects newly cloned into a secondmate home and refuses to mutate a preexisting clone that is not already initialized.
+For `no-mistakes` and `direct-push` projects, seeding initializes only projects newly cloned into a secondmate home and refuses to mutate a preexisting clone that is not already initialized.
+That refusal aborts the whole seed transactionally, including for an uninitialized preexisting `direct-push` clone, so initialize that clone and reseed.
 
 ## Backlog handoff
 

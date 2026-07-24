@@ -15,9 +15,12 @@
 #       project list, and omitting both still fails loudly. A project-less seed
 #       refuses a home with project clones or project-registry entries, so it
 #       never converts populated homes in place. The charter brief
-#       is copied to data/charter.md, newly cloned no-mistakes projects are
-#       initialized, an ignored .fm-secondmate-home identity marker is written, and
+#       is copied to data/charter.md, newly cloned no-mistakes and direct-push
+#       projects are initialized, an ignored .fm-secondmate-home identity marker
+#       is written, and
 #       data/secondmates.md is updated.
+#       An uninitialized preexisting clone of either mode is refused rather than
+#       mutated, which aborts the whole seed; initialize that clone and reseed.
 #       Seeding is transactional: on validation, clone, init, or registry failure,
 #       generated briefs, new homes, new project clones, and registry edits are
 #       rolled back. Treehouse-acquired homes are returned only when the rollback
