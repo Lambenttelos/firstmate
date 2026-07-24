@@ -1473,6 +1473,51 @@ test_direct_push_branch_on_origin_allows() {
   pass "direct-push worktree whose branch is on origin is torn down"
 }
 
+test_direct_push_stale_origin_ref_refuses() {
+  local case_dir rc
+  case_dir=$(make_case dp-stale-origin)
+  write_meta "$case_dir" direct-push ship
+  wt_commit_file "$case_dir" feature.txt hello "validated work"
+  git -C "$case_dir/wt" push -q origin fm/task-x1
+  git -C "$case_dir/project" fetch -q origin
+  wt_commit_file "$case_dir" feature.txt later "later work never pushed to origin"
+  add_no_mistakes_internal_remote_with_pushed_branch "$case_dir"
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 1 "$rc" "dp-stale-origin: teardown should refuse when origin lags the worktree head"
+  assert_grep "has commits after what origin holds" "$case_dir/stderr" \
+    "dp-stale-origin: teardown did not refuse for the stale origin ref"
+  assert_no_grep "never pushed to origin" "$case_dir/stderr" \
+    "dp-stale-origin: stale-ref refusal must read differently from the branch-absent refusal"
+  pass "direct-push worktree whose origin ref lags its head is refused"
+}
+
+test_direct_push_origin_ahead_of_head_allows() {
+  local case_dir rc
+  case_dir=$(make_case dp-origin-ahead)
+  write_meta "$case_dir" direct-push ship
+  wt_commit_file "$case_dir" feature.txt hello "validated work"
+  git -C "$case_dir/wt" push -q origin fm/task-x1
+  git -C "$case_dir/project" fetch -q origin
+  wt_commit_file "$case_dir" feature.txt later "later work"
+  git -C "$case_dir/wt" push -q origin fm/task-x1
+  git -C "$case_dir/wt" reset -q --hard HEAD~1
+  git -C "$case_dir/project" fetch -q origin
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 0 "$rc" "dp-origin-ahead: origin containing the head should be treated as landed"
+  ! grep -q REFUSED "$case_dir/stderr" || fail "dp-origin-ahead: teardown printed a REFUSED line"
+  pass "direct-push worktree whose head is contained in origin is torn down"
+}
+
 test_direct_push_force_overrides_missing_origin_branch() {
   local case_dir rc
   case_dir=$(make_case dp-force)
@@ -1639,4 +1684,6 @@ test_fractional_legacy_retry_wait_refuses_without_arithmetic_error
 test_direct_push_branch_absent_from_origin_refuses
 test_direct_push_ls_remote_failure_refuses
 test_direct_push_branch_on_origin_allows
+test_direct_push_stale_origin_ref_refuses
+test_direct_push_origin_ahead_of_head_allows
 test_direct_push_force_overrides_missing_origin_branch
