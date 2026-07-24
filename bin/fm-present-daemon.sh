@@ -247,6 +247,10 @@ run_main() {
       [ "$failures" -eq 0 ] || log_line "recovered after $failures rapid failure(s)"
       failures=0
       degraded=0
+      # A clean-but-instant return would otherwise re-arm in a tight loop and
+      # burn a core on a resource-constrained host. One second is invisible
+      # against the guard grace and makes the loop unspinnable by construction.
+      [ "$elapsed" -ge "$RAPID_SECONDS" ] || interruptible_sleep 1
       continue
     fi
 

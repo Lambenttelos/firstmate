@@ -44,7 +44,9 @@ make_home() {  # <dir> <arm-body>
   local dir=$1 arm_body=$2
   mkdir -p "$dir/bin" "$dir/state" "$dir/config"
   cp "$ROOT/bin/fm-present-daemon.sh" "$dir/bin/fm-present-daemon.sh"
-  cp "$ROOT/bin/fm-wake-lib.sh" "$dir/bin/fm-wake-lib.sh"
+  # fm-wake-lib.sh sources its own siblings, so the copied bin/ needs them too.
+  cp "$ROOT/bin/fm-wake-lib.sh" "$ROOT/bin/fm-mutex-lib.sh" \
+    "$ROOT/bin/fm-pid-lib.sh" "$dir/bin/"
   chmod +x "$dir/bin/fm-present-daemon.sh"
   printf '#!/usr/bin/env bash\n%s\n' "$arm_body" > "$dir/bin/fm-watch-arm.sh"
   chmod +x "$dir/bin/fm-watch-arm.sh"
