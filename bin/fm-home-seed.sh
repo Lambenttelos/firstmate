@@ -770,7 +770,10 @@ sync_project_registry() {
 initialize_no_mistakes_project() {
   local home=$1 project=$2 created=$3 mode dst
   mode=$(project_mode_in_home "$home" "$project")
-  [ "$mode" = no-mistakes ] || return 0
+  case "$mode" in
+    no-mistakes|direct-push) ;;
+    *) return 0 ;;
+  esac
   dst=$(validate_project_destination "$home" "$project") || return 1
   if git -C "$dst" remote get-url no-mistakes >/dev/null 2>&1; then
     return 0

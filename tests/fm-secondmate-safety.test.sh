@@ -696,7 +696,7 @@ test_home_seed_refuses_local_only_project() {
   if FM_HOME="$home" "$ROOT/bin/fm-home-seed.sh" design "$subhome" alpha >/dev/null 2>"$err"; then
     fail "seed allowed a local-only project into a secondmate home"
   fi
-  grep -F 'project alpha is local-only; secondmate routes support only no-mistakes and direct-PR projects' "$err" >/dev/null \
+  grep -F 'project alpha is local-only; secondmate routes support only remote-backed no-mistakes, direct-PR, and direct-push projects' "$err" >/dev/null \
     || fail "seed did not explain local-only project rejection"
   [ ! -e "$subhome" ] || fail "seed created a subhome before rejecting a local-only project"
   pass "home seeding refuses local-only projects"
@@ -995,6 +995,31 @@ test_home_seed_skips_initialized_existing_no_mistakes_projects() {
   [ ! -f "$subhome/projects/alpha/.no-mistakes-doctor" ] || fail "seed mutated initialized existing clone with no-mistakes doctor"
   [ ! -e "$subhome/projects/beta" ] || fail "failed seed left a newly cloned project after no-mistakes failure"
   pass "home seeding skips initialized existing no-mistakes clones"
+}
+
+test_home_seed_initializes_direct_push_projects() {
+  local home subhome fakebin log
+  home="$TMP_ROOT/direct-push-init-home"
+  subhome="$TMP_ROOT/direct-push-init-subhome"
+  log="$TMP_ROOT/direct-push-init-no-mistakes.log"
+  mkdir -p "$home/projects" "$home/data" "$home/state"
+  fm_git_init_commit "$home/projects/alpha"
+  fm_git_add_origin "$home/projects/alpha" "$TMP_ROOT/remotes/direct-push-alpha.git"
+  printf '%s\n' '- alpha [direct-push] - alpha project (added 2026-06-22)' > "$home/data/projects.md"
+  fakebin=$(make_recording_no_mistakes "$TMP_ROOT/direct-push-init-fake")
+  : > "$log"
+
+  PATH="$fakebin:$PATH" FM_FAKE_NO_MISTAKES_LOG="$log" \
+    FM_HOME="$home" FM_SECONDMATE_CHARTER='direct push init scope' FM_SECONDMATE_SCOPE='direct push init scope' \
+    "$ROOT/bin/fm-home-seed.sh" design "$subhome" alpha >/dev/null \
+    || fail "seed failed for a direct-push project"
+  [ -f "$subhome/projects/alpha/.no-mistakes-init" ] \
+    || fail "seed did not no-mistakes-initialize a direct-push clone"
+  [ -f "$subhome/projects/alpha/.no-mistakes-doctor" ] \
+    || fail "seed did not run no-mistakes doctor on a direct-push clone"
+  [ ! -f "$home/projects/alpha/.no-mistakes-init" ] \
+    || fail "seed wrote no-mistakes state through the parent direct-push project"
+  pass "home seeding initializes direct-push clones like no-mistakes clones"
 }
 
 test_home_seed_refuses_uninitialized_existing_no_mistakes_project() {
@@ -2197,6 +2222,7 @@ test_home_seed_refuses_remote_backed_project_without_origin
 test_home_seed_refuses_existing_remote_backed_project_with_wrong_origin
 test_home_seed_resolves_relative_source_origins
 test_home_seed_skips_initialized_existing_no_mistakes_projects
+test_home_seed_initializes_direct_push_projects
 test_home_seed_refuses_uninitialized_existing_no_mistakes_project
 test_home_seed_refuses_project_destinations_outside_subhome
 test_home_seed_refuses_operational_dirs_outside_subhome
