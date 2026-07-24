@@ -15,30 +15,26 @@ tradeoff **consented** and **explicit**: the captain is stepping away, so the
 sub-supervisor may triage routine wakes in bash instead of waking firstmate's
 LLM for each one. Escalations still reach the captain, but as one pre-read,
 batched digest rather than per-wake injections.
-Where no pane exists for the daemon to inject into, the same away posture is
-entered without a daemon and this home's own watcher keeps supervising; pick the
-entry path first.
+Where no pane exists for the daemon to inject into, the daemon still runs and delivers through the durable outbox that firstmate's armed inbox reader drains; pick the entry path first.
 
 ## Pick the entry path first
 
-Away mode has two first-class entry paths. Decide between them BEFORE running
-anything, from one question: does this session have an injectable supervisor
-pane, meaning a pane the daemon can type escalations into?
+Away mode has two first-class entry paths.
+Decide between them BEFORE running anything, from one question: does the daemon have a delivery channel here?
 
-- **Yes, there is an injectable supervisor pane** (firstmate runs inside tmux or
-  herdr): use the **daemon entry** below.
-- **No injectable supervisor pane** (the captain runs firstmate outside any such
-  pane, so nothing exists for a daemon to type into): use the **daemon-free
-  entry** below.
+- **An injectable supervisor pane exists** (firstmate runs inside tmux or herdr, so a pane can be typed into): use the **daemon entry** below in its pane-delivery form.
+- **No injectable supervisor pane, but this harness has a native tracked-background tool** (claude's background bash, grok's background tool, so the daemon and the inbox reader can both be hosted): use the **daemon entry** below in its paneless pull-delivery form.
+- **Neither** (no pane the daemon could reach and no way to host the daemon or the reader, or a supported backend that refuses to launch the daemon terminal): use the **daemon-free entry** below.
 
-Never start a daemon without a pane it can inject into. A daemon with nowhere to
-type talks to nobody: its escalations buffer and are lost silently, a failure
-this fleet has already had. Never manufacture a pane just to satisfy the daemon.
+Never start a daemon with nowhere to deliver.
+A daemon that cannot reach firstmate talks to nobody: its escalations buffer and are lost silently, a failure this fleet has already had.
+Paneless pull delivery through the durable outbox plus the armed inbox reader IS a delivery channel, so it satisfies that requirement; a daemon started with no pane AND no armed reader does not.
+Never manufacture a pane just to satisfy the daemon.
 
 Both entries share the same away posture, the same exit contract, and the same
 approval authority; they differ only in what supervises.
 
-## Daemon entry (injectable supervisor pane)
+## Daemon entry (pane delivery or paneless pull delivery)
 
 1. **Enter the lifecycle through `bin/fm-afk-launch.sh`.**
    This owns the durable state write, session-scoped stale-artifact clearing,
@@ -65,15 +61,17 @@ approval authority; they differ only in what supervises.
      active pane** (`herdr pane split`): a split co-tenants the tab and visibly
      shrinks the captain's pane (docs/herdr-backend.md "Away-mode daemon terminal
      launch").
+   The paneless form always uses the harness-native path, because there is no supervisor pane to capture and nothing to inject into; the daemon detects that honestly and selects pull delivery itself.
    Both paths share `bin/fm-afk-start.sh` as the daemon entry.
    The native path tells it that the launcher already prepared lifecycle state; the terminal-backed path lets the entry perform its existing state setup inside the new terminal.
    It exits immediately if the identity-backed daemon lock already names a live process, otherwise it execs `bin/fm-supervise-daemon.sh` in the foreground.
    The daemon is **presence-gated**: it injects escalations only while
    `state/.afk` exists, and stays quiet otherwise.
 
-3. **Arm the away-mode inbox reader as a tracked background task.**
+3. **On the paneless form, arm the away-mode inbox reader as a tracked background task.**
+   This step belongs to the paneless entry, because the reader IS that form's delivery channel (see "Delivery channel" below); a pane-delivery entry does not arm a reader.
    Run `bin/fm-afk-inbox.sh` through the harness's own tracked background mechanism, exactly the way `bin/fm-watch-arm.sh` is armed, and never with a shell `&`.
-   It is the delivery channel whenever the daemon has no supervisor pane to type into (see "Delivery channel" below), and it costs nothing when there is one: it prints one line saying the pane is delivering and exits immediately.
+   If you armed it on a session that turns out to have a pane, it costs nothing: it prints one line saying the pane is delivering and exits immediately.
    Each completion is an internal escalation, not captain input.
    Read the digests it printed and act on them.
    Then obey its final line for whether to arm it again: every exit ends in either `re-arm to keep listening` or `- do not re-arm`.
@@ -85,8 +83,10 @@ approval authority; they differ only in what supervises.
 
 5. **Acknowledge** in `AGENTS.md` section 9 language: "Captain, away mode is active; I will batch routine updates and surface only decisions, failures, credentials, or review-ready work until you return."
 
-## Daemon-free entry (no injectable supervisor pane)
+## Daemon-free entry (no delivery channel at all)
 
+Use this only when the daemon has neither a pane nor a hostable pull path: this harness has no native tracked-background tool to run the daemon and its reader in, or the supported backend it would need refuses to launch the daemon terminal.
+A session that merely lacks a supervisor pane is NOT this case; it takes the paneless daemon entry above.
 This is a supported configuration, not a degraded one.
 `state/.afk` then carries the away POSTURE only (batched updates and the standing routine merge authority), while this home's own watcher stays the real supervision mechanism.
 
@@ -97,14 +97,14 @@ This is a supported configuration, not a degraded one.
    It creates no terminal and starts nothing.
    Never hand-write `state/.afk`.
    It refuses with a non-zero status, and changes nothing, when an away-mode daemon is already live for this home, naming that daemon's process id.
-   Handle that refusal deliberately: either stop the live daemon with `bin/fm-afk-launch.sh stop` and re-run the daemon-free entry, or decide this session really does have an injectable supervisor pane and use the daemon entry instead.
+   Handle that refusal deliberately: either stop the live daemon with `bin/fm-afk-launch.sh stop` and re-run the daemon-free entry, or decide this session really does have a delivery channel and use the daemon entry instead.
    Never work around the refusal by hand-writing the flag.
 
 2. **Skip the daemon entirely.**
    Do not run `bin/fm-afk-start.sh`, `start`, or `start-native`, and do not
    manufacture a pane for a daemon.
    Say plainly to the captain that away mode is running without the daemon
-   because there is no pane it could reach.
+   because there is no way to reach them with its escalations here.
 
 3. **Keep arming and repairing this home's own watcher cycle** exactly as in
    normal mode, for the whole away stretch, through the emitted primary-harness

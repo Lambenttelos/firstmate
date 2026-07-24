@@ -807,6 +807,57 @@ test_transient_temp_templates_track_their_artifact_constants() {
   pass "every temp template is derived from the same constant as its cleanup glob"
 }
 
+# A fresh away entry clears another session's leftover scratch, but a lock whose
+# owner process is still running is a WORKING lock, not scratch: removing it
+# breaks mutual exclusion between that live holder and the new daemon's appends.
+# A genuinely dead owner is still cleared, and a skipped live lock is not a
+# clearing failure.
+test_clearing_transients_leaves_a_live_lock_alone() {
+  local state live_lock live_owner dead_lock dead_owner sleeper status ack_temp
+  state=$(make_inbox_case clear-transient-live-lock)
+  ack_temp="$(fm_afk_outbox_ack_file "$state").pending.abc"
+
+  live_lock=$(fm_afk_outbox_lock_file "$state")
+  live_owner="$live_lock.owner.live"
+  mkdir -p "$live_owner"
+  sleep 60 &
+  sleeper=$!
+  printf '%s\n' "$sleeper" > "$live_owner/pid"
+  ln -s "$live_owner" "$live_lock"
+
+  : > "$ack_temp"
+  : > "$(fm_afk_outbox_file "$state").compact.abc"
+  : > "$(fm_afk_inbox_beacon_file "$state")"
+
+  status=0
+  fm_afk_outbox_clear_transient "$state" || status=$?
+  [ "$status" -eq 0 ] \
+    || fail "a live lock was reported as a clearing failure (status $status)"
+  [ -L "$live_lock" ] || fail "the live away-mode outbox lock was torn out from under its owner"
+  [ -f "$live_owner/pid" ] || fail "the live lock's owner record was discarded"
+  [ ! -e "$ack_temp" ] || fail "a leftover ack temp survived clearing"
+  [ ! -e "$(fm_afk_outbox_file "$state").compact.abc" ] || fail "a leftover compaction temp survived clearing"
+  [ ! -e "$(fm_afk_inbox_beacon_file "$state")" ] || fail "the stale reader beacon survived clearing"
+
+  kill "$sleeper" 2>/dev/null || true
+  wait "$sleeper" 2>/dev/null || true
+  rm -rf "$live_lock" "$live_owner"
+
+  dead_lock=$(fm_afk_outbox_lock_file "$state")
+  dead_owner="$dead_lock.owner.dead"
+  mkdir -p "$dead_owner"
+  printf '%s\n' "$sleeper" > "$dead_owner/pid"
+  ln -s "$dead_owner" "$dead_lock"
+
+  status=0
+  fm_afk_outbox_clear_transient "$state" || status=$?
+  [ "$status" -eq 0 ] || fail "clearing a dead-owner lock reported a failure (status $status)"
+  [ ! -e "$dead_lock" ] && [ ! -L "$dead_lock" ] \
+    || fail "a lock whose owner is gone was left behind as stale scratch"
+
+  pass "clearing transients skips a live lock and still clears dead scratch"
+}
+
 test_reader_delivers_pending_records_then_acknowledges_them
 test_killed_reader_loses_nothing
 test_reader_wakes_on_a_record_written_while_it_waits
@@ -827,4 +878,5 @@ test_every_exit_line_carries_a_re_arm_verdict
 test_a_transient_lock_timeout_keeps_the_reader_alive
 test_a_lock_that_never_clears_ends_the_reader_within_its_bound
 test_transient_temp_templates_track_their_artifact_constants
+test_clearing_transients_leaves_a_live_lock_alone
 test_real_daemon_without_a_backend_delivers_to_the_reader

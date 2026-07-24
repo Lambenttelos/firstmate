@@ -151,6 +151,8 @@ fm_afk_outbox_artifact_names() {
 # behind, and the lock is only recovered lazily by the portable helper's dead-pid
 # steal, so a fresh away entry clears them here rather than inheriting another
 # session's scratch.
+# A lock whose owner process is still ALIVE is the one exception: it is left
+# exactly where it is, because it is a working lock rather than scratch.
 #
 # The beacon belongs in THIS list rather than the durable one above for the same
 # reason the lock does: it is a liveness signal about a running process, so it can
@@ -167,10 +169,35 @@ fm_afk_outbox_transient_artifact_globs() {
     "$FM_AFK_INBOX_BEACON_NAME"
 }
 
+# Is the portable lock at <path> still held by a LIVE process? A lock whose owner
+# is running is not stale scratch: tearing it out would break mutual exclusion
+# between that live holder (a reader armed by an earlier still-running session,
+# mid-compaction) and whoever clears. A genuinely dead owner needs no help here,
+# because bin/fm-wake-lib.sh's own dead-pid steal already recovers it lazily.
+#
+# Unreadable or non-numeric pid means NOT alive, so clearing proceeds: that is the
+# same reading the lock helper's steal path takes.
+_fm_afk_outbox_lock_owner_alive() {  # <path>
+  local path=$1 pid
+  pid=$(cat "$path/pid" 2>/dev/null || true)
+  case "$pid" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  if declare -F fm_pid_alive >/dev/null 2>&1; then
+    fm_pid_alive "$pid"
+    return
+  fi
+  kill -0 "$pid" 2>/dev/null
+}
+
 # Remove one transient artifact glob. The lock is a directory or a symlink to an
 # owner directory rather than a plain file, so it is retired through the portable
 # lock helper's own removal path when that helper is loaded, and torn out
 # wholesale otherwise.
+#
+# A lock still held by a live process is SKIPPED rather than removed, and a skip
+# is not a clearing failure: it neither names an unclearable artifact nor makes
+# this helper return non-zero, because nothing is stale and nothing is stuck.
 #
 # Every failure NAMES the artifact it could not clear on stderr as well as
 # returning non-zero, so a caller that only sees the status can still report
@@ -181,6 +208,13 @@ fm_afk_outbox_clear_transient() {  # <state>
     [ -n "$glob" ] || continue
     for path in "$state"/$glob; do
       [ -e "$path" ] || [ -L "$path" ] || continue
+      case "$glob" in
+        "$FM_AFK_OUTBOX_LOCK_NAME"|"$FM_AFK_OUTBOX_LOCK_NAME".steal)
+          if _fm_afk_outbox_lock_owner_alive "$path"; then
+            continue
+          fi
+          ;;
+      esac
       if [ -d "$path" ] || [ -L "$path" ]; then
         if declare -F fm_lock_remove_path >/dev/null 2>&1; then
           fm_lock_remove_path "$path" 2>/dev/null && continue
