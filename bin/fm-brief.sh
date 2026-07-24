@@ -313,6 +313,10 @@ The task is complete only when committed on your branch.
 When you believe it is complete, append \`done: {summary}\` to the status file and stop.
 Firstmate will then instruct you to run /no-mistakes to validate and ship a PR.
 
+Before you invoke /no-mistakes, run \`$FM_ROOT/bin/fm-nm-preflight.sh\` from this worktree.
+If it refuses, do NOT invoke /no-mistakes: append \`blocked: {the refusal it printed}\` and stop.
+It refuses when the pipeline already has a run in flight on a different branch, because a run started here would silently attach to that one and validate that branch instead of yours - never respond to or abort that run, because its findings belong to the lane that started it.
+
 You drive no-mistakes by responding to its gates, not by implementing fixes.
 Follow the guidance no-mistakes itself provides for the mechanics: it loads when you invoke /no-mistakes, and \`no-mistakes axi run --help\` plus the \`help\` lines in each \`axi\` response are authoritative and version-matched to the installed binary.
 Do not hand-edit, commit, or fix findings yourself while a run is active - the pipeline applies every fix.

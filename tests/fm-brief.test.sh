@@ -119,6 +119,29 @@ test_no_mistakes_dod_wording() {
   pass "fm-brief.sh: no-mistakes DOD wording avoids the apostrophe regression"
 }
 
+# A no-mistakes brief must send the crewmate through the wrong-branch-attach
+# guard before it invokes the pipeline, with an absolute path it can run from
+# its own worktree, and must say what to do when the guard refuses. Without
+# this step a lane silently validates another lane's branch
+# (bin/fm-nm-preflight.sh; data/learnings.md `no-mistakes-wrong-repo-attach`).
+test_no_mistakes_dod_requires_preflight() {
+  local home id brief
+  home="$TMP_ROOT/preflight-home"
+  mkdir -p "$home/data"
+  id="brief-preflight-b2"
+  FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" some-proj >/dev/null 2>&1
+  brief="$home/data/$id/brief.md"
+  assert_present "$brief" "brief was not scaffolded"
+  assert_grep "$ROOT/bin/fm-nm-preflight.sh" "$brief" \
+    "no-mistakes DOD lost the pre-run guard step, or stopped giving it an absolute path"
+  assert_grep "If it refuses, do NOT invoke /no-mistakes" "$brief" \
+    "no-mistakes DOD does not say to stop when the guard refuses"
+  # The refusal must not be answered by driving the foreign run.
+  assert_grep "never respond to or abort that run" "$brief" \
+    "no-mistakes DOD does not warn against driving the other lane's run"
+  pass "fm-brief.sh: no-mistakes DOD requires the wrong-branch-attach guard before the pipeline"
+}
+
 test_ship_project_memory_wording() {
   local home id brief
   home="$TMP_ROOT/project-memory-home"
@@ -346,6 +369,7 @@ test_help_includes_entire_header
 test_ship_modes_generate_clean_briefs
 test_faster_paths_use_configured_authority_without_stacked_review
 test_no_mistakes_dod_wording
+test_no_mistakes_dod_requires_preflight
 test_ship_project_memory_wording
 test_herdr_lab_contract_is_explicit_and_complete
 test_herdr_lab_contract_quotes_foreign_firstmate_path

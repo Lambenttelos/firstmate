@@ -511,9 +511,25 @@ if [ "$1" = "-f" ] && [ "$2" = "%Lp" ]; then
 fi
 exit 1
 SH
+  # The refill claim is proven by ordering, not by a fixed sleep long enough to
+  # out-wait the scheduler: on a loaded host any fixed slow-fixture duration can
+  # expire before the scheduler gets around to launching the replacement, which
+  # made this assertion fail for load reasons rather than for scheduling ones.
+  # Instead the slow fixture BLOCKS until the replacement announces itself, so a
+  # correct scheduler cannot produce the failing interleaving at any host speed.
+  # SCHED_REFILL_EXPECTED scopes that handshake to this one run - later runs in
+  # this test reuse the same slow fixture with no replacement to wait for. The
+  # wait is bounded so a scheduler that really does drain the oldest worker
+  # first still fails the assertion instead of hanging the suite.
   cat >"$repo/$a" <<'SH'
 #!/usr/bin/env bash
-sleep 0.5
+if [ "${SCHED_REFILL_EXPECTED:-0}" = 1 ]; then
+  waited=0
+  while [ ! -e "$SCHED_EVIDENCE/refill-started" ] && [ "$waited" -lt 600 ]; do
+    sleep 0.05
+    waited=$((waited + 1))
+  done
+fi
 touch "$SCHED_EVIDENCE/slow-done"
 echo "ok - slow fixture"
 SH
@@ -525,14 +541,16 @@ SH
   cat >"$repo/$c" <<'SH'
 #!/usr/bin/env bash
 if [ -e "$SCHED_EVIDENCE/slow-done" ]; then
+  touch "$SCHED_EVIDENCE/refill-started"
   echo "not ok - scheduler waited for oldest worker"
   exit 1
 fi
+touch "$SCHED_EVIDENCE/refill-started"
 echo "ok - replacement fixture started before slow fixture finished"
 SH
   chmod +x "$runner" "$repo/$a" "$repo/$b" "$repo/$c" "$fake_bin/stat"
   set +e
-  PATH="$fake_bin:$PATH" SCHED_EVIDENCE="$evidence" \
+  PATH="$fake_bin:$PATH" SCHED_EVIDENCE="$evidence" SCHED_REFILL_EXPECTED=1 \
     "$runner" --jobs 2 --json "$tmp/timing.json" \
     "$a" "$b" "$c" >"$tmp/out" 2>"$tmp/err"
   rc=$?
