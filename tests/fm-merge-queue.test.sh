@@ -13,6 +13,9 @@
 #     unmerged one
 #   - the merged check uses content-in-base, not a PR lookup, so it works for a
 #     Bitbucket-style repo with no PR automation
+#   - task ids are matched literally, so a dotted id cannot clobber another entry
+#   - an entry whose head object is gone clears only when origin provably no longer
+#     carries the branch, and is kept on an inconclusive probe
 #   - compare-url builds github and bitbucket links and falls back for unknown hosts
 set -u
 
@@ -138,6 +141,62 @@ test_sweep_uses_content_not_pr_lookup() {
   pass "sweep merged check uses content-in-base, not a PR lookup"
 }
 
+test_id_is_matched_literally() {
+  # A task id may contain '.', which is a regex metacharacter: matching it as a
+  # pattern would let 'a.b' delete an unrelated 'aXb' entry.
+  local data="$TMP_ROOT/literal/data"
+  mkdir -p "$data"
+  fm_merge_queue_record "$data" aXb /proj fm/x c1 main url-x
+  fm_merge_queue_record "$data" a.b /proj fm/dot c2 main url-dot
+  [ "$(run_cli "$data" count)" = 2 ] || fail "re-record with a dotted id clobbered another entry"
+  run_cli "$data" remove a.b >/dev/null
+  run_cli "$data" list --raw | grep -F aXb >/dev/null || fail "remove of a dotted id took the wrong entry"
+  [ "$(run_cli "$data" count)" = 1 ] || fail "expected 1 entry after removing the dotted id"
+  pass "task ids are matched literally, so a dotted id cannot clobber another entry"
+}
+
+test_sweep_clears_when_head_gone_and_branch_deleted() {
+  # After teardown the local branch is gone; a pruning fetch plus gc can drop the
+  # last copy of the head object for a branch the forge deleted on merge. The entry
+  # must clear rather than stick forever.
+  local data="$TMP_ROOT/gone/data" repo="$TMP_ROOT/gone/repo"
+  mkdir -p "$data" "$repo"
+  make_repo_with_pushed_branch "$repo" fm/gone
+  local head
+  head=$(git -C "$repo/clone" rev-parse HEAD)
+  git -C "$repo/origin.git" update-ref -d refs/heads/fm/gone
+  fm_merge_queue_record "$data" task-g "$repo/clone" fm/gone 0000000000000000000000000000000000000000 main url-g
+  run_cli "$data" sweep >/dev/null
+  run_cli "$data" list --raw | grep -F task-g >/dev/null && fail "unresolvable head with deleted branch not swept"
+  [ -n "$head" ] || fail "fixture head unset"
+  pass "sweep clears an entry whose head is gone and whose branch no longer exists on origin"
+}
+
+test_sweep_keeps_when_head_gone_but_branch_alive() {
+  # Same unresolvable head, but the branch still exists on origin: that is not
+  # evidence of a merge, so the entry must be kept.
+  local data="$TMP_ROOT/alive/data" repo="$TMP_ROOT/alive/repo"
+  mkdir -p "$data" "$repo"
+  make_repo_with_pushed_branch "$repo" fm/alive
+  fm_merge_queue_record "$data" task-a2 "$repo/clone" fm/alive 0000000000000000000000000000000000000000 main url-a
+  run_cli "$data" sweep >/dev/null
+  run_cli "$data" list --raw | grep -F task-a2 >/dev/null || fail "entry cleared while its branch still exists on origin"
+  pass "sweep keeps an entry whose head is gone while the branch still exists on origin"
+}
+
+test_sweep_keeps_when_origin_unreachable() {
+  # Inconclusive probe (origin URL points nowhere): never clear on an unverifiable
+  # claim.
+  local data="$TMP_ROOT/unreach/data" repo="$TMP_ROOT/unreach/repo"
+  mkdir -p "$data" "$repo"
+  make_repo_with_pushed_branch "$repo" fm/unreach
+  git -C "$repo/clone" remote set-url origin "$repo/does-not-exist.git"
+  fm_merge_queue_record "$data" task-u "$repo/clone" fm/unreach 0000000000000000000000000000000000000000 main url-u
+  run_cli "$data" sweep >/dev/null
+  run_cli "$data" list --raw | grep -F task-u >/dev/null || fail "entry cleared on an unreachable origin"
+  pass "sweep keeps an entry when the origin probe is inconclusive"
+}
+
 test_compare_url_hosts() {
   local u
   u=$(fm_merge_queue_compare_url 'git@github.com:yjuyjuy/firstmate.git' main fm/x)
@@ -157,4 +216,8 @@ test_unsafe_field_refused
 test_remove_and_count
 test_sweep_clears_merged_keeps_unmerged
 test_sweep_uses_content_not_pr_lookup
+test_id_is_matched_literally
+test_sweep_clears_when_head_gone_and_branch_deleted
+test_sweep_keeps_when_head_gone_but_branch_alive
+test_sweep_keeps_when_origin_unreachable
 test_compare_url_hosts

@@ -746,7 +746,31 @@ EOF
   assert_contains "$out" "(none)" "empty fleet did not report (none) for in-flight tasks"
   assert_contains "$out" "absent" "empty fleet's AFK section did not report absent"
 
+  assert_not_contains "$out" "Finished work still waiting to merge" \
+    "an empty merge queue must stay silent in the fleet digest"
+
   pass "an empty fleet reports (none) for in-flight tasks and an absent AFK flag"
+}
+
+# The release-on-pushed safety guard must be structural: a non-empty merge queue is
+# surfaced by the digest itself, not only by remembering to run the CLI.
+test_fleet_digest_surfaces_merge_queue() {
+  local rec root home fakebin out
+  rec=$(new_world merge-queue-line)
+  IFS='|' read -r root home fakebin <<EOF
+$rec
+EOF
+  make_fake_toolchain "$fakebin"
+  make_fake_ps_claude "$fakebin"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\n' task-q /proj fm/q c1 main url-q > "$home/data/merge-queue.tsv"
+
+  out=$(run_session_start "$home" "$root" "$fakebin:$BASE_PATH")
+  assert_contains "$out" "Finished work still waiting to merge" \
+    "a non-empty merge queue was not surfaced in the fleet digest"
+  assert_contains "$out" "1 finished branch(es) are pushed but not merged yet" \
+    "the merge-queue digest line did not report the queued count"
+
+  pass "a non-empty merge queue is surfaced as one bounded fleet-digest line"
 }
 
 test_next_step_sources_x_mode_cadence() {
@@ -983,6 +1007,7 @@ test_backlog_compact_tasks_axi_omits_bodies_and_keeps_metadata
 test_backlog_compact_manual_backend_skips_indented_bodies
 test_backlog_compact_tasks_axi_unavailable_uses_manual_fallback
 test_fleet_digest_empty_fleet
+test_fleet_digest_surfaces_merge_queue
 test_next_step_sources_x_mode_cadence
 test_next_step_afk_delegates_to_daemon
 test_next_step_afk_without_daemon_keeps_own_watcher

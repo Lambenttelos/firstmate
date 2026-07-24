@@ -1146,10 +1146,11 @@ if [ -d "$WT" ] && [ "$FORCE" != "--force" ]; then
   fi
 fi
 
-# Safety passed. Before the worktree is destroyed, record a pushed-but-unmerged ship
-# branch in the durable merge queue so a released-yet-unmerged branch is never
-# silently forgotten (see bin/fm-merge-queue.sh, docs/merge-queue.md).
-if [ "$FORCE" != "--force" ] && [ "$KIND" != scout ] && [ "$KIND" != secondmate ] \
+# Before the worktree is destroyed, record a pushed-but-unmerged ship branch in the
+# durable merge queue so a released-yet-unmerged branch is never silently forgotten
+# (see bin/fm-merge-queue.sh, docs/merge-queue.md). Recording is read-only and runs
+# for a forced teardown too, which is exactly when a branch is most easily lost.
+if [ "$KIND" != scout ] && [ "$KIND" != secondmate ] \
    && [ "$MODE" != local-only ] && [ -d "$WT" ]; then
   record_pushed_unmerged_to_merge_queue || true
 fi

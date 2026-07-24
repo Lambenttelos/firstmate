@@ -41,7 +41,9 @@
 #                       one host CPU/memory/swap reading with the concurrent-crew
 #                       ceiling it supports (bin/fm-resource-check.sh, so the
 #                       session opens knowing whether the machine can take more
-#                       work), state/.afk, and a cheap per-task endpoint-liveness
+#                       work), a one-line count of released-but-unmerged branches
+#                       when the merge queue is non-empty (silent when empty),
+#                       state/.afk, and a cheap per-task endpoint-liveness
 #                       read: read-only, always runs.
 #   6. closing reminder - prints the context-specific watcher next step; this
 #                       script points back to the emitted harness supervision
@@ -389,6 +391,19 @@ for status in "$STATE"/*.status; do
   print_status_tail "$status"
 done
 [ "$ORPHAN_STATUS_FOUND" -eq 1 ] || printf '(none)\n'
+
+# Released-but-unmerged branches. Structural, not discretionary: the release-on-pushed
+# safety guard cannot depend on remembering to run the merge-queue CLI. One bounded
+# line, and nothing at all when the queue is empty.
+MERGE_QUEUE_COUNT=$("$SCRIPT_DIR/fm-merge-queue.sh" count 2>/dev/null || echo 0)
+case "$MERGE_QUEUE_COUNT" in
+  ''|*[!0-9]*) MERGE_QUEUE_COUNT=0 ;;
+esac
+if [ "$MERGE_QUEUE_COUNT" -gt 0 ]; then
+  subsection "Finished work still waiting to merge"
+  printf '%s finished branch(es) are pushed but not merged yet; run bin/fm-merge-queue.sh list for the batched compare links.\n' \
+    "$MERGE_QUEUE_COUNT"
+fi
 
 subsection "Host resources"
 # No --sweep here: the digest is fast and bounded, so it reads the watcher's

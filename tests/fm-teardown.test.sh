@@ -1410,6 +1410,27 @@ test_pushed_unmerged_releases_and_records_merge_queue() {
   pass "no-mistakes worktree fully pushed but unmerged is released and queued for merge"
 }
 
+# (z2) forced teardown of a pushed-but-unmerged branch still records the merge queue:
+#      recording is read-only, and a forced release is exactly when a pushed branch is
+#      most easily lost.
+test_forced_pushed_unmerged_still_records_merge_queue() {
+  local case_dir rc
+  case_dir=$(make_case pushed-unmerged-forced)
+  write_meta "$case_dir" no-mistakes ship
+  wt_commit_file "$case_dir" feature.txt hello "pushed unmerged work"
+  push_branch_then_forget_local_ref "$case_dir"
+
+  set +e
+  run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 0 "$rc" "pushed-unmerged-forced: forced teardown should succeed"
+  grep -E '^task-x1	' "$case_dir/data/merge-queue.tsv" >/dev/null \
+    || fail "pushed-unmerged-forced: forced teardown did not queue the released branch"
+  pass "forced teardown of a pushed-but-unmerged branch is still queued for merge"
+}
+
 # (aa) no-mistakes + pushed base commit + an EXTRA local commit past the origin ref ->
 #      REFUSE (a commit absent from the remote ref is still unpushed).
 test_pushed_with_extra_local_commit_refuses() {
@@ -1477,6 +1498,7 @@ test_pushed_but_origin_unreachable_refuses() {
 
 test_local_only_fork_remote_allows
 test_pushed_unmerged_releases_and_records_merge_queue
+test_forced_pushed_unmerged_still_records_merge_queue
 test_pushed_with_extra_local_commit_refuses
 test_pushed_but_dirty_refuses
 test_pushed_but_origin_unreachable_refuses

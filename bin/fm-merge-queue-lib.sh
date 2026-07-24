@@ -18,6 +18,46 @@
 # One entry per task id; recording an id again replaces its line. All writes are
 # atomic (tmp + mv). Field values may not contain a tab or newline.
 
+FM_MERGE_QUEUE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Serialize the read-modify-write in record/remove so two concurrent teardowns
+# cannot lose an entry. The lock primitives live in bin/fm-wake-lib.sh (one owner
+# for portable locking); it is sourced lazily so this leaf lib stays cheap for
+# read-only callers. A lock that cannot be taken within the bounded wait is not a
+# reason to drop a record: the write itself is atomic (tmp + mv), so proceed.
+fm_merge_queue_lock_path() {
+  printf '%s\n' "$1/.merge-queue.lock"
+}
+
+fm_merge_queue_lock() {
+  local data_dir=$1 lock attempt=0
+  command -v fm_lock_try_acquire >/dev/null 2>&1 || {
+    # shellcheck source=bin/fm-wake-lib.sh
+    . "$FM_MERGE_QUEUE_LIB_DIR/fm-wake-lib.sh"
+  }
+  lock=$(fm_merge_queue_lock_path "$data_dir")
+  while [ "$attempt" -lt 100 ]; do
+    if fm_lock_try_acquire "$lock"; then
+      return 0
+    fi
+    attempt=$((attempt + 1))
+    sleep 0.1
+  done
+  return 1
+}
+
+fm_merge_queue_unlock() {
+  local data_dir=$1
+  fm_lock_release "$(fm_merge_queue_lock_path "$data_dir")" 2>/dev/null || true
+}
+
+# Print every entry line whose first tab-separated field is NOT <id>. Literal
+# field comparison, never a regex, so an id containing '.' cannot match another.
+fm_merge_queue_drop_id() {
+  local file=$1 id=$2
+  awk -F'\t' -v id="$id" '$1 != id' "$file"
+}
+
 # Absolute path to the merge-queue file for a data dir.
 fm_merge_queue_file() {
   local data_dir=$1
@@ -61,10 +101,12 @@ fm_merge_queue_record() {
   done
   mkdir -p "$data_dir" || return 1
   file=$(fm_merge_queue_file "$data_dir")
+  local locked=0
+  fm_merge_queue_lock "$data_dir" && locked=1
   tmp="$file.tmp.$$"
   {
     if [ -f "$file" ]; then
-      grep -vE "^$id	" "$file" || true
+      fm_merge_queue_drop_id "$file" "$id" || true
     else
       printf '%s\n' \
         '# firstmate merge queue: pushed-but-unmerged branches whose worktree was released.' \
@@ -72,8 +114,15 @@ fm_merge_queue_record() {
         '# Owned by bin/fm-merge-queue-lib.sh; surface with bin/fm-merge-queue.sh list.'
     fi
     printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$id" "$project" "$branch" "$head" "$base" "$url"
-  } > "$tmp" || { rm -f "$tmp"; return 1; }
+  } > "$tmp" || {
+    rm -f "$tmp"
+    [ "$locked" -eq 1 ] && fm_merge_queue_unlock "$data_dir"
+    return 1
+  }
   mv "$tmp" "$file"
+  local rc=$?
+  [ "$locked" -eq 1 ] && fm_merge_queue_unlock "$data_dir"
+  return "$rc"
 }
 
 # Remove the entry for a task id. Succeeds silently when absent.
@@ -82,9 +131,27 @@ fm_merge_queue_remove() {
   fm_merge_queue_id_safe "$id" || return 1
   file=$(fm_merge_queue_file "$data_dir")
   [ -f "$file" ] || return 0
+  local locked=0
+  fm_merge_queue_lock "$data_dir" && locked=1
   tmp="$file.tmp.$$"
-  grep -vE "^$id	" "$file" > "$tmp" || true
+  fm_merge_queue_drop_id "$file" "$id" > "$tmp" || true
   mv "$tmp" "$file"
+  local rc=$?
+  [ "$locked" -eq 1 ] && fm_merge_queue_unlock "$data_dir"
+  return "$rc"
+}
+
+# True only when origin PROVABLY no longer carries <branch>. Used when the recorded
+# head object is no longer in the clone (the local branch is gone after teardown, and
+# a pruning fetch plus gc can drop the last remote-tracking copy of a merged branch):
+# a branch the forge deleted after merging must clear rather than stick forever. Any
+# inconclusive answer - a network or auth failure, an ls-remote error - returns
+# non-zero so nothing clears on an unverifiable claim.
+fm_merge_queue_branch_gone_from_origin() {
+  local project=$1 branch=$2 rc=0
+  [ -n "$branch" ] || return 1
+  git -C "$project" ls-remote --exit-code --heads origin "refs/heads/$branch" >/dev/null 2>&1 || rc=$?
+  [ "$rc" -eq 2 ]
 }
 
 # True when <branch>'s work (tip <head>) is confirmed merged into <base> on origin.
@@ -98,8 +165,11 @@ fm_merge_queue_branch_merged() {
   local project=$1 branch=$2 head=$3 base=$4 ref base_tree merged_tree
   [ -n "$project" ] && [ -d "$project" ] || return 1
   [ -n "$base" ] || return 1
-  git -C "$project" cat-file -e "$head^{commit}" 2>/dev/null || return 1
   git -C "$project" remote get-url origin >/dev/null 2>&1 || return 1
+  if ! git -C "$project" cat-file -e "$head^{commit}" 2>/dev/null; then
+    fm_merge_queue_branch_gone_from_origin "$project" "$branch"
+    return
+  fi
   git -C "$project" fetch --quiet origin "+refs/heads/$base:refs/remotes/origin/$base" >/dev/null 2>&1 || return 1
   ref="refs/remotes/origin/$base"
   git -C "$project" merge-base --is-ancestor "$head" "$ref" 2>/dev/null && return 0
