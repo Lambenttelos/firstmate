@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
 # Regression test for bin/fm-nm-preflight.sh.
 #
-# `no-mistakes axi run` resolves the run it acts on per repo, not per branch, so
-# a second lane invoking it while the repo already has a run in flight silently
-# ATTACHES to that run - on whatever branch it belongs to - instead of
-# validating the invoking branch. These tests pin the guard that refuses that
-# case, and pin the two shapes it must NOT refuse: a run on the invoking branch
-# (the documented resume after adding fix commits) and a finished run left
-# behind on another branch (the ordinary steady state of every repo).
+# no-mistakes serializes runs per repo+branch, never per repo, so a run in
+# flight on ANOTHER branch cannot be attached to, answered, or aborted from
+# here: `axi run`, `axi respond`, and `axi abort` all resolve through a
+# branch-scoped active-run lookup. Only `axi status` and `axi logs` fall back
+# repo-wide, and only for display. These tests pin that an unrelated in-flight
+# run is ALLOWED and loudly annotated, that every allow carries the drive-by-id
+# instruction that makes the display fallback harmless, and that the two real
+# refusals - a detached HEAD and a worktree from another copy of the repo -
+# still stand.
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -60,36 +62,61 @@ run_preflight() {  # <worktree> <fakebin> [args...]
   (cd "$wt" && PATH="$fakebin:$PATH" "$PREFLIGHT" "$@" 2>&1)
 }
 
-# The incident shape: this lane is on its own branch, but the repo already has
-# a run in flight on an unrelated one. Starting a run here would adopt it.
-test_inflight_run_on_other_branch_is_refused() {
+# A run in flight on an unrelated branch does not block this lane: nothing this
+# lane can invoke resolves to it. The allow must still name it, so the lane
+# knows the run a bare `axi status` shows is not its own.
+test_inflight_run_on_other_branch_is_allowed_and_named() {
   local clone wt fakebin out status
   IFS='|' read -r clone wt <<<"$(make_repo inflight fm/mine)"
   fakebin=$(make_nm "$TMP_ROOT/inflight" fm/theirs running 01KY7N2XXAG28JB6H838K5XJSS)
 
   out=$(run_preflight "$wt" "$fakebin")
   status=$?
-  [ "$status" -eq 1 ] || fail "preflight allowed an in-flight run on another branch (exit $status): $out"
-  assert_contains "$out" "fm/theirs" "refusal did not name the branch of the run it would have attached to"
-  assert_contains "$out" "01KY7N2XXAG28JB6H838K5XJSS" "refusal did not name the in-flight run"
-  assert_contains "$out" "fm/mine" "refusal did not name the branch that should have been validated"
+  expect_code 0 "$status" "preflight refused a lane merely because another branch had a run in flight: $out"
+  assert_contains "$out" "ok:" "allow did not print the ok line"
+  assert_contains "$out" "fm/mine" "allow did not name the branch being validated"
+  assert_contains "$out" "fm/theirs" "allow did not name the branch of the unrelated run"
+  assert_contains "$out" "01KY7N2XXAG28JB6H838K5XJSS" "allow did not name the unrelated run id"
+  assert_contains "$out" "not yours" "allow did not warn that the unrelated run belongs to another lane"
   : "$clone"
-  pass "an in-flight run on another branch is refused, naming both branches and the run"
+  pass "an in-flight run on another branch is allowed and named as another lane's"
 }
 
-# A run in a state this guard has never seen is treated as in flight: an
-# unrecognized state is exactly the case where attaching is unsafe.
-test_unknown_state_on_other_branch_is_refused() {
+# A parked or unrecognized state on another branch is the same case: parked or
+# not, a branch-scoped lookup from here cannot reach it.
+test_unknown_state_on_other_branch_is_allowed() {
   local clone wt fakebin out status
   IFS='|' read -r clone wt <<<"$(make_repo unknown-state fm/mine)"
   fakebin=$(make_nm "$TMP_ROOT/unknown-state" fm/theirs awaiting_approval)
 
   out=$(run_preflight "$wt" "$fakebin")
   status=$?
-  [ "$status" -eq 1 ] || fail "preflight allowed a parked run on another branch (exit $status): $out"
-  assert_contains "$out" "awaiting_approval" "refusal did not report the run state"
+  expect_code 0 "$status" "preflight refused a lane because another branch's run was parked: $out"
+  assert_contains "$out" "awaiting_approval" "allow did not report the unrelated run's state"
+  assert_contains "$out" "not yours" "allow did not warn that the parked run belongs to another lane"
   : "$clone"
-  pass "a parked or otherwise unrecognized run state on another branch is refused"
+  pass "a parked run on another branch is allowed and flagged as another lane's"
+}
+
+# The display fallback is what made the old guard necessary: with no run row for
+# this branch, `axi status` answers with whatever run the repo has. Driving by
+# explicit run id bypasses that resolution entirely, so every allow must carry
+# the instruction - not just the ones that saw another lane's run.
+test_every_allow_carries_the_drive_by_id_instruction() {
+  local clone wt fakebin out status
+  IFS='|' read -r clone wt <<<"$(make_repo driveby fm/mine)"
+
+  for fakebin in \
+    "$(make_nm "$TMP_ROOT/driveby-other" fm/theirs running)" \
+    "$(make_nm "$TMP_ROOT/driveby-own" fm/mine running)" \
+    "$(make_nm "$TMP_ROOT/driveby-none" "" "")"; do
+    out=$(run_preflight "$wt" "$fakebin")
+    status=$?
+    expect_code 0 "$status" "preflight refused an allowed shape: $out"
+    assert_contains "$out" "--run" "allow did not instruct the lane to drive its run by id"
+  done
+  : "$clone"
+  pass "every allow tells the lane to drive its own run by explicit id"
 }
 
 # Legitimate resume: re-running on the branch that owns the run is the
@@ -190,8 +217,9 @@ test_detached_head_is_refused() {
   pass "a detached HEAD is refused before any run comparison"
 }
 
-test_inflight_run_on_other_branch_is_refused
-test_unknown_state_on_other_branch_is_refused
+test_inflight_run_on_other_branch_is_allowed_and_named
+test_unknown_state_on_other_branch_is_allowed
+test_every_allow_carries_the_drive_by_id_instruction
 test_run_on_same_branch_is_allowed
 test_finished_run_on_other_branch_is_allowed
 test_no_existing_run_is_allowed
