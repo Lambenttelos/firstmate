@@ -27,6 +27,17 @@ make_home() {
 set -u
 if [ "${1:-}" = "list-windows" ]; then
   [ -n "${FM_FAKE_TMUX_CALLS:-}" ] && printf 'x\n' >> "$FM_FAKE_TMUX_CALLS"
+  # Real tmux rewrites control characters in a -F format before printing it (a
+  # literal tab comes back as `_`), so a control-delimited format silently
+  # collapses to one field and every live window reads dead. Refuse it here
+  # rather than letting a fixture echo back a separator real tmux never emits.
+  for arg in "$@"; do
+    case "$arg" in
+      *[[:cntrl:]]*)
+        printf 'fake tmux: -F format contains a control character real tmux would rewrite\n' >&2
+        exit 1 ;;
+    esac
+  done
   [ -n "${FM_FAKE_TMUX_WINDOWS:-}" ] && printf '%s\n' "$FM_FAKE_TMUX_WINDOWS"
   exit 0
 fi
@@ -236,9 +247,9 @@ test_endpoint_sweep_uses_exact_window_match() {
 
   # fm-live-extra deliberately CONTAINS fm-live as a substring: a fuzzy or
   # prefix match would report the torn-down fm-gone or a partial name as alive.
-  out=$(FM_FAKE_TMUX_WINDOWS="firstmate:fm-live	claude
-firstmate:fm-husk	zsh
-firstmate:fm-live-extra	claude" run_brief "$home") || fail "brief must exit 0"
+  out=$(FM_FAKE_TMUX_WINDOWS="claude firstmate:fm-live
+zsh firstmate:fm-husk
+claude firstmate:fm-live-extra" run_brief "$home") || fail "brief must exit 0"
 
   case "$out" in
     *"live backend=tmux window=firstmate:fm-live endpoint=alive pane=claude"*) ;;
@@ -412,8 +423,8 @@ test_tmux_listing_is_read_once_for_the_whole_sweep() {
   calls="$home/tmux-calls"
   : > "$calls"
 
-  out=$(FM_FAKE_TMUX_CALLS="$calls" FM_FAKE_TMUX_WINDOWS="firstmate:fm-t1	claude
-firstmate:fm-t2	claude" run_brief "$home") || fail "brief must exit 0"
+  out=$(FM_FAKE_TMUX_CALLS="$calls" FM_FAKE_TMUX_WINDOWS="claude firstmate:fm-t1
+claude firstmate:fm-t2" run_brief "$home") || fail "brief must exit 0"
 
   case "$out" in
     *"t3 backend=tmux window=firstmate:fm-t3 endpoint=dead"*) ;;

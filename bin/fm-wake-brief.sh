@@ -270,14 +270,20 @@ fi
 # reading carries `pane_current_command`, so a live harness process and a bare
 # `zsh` husk are distinguishable at a glance without a second call.
 section "ENDPOINTS"
-TAB=$(printf '\t')
 TMUX_WINDOWS=
 TMUX_READ=0
+# The two fields are separated by a single SPACE, and the command comes FIRST,
+# deliberately. tmux rewrites control characters in a `-F` format before it
+# prints them (a literal tab comes back as `_`), so a tab-delimited reading
+# parses as one field and every live window reads dead. A window name may
+# itself contain spaces, but `pane_current_command` is a process name and
+# cannot, so putting the command first keeps the window name as the whole
+# unambiguous remainder of the line.
 tmux_windows_load() {
   [ "$TMUX_READ" -eq 0 ] || return 0
   TMUX_READ=1
   command -v tmux >/dev/null 2>&1 || return 0
-  TMUX_WINDOWS=$(tmux list-windows -a -F "#{session_name}:#{window_name}${TAB}#{pane_current_command}" 2>/dev/null) || TMUX_WINDOWS=
+  TMUX_WINDOWS=$(tmux list-windows -a -F "#{pane_current_command} #{session_name}:#{window_name}" 2>/dev/null) || TMUX_WINDOWS=
 }
 
 # Resolve an exact recorded window against the one listing into TMUX_ROW_STATE
@@ -293,8 +299,8 @@ tmux_window_row() {
   TMUX_ROW_CMD=-
   while IFS= read -r line; do
     [ -n "$line" ] || continue
-    name=${line%%"$TAB"*}
-    command=${line#*"$TAB"}
+    command=${line%% *}
+    name=${line#* }
     [ "$name" = "$want" ] || continue
     TMUX_ROW_STATE=alive
     TMUX_ROW_CMD=${command:--}
