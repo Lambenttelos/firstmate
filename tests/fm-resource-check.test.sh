@@ -249,7 +249,7 @@ test_synchronous_reading_never_probes_a_wedged_backend() {
   local home fakebin started elapsed
   home=$(make_home live-count-wedged)
   fakebin=$(fm_fakebin "$TMP_ROOT/live-count-wedged-bin")
-  printf '#!/usr/bin/env bash\nsleep 60\n' > "$fakebin/tmux"
+  printf '#!/usr/bin/env bash\nsleep 4713\n' > "$fakebin/tmux"
   chmod +x "$fakebin/tmux"
   fm_write_meta "$home/state/alpha.meta" "window=firstmate:fm-alpha" "harness=claude"
   fm_write_meta "$home/state/beta.meta" "window=firstmate:fm-beta" "harness=claude"
@@ -311,6 +311,54 @@ test_probe_timeout_leaves_no_stuck_backend_process() {
     fail "the wedged backend command outlived its probe timeout"
   fi
   pass "a probe timeout terminates the wedged backend command, not just the waiter"
+}
+
+test_sweep_probing_is_bounded_as_a_whole() {
+  local home fakebin i started elapsed_small elapsed_big
+  home=$(make_home sweep-budget)
+  fakebin=$(fm_fakebin "$TMP_ROOT/sweep-budget-bin")
+  printf '#!/usr/bin/env bash\nsleep 4713\n' > "$fakebin/tmux"
+  chmod +x "$fakebin/tmux"
+  for i in 1 2; do
+    fm_write_meta "$home/state/task$i.meta" "window=firstmate:fm-task$i" "harness=claude"
+  done
+  started=$SECONDS
+  run_in_home "$home" "$fakebin" --sweep FM_RESOURCE_PROBE_TIMEOUT=1 FM_RESOURCE_SWEEP_BUDGET=1
+  elapsed_small=$((SECONDS - started))
+  expect_code 0 "$RC" "budgeted sweep exit with two crews"
+  assert_contains "$OUT" "live crews 2 (liveness partly unverified, probe budget spent)" \
+    "a partly probed sweep must count unprobed crews and say the count is partly unverified"
+
+  # Eight recorded crews, same budget: the sweep must not cost four times as much.
+  for i in 3 4 5 6 7 8; do
+    fm_write_meta "$home/state/task$i.meta" "window=firstmate:fm-task$i" "harness=claude"
+  done
+  started=$SECONDS
+  run_in_home "$home" "$fakebin" --sweep FM_RESOURCE_PROBE_TIMEOUT=1 FM_RESOURCE_SWEEP_BUDGET=1
+  elapsed_big=$((SECONDS - started))
+  expect_code 0 "$RC" "budgeted sweep exit with eight crews"
+  assert_contains "$OUT" "live crews 8 (liveness partly unverified, probe budget spent)" \
+    "every crew left unprobed must still count toward the live total"
+  [ "$elapsed_big" -lt $(( elapsed_small + 4 )) ] \
+    || fail "sweep probing scaled with the crew count: ${elapsed_small}s then ${elapsed_big}s"
+  [ "$elapsed_big" -lt 10 ] || fail "a wedged backend held the sweep for ${elapsed_big}s"
+  pass "total sweep probing stays inside its budget however many crews are recorded"
+}
+
+test_malformed_sweep_budget_never_disables_the_budget() {
+  local home fakebin
+  home=$(make_home sweep-budget-malformed)
+  fakebin=$(fake_tmux "$TMP_ROOT/sweep-budget-malformed-bin" fm-alpha)
+  fm_write_meta "$home/state/alpha.meta" "window=firstmate:fm-alpha" "harness=claude"
+  fm_write_meta "$home/state/beta.meta" "window=firstmate:fm-beta" "harness=claude"
+  run_in_home "$home" "$fakebin" --sweep FM_RESOURCE_SWEEP_BUDGET=30s
+  expect_code 0 "$RC" "malformed sweep-budget exit"
+  assert_contains "$OUT" "resources: healthy" \
+    "a malformed sweep budget must fall back, not degrade the whole reading"
+  assert_contains "$OUT" "live crews 1" "the sweep must still probe with the fallback budget"
+  assert_not_contains "$OUT" "partly unverified" \
+    "a fallback budget must leave a fully probed sweep verified"
+  pass "a malformed sweep budget falls back to the default instead of disabling it"
 }
 
 test_malformed_probe_timeout_never_takes_monitoring_dark() {
@@ -486,6 +534,40 @@ test_disabled_monitor_leaves_the_watcher_untouched() {
   pass "a disabled monitor adds nothing to the watcher"
 }
 
+# annotated_heartbeat_reason: run the watcher until it prints an annotated
+# heartbeat on a critical host, and return that exact reason line.
+annotated_heartbeat_reason() {
+  local home out status
+  home=$(make_home "$1")
+  : > "$home/state/.afk"
+  printf 'critical\n' > "$home/state/.resource-surfaced"
+  out="$home/out.txt"
+  status=0
+  env "${HEALTHY_ENV[@]}" FM_RESOURCE_INTERVAL=1 FM_RESOURCE_LOAD1=40 \
+    FM_HOME="$home" FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 \
+    FM_HEARTBEAT=1 "$CHECKPOINT" --seconds 8 >"$out" 2>/dev/null || status=$?
+  [ "$status" = 0 ] || fail "annotated-heartbeat checkpoint exited $status"
+  grep -m1 '^heartbeat' "$out" || fail "the watcher printed no heartbeat wake"
+}
+
+test_annotated_heartbeat_is_still_an_actionable_wake() {
+  local reason arm_pattern
+  reason=$(annotated_heartbeat_reason heartbeat-matchers)
+  assert_contains "$reason" "host resources critical" \
+    "the annotated heartbeat lost its host-resource pressure"
+  # Both matchers come from the real sources, so a reason shape that stops being
+  # a wake for the arm path or the away-mode daemon fails here instead of
+  # silently disabling the heartbeat backstop while the host is under pressure.
+  arm_pattern=$(awk -F"'" '/grep -Eq .\^\(signal:/ {print $2; exit}' "$ROOT/bin/fm-watch-arm.sh")
+  [ -n "$arm_pattern" ] || fail "could not read fm-watch-arm.sh's actionable-wake pattern"
+  printf '%s\n' "$reason" | grep -Eq "$arm_pattern" \
+    || fail "fm-watch-arm.sh would not treat '$reason' as an actionable wake"
+  eval "$(awk '/^is_wake_reason\(\)/,/^}/' "$ROOT/bin/fm-supervise-daemon.sh")"
+  is_wake_reason "$reason" \
+    || fail "fm-supervise-daemon.sh would idle on '$reason' instead of handling it"
+  pass "an annotated heartbeat is still recognised as a wake by every consumer"
+}
+
 test_heartbeat_carries_the_cached_pressure() {
   local home out status
   home=$(make_home heartbeat-annotation)
@@ -502,7 +584,7 @@ test_heartbeat_carries_the_cached_pressure() {
     FM_HOME="$home" FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 \
     FM_HEARTBEAT=1 "$CHECKPOINT" --seconds 8 >"$out" 2>/dev/null || status=$?
   expect_code 0 "$status" "heartbeat checkpoint exit"
-  assert_contains "$(cat "$out")" "heartbeat (host resources critical)" \
+  assert_contains "$(cat "$out")" "heartbeat: host resources critical" \
     "the heartbeat lost its host-resource annotation"
   pass "every heartbeat carries the host's latest known pressure"
 }
@@ -579,6 +661,8 @@ test_synchronous_reading_never_probes_a_wedged_backend
 test_stale_cached_verdict_degrades_honestly
 test_sweep_without_the_backend_library_labels_its_count
 test_probe_timeout_leaves_no_stuck_backend_process
+test_sweep_probing_is_bounded_as_a_whole
+test_malformed_sweep_budget_never_disables_the_budget
 test_malformed_probe_timeout_never_takes_monitoring_dark
 test_injected_live_count_still_wins
 test_unreadable_host_is_unknown_and_never_alarms
@@ -593,6 +677,7 @@ test_watcher_surfaces_pressure_once_and_queues_it
 test_watcher_absorbs_already_reported_pressure
 test_watcher_stays_quiet_on_a_healthy_host_and_rearms
 test_disabled_monitor_leaves_the_watcher_untouched
+test_annotated_heartbeat_is_still_an_actionable_wake
 test_heartbeat_carries_the_cached_pressure
 test_heartbeat_is_unannotated_on_a_healthy_host
 test_disabled_monitor_never_annotates_from_a_stale_reading

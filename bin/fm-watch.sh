@@ -39,10 +39,13 @@
 #                          WORSE than the level firstmate was last told about.
 #                          Report-only: nothing is paused, shed or killed here.
 #   heartbeat              fleet-scan backstop found an unsurfaced captain-relevant
-#                          status, unless afk is active. Carries a
-#                          "(host resources degraded|critical)" annotation when a
+#                          status, unless afk is active. Becomes
+#                          "heartbeat: host resources degraded|critical" when a
 #                          recent sweep found the host under pressure; a disabled
-#                          monitor or a stale cached reading annotates nothing
+#                          monitor or a stale cached reading annotates nothing.
+#                          The annotation keeps the "heartbeat:" prefix every
+#                          wake consumer matches on, so an annotated heartbeat is
+#                          still recognised as an actionable wake
 # For normal supervision, resume the session-start primary-harness protocol
 # after each printed reason. Direct duplicate invocations of this script still
 # no-op through the watcher singleton lock.
@@ -1261,13 +1264,16 @@ EOF
     # healthy, unknown or disabled host annotates nothing. .resource-status is
     # only ever written, never cleared, so a disabled monitor and a reading older
     # than two sweeps are both ignored rather than annotating the heartbeat with
-    # pressure that may have gone away long ago.
+    # pressure that may have gone away long ago. The annotated form keeps the
+    # "heartbeat:" prefix, because fm-watch-arm.sh and fm-supervise-daemon.sh both
+    # recognise an actionable heartbeat by that exact prefix; any other shape
+    # would silently stop being a wake precisely while the host is under pressure.
     hb_reason=heartbeat
     if [ "$RESOURCE_INTERVAL" -gt 0 ] \
       && [ "$(age_of "$STATE/.resource-status")" -lt $(( RESOURCE_INTERVAL * 2 )) ]; then
       case "$(cat "$STATE/.resource-status" 2>/dev/null || true)" in
-        degraded) hb_reason='heartbeat (host resources degraded)' ;;
-        critical) hb_reason='heartbeat (host resources critical)' ;;
+        degraded) hb_reason='heartbeat: host resources degraded' ;;
+        critical) hb_reason='heartbeat: host resources critical' ;;
       esac
     fi
     if afk_present; then

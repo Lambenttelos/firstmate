@@ -213,6 +213,10 @@ The crew count in the reading is the number of crews whose agent is actually run
 Only the watcher's sweep pays for that liveness answer, and it caches the verdict, so the count every other caller shows is at most one sweep interval old (`FM_RESOURCE_INTERVAL`, default 900 seconds).
 When no cached verdict is available, or it is older than two sweep intervals, the reading falls back to the count of recorded tasks and says so with "liveness unverified" instead of presenting it as a verified count.
 
+`FM_RESOURCE_SWEEP_BUDGET` is the number of seconds one sweep may spend checking crew liveness in total, defaulting to `30`, and a malformed value falls back to that default rather than disabling the budget.
+It bounds the watcher's poll loop however many crews are recorded and however unresponsive a backend is, since bounding each check on its own would still allow one timeout per recorded crew.
+Crews left unchecked when the budget runs out count toward the live total anyway, the same conservative direction an unanswered check already takes, and the reading says "liveness partly unverified" so a partly checked count is never shown as a fully verified one.
+
 Three callers consult the monitor, and all three only report:
 
 - [`bin/fm-spawn.sh`](../bin/fm-spawn.sh) prints the reading to stderr as a pre-dispatch `warning:` advisory when the host is degraded or critical, and still spawns.

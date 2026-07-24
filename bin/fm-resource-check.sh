@@ -59,8 +59,17 @@
 # state/.resource-live. An ambiguous or unreadable probe counts that one crew as
 # live rather than discarding the whole reading; each probe is bounded by
 # FM_RESOURCE_PROBE_TIMEOUT seconds (default 5, malformed values falling back to
-# it) and is terminated as a process group, so a wedged backend can neither hang
-# the sweep nor leak a stuck process behind it.
+# it) and is terminated as a process group, so a wedged backend leaks no stuck
+# process behind it.
+# Probing for the sweep AS A WHOLE is bounded by FM_RESOURCE_SWEEP_BUDGET seconds
+# (default 30, malformed values falling back to it), because per-probe bounding
+# alone still lets a wedged backend hold the watcher's poll loop for one timeout
+# per recorded crew. Once the budget is spent the sweep stops probing and every
+# remaining crew degrades to unknown, which counts it as live under the same
+# only-a-confident-dead-verdict-excludes rule; the reading then says "liveness
+# partly unverified" so a partly probed count is never shown as a fully verified
+# one. The budget therefore bounds the sweep no matter how many crews are
+# recorded or how wedged the backend is.
 #
 # Every OTHER caller (bin/fm-spawn.sh before a dispatch, bin/fm-session-start.sh
 # inside its fast digest) READS that cache and never probes, so a wedged backend
@@ -220,11 +229,14 @@ read_swap_total_mb() {
 # on it. Anything that is not a confident alive/dead answer degrades to unknown
 # for that one crew rather than spoiling the whole reading. A malformed timeout
 # knob falls back to the default instead of aborting the reading.
+# bin/fm-watch.sh's run_check_capture is the hardened implementation of this same
+# bounded process-group execution; consolidating the two into a shared helper is
+# intended follow-on work, kept out of this path's change for now.
 PROBE_TIMEOUT_DEFAULT=5
 PROBE_TIMEOUT=${FM_RESOURCE_PROBE_TIMEOUT:-$PROBE_TIMEOUT_DEFAULT}
 case "$PROBE_TIMEOUT" in ''|0|*[!0-9]*) PROBE_TIMEOUT=$PROBE_TIMEOUT_DEFAULT ;; esac
 probe_verdict() {  # <backend> <target>
-  local out pid slices=0 verdict
+  local out pid pgid waited=0 limit step inc verdict
   out=$(mktemp "${TMPDIR:-/tmp}/fm-resource-probe.XXXXXX" 2>/dev/null) || {
     printf 'unknown'
     return 0
@@ -233,13 +245,24 @@ probe_verdict() {  # <backend> <target>
   ( fm_backend_agent_alive "$1" "$2" 2>/dev/null || printf 'unknown' ) > "$out" 2>/dev/null &
   pid=$!
   set +m
+  # Only signal the group once the child is confirmed to lead its own, the way
+  # run_check_capture verifies it; otherwise a group kill would reach the watcher.
+  pgid=$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d '[:space:]')
+  limit=$(( PROBE_TIMEOUT * 100 ))
+  # Centisecond slices, fine-grained at first so a backend that answers instantly
+  # is not held for a fixed floor, coarser once the probe is clearly slow.
   while kill -0 "$pid" 2>/dev/null; do
-    if [ "$slices" -ge $(( PROBE_TIMEOUT * 5 )) ]; then
-      kill -TERM -"$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+    if [ "$waited" -ge "$limit" ]; then
+      if [ -n "$pgid" ] && [ "$pgid" = "$pid" ]; then
+        kill -TERM -"$pgid" 2>/dev/null || true
+      else
+        kill -TERM "$pid" 2>/dev/null || true
+      fi
       break
     fi
-    sleep 0.2
-    slices=$((slices + 1))
+    if [ "$waited" -lt 20 ]; then step=0.01; inc=1; else step=0.1; inc=10; fi
+    sleep "$step"
+    waited=$((waited + inc))
   done
   wait "$pid" 2>/dev/null || true
   verdict=$(cat "$out" 2>/dev/null || true)
@@ -253,6 +276,7 @@ probe_verdict() {  # <backend> <target>
 # whitespace; it is empty for a verified count and names the degradation
 # otherwise, so a recorded-work count is never displayed as a verified one.
 UNVERIFIED_NOTE=' (recorded work, liveness unverified)'
+PARTIAL_NOTE=' (liveness partly unverified, probe budget spent)'
 
 count_metas() {  # <note>
   local meta n=0
@@ -270,26 +294,43 @@ mtime_of() {  # epoch seconds of <file>, empty when unreadable
   fi
 }
 
+# Total probing budget for one sweep, so the watcher's poll loop is bounded by
+# this many seconds however many crews are recorded and however wedged the
+# backend is. Validated like the sweep interval: a malformed value falls back to
+# the default rather than disabling the budget or taking the monitor dark.
+SWEEP_BUDGET_DEFAULT=30
+SWEEP_BUDGET=${FM_RESOURCE_SWEEP_BUDGET:-$SWEEP_BUDGET_DEFAULT}
+case "$SWEEP_BUDGET" in ''|0|*[!0-9]*) SWEEP_BUDGET=$SWEEP_BUDGET_DEFAULT ;; esac
+
 # sweep_live_crews: the probing path, watcher-only. Caches the verified count so
-# every synchronous caller can read it without touching a backend.
+# every synchronous caller can read it without touching a backend. Crews left
+# unprobed when the total budget runs out degrade to unknown, which counts them
+# as live, and the note says the count is only partly verified.
 sweep_live_crews() {
-  local meta backend target n=0
+  local meta backend target n=0 deadline partial='' note=''
   # shellcheck source=bin/fm-backend.sh
   . "$FM_ROOT/bin/fm-backend.sh" 2>/dev/null || {
     count_metas "$UNVERIFIED_NOTE"
     return 0
   }
+  deadline=$(( $(date +%s) + SWEEP_BUDGET ))
   for meta in "$STATE"/*.meta; do
     [ -f "$meta" ] || continue
-    backend=$(fm_backend_of_meta "$meta")
-    target=$(fm_backend_target_of_meta "$meta")
-    if [ -n "$target" ] && [ "$(probe_verdict "$backend" "$target")" = dead ]; then
-      continue
+    if [ -z "$partial" ] && [ "$(date +%s)" -ge "$deadline" ]; then
+      partial=1
+    fi
+    if [ -z "$partial" ]; then
+      backend=$(fm_backend_of_meta "$meta")
+      target=$(fm_backend_target_of_meta "$meta")
+      if [ -n "$target" ] && [ "$(probe_verdict "$backend" "$target")" = dead ]; then
+        continue
+      fi
     fi
     n=$((n + 1))
   done
+  [ -z "$partial" ] || note=$PARTIAL_NOTE
   [ -d "$STATE" ] && printf '%s\n' "$n" > "$LIVE_CACHE" 2>/dev/null
-  printf '\t%s' "$n"
+  printf '%s\t%s' "$note" "$n"
 }
 
 # cached_live_crews: the synchronous path. Reads the sweep's verdict and NEVER
