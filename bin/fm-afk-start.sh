@@ -8,8 +8,9 @@
 #     - prints "afk: daemon already running pid=<pid>" then exits 0 when that
 #       lock is held by a live daemon (a REFRESH: no stale-artifact clear);
 #     - otherwise clears any prior away session's stale escalation artifacts
-#       (fm_afk_clear_stale_artifacts) for a direct, non-prepared start, then
-#       execs bin/fm-supervise-daemon.sh in the foreground. A prepared start was
+#       (fm_afk_clear_stale_artifacts) for a direct, non-prepared start - naming
+#       on stderr, never aborting on, any it cannot clear - then execs
+#       bin/fm-supervise-daemon.sh in the foreground. A prepared start was
 #       already cleared transactionally by bin/fm-afk-launch.sh.
 #
 # This file is sourceable: its BASH_SOURCE guard keeps main from running, while
@@ -43,6 +44,10 @@ FM_AFK_DAEMON="$FM_AFK_START_DIR/fm-supervise-daemon.sh"
 . "$FM_AFK_START_DIR/fm-wake-lib.sh"
 # shellcheck source=bin/fm-afk-daemon-lib.sh
 . "$FM_AFK_START_DIR/fm-afk-daemon-lib.sh"
+# Paneless-delivery artifact names (bin/fm-afk-outbox-lib.sh owns the outbox
+# record and acknowledgement contract itself).
+# shellcheck source=bin/fm-afk-outbox-lib.sh
+. "$FM_AFK_START_DIR/fm-afk-outbox-lib.sh"
 
 fm_afk_start_usage() {
   sed -n '2,14p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
@@ -61,11 +66,66 @@ fm_afk_start_usage() {
 # lifecycle" and bin/fm-supervise-daemon.sh's escalate_add/inject_wedge_alarm).
 # NOT called on a refresh (daemon already alive), so the current session's own
 # buffered escalations are preserved.
+#
+# fm_afk_session_artifact_names lists every one of those DURABLE artifacts, one
+# name per line, covering both delivery modes: the pane path's escalation buffer
+# and wedge marker, and the paneless path's outbox, acknowledgement, sequence
+# counter, and recorded delivery mode. Clearing here and the launcher's
+# transactional backup and rollback both iterate this one list, so the two sets
+# cannot drift apart.
+#
+# The paneless path also leaves process-scoped scratch - its portable lock and
+# the mktemp siblings used for atomic acknowledgement and delivery-mode renames.
+# Those are cleared by fm_afk_clear_stale_artifacts too (through the outbox
+# library's own owning list), but deliberately stay out of the durable list: a
+# lock directory cannot be backed up and restored, and restoring one from a
+# rolled-back start would hand the new session another session's lock.
+fm_afk_session_artifact_names() {
+  printf '%s\n' \
+    .subsuper-escalations \
+    .subsuper-escalations.since \
+    .subsuper-inject-wedged
+  fm_afk_outbox_artifact_names
+}
+
+# The one wording every away-mode entry point uses after fm_afk_clear_stale_artifacts
+# fails. Away mode must still come up: refusing to enter costs the captain ALL
+# supervision over a rare filesystem condition, which is the exact outcome the
+# pull-delivery path exists to prevent, while a lock whose owner is dead is
+# already stolen by bin/fm-wake-lib.sh and a genuinely unusable one surfaces at
+# runtime through the paneless append-failure alarm. Both bin/fm-afk-start.sh's
+# direct start and both bin/fm-afk-launch.sh entry points render THIS text, so an
+# operator reading either sees the same fact and the two paths cannot drift into
+# disagreeing about whether away mode may come up.
+fm_afk_stale_artifact_continue_message() {
+  printf 'continuing into daemon startup despite the stale away-mode artifact(s) named above'
+}
+
+# Every failure NAMES the artifact it could not clear on stderr in addition to
+# returning non-zero, so no caller can turn a clearing problem into a silent stop.
+#
+# The outbox-owned artifacts are cleared by fm_afk_outbox_clear_session rather
+# than by this loop, because they must be cleared under the outbox lock that
+# guards appends and compaction; this loop owns only the pane path's artifacts,
+# which no lock guards.
 fm_afk_clear_stale_artifacts() {  # <state-dir>
-  local state=$1
-  rm -f "$state/.subsuper-escalations" \
-        "$state/.subsuper-escalations.since" \
-        "$state/.subsuper-inject-wedged" 2>/dev/null
+  local state=$1 name outbox_names status=0
+  outbox_names=$(fm_afk_outbox_artifact_names)
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    case "
+$outbox_names
+" in
+      *"
+$name
+"*) continue ;;
+    esac
+    rm -f "$state/$name" 2>/dev/null && continue
+    printf 'afk: could not clear stale away-mode artifact %s\n' "$state/$name" >&2
+    status=1
+  done < <(fm_afk_session_artifact_names)
+  fm_afk_outbox_clear_session "$state" || status=1
+  return "$status"
 }
 
 # Daemon-lock liveness lives in bin/fm-afk-daemon-lib.sh so the turn-end guard
@@ -116,8 +176,19 @@ fm_afk_start_main() {
 
   # Fresh start: clear the previous away session's stale delivery artifacts
   # before the new daemon can surface them (fix for the leaked-artifact defect).
+  #
+  # Deliberately NOT fatal, and deliberately not a bare call under `set -e`: a
+  # single artifact that will not delete - most likely a leftover outbox lock -
+  # would otherwise abort right here, so `exec` below never runs and away mode
+  # comes up with no sub-supervisor and no diagnostic at all. Coming up with a
+  # supervisor and a stale artifact is strictly better than coming up with
+  # neither, and the portable lock helper already recovers a stale lock through
+  # its dead-pid steal. The clearing helpers name each artifact they could not
+  # clear on stderr, so the problem is reported rather than swallowed.
   if [ "${FM_AFK_STATE_PREPARED:-0}" != 1 ]; then
-    fm_afk_clear_stale_artifacts "$FM_AFK_STATE"
+    if ! fm_afk_clear_stale_artifacts "$FM_AFK_STATE"; then
+      echo "afk: $(fm_afk_stale_artifact_continue_message)" >&2
+    fi
   fi
 
   echo "afk: starting supervise daemon in foreground; keep this command as a tracked background session"

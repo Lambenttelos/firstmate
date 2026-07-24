@@ -48,7 +48,7 @@ The turn-end guard, the watcher's triage gate in `bin/fm-watch.sh`, the pull-bas
 
 With away mode on and a live daemon, the daemon owns supervision and the repair instruction still points at `/afk`, unchanged.
 With away mode on and no live daemon, the home's own watcher is the real supervision mechanism: the ordinary live lock and fresh beacon test decides the turn, a healthy watcher keeps the guard silent, and only a genuinely missing or stale watcher blocks, with a repair instruction that names re-arming the watcher for the active harness.
-That daemon-free posture is deliberate for a captain session that runs outside any injectable supervisor pane, because the daemon delivers escalations by typing into such a pane and has nothing to type into there.
+That daemon-free posture is deliberate for a captain session where the daemon would have no delivery channel at all, neither a pane to type into nor a way to host the paneless pull path; the `/afk` skill owns which entry a session takes.
 It is a first-class configuration, so the watcher also keeps its own normal triage there and absorbs benign wakes instead of handing every wake to a daemon that never runs.
 
 With away mode off, behavior is unchanged.

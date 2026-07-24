@@ -90,8 +90,33 @@ It currently supports only `tmux` and `herdr` supervisor panes.
 Set `FM_SUPERVISOR_BACKEND=tmux|herdr` and `FM_SUPERVISOR_TARGET=<target>` to override both axes explicitly; for herdr the target is `"<session>:<pane-id>"`.
 Without overrides, backend detection uses `$TMUX_PANE` first, then `HERDR_ENV=1` with `HERDR_PANE_ID`, then falls back to `tmux`.
 That keeps a tmux pane nested inside herdr on the tmux transport, matching the runtime backend's innermost-first rule.
-Target detection uses `FM_SUPERVISOR_TARGET`, then `$TMUX_PANE`, then `"${HERDR_SESSION:-default}:${HERDR_PANE_ID}"` under herdr, then the legacy `firstmate:0` tmux fallback with a warning.
+Target detection uses `FM_SUPERVISOR_TARGET`, then `$TMUX_PANE`, then `"${HERDR_SESSION:-default}:${HERDR_PANE_ID}"` under herdr.
+When none of those identifies firstmate's pane, the daemon no longer injects into the legacy `firstmate:0` guess; it selects paneless delivery instead, as the next section describes.
 Selecting any other supervisor backend, including `zellij`, `orca`, or `cmux`, refuses at daemon startup instead of trying tmux injection primitives against a non-tmux pane.
+
+## Away-mode paneless delivery (FM_AFK_DELIVERY / state/.afk-outbox)
+
+The sub-supervisor delivers escalation digests one of two ways, chosen once at daemon startup and logged with its reason.
+Pane delivery types the digest into firstmate's own pane and is unchanged whenever the discovery above positively identifies that pane.
+Paneless delivery is selected when nothing identified it - a primary firstmate running outside every supported terminal backend, such as a session launched from the desktop app - and appends each flushed digest to a durable outbox that firstmate pulls from, so escalations no longer depend on a pane that does not exist.
+`FM_AFK_DELIVERY` overrides that choice with `auto` (the default), `pane`, or `paneless`; an unrecognized value warns and behaves as `auto`.
+A supported-but-broken pane, such as an explicit `FM_SUPERVISOR_TARGET` that does not resolve or an unsupported `FM_SUPERVISOR_BACKEND`, still refuses loudly at startup rather than switching channels silently.
+
+Paneless state lives in the effective home's `state/`: `.afk-delivery` records the selected mode, `.afk-outbox` holds the append-only delivery records, `.afk-outbox.ack` holds the acknowledged high-water mark, `.afk-outbox.seq` holds the sequence counter, `.afk-outbox.lock` serializes the writer against the reader, and `.afk-inbox.beat` is the reader's liveness beacon.
+[`bin/fm-afk-outbox-lib.sh`](../bin/fm-afk-outbox-lib.sh) is the single owner of that record format and its acknowledgement contract, including why only the reader may consume a record.
+Firstmate arms [`bin/fm-afk-inbox.sh`](../bin/fm-afk-inbox.sh) as its own harness-tracked background task the way it arms the watcher; that script's header and `--help` own its flags, its exit lines, and the `FM_AFK_INBOX_TIMEOUT` and `FM_AFK_INBOX_POLL` knobs.
+All of these are session-scoped delivery state: `bin/fm-afk-start.sh` clears them on a fresh away entry - the lock and the atomic-rename temporary files included - and `bin/fm-afk-return.sh` reports any unacknowledged record as return catch-up evidence before clearing it.
+A read of the outbox that fails is never treated as an outbox that is empty: the reader exits non-zero rather than printing a healthy idle line, and return catch-up reports the failure as a blocker and leaves the records on disk instead of deleting escalations it never read.
+A read that failed only because the bounded outbox-lock acquire timed out is reported as its own condition, because that one is transient: a blocking reader stays alive, prints no status line, acknowledges nothing, and retries on its next poll, and only after `FM_AFK_INBOX_LOCK_TIMEOUT_MAX` consecutive timeouts does it exit non-zero naming the lock it could not acquire.
+Return catch-up gets a single pass and then clears the outbox, so it treats that same timeout as a blocker exactly like any other failed read.
+Because appending to the outbox always succeeds, the pane path's max-defer wedge alarm cannot detect a stall here, so the daemon raises that same alarm from the age of the oldest unacknowledged record when it exceeds `FM_MAX_DEFER_SECS`, and clears it once the reader has acknowledged everything.
+That alarm also requires the reader's liveness beacon to be absent or stale, because age alone cannot tell a reader that was never armed from a firstmate that is armed and simply mid-turn, and agent turns longer than the max-defer window are routine.
+The reader stamps `.afk-inbox.beat` when it arms, on every poll iteration, and on every acknowledgement, and `FM_AFK_INBOX_BEACON_STALE_SECS` sets how stale it must be.
+Its default is twice `FM_MAX_DEFER_SECS` (600 seconds at defaults; an invalid or zero value uses that derived default) because the window it must survive is one firstmate turn rather than one poll interval: the reader exits as soon as it delivers, so nothing stamps the beacon while firstmate processes the digests and only re-arms it at the end of that turn.
+A reader that is never re-armed, or a firstmate that died, is therefore still reported within that window of its last sign of life rather than silently, and raising `FM_MAX_DEFER_SECS` instead is the wrong fix because that trades the false alarm for a silent gap.
+An alarm whose own inbox read then finds every record already acknowledged records that recovery in the daemon log only, raising no alert and writing no wedge marker, because that marker means wedged to every consumer that surfaces it; an inbox that could not be read still alarms.
+A read that cannot even look into `state/` is a failed read too, not an empty outbox, so an untraversable state directory blocks the reader and return catch-up rather than reading as nothing pending.
+The [`afk`](../.agents/skills/afk/SKILL.md) skill owns the operating procedure.
 
 ## Away-mode wedge alarm channels (config/wedge-alarm)
 

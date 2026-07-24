@@ -15,30 +15,26 @@ tradeoff **consented** and **explicit**: the captain is stepping away, so the
 sub-supervisor may triage routine wakes in bash instead of waking firstmate's
 LLM for each one. Escalations still reach the captain, but as one pre-read,
 batched digest rather than per-wake injections.
-Where no pane exists for the daemon to inject into, the same away posture is
-entered without a daemon and this home's own watcher keeps supervising; pick the
-entry path first.
+Where no pane exists for the daemon to inject into, the daemon still runs and delivers through the durable outbox that firstmate's armed inbox reader drains; pick the entry path first.
 
 ## Pick the entry path first
 
-Away mode has two first-class entry paths. Decide between them BEFORE running
-anything, from one question: does this session have an injectable supervisor
-pane, meaning a pane the daemon can type escalations into?
+Away mode has two first-class entry paths.
+Decide between them BEFORE running anything, from one question: does the daemon have a delivery channel here?
 
-- **Yes, there is an injectable supervisor pane** (firstmate runs inside tmux or
-  herdr): use the **daemon entry** below.
-- **No injectable supervisor pane** (the captain runs firstmate outside any such
-  pane, so nothing exists for a daemon to type into): use the **daemon-free
-  entry** below.
+- **An injectable supervisor pane exists** (firstmate runs inside tmux or herdr, so a pane can be typed into): use the **daemon entry** below in its pane-delivery form.
+- **No injectable supervisor pane, but this harness has a native tracked-background tool** (claude's background bash, grok's background tool, so the daemon and the inbox reader can both be hosted): use the **daemon entry** below in its paneless pull-delivery form.
+- **Neither** (no pane the daemon could reach and no way to host the daemon or the reader, or a supported backend that refuses to launch the daemon terminal): use the **daemon-free entry** below.
 
-Never start a daemon without a pane it can inject into. A daemon with nowhere to
-type talks to nobody: its escalations buffer and are lost silently, a failure
-this fleet has already had. Never manufacture a pane just to satisfy the daemon.
+Never start a daemon with nowhere to deliver.
+A daemon that cannot reach firstmate talks to nobody: its escalations buffer and are lost silently, a failure this fleet has already had.
+Paneless pull delivery through the durable outbox plus the armed inbox reader IS a delivery channel, so it satisfies that requirement; a daemon started with no pane AND no armed reader does not.
+Never manufacture a pane just to satisfy the daemon.
 
 Both entries share the same away posture, the same exit contract, and the same
 approval authority; they differ only in what supervises.
 
-## Daemon entry (injectable supervisor pane)
+## Daemon entry (pane delivery or paneless pull delivery)
 
 1. **Enter the lifecycle through `bin/fm-afk-launch.sh`.**
    This owns the durable state write, session-scoped stale-artifact clearing,
@@ -65,20 +61,32 @@ approval authority; they differ only in what supervises.
      active pane** (`herdr pane split`): a split co-tenants the tab and visibly
      shrinks the captain's pane (docs/herdr-backend.md "Away-mode daemon terminal
      launch").
+   The paneless form always uses the harness-native path, because there is no supervisor pane to capture and nothing to inject into; the daemon detects that honestly and selects pull delivery itself.
    Both paths share `bin/fm-afk-start.sh` as the daemon entry.
    The native path tells it that the launcher already prepared lifecycle state; the terminal-backed path lets the entry perform its existing state setup inside the new terminal.
    It exits immediately if the identity-backed daemon lock already names a live process, otherwise it execs `bin/fm-supervise-daemon.sh` in the foreground.
    The daemon is **presence-gated**: it injects escalations only while
    `state/.afk` exists, and stays quiet otherwise.
 
-3. **Do not separately arm the watcher.**
+3. **On the paneless form, arm the away-mode inbox reader as a tracked background task.**
+   This step belongs to the paneless entry, because the reader IS that form's delivery channel (see "Delivery channel" below); a pane-delivery entry does not arm a reader.
+   Run `bin/fm-afk-inbox.sh` through the harness's own tracked background mechanism, exactly the way `bin/fm-watch-arm.sh` is armed, and never with a shell `&`.
+   If you armed it on a session that turns out to have a pane, it costs nothing: it prints one line saying the pane is delivering and exits immediately.
+   Each completion is an internal escalation, not captain input.
+   Read the digests it printed and act on them.
+   Then obey its final line for whether to arm it again: every exit ends in either `re-arm to keep listening` or `- do not re-arm`.
+   Re-arming after a `do not re-arm` line is an immediate-exit loop, because that line means the pane is delivering or the away session is over, so nothing will ever arrive here.
+
+4. **Do not separately arm the watcher.**
    The daemon manages `bin/fm-watch.sh` as its child, and the singleton lock
    no-ops a stray arm harmlessly.
 
-4. **Acknowledge** in `AGENTS.md` section 9 language: "Captain, away mode is active; I will batch routine updates and surface only decisions, failures, credentials, or review-ready work until you return."
+5. **Acknowledge** in `AGENTS.md` section 9 language: "Captain, away mode is active; I will batch routine updates and surface only decisions, failures, credentials, or review-ready work until you return."
 
-## Daemon-free entry (no injectable supervisor pane)
+## Daemon-free entry (no delivery channel at all)
 
+Use this only when the daemon has neither a pane nor a hostable pull path: this harness has no native tracked-background tool to run the daemon and its reader in, or the supported backend it would need refuses to launch the daemon terminal.
+A session that merely lacks a supervisor pane is NOT this case; it takes the paneless daemon entry above.
 This is a supported configuration, not a degraded one.
 `state/.afk` then carries the away POSTURE only (batched updates and the standing routine merge authority), while this home's own watcher stays the real supervision mechanism.
 
@@ -89,14 +97,14 @@ This is a supported configuration, not a degraded one.
    It creates no terminal and starts nothing.
    Never hand-write `state/.afk`.
    It refuses with a non-zero status, and changes nothing, when an away-mode daemon is already live for this home, naming that daemon's process id.
-   Handle that refusal deliberately: either stop the live daemon with `bin/fm-afk-launch.sh stop` and re-run the daemon-free entry, or decide this session really does have an injectable supervisor pane and use the daemon entry instead.
+   Handle that refusal deliberately: either stop the live daemon with `bin/fm-afk-launch.sh stop` and re-run the daemon-free entry, or decide this session really does have a delivery channel and use the daemon entry instead.
    Never work around the refusal by hand-writing the flag.
 
 2. **Skip the daemon entirely.**
    Do not run `bin/fm-afk-start.sh`, `start`, or `start-native`, and do not
    manufacture a pane for a daemon.
    Say plainly to the captain that away mode is running without the daemon
-   because there is no pane it could reach.
+   because there is no way to reach them with its escalations here.
 
 3. **Keep arming and repairing this home's own watcher cycle** exactly as in
    normal mode, for the whole away stretch, through the emitted primary-harness
@@ -121,7 +129,7 @@ No `/back` is needed. The first genuine message is the return signal:
 
 - A message **without** the current operational prefix or a legacy bare marker, and **not** starting with `/afk` -> the captain is back.
   Run `bin/fm-afk-return.sh` before acting on the message that brought the captain back.
-  That script owns correct-ordered daemon shutdown, durable wake draining, escalation and wedge evidence, and the return-catch-up gate.
+  That script owns correct-ordered daemon shutdown, durable wake draining, escalation and wedge evidence, any escalation the inbox reader never picked up, and the return-catch-up gate.
   If it reports a firstmate-actionable `blocked:` event, remediate it immediately through the normal lifecycle, or explicitly reclassify it with a durable reason and close its decision key with `resolved [key=...]`, then run `bin/fm-afk-return.sh check`.
   Once the daemon stops, or immediately when the daemon-free entry left none to stop, resume full per-wake responsiveness through the emitted primary-harness supervision protocol while blocker handling proceeds, so the gate never creates a blind wait.
   Do not answer a Bearings request or perform any other ordinary captain work until the check exits successfully.
@@ -138,6 +146,20 @@ afk changes how aggressively firstmate surfaces things, **not who approves
 what**. "Away" never means "approves more." A PR ready for merge, a
 needs-decision finding, or anything destructive still waits for the captain's
 explicit word - the daemon just batches the notification.
+
+## Delivery channel
+
+Escalations reach firstmate one of two ways, chosen once at daemon startup and logged with the reason.
+
+- **Pane delivery** types the digest into firstmate's own pane.
+  It is selected whenever supervisor discovery positively identifies that pane, and everything below about busy guards, composer guards, and the verified submit model applies to it.
+- **Paneless delivery** is selected when nothing identified that pane, for example a primary firstmate running outside every supported terminal backend such as a desktop-app session.
+  Rather than typing into the legacy `firstmate:0` guess, which lands in an unrelated pane and never confirms a submit, the daemon appends each flushed digest to a durable outbox and the armed reader (step 3 above) delivers it.
+  A supported-but-broken pane is different and still refuses loudly at startup: an explicit target that does not resolve, or an unsupported supervisor backend, means the captain named a pane and the daemon must not quietly stop using it.
+
+Nothing is lost in either mode.
+Records are acknowledged only after the reader has already printed them, so a reader killed mid-wait or mid-print simply delivers the same records on its next run, and anything still unacknowledged at return is reported by `bin/fm-afk-return.sh` as catch-up evidence.
+`docs/configuration.md` owns the state files and the `FM_AFK_DELIVERY` override, `bin/fm-afk-outbox-lib.sh` owns the record and acknowledgement contract, and `bin/fm-afk-inbox.sh --help` owns the reader's flags and exit lines.
 
 ## Operational prefix contract
 
@@ -281,9 +303,10 @@ the operational prefix lets firstmate distinguish it from a real captain message
   `$HERDR_PANE_ID` present (herdr), then a tmux fallback. Target:
   `FM_SUPERVISOR_TARGET` override (a tmux target or a herdr
   `"<session>:<pane-id>"` target), then `$TMUX_PANE`, then
-  `"${HERDR_SESSION:-default}:${HERDR_PANE_ID}"` under herdr, then a
-  `firstmate:0` fallback with a warning. Both resolution sources are logged at
-  startup so a wrong-but-resolving fallback is detectable. Other runtime
+  `"${HERDR_SESSION:-default}:${HERDR_PANE_ID}"` under herdr. When none of those
+  identifies the pane, the daemon selects paneless delivery instead of injecting
+  into the legacy `firstmate:0` guess ("Delivery channel" above). Both resolution
+  sources and the selected delivery mode are logged at startup. Other runtime
   backends, including zellij, orca, and cmux, are not yet supported as
   supervisor backends; the daemon refuses loudly at startup instead of
   misapplying tmux primitives to a pane that isn't one
@@ -291,7 +314,8 @@ the operational prefix lets firstmate distinguish it from a real captain message
 
 ## Stale-artifact lifecycle
 
-Treat `state/.subsuper-escalations`, its `.since` sidecar, and `state/.subsuper-inject-wedged` as session-scoped delivery artifacts, not as the durable work record.
+Treat `state/.subsuper-escalations`, its `.since` sidecar, `state/.subsuper-inject-wedged`, and the paneless outbox files as session-scoped delivery artifacts, not as the durable work record.
+`bin/fm-afk-start.sh` owns the one list of those artifacts that fresh-entry clearing and the launcher's transactional rollback both use.
 Always enter through `bin/fm-afk-launch.sh`, which clears prior-session artifacts only for a fresh entry and preserves the current session's buffer on refresh.
 Always exit through `bin/fm-afk-launch.sh stop`, which keeps `state/.afk` present through the daemon's shutdown flush and clears it last.
 `docs/herdr-backend.md` "Stale-artifact lifecycle fix" owns the mechanism and verification evidence.

@@ -15,7 +15,8 @@
 #
 # The durable state/.afk-return-catchup file is written BEFORE daemon shutdown,
 # so a crash between stopping, draining, and blocker handling fails closed. It
-# retains the drained wake, buffered-escalation, and wedge-marker evidence until
+# retains the drained wake, buffered-escalation, unacknowledged paneless-outbox,
+# and wedge-marker evidence until
 # every live open blocker is closed and `check` succeeds. Repeated begin/check
 # calls are idempotent. `guard` never mutates state and is suitable for ordinary
 # read entrypoints such as fm-bearings-snapshot.sh.
@@ -120,10 +121,20 @@ print_blockers() {  # <file>
 }
 
 clear_delivery_artifacts() {
+  local name
   rm -f \
     "$STATE/.subsuper-escalations" \
     "$STATE/.subsuper-escalations.since" \
     "$STATE/.subsuper-inject-wedged"
+  # Paneless delivery keeps its undelivered digests in the outbox instead of the
+  # escalation buffer; both are session-scoped delivery artifacts, and both are
+  # cleared only after return_reconcile has already retained their content as
+  # catch-up evidence.
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    rm -f "$STATE/$name"
+  done < <(fm_afk_outbox_artifact_names)
+  fm_afk_outbox_clear_transient "$STATE" || true
 }
 
 return_guard() {
@@ -140,7 +151,7 @@ return_guard() {
 }
 
 return_reconcile() {
-  local evidence blockers drained wedge escalations lifecycle_ok=1
+  local evidence blockers drained wedge escalations outbox outbox_rc lifecycle_ok=1
   evidence=$(mktemp "$STATE/.afk-return-evidence.XXXXXX") || return 1
   blockers=$(mktemp "$STATE/.afk-return-blockers.XXXXXX") || { rm -f "$evidence"; return 1; }
   preserve_evidence "$evidence"
@@ -166,6 +177,29 @@ return_reconcile() {
   if [ -s "$STATE/.subsuper-escalations" ]; then
     escalations=$(cat "$STATE/.subsuper-escalations" 2>/dev/null || true)
     append_evidence escalation "$escalations" "$evidence"
+  fi
+  # Paneless away sessions deliver through the pull outbox, so an escalation the
+  # reader never picked up lives there rather than in the escalation buffer. It
+  # is the same catch-up evidence and is reported the same way.
+  #
+  # A read that FAILS is a blocker, not an empty outbox. Swallowing it would file
+  # no escalation evidence at all and then let clear_delivery_artifacts delete the
+  # outbox below, permanently losing undelivered escalations this gate never
+  # actually saw. Clearing is allowed only after a read that genuinely succeeded
+  # and whose content is now retained above as catch-up evidence.
+  outbox_rc=0
+  outbox=$(fm_afk_outbox_pending_report "$STATE" 2>/dev/null) || outbox_rc=$?
+  if [ "$outbox_rc" -eq "$FM_AFK_OUTBOX_LOCK_TIMEOUT" ]; then
+    # A lock timeout is retryable for the blocking reader, but this gate gets one
+    # pass and then deletes the outbox, so it is exactly as conservative here as
+    # any other failed read: blocker, nothing cleared, nothing acknowledged.
+    lifecycle_ok=0
+    append_evidence lifecycle 'away-mode inbox lock could not be acquired; undelivered escalations may remain and are preserved on disk - retry catch-up before ordinary work' "$evidence"
+  elif [ "$outbox_rc" -ne 0 ]; then
+    lifecycle_ok=0
+    append_evidence lifecycle 'away-mode inbox could not be read; undelivered escalations may remain and are preserved on disk - retry catch-up before ordinary work' "$evidence"
+  else
+    append_evidence escalation "$outbox" "$evidence"
   fi
 
   scan_open_blockers > "$blockers"
@@ -203,6 +237,8 @@ main() {
   . "$SCRIPT_DIR/fm-wake-lib.sh"
   # shellcheck source=bin/fm-classify-lib.sh
   . "$SCRIPT_DIR/fm-classify-lib.sh"
+  # shellcheck source=bin/fm-afk-outbox-lib.sh
+  . "$SCRIPT_DIR/fm-afk-outbox-lib.sh"
 
   mkdir -p "$STATE" || return 1
   fm_lock_acquire_wait "$LOCK"

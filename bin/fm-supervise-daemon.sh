@@ -20,9 +20,20 @@
 # state/.subsuper-escalations and are flushed on the next "while you were out"
 # catch-up or when afk is re-entered.
 #
+# DELIVERY MODES. Escalations reach firstmate one of two ways, chosen once at
+# startup by afk_delivery_mode_select and logged with its reason. PANE mode types
+# the digest into firstmate's own pane (the original path, unchanged whenever a
+# real supervisor pane is identified). PANELESS mode - selected when nothing
+# positively identified that pane, e.g. a primary firstmate running outside every
+# supported terminal backend - appends the same marked, single-line digest to a
+# durable outbox that firstmate's armed reader pulls (bin/fm-afk-outbox-lib.sh
+# owns the record and acknowledgement contract; bin/fm-afk-inbox.sh is the
+# reader). A supported-but-broken pane still refuses loudly at startup.
+#
 # IN-BAND OPERATIONAL INPUT. bin/fm-operational-input.sh constructs every
 # current daemon injection as the typed away-supervisor kind after the stable
-# FM_OPERATIONAL_PREFIX. A human cannot type its leading U+2063 from a normal
+# FM_OPERATIONAL_PREFIX, on both delivery modes. A human cannot type its leading
+# U+2063 from a normal
 # keyboard at the start of a message, and Herdr transports it as text.
 # Firstmate's contract: a message that starts with the current prefix, or a
 # legacy bare-marker daemon escalation, is internal (stay afk); an unmarked
@@ -50,7 +61,11 @@
 #     Buffered escalation delivery also has a max-defer alarm: if a digest stays
 #     undelivered past FM_MAX_DEFER_SECS, the daemon retries a normal flush and
 #     writes state/.subsuper-inject-wedged and attempts a configurable active
-#     alert if submit still cannot be confirmed.
+#     alert if submit still cannot be confirmed. Paneless delivery gets the same
+#     alarm off the age of the oldest unacknowledged outbox record, because there
+#     the append itself always succeeds and could otherwise never look wedged -
+#     gated on the reader's liveness beacon so an armed reader waiting through a
+#     long firstmate turn is never mistaken for one that was never armed.
 #   - Cheap heartbeat catch-all: every HEARTBEAT_SCAN_SECS the daemon greps all
 #     state/*.status for a captain-relevant line the per-wake classifier might
 #     have missed (e.g. a status verb outside CAPTAIN_RE) and escalates it.
@@ -81,6 +96,13 @@
 #                                   supported as supervisor backends; the daemon
 #                                   refuses loudly at startup rather than trying
 #                                   tmux primitives against a non-tmux pane.
+#          FM_AFK_DELIVERY          delivery mode: auto (default), pane, or
+#                                   paneless. auto picks pane whenever the
+#                                   supervisor target came from a real signal
+#                                   (override, $TMUX_PANE, herdr env) and
+#                                   paneless when only the legacy firstmate:0
+#                                   fallback remained. An unrecognized value
+#                                   warns and behaves as auto.
 #          FM_INJECT_SKIP           |-prefixes force-self-handle bypassing
 #                                   classification (default "heartbeat"); empty
 #                                   disables. Use sparingly: it overrides the
@@ -104,6 +126,13 @@
 #                                   undelivered before one normal flush attempt;
 #                                   if that cannot confirm a submit, a wedge
 #                                   alarm fires (default 300; 0 disables)
+#          FM_AFK_INBOX_BEACON_STALE_SECS seconds without a stamp on
+#                                   state/.afk-inbox.beat before the paneless
+#                                   undelivered alarm treats firstmate's inbox
+#                                   reader as gone. docs/configuration.md
+#                                   ("Away-mode paneless delivery") owns the
+#                                   default, the reporting bound, and why they are
+#                                   derived from FM_MAX_DEFER_SECS.
 #          FM_WEDGE_ALARM_CHANNEL   override config/wedge-alarm with a single
 #                                   active-alert directive for that wedge alarm
 #                                   (off|auto|osascript|herdr|command:<cmd>). An
@@ -179,6 +208,13 @@ FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 # shellcheck source=bin/fm-afk-daemon-lib.sh
 . "$FM_DAEMON_DIR/fm-afk-daemon-lib.sh"
 
+# Paneless (pull) delivery: the durable outbox record and acknowledgement
+# contract used when no supervisor pane can be identified. Owned by
+# bin/fm-afk-outbox-lib.sh and shared with its reader (bin/fm-afk-inbox.sh), the
+# away launcher, and the return catch-up gate.
+# shellcheck source=bin/fm-afk-outbox-lib.sh
+. "$FM_DAEMON_DIR/fm-afk-outbox-lib.sh"
+
 # --- tunables ---------------------------------------------------------------
 # Supervisor backends this daemon knows how to inject into today. zellij, orca,
 # and cmux are real backends elsewhere in firstmate (bin/fm-backend.sh) but this
@@ -200,6 +236,21 @@ MAX_DEFER_SECS_DEFAULT=300
 WEDGE_ALARM_TIMEOUT_SECS_DEFAULT=10
 WEDGE_ALARM_LAST_EPOCH=0
 WEDGE_ALARM_NOTIFIER_PID=
+# Paneless undelivered-alarm probe state. A probe that cannot read the outbox
+# burns the whole bounded lock acquire, so housekeeping logs the transition into
+# and out of that state rather than every one-second tick, and backs the next
+# probe off by one max-defer window instead of stalling on every pass.
+OUTBOX_UNREADABLE=0
+OUTBOX_PROBE_NOT_BEFORE=0
+# How stale bin/fm-afk-inbox.sh's liveness beacon must be before the paneless
+# undelivered alarm treats the reader as gone, expressed as a multiple of the
+# effective max-defer window rather than a fixed number of seconds.
+#
+# The window this has to survive is one firstmate TURN, not one poll interval,
+# and the reporting bound that follows from it, are owned by
+# docs/configuration.md ("Away-mode paneless delivery"); deriving the window from
+# max-defer here is what keeps the two comparable however max-defer is configured.
+INBOX_BEACON_STALE_DEFER_MULTIPLE=2
 # The captain-relevant verb set and the status classifiers (last_status_line,
 # status_is_captain_relevant, window_to_task, scan_captain_relevant_statuses) now
 # live in bin/fm-classify-lib.sh, shared with the always-on watcher.
@@ -322,6 +373,43 @@ _collapse_newlines() {  # <text>
 # bin/fm-supervisor-target-lib.sh (sourced above). fm_super_main below calls
 # them exactly as before; the away launcher reuses the identical resolution to
 # pass the captain pane in as FM_SUPERVISOR_TARGET.
+
+# --- delivery-mode selection (PURE: reads env, no side effects) --------------
+# Two delivery modes, chosen once at startup and logged with the reason:
+#   pane     - type the digest into firstmate's own pane (the original path,
+#              unchanged whenever a real supervisor pane is identified).
+#   paneless - append the digest to the durable outbox and let firstmate's armed
+#              reader (bin/fm-afk-inbox.sh) pull it. No pane is touched at all.
+#
+# Why paneless exists: supervisor-target discovery ends in a legacy "firstmate:0"
+# fallback that is a GUESS, not evidence. A primary firstmate running outside
+# every supported terminal backend (a desktop-app session) reaches that guess,
+# types into whatever unrelated pane answers to it, never gets a confirmed
+# submit, and buffers forever - the 2026-07-22 incident bin/fm-afk-outbox-lib.sh
+# describes. Choosing the pull channel when NOTHING positively identified
+# firstmate's pane is the honest reading of that state.
+#
+# This is only for supported-backend-ABSENT. A supported-but-BROKEN supervisor
+# pane - an explicit FM_SUPERVISOR_TARGET that does not resolve, or an
+# unsupported FM_SUPERVISOR_BACKEND - still refuses loudly at startup, because
+# there the captain named a pane and the daemon must not quietly stop using it.
+#
+# Returns 2 (with the auto-selected mode still printed) when FM_AFK_DELIVERY
+# holds an unrecognized value, so the caller can warn about the typo without
+# taking away mode down over it.
+afk_delivery_mode_select() {  # <target-source>
+  local target_source=$1 override="${FM_AFK_DELIVERY:-auto}" auto=pane rc=0
+  case "$target_source" in
+    FALLBACK*) auto=paneless ;;
+  esac
+  case "$override" in
+    pane|paneless) printf '%s' "$override"; return 0 ;;
+    ''|auto|default) ;;
+    *) rc=2 ;;
+  esac
+  printf '%s' "$auto"
+  return "$rc"
+}
 
 # --- classification helpers (PURE: no side effects, testable) ---------------
 # last_status_line, status_is_captain_relevant, window_to_task, and
@@ -637,8 +725,61 @@ escalate_flush() {  # <state>
   # Single-line wrapper: no embedded newlines (inject_msg also collapses as a
   # safety net, but keeping the source single-line makes the intent explicit).
   msg=$(printf 'Supervisor escalate (%s event(s)): %s (pre-read; re-arm not needed — watcher daemon-managed)' "$n" "$msg")
-  if inject_msg "$msg" "$state"; then : > "$buf"; rm -f "${buf}.since" "$state/.subsuper-inject-wedged"; return 0; fi
+  if inject_msg "$msg" "$state"; then
+    : > "$buf"; rm -f "${buf}.since"
+    # Retiring the undelivered marker means DELIVERY recovered. On the pane path a
+    # confirmed submit really is delivery, so it clears here exactly as before. In
+    # paneless mode a successful inject only APPENDED the record, so clearing here
+    # would let ordinary escalation traffic reset the marker's mtime-based
+    # re-alarm rate limit (the only limit that survives a daemon restart) and
+    # destroy the catch-up evidence bin/fm-afk-return.sh reads, while the records
+    # the marker describes are still unacknowledged. There the clear belongs to
+    # housekeeping (1c), which owns actual reader acknowledgement.
+    paneless_delivery || rm -f "$state/.subsuper-inject-wedged"
+    return 0
+  fi
   return 1
+}
+
+# Paneless delivery is in force for this run: escalations are appended to the
+# durable outbox for firstmate's armed reader instead of typed into a pane.
+paneless_delivery() {
+  [ "${FM_AFK_DELIVERY_MODE:-pane}" = paneless ]
+}
+
+# Seconds without a reader beacon stamp before the paneless undelivered alarm
+# treats firstmate's inbox reader as gone: INBOX_BEACON_STALE_DEFER_MULTIPLE times
+# the effective max-defer window (see docs/configuration.md for that default and
+# its reporting bound). A non-numeric or zero override falls back to the derived
+# default rather than disabling the staleness check, because a staleness window of
+# zero would make every armed reader look dead and restore the false alarm this
+# gate removes.
+inbox_beacon_stale_secs() {
+  local secs=${FM_AFK_INBOX_BEACON_STALE_SECS:-} max_defer
+  case "$secs" in
+    ''|*[!0-9]*|0)
+      max_defer=${FM_MAX_DEFER_SECS:-$MAX_DEFER_SECS_DEFAULT}
+      case "$max_defer" in
+        ''|*[!0-9]*|0) max_defer=$MAX_DEFER_SECS_DEFAULT ;;
+      esac
+      secs=$(( max_defer * INBOX_BEACON_STALE_DEFER_MULTIPLE ))
+      ;;
+  esac
+  printf '%s' "$secs"
+}
+
+# The supervisor pane target for THIS run, or the empty string when no pane is
+# reachable. The single owner of that derivation, so no caller can resurrect a
+# pane the daemon deliberately refused to identify.
+#
+# `${FM_SUPERVISOR_TARGET:-$FM_SUPERVISOR_TARGET_DEFAULT}` is wrong here:
+# fm_super_main sets FM_SUPERVISOR_TARGET to the EMPTY STRING in paneless mode
+# precisely so every pane primitive stays unreachable, and `:-` treats an empty
+# value as unset - which silently hands back the legacy "firstmate:0" guess, the
+# exact unrelated pane the 2026-07-22 incident typed into.
+supervisor_pane_target() {
+  paneless_delivery && return 0
+  printf '%s' "${FM_SUPERVISOR_TARGET:-$FM_SUPERVISOR_TARGET_DEFAULT}"
 }
 
 # --- backend-independent active wedge alert ---------------------------------
@@ -879,33 +1020,93 @@ wedge_alarm_notify() {  # <summary> <marker>
 # configurable backend-independent active alert (wedge_alarm_notify). Nothing
 # is lost - the buffer and the
 # wake-queue both survive - but the stall stops being invisible.
-inject_wedge_alarm() {  # <state> <age-seconds>
-  local state=$1 age=$2 marker target backend max_defer now notify=1
+#
+# <mode> selects which stall is being reported, and therefore which subsystem the
+# operator is pointed at while reading this during an incident:
+#   pane             (default) the supervisor pane would not accept a submit.
+#   paneless         the digests reached the durable outbox but firstmate's armed
+#                    reader never picked them up.
+#   paneless-append  the pull path could not even store the digest, so it is still
+#                    buffered. Naming the pane here would send diagnosis to a
+#                    subsystem this run does not have.
+inject_wedge_alarm() {  # <state> <age-seconds> [mode]
+  local state=$1 age=$2 mode=${3:-pane} marker target backend max_defer now notify=1
+  local cause detail headline report report_rc=0
   marker="$state/.subsuper-inject-wedged"
+  case "$mode" in
+    paneless)
+      cause="firstmate's away-mode inbox reader has not picked them up (never armed or never re-armed)"
+      detail="Records waiting in the away-mode inbox:"
+      ;;
+    paneless-append)
+      cause="the digest could not be stored in the away-mode inbox (state directory unwritable, or the inbox lock is held)"
+      detail="The away-mode inbox could not accept an escalation. Buffered items:"
+      ;;
+    *)
+      cause="inject could not confirm a submit (supervisor pane busy or wedged)"
+      detail="The supervisor pane could not accept an escalation. Buffered items:"
+      ;;
+  esac
   max_defer="${FM_MAX_DEFER_SECS:-$MAX_DEFER_SECS_DEFAULT}"
   # Re-alarm at most once per max-defer window so a long wedge does not spam.
   if [ "$(_file_age "$marker")" -lt "$max_defer" ]; then
     return 0
+  fi
+  headline=$(printf 'fm away-mode inject WEDGED: %ss undelivered as of %s' \
+    "$age" "$(date '+%Y-%m-%dT%H:%M:%S%z')")
+  # The paneless listing has THREE outcomes, and the marker must keep them
+  # distinguishable: it is read during an incident by the captain and by
+  # bin/fm-afk-return.sh's catch-up gate, and a heading followed by nothing is the
+  # failed-read-looks-empty presentation this delivery path removes everywhere
+  # else. Read it once, here, and branch on the status rather than discarding it.
+  if [ "$mode" = paneless ]; then
+    report=$(fm_afk_outbox_pending_report "$state" 2>/dev/null) || report_rc=$?
+    if [ "$report_rc" -eq 0 ] && [ -z "$report" ]; then
+      # A positively successful read that found nothing pending means the reader
+      # acknowledged every record between housekeeping's oldest-pending probe and
+      # this write, so the escalation WAS delivered. That is this alarm's own
+      # success condition - the same way the pane path retires the marker on a
+      # confirmed submit - so it neither wakes the away captain nor writes the
+      # marker: $marker means WEDGED to every one of its consumers, and
+      # bin/fm-afk-return.sh files its first line as wedge catch-up evidence that
+      # the away-mode skill then surfaces on the while-you-were-out report. The
+      # outcome is recorded in the daemon log instead, and housekeeping retires
+      # any pre-existing marker on its own terms. Suppression is allowed ONLY
+      # here; an inbox that could not be READ still alarms, because a failed read
+      # is never an empty one.
+      log "away-mode escalation ${age}s undelivered; firstmate's away-mode inbox reader picked every record up while this alarm was being written. No alert raised and no wedge marker written."
+      return 0
+    fi
   fi
   now=$(_now)
   if [ "$WEDGE_ALARM_LAST_EPOCH" -gt 0 ] && [ $((now - WEDGE_ALARM_LAST_EPOCH)) -lt "$max_defer" ]; then
     notify=0
   else
     WEDGE_ALARM_LAST_EPOCH=$now
-    log "ERROR: away-mode escalation undelivered ${age}s; inject could not confirm a submit (supervisor pane busy or wedged). Buffer + wake-queue preserved; alarm marker written."
+    log "ERROR: away-mode escalation undelivered ${age}s; ${cause}. Buffer + wake-queue preserved; alarm marker written."
   fi
   {
-    printf 'fm away-mode inject WEDGED: %ss undelivered as of %s\n' "$age" "$(date '+%Y-%m-%dT%H:%M:%S%z')"
-    printf 'The supervisor pane could not accept an escalation. Buffered items:\n'
-    cat "$state/.subsuper-escalations" 2>/dev/null
+    printf '%s\n' "$headline"
+    printf '%s\n' "$detail"
+    if [ "$mode" = paneless ]; then
+      if [ "$report_rc" -ne 0 ]; then
+        printf '(the away-mode inbox could not be read while writing this alarm; its records are still pending)\n'
+      else
+        printf '%s\n' "$report"
+      fi
+    else
+      cat "$state/.subsuper-escalations" 2>/dev/null
+    fi
   } 2>/dev/null > "$marker" || true
-  target="${FM_SUPERVISOR_TARGET:-$FM_SUPERVISOR_TARGET_DEFAULT}"
+  target=$(supervisor_pane_target)
   backend="${FM_SUPERVISOR_BACKEND:-$FM_SUPERVISOR_BACKEND_DEFAULT}"
   # Best-effort status-line flash. tmux's display-message is a client-side OSD
   # with no herdr equivalent; the log line + durable marker above are already
   # the primary, backend-independent signal, so a non-tmux backend just skips
   # this cosmetic extra rather than attempting an unsupported call.
-  if [ "$backend" = tmux ]; then
+  # Paneless mode leaves the target deliberately empty so no pane primitive is
+  # reachable, so there is nothing to flash there either.
+  if [ "$backend" = tmux ] && [ -n "$target" ]; then
     tmux display-message -t "$target" "fm: away-mode escalations WEDGED ${age}s — see $marker" 2>/dev/null || true
   fi
   # Backend-independent active alert. Unlike the tmux flash above (skipped on
@@ -936,6 +1137,13 @@ _oldest_line_age() {  # <buf> -> seconds since the oldest buffered item first ar
 #  1b) max-defer escape: if the buffer is STILL undelivered past MAX_DEFER_SECS,
 #     attempt one normal delivery; if it cannot confirm, raise the wedge alarm.
 #     Never silently defer forever.
+#  1c) paneless undelivered escape: in pull delivery the append always succeeds,
+#     so (1b) can never fire. Alarm instead when the oldest unacknowledged outbox
+#     record is older than MAX_DEFER_SECS *and* the reader's liveness beacon is
+#     absent or stale, through the same wedge alarm and marker, and clear that
+#     alarm once the reader has acknowledged everything. Both conditions are
+#     required: age alone cannot tell a reader that was never armed from a
+#     firstmate that is armed and mid-turn.
 #  2) stale recheck: for each pending stale marker past STALE_ESCALATE_SECS,
 #     re-peek the pane; still idle -> escalate (wedge); resumed -> clear marker.
 #  2b) pause re-surface: for each declared-pause marker past PAUSE_RESURFACE_SECS,
@@ -945,6 +1153,7 @@ _oldest_line_age() {  # <buf> -> seconds since the oldest buffered item first ar
 #     captain-relevant line the per-wake classifier missed and escalate it.
 housekeeping() {  # <state>
   local state=$1 now due f key task win marker age last max_defer oldest pause_secs
+  local oldest_epoch outbox_rc
   now=$(_now)
   migrate_watcher_pause_markers "$state"
 
@@ -971,9 +1180,75 @@ housekeeping() {  # <state>
        && [ "$(_file_age "$state/.subsuper-inject-wedged")" -ge "$max_defer" ]; then
       if escalate_flush "$state"; then
         log "inject recovered: max-defer flush succeeded after ${oldest}s undelivered"
-        rm -f "$state/.subsuper-inject-wedged"
+        # Same ownership split as escalate_flush: only the pane path's confirmed
+        # submit is delivery, so only it retires the marker here.
+        paneless_delivery || rm -f "$state/.subsuper-inject-wedged"
+      elif paneless_delivery; then
+        # A paneless run reaching here failed to STORE the digest; there is no
+        # supervisor pane to be busy or wedged, so the alarm must not name one.
+        inject_wedge_alarm "$state" "$oldest" paneless-append
       else
         inject_wedge_alarm "$state" "$oldest"
+      fi
+    fi
+  fi
+
+  # (1c) PANELESS undelivered escape. Appending to the outbox always succeeds, so
+  # in paneless mode the escalation buffer always clears and (1b) above - which
+  # keys off that buffer - can never fire. Without this age check, records
+  # accumulate unread whenever firstmate's reader was never armed or re-armed (a
+  # harness restart, a turn that ignored the reader's re-arm line, or paneless
+  # selected while firstmate actually had a reachable pane), which silently
+  # recreates the very undelivered-escalation incident this delivery mode exists
+  # to fix. Same alarm, same durable marker, same rate limiting as the pane path,
+  # and presence-gated on away mode exactly like every other away-mode behavior.
+  if afk_active "$state" && [ "$max_defer" -gt 0 ] && paneless_delivery \
+     && [ "$now" -ge "$OUTBOX_PROBE_NOT_BEFORE" ]; then
+    outbox_rc=0
+    oldest_epoch=$(fm_afk_outbox_oldest_pending_epoch "$state") || outbox_rc=$?
+    if [ "$outbox_rc" -ne 0 ]; then
+      # An outbox that could not be read is not an empty one, so neither alarm nor
+      # clear: leave whatever alarm state exists and retry later. Each failed
+      # attempt burns the full bounded lock acquire, so back the probe off to one
+      # per max-defer window and log only the transition INTO the failed-read
+      # state - otherwise this line, and that stall, repeat on every
+      # HOUSEKEEPING_TICK_DEFAULT tick during precisely the incident the line
+      # exists to document.
+      if [ "$OUTBOX_UNREADABLE" -eq 0 ]; then
+        OUTBOX_UNREADABLE=1
+        if [ "$outbox_rc" -eq "$FM_AFK_OUTBOX_LOCK_TIMEOUT" ]; then
+          log "away-mode inbox lock could not be acquired; undelivered-escalation alarm state left unchanged until the outbox can be read again"
+        else
+          log "away-mode inbox unreadable; undelivered-escalation alarm state left unchanged until it can be read again"
+        fi
+      fi
+      OUTBOX_PROBE_NOT_BEFORE=$(( now + max_defer ))
+    else
+      if [ "$OUTBOX_UNREADABLE" -eq 1 ]; then
+        OUTBOX_UNREADABLE=0
+        log "away-mode inbox readable again; undelivered-escalation alarm resumed"
+      fi
+      if [ -n "$oldest_epoch" ]; then
+        oldest=$(( now - oldest_epoch ))
+        # The alarm must answer "is anyone going to read this?", not "how old is
+        # the oldest record?". Age alone cannot separate a reader that was never
+        # armed from a firstmate that is armed and simply mid-turn, and agent
+        # turns longer than the max-defer window are routine, so age alone would
+        # alarm the captain on the healthy path. An armed reader stamps
+        # state/.afk-inbox.beat every poll iteration, so only a beacon that is
+        # ABSENT or stale means nothing has claimed the outbox. Raising the
+        # threshold instead was rejected on purpose: that trades a false alarm for
+        # a silent gap, which is the failure this delivery mode exists to remove.
+        if [ "$oldest" -ge "$max_defer" ] \
+           && [ "$(_file_age "$(fm_afk_inbox_beacon_file "$state")")" -ge "$(inbox_beacon_stale_secs)" ] \
+           && [ "$(_file_age "$state/.subsuper-inject-wedged")" -ge "$max_defer" ]; then
+          inject_wedge_alarm "$state" "$oldest" paneless
+        fi
+      elif [ ! -s "$state/.subsuper-escalations" ]; then
+        # Everything appended has been acknowledged and nothing is buffered behind
+        # a failed append, so a prior alarm is stale: clear it rather than let a
+        # delivered-then-quiet outbox keep alarming.
+        rm -f "$state/.subsuper-inject-wedged"
       fi
     fi
   fi
@@ -1112,7 +1387,24 @@ inject_msg() {  # <message> [state]
   msg=$(_collapse_newlines "$msg")
   fm_operational_input_encode away-supervisor "$msg" encoded || return 1
   msg=$encoded
-  target="${FM_SUPERVISOR_TARGET:-$FM_SUPERVISOR_TARGET_DEFAULT}"
+  # (2b) PANELESS delivery: no pane was ever identified, so there is nothing to
+  # type into. Append the identical marked, single-line digest to the durable
+  # outbox and let firstmate's armed reader (bin/fm-afk-inbox.sh) pull it. A
+  # failed append returns non-zero exactly like a failed inject, so the digest
+  # stays buffered for the next tick instead of vanishing.
+  if paneless_delivery; then
+    if fm_afk_outbox_append "$state" escalation "$msg"; then
+      # Both numbers come from inside the append's own critical section. Re-reading
+      # the count here would take the outbox lock again, and a bounded acquire lost
+      # to a concurrent reader would log "0 record(s) pending pickup" right after a
+      # record that was in fact appended.
+      log "delivered to the away-mode inbox (paneless): record #${FM_AFK_OUTBOX_APPEND_SEQ}, ${FM_AFK_OUTBOX_APPEND_PENDING:-unknown} record(s) pending pickup"
+      return 0
+    fi
+    log "inject failed: could not append the digest to the away-mode inbox"
+    return 1
+  fi
+  target=$(supervisor_pane_target)
   # BACKEND-AWARE (previously a raw `tmux display-message` pane-exists probe):
   # dispatches through bin/fm-backend.sh so a herdr supervisor pane is checked
   # via the herdr adapter instead of always assuming tmux. Falls back to tmux
@@ -1373,30 +1665,61 @@ fm_super_main() {
       target_source="FALLBACK(firstmate:0)"
     fi
   fi
-  if discovered=$(discover_supervisor_target); then
-    : # resolved cleanly
-  else
-    echo "warn: could not auto-discover supervisor pane (no FM_SUPERVISOR_TARGET, TMUX_PANE, or HERDR_ENV/HERDR_PANE_ID); falling back to '$discovered' — verify this is firstmate's pane" >&2
-  fi
-  FM_SUPERVISOR_TARGET="$discovered"
-  local TARGET="$FM_SUPERVISOR_TARGET"
 
-  # --- validate supervisor target at startup (a missing target is a typo) ---
-  # Dispatches through bin/fm-backend.sh instead of a raw `tmux display-message`
-  # probe, so a herdr supervisor pane is checked via the herdr adapter; for
-  # backend=tmux this runs the exact same `tmux display-message -p -t "$TARGET"
-  # '#{pane_id}'` call as before.
-  if ! fm_backend_target_exists "$BACKEND" "$TARGET"; then
-    echo "error: supervisor target '$TARGET' does not resolve to a $BACKEND pane; set FM_SUPERVISOR_TARGET" >&2
-    log "startup failed: target '$TARGET' not found (backend=$BACKEND)"
-    fm_lock_release "$LOCK" 2>/dev/null || true
-    rm -f "$PIDFILE" 2>/dev/null || true
-    exit 1
+  # --- choose the delivery mode before touching any pane --------------------
+  # A FALLBACK target source means nothing identified firstmate's own pane, so
+  # the legacy firstmate:0 guess is NOT used as an injection target: paneless
+  # pull delivery is selected instead (afk_delivery_mode_select above owns the
+  # rule and the reasoning). Both the mode and the reason are logged, and the
+  # mode is recorded durably so the reader and firstmate can tell a paneless away
+  # session from a pane one without re-deriving this discovery.
+  local DELIVERY delivery_rc=0
+  DELIVERY=$(afk_delivery_mode_select "$target_source") || delivery_rc=$?
+  if [ "$delivery_rc" -eq 2 ]; then
+    echo "warn: ignoring unrecognized FM_AFK_DELIVERY='${FM_AFK_DELIVERY:-}' (expected auto, pane, or paneless); using '$DELIVERY'" >&2
   fi
+  FM_AFK_DELIVERY_MODE="$DELIVERY"
+
+  local TARGET=""
+  if [ "$DELIVERY" = paneless ]; then
+    # Deliberately leave FM_SUPERVISOR_TARGET empty: with no identified pane,
+    # every pane primitive stays unreachable for the rest of this run, so the
+    # daemon cannot type an escalation into an unrelated terminal.
+    FM_SUPERVISOR_TARGET=""
+    echo "info: no supervisor pane identified (target_source=$target_source); away-mode escalations will be delivered through the pull inbox - arm bin/fm-afk-inbox.sh as a tracked background task" >&2
+    log "delivery mode: paneless (reason: no supervisor pane identified; target_source=$target_source, backend_source=$backend_source)"
+  else
+    if discovered=$(discover_supervisor_target); then
+      : # resolved cleanly
+    else
+      echo "warn: could not auto-discover supervisor pane (no FM_SUPERVISOR_TARGET, TMUX_PANE, or HERDR_ENV/HERDR_PANE_ID); falling back to '$discovered' — verify this is firstmate's pane" >&2
+    fi
+    FM_SUPERVISOR_TARGET="$discovered"
+    TARGET="$FM_SUPERVISOR_TARGET"
+    log "delivery mode: pane (reason: supervisor pane identified; target_source=$target_source)"
+
+    # --- validate supervisor target at startup (a missing target is a typo) ---
+    # Dispatches through bin/fm-backend.sh instead of a raw `tmux display-message`
+    # probe, so a herdr supervisor pane is checked via the herdr adapter; for
+    # backend=tmux this runs the exact same `tmux display-message -p -t "$TARGET"
+    # '#{pane_id}'` call as before. A named-but-absent pane is a supported-but-
+    # broken pane, so it still refuses loudly rather than silently switching
+    # channels.
+    if ! fm_backend_target_exists "$BACKEND" "$TARGET"; then
+      echo "error: supervisor target '$TARGET' does not resolve to a $BACKEND pane; set FM_SUPERVISOR_TARGET" >&2
+      log "startup failed: target '$TARGET' not found (backend=$BACKEND)"
+      fm_lock_release "$LOCK" 2>/dev/null || true
+      rm -f "$PIDFILE" 2>/dev/null || true
+      exit 1
+    fi
+  fi
+
+  fm_afk_delivery_mode_record "$STATE" "$DELIVERY" \
+    || log "warn: could not record the delivery mode in $(fm_afk_delivery_mode_file "$STATE")"
 
   local afk_status="off"
   afk_active "$STATE" && afk_status="on"
-  log "daemon starting (pid $$); target=$TARGET; target_source=$target_source; backend=$BACKEND; backend_source=$backend_source; afk=$afk_status; inject_skip='${FM_INJECT_SKIP:-$INJECT_SKIP_DEFAULT}'; stale_escalate=${FM_STALE_ESCALATE_SECS:-$STALE_ESCALATE_SECS_DEFAULT}s; batch=${FM_ESCALATE_BATCH_SECS:-$ESCALATE_BATCH_SECS_DEFAULT}s"
+  log "daemon starting (pid $$); delivery=$DELIVERY; target=${TARGET:-none}; target_source=$target_source; backend=$BACKEND; backend_source=$backend_source; afk=$afk_status; inject_skip='${FM_INJECT_SKIP:-$INJECT_SKIP_DEFAULT}'; stale_escalate=${FM_STALE_ESCALATE_SECS:-$STALE_ESCALATE_SECS_DEFAULT}s; batch=${FM_ESCALATE_BATCH_SECS:-$ESCALATE_BATCH_SECS_DEFAULT}s"
   migrate_watcher_pause_markers "$STATE"
 
   # --- shutdown: flush buffered escalations, reap child, release lock -------
@@ -1454,7 +1777,10 @@ fm_super_main() {
     # has nowhere to go, and firstmate itself is the consumer of escalations.
     # Catch-up signals persist in state/*.status and flow on the next run, so
     # this delays rather than loses work.
-    if ! fm_backend_target_exists "$BACKEND" "$TARGET"; then
+    # Paneless delivery has no pane to lose: the outbox is always reachable, so
+    # this guard is skipped entirely rather than backing off against a target
+    # that was never used.
+    if [ "$DELIVERY" != paneless ] && ! fm_backend_target_exists "$BACKEND" "$TARGET"; then
       log "warn: supervisor target '$TARGET' gone; backing off ${INJECT_FAIL_SLEEP}s, will retry"
       # Flush is pointless with no pane; preserve any buffered escalations.
       sleep "$INJECT_FAIL_SLEEP"
