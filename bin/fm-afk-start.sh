@@ -163,6 +163,14 @@ fm_afk_start_main() {
     fi
   fi
 
+  # Away-mode interlock: the present-mode daemon (bin/fm-present-daemon.sh) keeps
+  # a watcher armed for an ACTIVE session. Away mode hands supervision to the
+  # sub-supervisor daemon, which owns triage instead, so the two must never run
+  # together. Stopping it here is the immediate handover; the present daemon also
+  # re-checks state/.afk between its own cycles as a backstop. Inert and silent
+  # when the feature is not opted in.
+  FM_HOME="$FM_HOME" "$FM_AFK_START_DIR/fm-present-daemon.sh" stop >/dev/null 2>&1 || true
+
   local pid
   pid=$(daemon_lock_pid 2>/dev/null || true)
   if daemon_lock_held_by_live_daemon; then

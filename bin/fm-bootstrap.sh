@@ -10,6 +10,7 @@
 #                 "BACKEND_INVALID: <name> (known: <names>)",
 #                 "CREW_DISPATCH: invalid config/crew-dispatch.json - <reason>",
 #                 "FLEET_SYNC: <repo>: skipped|recovered|STUCK: <detail>",
+#                 "PRESENT_DAEMON: <reason>",
 #                 "PR_CHECK_MIGRATION: <private remediation>",
 #                 "TANGLE: <remediation>",
 #                 "SECONDMATE_SYNC: secondmate <id>: skipped: <reason>",
@@ -40,6 +41,11 @@
 #          skipped means the probe could not confidently classify the endpoint,
 #          and respawn failed means relaunch did not complete. Already-live and
 #          successfully respawned secondmates are silent.
+#          A PRESENT_DAEMON line means the opted-in present-mode supervision
+#          daemon (bin/fm-present-daemon.sh) could not be launched, so this
+#          session keeps arming the watcher itself per turn. The sweep is silent
+#          when the feature is not opted in, when away mode owns supervision,
+#          and when the daemon is already running.
 #          A TANGLE line means the firstmate primary checkout (FM_ROOT) is stranded
 #          on a feature branch instead of its default branch - a crewmate's work
 #          landed in the primary instead of its own worktree; restore it per the line.
@@ -67,8 +73,9 @@
 #          refresh relays any completed fm-fleet-sync.sh output before the
 #          aggregate timeout skip line with timeout and elapsed seconds.
 #          Set FM_FLEET_PRUNE=0 to skip branch pruning during that refresh.
-#          Set FM_BOOTSTRAP_DETECT_ONLY=1 to skip the five MUTATING sweeps
-#          (PR-check migration, secondmate_sync, secondmate_liveness_sweep,
+#          Set FM_BOOTSTRAP_DETECT_ONLY=1 to skip the six MUTATING sweeps
+#          (PR-check migration, present_daemon_sweep, secondmate_sync,
+#          secondmate_liveness_sweep,
 #          x_mode_setup, fleet_sync) while still printing every read-only detect line
 #          above; the TANGLE line switches to advisory-only wording with no
 #          checkout command. Used by
@@ -479,6 +486,26 @@ secondmate_liveness_sweep() {
   return 0
 }
 
+present_daemon_sweep() {
+  # Idempotent present-mode daemon liveness guarantee - SESSION START ONLY, and
+  # only while this session actually holds the fleet lock. The daemon
+  # (bin/fm-present-daemon.sh) keeps a watcher continuously armed so the active
+  # session stops paying the per-turn re-arm tax. It is inert unless the local
+  # config/present-daemon flag exists, and it must never run alongside away
+  # mode, which owns supervision through its own daemon. Both conditions are
+  # owned by the daemon itself, so this sweep can call `start` unconditionally:
+  # disabled, away-mode, and already-running all return 0 silently. Only a real
+  # launch failure is actionable, and that surfaces as one PRESENT_DAEMON line.
+  # Never blind either way: if the daemon is absent or dies, the turn-end guard
+  # (bin/fm-turnend-guard.sh) still fires its normal alarm and the session
+  # degrades to arming supervision per turn, exactly as before this feature.
+  local out
+  if ! out=$(FM_HOME="$FM_HOME" "$SCRIPT_DIR/fm-present-daemon.sh" start 2>&1); then
+    echo "PRESENT_DAEMON: $(first_line "$out")"
+  fi
+  return 0
+}
+
 install_cmd() {
   case "$1" in
     tmux|node|git|gh|curl|jq|orca|zellij) echo "brew install $1  # or the platform's package manager" ;;
@@ -867,6 +894,7 @@ if [ "${FM_BOOTSTRAP_VERBOSE_FACTS:-0}" = 1 ] \
   echo "BOOTSTRAP_INFO: tasks-axi available"
 fi
 if [ "${FM_BOOTSTRAP_DETECT_ONLY:-0}" != 1 ]; then
+  present_daemon_sweep
   secondmate_liveness_sweep
   secondmate_sync
   x_mode_setup
