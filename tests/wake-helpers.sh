@@ -124,6 +124,10 @@ make_supercase() {
   cat > "$fakebin/tmux" <<'SH'
 #!/usr/bin/env bash
 set -u
+# Every invocation, for tests that assert a code path touches NO pane at all.
+if [ -n "${FM_FAKE_TMUX_CALLS:-}" ]; then
+  printf '%s\n' "$*" >> "$FM_FAKE_TMUX_CALLS"
+fi
 case "${1:-}" in
   display-message)
     [ "${FM_FAKE_TMUX_PANE_ALIVE:-1}" = "1" ] || exit 1

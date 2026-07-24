@@ -103,6 +103,7 @@ state/               volatile runtime signals; gitignored
   x-poll.error x-poll.claim-error  generated X-mode relay and offer-claim diagnostic dedupe markers
   .wake-queue        durable queued wakes: epoch<TAB>seq<TAB>kind<TAB>key<TAB>payload
   .afk               durable away-mode flag; present = the away posture, so a live sub-supervisor daemon may inject escalations, while supervision ownership follows an actually-live daemon rather than this flag (bin/fm-afk-daemon-lib.sh; set by /afk, cleared on user return)
+  .afk-delivery .afk-outbox* .afk-inbox.beat  away-mode delivery mode, the durable pull-delivery records used when no supervisor pane exists, and the reader's liveness beacon; acknowledged only by bin/fm-afk-inbox.sh (docs/configuration.md)
   .watch.lock .wake-queue.lock watcher singleton and queue serialization locks
   .hash-* .count-* .stale-* .stale-since-* .paused-* .wedge-escalations-* .seen-* .hb-surfaced-* .last-* .resource-* .heartbeat-streak   watcher internals; never touch
   .watch-triage.log  watcher's absorbed-wake debug log (size-capped); never relied on, safe to delete
@@ -360,6 +361,7 @@ The skill owns the daemon procedure; these safety facts remain inline:
 - While a live away-mode daemon runs for this home, the daemon owns supervision; do not arm a separate watcher.
   Away mode with no live daemon is the away posture only, so this home keeps arming and repairing its own watcher cycle normally.
 - A marked message while away mode is active is internal escalation and does not exit away mode.
+- A completed `bin/fm-afk-inbox.sh` background task is internal escalation too, never captain input; act on the digests it printed and obey its final line's re-arm verdict rather than re-deriving it.
 - A message beginning `/afk` refreshes away mode.
 - Any other unmarked message means the captain returned; load `/afk`, run the return owner, and do not process that message as ordinary work until its durable catch-up gate clears.
 - Away mode never expands approval authority for merges, ask-user findings, destructive actions, irreversible actions, or security-sensitive choices.

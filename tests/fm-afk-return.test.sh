@@ -20,6 +20,7 @@ install_runner() {  # <case-dir>
   cp "$ROOT/bin/fm-wake-lib.sh" "$dir/bin/"
   cp "$ROOT/bin/fm-pid-lib.sh" "$dir/bin/"
   cp "$ROOT/bin/fm-classify-lib.sh" "$dir/bin/"
+  cp "$ROOT/bin/fm-afk-outbox-lib.sh" "$dir/bin/"
   cat > "$dir/bin/fm-afk-launch.sh" <<'SH'
 #!/usr/bin/env bash
 [ "${1:-}" = stop ] || exit 2
@@ -210,8 +211,133 @@ test_check_retries_recorded_terminal_teardown() {
   pass "check retries recorded terminal teardown and keeps catch-up gated until success"
 }
 
+# An away session with no supervisor pane delivers through the durable outbox
+# instead of the escalation buffer, so a digest the reader never picked up lives
+# there. Return catch-up must report it as the same evidence and clear it only
+# after the gate closes.
+test_return_reports_undelivered_inbox_records() {
+  local dir gate out
+  dir="$TMP_ROOT/paneless-catchup"
+  install_runner "$dir"
+  gate="$dir/home/state/.afk-return-catchup"
+  date +%s > "$dir/home/state/.afk"
+  : > "$dir/home/state/.fake-drain"
+  printf 'paneless\n' > "$dir/home/state/.afk-delivery"
+  printf '1784074271\t1\tescalation\tSupervisor escalate (1 event(s)): omega.status: done: PR 7\n' \
+    > "$dir/home/state/.afk-outbox"
+  seed_live_blocker "$dir" tmux inbox-blocker
+
+  set +e
+  out=$(run_return "$dir" begin)
+  set -e
+  assert_contains "$out" 'omega.status: done: PR 7' "an undelivered inbox record was not reported at return"
+  grep -F $'evidence\tescalation\t' "$gate" >/dev/null \
+    || fail "the undelivered inbox record was not retained as durable catch-up evidence"
+  [ -s "$dir/home/state/.afk-outbox" ] || fail "return discarded an undelivered record while the gate was still open"
+
+  printf 'resolved [key=inbox-blocker]: refreshed the synthetic token\n' >> "$dir/home/state/repair-task.status"
+  out=$(run_return "$dir" check) || fail "resolved blocker did not clear return catch-up: $out"
+  [ ! -e "$dir/home/state/.afk-outbox" ] || fail "successful check left reported inbox records behind"
+  [ ! -e "$dir/home/state/.afk-delivery" ] || fail "successful check left the recorded delivery mode behind"
+  pass "return catch-up reports undelivered inbox records as evidence and clears them only after the gate closes"
+}
+
+# An outbox that could not be READ is not an outbox that is EMPTY. Swallowing the
+# read failure would file no escalation evidence and then delete the outbox on the
+# way out, losing undelivered escalations this gate never actually saw.
+test_return_refuses_to_clear_an_unreadable_inbox() {
+  local dir gate out rc lock holder i=0
+  dir="$TMP_ROOT/paneless-unreadable"
+  install_runner "$dir"
+  gate="$dir/home/state/.afk-return-catchup"
+  date +%s > "$dir/home/state/.afk"
+  : > "$dir/home/state/.fake-drain"
+  printf 'paneless\n' > "$dir/home/state/.afk-delivery"
+  printf '1784074271\t1\tescalation\tSupervisor escalate (1 event(s)): omega.status: blocked: needs a token\n' \
+    > "$dir/home/state/.afk-outbox"
+
+  # Hold the outbox lock in a live process so the gate's bounded read genuinely
+  # fails. No live blocker is seeded: without the failed read this run would
+  # close the gate and delete the outbox.
+  lock="$dir/home/state/.afk-outbox.lock"
+  bash -c '
+    # shellcheck disable=SC1090
+    . "$1/bin/fm-wake-lib.sh"
+    fm_lock_acquire_wait "$2"
+    sleep 15
+  ' _ "$ROOT" "$lock" >/dev/null 2>&1 &
+  holder=$!
+  while [ ! -e "$lock" ]; do
+    [ "$i" -lt 100 ] || fail "the background lock holder never took the outbox lock"
+    sleep 0.1
+    i=$((i + 1))
+  done
+
+  set +e
+  out=$(FM_AFK_OUTBOX_LOCK_TRIES=2 run_return "$dir" begin)
+  rc=$?
+  set -e
+  kill "$holder" 2>/dev/null || true
+  wait "$holder" 2>/dev/null || true
+
+  [ "$rc" -eq 3 ] || fail "an unreadable inbox must block return catch-up (rc=$rc): $out"
+  # The gate gets one pass and then deletes the outbox, so a lock timeout that a
+  # retrying reader would survive is still a blocker here, named for what it was.
+  assert_contains "$out" 'away-mode inbox lock could not be acquired' "the read failure was not reported as a blocker: $out"
+  [ -s "$dir/home/state/.afk-outbox" ] \
+    || fail "return deleted an inbox whose content it never read"
+  [ -e "$gate" ] || fail "the return gate did not stay open after an unreadable inbox"
+
+  # With the lock released the retry reads it, reports it, and only then clears.
+  out=$(run_return "$dir" check) || fail "return check failed once the inbox was readable again: $out"
+  assert_contains "$out" 'omega.status: blocked: needs a token' "the retry did not report the record it finally read"
+  [ ! -e "$dir/home/state/.afk-outbox" ] || fail "a successful read did not clear the reported inbox"
+  pass "return catch-up blocks on an unreadable inbox and never deletes records it did not read"
+}
+
+# The same gate against the other way a read fails: the outbox file itself is
+# present but unreadable, so the failure surfaces past the lock in the record scan
+# rather than in the acquire. Preserving the records matters most here, because
+# nothing else on disk holds an escalation the gate never saw.
+test_return_refuses_to_clear_an_unreadable_inbox_file() {
+  local dir gate out rc
+  if [ "$(id -u)" = 0 ]; then
+    pass "skipped: running as root, where mode 000 does not deny a read"
+    return 0
+  fi
+  dir="$TMP_ROOT/paneless-unreadable-file"
+  install_runner "$dir"
+  gate="$dir/home/state/.afk-return-catchup"
+  date +%s > "$dir/home/state/.afk"
+  : > "$dir/home/state/.fake-drain"
+  printf 'paneless\n' > "$dir/home/state/.afk-delivery"
+  printf '1784074271\t1\tescalation\tSupervisor escalate (1 event(s)): omega.status: blocked: needs a token\n' \
+    > "$dir/home/state/.afk-outbox"
+  chmod 000 "$dir/home/state/.afk-outbox"
+
+  set +e
+  out=$(run_return "$dir" begin)
+  rc=$?
+  set -e
+
+  [ "$rc" -eq 3 ] || fail "an unreadable inbox file must block return catch-up (rc=$rc): $out"
+  assert_contains "$out" 'away-mode inbox could not be read' "the read failure was not reported as a blocker: $out"
+  [ -e "$dir/home/state/.afk-outbox" ] \
+    || fail "return deleted an inbox file whose content it never read"
+  [ -e "$gate" ] || fail "the return gate did not stay open after an unreadable inbox file"
+
+  chmod 644 "$dir/home/state/.afk-outbox"
+  out=$(run_return "$dir" check) || fail "return check failed once the inbox was readable again: $out"
+  assert_contains "$out" 'omega.status: blocked: needs a token' "the retry did not report the record it finally read"
+  [ ! -e "$dir/home/state/.afk-outbox" ] || fail "a successful read did not clear the reported inbox"
+  pass "return catch-up blocks on an unreadable inbox FILE and never deletes records it did not read"
+}
+
 test_return_gate_orders_catchup_before_bearings
 test_explicit_reclassification_requires_durable_reason
 test_captain_decision_does_not_masquerade_as_firstmate_blocker
 test_away_reentry_refuses_pending_return_gate
 test_check_retries_recorded_terminal_teardown
+test_return_reports_undelivered_inbox_records
+test_return_refuses_to_clear_an_unreadable_inbox
+test_return_refuses_to_clear_an_unreadable_inbox_file

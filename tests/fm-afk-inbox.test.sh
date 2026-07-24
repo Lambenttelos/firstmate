@@ -1,0 +1,882 @@
+#!/usr/bin/env bash
+# tests/fm-afk-inbox.test.sh - away-mode PULL delivery: the durable outbox record
+# and acknowledgement contract (bin/fm-afk-outbox-lib.sh) and its blocking reader
+# (bin/fm-afk-inbox.sh).
+#
+# The contract these cover is the one the 2026-07-22 incident needed: a primary
+# firstmate with no supervisor pane must still receive away-mode escalations, and
+# a reader that dies mid-wait or mid-print must lose nothing. Delivery is
+# exactly-once within a run and at-least-once across a killed run, because
+# records are acknowledged only after they are already on the reader's stdout.
+#
+# Mode selection and the daemon-side dispatch into this outbox live in
+# tests/fm-daemon.test.sh, next to the rest of the injection units.
+set -u
+
+# wake-helpers.sh brings tests/lib.sh plus the wedge-alarm notifier recorder, so
+# the real daemon this suite starts can never post a desktop notification.
+# shellcheck source=tests/wake-helpers.sh
+. "$(dirname "${BASH_SOURCE[0]}")/wake-helpers.sh"
+
+INBOX="$ROOT/bin/fm-afk-inbox.sh"
+DAEMON="$ROOT/bin/fm-supervise-daemon.sh"
+OUTBOX_LIB="$ROOT/bin/fm-afk-outbox-lib.sh"
+TMP_ROOT=$(fm_test_tmproot fm-afk-inbox-tests)
+
+# shellcheck source=bin/fm-afk-outbox-lib.sh
+. "$OUTBOX_LIB"
+
+# The daemon prefixes every digest with the sentinel marker before delivery; the
+# record must carry it through verbatim, so the fixtures use the real bytes.
+FM_TEST_MARK=$'\xE2\x81\xA3'
+
+make_inbox_case() {  # <name> -> state dir
+  local name=$1 state
+  state="$TMP_ROOT/$name/state"
+  mkdir -p "$state"
+  printf '%s\n' "$state"
+}
+
+enter_away() {  # <state>
+  date +%s > "$1/.afk"
+}
+
+# Portable mtime in epoch seconds; BSD and GNU stat disagree on the flag, the
+# same split bin/fm-watch.sh decides once rather than probing per call.
+if stat -f %m . >/dev/null 2>&1; then
+  fm_test_mtime() { stat -f %m "$1"; }
+else
+  fm_test_mtime() { stat -c %Y "$1"; }
+fi
+
+append_digest() {  # <state> <text>
+  fm_afk_outbox_append "$1" escalation "${FM_TEST_MARK}$2" \
+    || fail "could not append an away-mode delivery record"
+}
+
+run_inbox() {  # <state> [args...]
+  local state=$1
+  shift
+  FM_STATE_OVERRIDE="$state" FM_HOME="$(dirname "$state")" "$INBOX" "$@" 2>&1
+}
+
+wait_pid_exit() {  # <pid> [tenths]
+  local pid=$1 limit=${2:-200} i=0
+  while kill -0 "$pid" 2>/dev/null; do
+    if [ "$i" -ge "$limit" ]; then
+      kill -9 "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+      return 124
+    fi
+    sleep 0.1
+    i=$((i + 1))
+  done
+  wait "$pid"
+}
+
+test_reader_delivers_pending_records_then_acknowledges_them() {
+  local state out
+  state=$(make_inbox_case deliver-once)
+  enter_away "$state"
+  append_digest "$state" "Supervisor escalate (1 event(s)): alpha.status: done: PR 1"
+  append_digest "$state" "Supervisor escalate (1 event(s)): beta.status: blocked: needs a token"
+
+  out=$(run_inbox "$state" --once) || fail "reader failed with records pending: $out"
+  assert_contains "$out" "afk-inbox: delivered 2 away-mode escalation(s)" "reader did not announce what it delivered"
+  assert_contains "$out" "alpha.status: done: PR 1" "reader did not print the first digest"
+  assert_contains "$out" "beta.status: blocked: needs a token" "reader did not print the second digest"
+  assert_contains "$out" "${FM_TEST_MARK}Supervisor escalate" "reader dropped the sentinel marker from the digest"
+  [ "$(cat "$state/.afk-outbox.ack")" = 2 ] || fail "reader did not record the acknowledged high-water mark"
+
+  out=$(run_inbox "$state" --once) || fail "second reader run failed: $out"
+  assert_contains "$out" "afk-inbox: nothing pending" "acknowledged records were delivered a second time"
+  assert_not_contains "$out" "alpha.status" "acknowledged records were re-printed"
+  pass "reader delivers every pending record once and acknowledges exactly what it printed"
+}
+
+test_killed_reader_loses_nothing() {
+  local state out pid rc
+  state=$(make_inbox_case killed-reader)
+  enter_away "$state"
+
+  # (1) A reader killed while WAITING, before anything is written.
+  FM_STATE_OVERRIDE="$state" "$INBOX" --poll 1 --timeout 60 > "$state/killed.out" 2>&1 &
+  pid=$!
+  sleep 1
+  kill -9 "$pid" 2>/dev/null || fail "background reader was not running to be killed"
+  wait "$pid" 2>/dev/null || true
+  append_digest "$state" "Supervisor escalate (1 event(s)): gamma.status: failed: CI red"
+  out=$(run_inbox "$state" --once) || fail "reader after a killed wait failed: $out"
+  assert_contains "$out" "gamma.status: failed: CI red" "a record written after a killed reader was not delivered"
+  [ "$(cat "$state/.afk-outbox.ack")" = 1 ] || fail "delivery after a killed wait did not acknowledge"
+
+  # (2) A reader killed BETWEEN printing and acknowledging: the records were
+  # printed to a stdout nobody received, so the same records must be delivered
+  # again - once - by the next run.
+  append_digest "$state" "Supervisor escalate (1 event(s)): delta.status: needs-decision: pick one"
+  fm_afk_outbox_pending "$state" >/dev/null || fail "pending read failed"
+  [ "$(cat "$state/.afk-outbox.ack")" = 1 ] || fail "a pending read must never acknowledge on its own"
+  rc=0
+  out=$(run_inbox "$state" --once) || rc=$?
+  [ "$rc" -eq 0 ] || fail "reader failed re-delivering an unacknowledged record (rc=$rc): $out"
+  assert_contains "$out" "delta.status: needs-decision: pick one" "an unacknowledged record was lost"
+  [ "$(printf '%s\n' "$out" | grep -c 'delta.status')" -eq 1 ] || fail "re-delivery duplicated the record within one run"
+  [ "$(cat "$state/.afk-outbox.ack")" = 2 ] || fail "re-delivery did not advance the acknowledged mark"
+
+  out=$(run_inbox "$state" --once) || fail "reader failed after re-delivery: $out"
+  assert_contains "$out" "nothing pending" "re-delivered records were not acknowledged"
+  pass "a killed reader loses nothing and the next run delivers the same records exactly once"
+}
+
+test_reader_wakes_on_a_record_written_while_it_waits() {
+  local state pid rc out
+  state=$(make_inbox_case concurrent-append)
+  enter_away "$state"
+  FM_STATE_OVERRIDE="$state" "$INBOX" --poll 1 --timeout 60 > "$state/reader.out" 2>&1 &
+  pid=$!
+  sleep 1
+  append_digest "$state" "Supervisor escalate (1 event(s)): epsilon.status: done: PR 9"
+  wait_pid_exit "$pid" 200
+  rc=$?
+  [ "$rc" -eq 0 ] || fail "blocked reader did not exit cleanly after a record arrived (rc=$rc)"
+  out=$(cat "$state/reader.out")
+  assert_contains "$out" "epsilon.status: done: PR 9" "blocked reader did not deliver the record written while it waited"
+  assert_contains "$out" "re-arm to keep listening" "delivery did not tell firstmate to re-arm"
+  pass "a record appended while the reader waits wakes it and is delivered"
+}
+
+# The daemon's undelivered alarm keys off this beacon to tell an armed reader
+# blocking through a long firstmate turn from a reader that was never armed, so
+# it has to be stamped on every poll iteration - not only at arm time - or a long
+# quiet wait would read as dead and alarm the away captain on the healthy path.
+test_reader_stamps_its_liveness_beacon_while_it_waits() {
+  local state beacon pid first second
+  state=$(make_inbox_case reader-beacon)
+  enter_away "$state"
+  beacon=$(fm_afk_inbox_beacon_file "$state")
+  [ ! -e "$beacon" ] || fail "a beacon existed before any reader was armed"
+
+  FM_STATE_OVERRIDE="$state" "$INBOX" --poll 1 --timeout 30 > "$state/reader.out" 2>&1 &
+  pid=$!
+  sleep 1
+  [ -e "$beacon" ] || fail "an armed reader stamped no liveness beacon"
+  first=$(fm_test_mtime "$beacon")
+
+  # Nothing at all happens for a few seconds: the beacon must keep advancing
+  # anyway, because a quiet wait is exactly what a long firstmate turn looks like.
+  sleep 3
+  second=$(fm_test_mtime "$beacon")
+  [ "$second" -gt "$first" ] || fail "the beacon stopped advancing during a quiet wait ($first -> $second)"
+
+  append_digest "$state" "Supervisor escalate (1 event(s)): theta.status: done: PR 7"
+  wait_pid_exit "$pid" 200
+  [ "$(fm_test_mtime "$beacon")" -ge "$second" ] || fail "the beacon regressed after an acknowledgement"
+  pass "the reader stamps its liveness beacon on every poll and after acknowledging"
+}
+
+test_reader_exits_immediately_when_the_daemon_uses_the_pane() {
+  local state out started elapsed
+  state=$(make_inbox_case pane-mode)
+  enter_away "$state"
+  fm_afk_delivery_mode_record "$state" pane || fail "could not record pane delivery mode"
+
+  started=$(date +%s)
+  out=$(run_inbox "$state" --poll 1 --timeout 30) || fail "reader failed in pane mode: $out"
+  elapsed=$(( $(date +%s) - started ))
+  assert_contains "$out" "delivering into the supervisor pane" "reader did not report that no inbox is needed"
+  [ "$elapsed" -lt 5 ] || fail "reader blocked for ${elapsed}s in pane mode instead of exiting immediately"
+  pass "recorded pane delivery makes the reader exit immediately instead of waiting"
+}
+
+test_reader_exits_when_away_mode_is_over_but_still_delivers_leftovers() {
+  local state out pid rc
+  state=$(make_inbox_case away-ended)
+
+  out=$(run_inbox "$state" --poll 1 --timeout 30) || fail "reader failed with away mode off: $out"
+  assert_contains "$out" "away mode is not active" "reader did not refuse to wait outside away mode"
+
+  # A record left over from the away session is still delivered, never dropped
+  # because the flag has since been cleared.
+  append_digest "$state" "Supervisor escalate (1 event(s)): zeta.status: done: PR 4"
+  out=$(run_inbox "$state" --once) || fail "reader failed delivering a leftover record: $out"
+  assert_contains "$out" "zeta.status: done: PR 4" "a leftover record was dropped after away mode ended"
+
+  # A reader already waiting exits as soon as away mode ends.
+  enter_away "$state"
+  FM_STATE_OVERRIDE="$state" "$INBOX" --poll 1 --timeout 60 > "$state/ended.out" 2>&1 &
+  pid=$!
+  sleep 1
+  rm -f "$state/.afk"
+  wait_pid_exit "$pid" 200
+  rc=$?
+  [ "$rc" -eq 0 ] || fail "waiting reader did not exit cleanly when away mode ended (rc=$rc)"
+  assert_contains "$(cat "$state/ended.out")" "away mode ended" "waiting reader did not report the ended away session"
+  pass "the reader never waits outside away mode and still delivers leftover records"
+}
+
+test_reader_reports_an_idle_timeout() {
+  local state out
+  state=$(make_inbox_case idle-timeout)
+  enter_away "$state"
+  out=$(run_inbox "$state" --poll 1 --timeout 1) || fail "idle reader should exit 0: $out"
+  assert_contains "$out" "idle after" "idle reader did not report its timeout"
+  assert_contains "$out" "re-arm to keep listening" "idle reader did not tell firstmate to re-arm"
+  pass "an idle reader times out with a re-arm line rather than hanging forever"
+}
+
+test_records_survive_a_lost_sequence_counter() {
+  local state out
+  state=$(make_inbox_case lost-counter)
+  enter_away "$state"
+  append_digest "$state" "first"
+  run_inbox "$state" --once >/dev/null || fail "initial delivery failed"
+  [ "$(cat "$state/.afk-outbox.ack")" = 1 ] || fail "initial delivery did not acknowledge"
+
+  # A truncated or deleted counter must not hand out a sequence number that an
+  # existing acknowledgement already covers, which would hide the record forever.
+  rm -f "$state/.afk-outbox.seq"
+  append_digest "$state" "second"
+  out=$(run_inbox "$state" --once) || fail "delivery after a lost counter failed: $out"
+  assert_contains "$out" "second" "a record written after the counter was lost became invisible"
+  pass "a lost sequence counter cannot make a new record look already acknowledged"
+}
+
+test_append_failure_is_reported_rather_than_hanging() {
+  local state lock holder rc i=0
+  state=$(make_inbox_case lock-held)
+  enter_away "$state"
+  lock="$state/$FM_AFK_OUTBOX_LOCK_NAME"
+
+  # A live holder keeps the lock for longer than the append's bounded budget.
+  # The append must report failure so the daemon keeps the digest buffered,
+  # rather than waiting forever inside a delivery attempt.
+  FM_STATE_OVERRIDE="$state" bash -c '
+    # shellcheck disable=SC1090
+    . "$1/bin/fm-wake-lib.sh"
+    fm_lock_acquire_wait "$2"
+    sleep 5
+  ' _ "$ROOT" "$lock" &
+  holder=$!
+  while [ ! -e "$lock" ]; do
+    [ "$i" -lt 100 ] || fail "the background lock holder never took the outbox lock"
+    sleep 0.1
+    i=$((i + 1))
+  done
+
+  rc=0
+  FM_AFK_OUTBOX_LOCK_TRIES=2 fm_afk_outbox_append "$state" escalation "blocked digest" || rc=$?
+  kill "$holder" 2>/dev/null || true
+  wait "$holder" 2>/dev/null || true
+  [ "$rc" -ne 0 ] || fail "an append that cannot take the lock must report failure, not claim delivery"
+  [ ! -s "$state/.afk-outbox" ] || fail "a failed append still wrote a record"
+  pass "an outbox lock held elsewhere fails the append in bounded time instead of hanging"
+}
+
+# Hold the outbox lock in a live background process for <secs>, so a bounded
+# acquire in the foreground genuinely fails. Sets OUTBOX_LOCK_HOLDER rather than
+# printing the pid: a command substitution would keep the caller waiting on the
+# background process's inherited stdout until it exited, releasing the very lock
+# the test needs held.
+OUTBOX_LOCK_HOLDER=
+hold_outbox_lock() {  # <state> <secs>
+  local state=$1 secs=$2 lock i=0
+  lock="$state/$FM_AFK_OUTBOX_LOCK_NAME"
+  bash -c '
+    # shellcheck disable=SC1090
+    . "$1/bin/fm-wake-lib.sh"
+    fm_lock_acquire_wait "$2"
+    sleep "$3"
+  ' _ "$ROOT" "$lock" "$secs" >/dev/null 2>&1 &
+  OUTBOX_LOCK_HOLDER=$!
+  while [ ! -e "$lock" ]; do
+    [ "$i" -lt 100 ] || fail "the background lock holder never took the outbox lock"
+    sleep 0.1
+    i=$((i + 1))
+  done
+}
+
+release_outbox_lock() {
+  [ -n "$OUTBOX_LOCK_HOLDER" ] || return 0
+  kill "$OUTBOX_LOCK_HOLDER" 2>/dev/null || true
+  wait "$OUTBOX_LOCK_HOLDER" 2>/dev/null || true
+  OUTBOX_LOCK_HOLDER=
+}
+
+# A read that FAILED must never look like a read that FOUND NOTHING. Conflating
+# them announces a healthy idle exit while records sit undelivered, which is the
+# incident the whole pull path exists to prevent, and it lets the return gate
+# delete an outbox it never actually read.
+test_an_unreadable_outbox_is_never_reported_as_an_empty_one() {
+  local state rc out
+  state=$(make_inbox_case unreadable-not-empty)
+  enter_away "$state"
+  append_digest "$state" "Supervisor escalate (1 event(s)): alpha.status: blocked: needs a token"
+
+  hold_outbox_lock "$state" 10
+
+  rc=0; FM_AFK_OUTBOX_LOCK_TRIES=2 fm_afk_outbox_pending "$state" >/dev/null || rc=$?
+  [ "$rc" -eq "$FM_AFK_OUTBOX_LOCK_TIMEOUT" ] \
+    || fail "a pending read that could not take the lock must report the lock timeout, got rc=$rc"
+
+  rc=0; out=$(FM_AFK_OUTBOX_LOCK_TRIES=2 fm_afk_outbox_pending_count "$state") || rc=$?
+  [ "$rc" -eq "$FM_AFK_OUTBOX_LOCK_TIMEOUT" ] \
+    || fail "pending_count must report the lock timeout rather than a count, got rc=$rc"
+  [ -z "$out" ] || fail "pending_count printed '$out' for an outbox it could not read"
+
+  rc=0; out=$(FM_AFK_OUTBOX_LOCK_TRIES=2 fm_afk_outbox_pending_report "$state") || rc=$?
+  [ "$rc" -eq "$FM_AFK_OUTBOX_LOCK_TIMEOUT" ] \
+    || fail "pending_report must report the lock timeout rather than empty evidence, got rc=$rc"
+
+  rc=0; out=$(FM_AFK_OUTBOX_LOCK_TRIES=2 fm_afk_outbox_oldest_pending_epoch "$state") || rc=$?
+  [ "$rc" -eq "$FM_AFK_OUTBOX_LOCK_TIMEOUT" ] \
+    || fail "oldest_pending_epoch must report the lock timeout rather than 'nothing pending', got rc=$rc"
+
+  rc=0; out=$(FM_AFK_OUTBOX_LOCK_TRIES=2 fm_afk_outbox_deliver "$state") || rc=$?
+  [ "$rc" -eq "$FM_AFK_OUTBOX_DELIVER_LOCK_TIMEOUT" ] \
+    || fail "deliver must distinguish a lock timeout from an empty outbox, got rc=$rc"
+  [ -z "$out" ] || fail "deliver printed records it never read: $out"
+
+  release_outbox_lock
+  [ ! -e "$state/.afk-outbox.ack" ] || fail "a failed read acknowledged records it never delivered"
+  [ "$(fm_afk_outbox_pending_count "$state")" -eq 1 ] \
+    || fail "the record did not stay pending after the failed reads"
+  pass "a failed outbox read is reported as a failure at every level, never as an empty outbox"
+}
+
+# The same invariant one layer deeper. A lock the reader cannot take is only one
+# way a read fails: the outbox file can be present but unreadable (mode 000, an
+# ACL, a bad mount), and `[ -s ]` only STATS it, so the record scan itself must
+# propagate that failure rather than returning an empty result with status 0.
+test_a_present_but_unreadable_outbox_file_is_not_an_empty_one() {
+  local state rc out
+  if [ "$(id -u)" = 0 ]; then
+    pass "skipped: running as root, where mode 000 does not deny a read"
+    return 0
+  fi
+  state=$(make_inbox_case unreadable-file)
+  enter_away "$state"
+  append_digest "$state" "Supervisor escalate (1 event(s)): alpha.status: blocked: needs a token"
+  chmod 000 "$state/.afk-outbox"
+
+  rc=0; out=$(fm_afk_outbox_pending "$state") || rc=$?
+  [ "$rc" -eq "$FM_AFK_OUTBOX_UNREADABLE" ] \
+    || fail "an unreadable outbox FILE must report unreadable, got rc=$rc"
+  [ -z "$out" ] || fail "pending printed records it never read: $out"
+
+  rc=0; out=$(fm_afk_outbox_pending_report "$state") || rc=$?
+  [ "$rc" -eq "$FM_AFK_OUTBOX_UNREADABLE" ] \
+    || fail "pending_report must report unreadable rather than empty evidence, got rc=$rc"
+
+  rc=0; out=$(fm_afk_outbox_deliver "$state") || rc=$?
+  [ "$rc" -eq "$FM_AFK_OUTBOX_DELIVER_UNREADABLE" ] \
+    || fail "deliver must report unreadable for an unreadable outbox file, got rc=$rc"
+
+  # The allocator reads the same file, so it must refuse rather than hand out a
+  # sequence number an existing acknowledgement could already cover.
+  rc=0; fm_afk_outbox_append "$state" escalation "${FM_TEST_MARK}another" || rc=$?
+  [ "$rc" -ne 0 ] || fail "the append allocated a sequence number from an outbox it could not read"
+
+  rc=0; out=$(run_inbox "$state" --once) || rc=$?
+  [ "$rc" -ne 0 ] || fail "the reader exited 0 on an unreadable outbox file: $out"
+  case "$out" in
+    *"afk-inbox: nothing pending"*|*"afk-inbox: idle after"*|*"afk-inbox: delivered "*)
+      fail "the reader printed a healthy status line for a failed read: $out" ;;
+  esac
+
+  chmod 644 "$state/.afk-outbox"
+  [ ! -e "$state/.afk-outbox.ack" ] || fail "a failed read acknowledged records it never delivered"
+  [ "$(fm_afk_outbox_pending_count "$state")" -eq 1 ] \
+    || fail "the record did not stay pending after the failed reads"
+  pass "a present-but-unreadable outbox file fails the read instead of reading as empty"
+}
+
+# The acknowledgement mark is the ONLY thing that narrows the pending set, so a
+# mark that reads as 0 when it could not actually be read makes every record of
+# the session look unacknowledged: the reader replays digests it already
+# delivered, and the daemon's age alarm fires off the session's first record. An
+# ABSENT mark is still a genuine 0 - that is a fresh away session.
+test_an_unreadable_acknowledgement_mark_is_not_a_zero() {
+  local state rc out
+  if [ "$(id -u)" = 0 ]; then
+    pass "skipped: running as root, where mode 000 does not deny a read"
+    return 0
+  fi
+  state=$(make_inbox_case unreadable-ack)
+  enter_away "$state"
+  append_digest "$state" "Supervisor escalate (1 event(s)): alpha.status: done: PR 1"
+
+  rc=0; out=$(fm_afk_outbox_ack_seq "$state") || rc=$?
+  [ "$rc" -eq 0 ] && [ "$out" = 0 ] \
+    || fail "an absent acknowledgement mark must read as a genuine 0, got rc=$rc out='$out'"
+
+  run_inbox "$state" --once >/dev/null || fail "initial delivery failed"
+  append_digest "$state" "Supervisor escalate (1 event(s)): beta.status: blocked: needs a token"
+  chmod 000 "$state/.afk-outbox.ack"
+
+  rc=0; out=$(fm_afk_outbox_ack_seq "$state") || rc=$?
+  [ "$rc" -eq "$FM_AFK_OUTBOX_UNREADABLE" ] \
+    || fail "an unreadable acknowledgement mark must report unreadable, got rc=$rc"
+  [ -z "$out" ] || fail "ack_seq printed '$out' for a mark it could not read"
+
+  for out in fm_afk_outbox_pending fm_afk_outbox_pending_report fm_afk_outbox_oldest_pending_epoch; do
+    rc=0; "$out" "$state" >/dev/null || rc=$?
+    [ "$rc" -eq "$FM_AFK_OUTBOX_UNREADABLE" ] \
+      || fail "$out must propagate the unreadable acknowledgement mark, got rc=$rc"
+  done
+  rc=0; out=$(fm_afk_outbox_deliver "$state") || rc=$?
+  [ "$rc" -eq "$FM_AFK_OUTBOX_DELIVER_UNREADABLE" ] \
+    || fail "deliver must refuse an unreadable acknowledgement mark rather than replay, got rc=$rc"
+  [ -z "$out" ] || fail "deliver replayed records off an unreadable mark: $out"
+
+  rc=0; fm_afk_outbox_append "$state" escalation "${FM_TEST_MARK}gamma" || rc=$?
+  [ "$rc" -ne 0 ] || fail "the append allocated a sequence number from an unreadable acknowledgement mark"
+
+  rc=0; out=$(run_inbox "$state" --once) || rc=$?
+  [ "$rc" -ne 0 ] || fail "the reader exited 0 on an unreadable acknowledgement mark: $out"
+
+  # A garbled mark is the same failure: it was written atomically, so it is never
+  # legitimately empty or non-numeric while it exists.
+  chmod 644 "$state/.afk-outbox.ack"
+  printf 'not-a-number\n' > "$state/.afk-outbox.ack"
+  rc=0; fm_afk_outbox_ack_seq "$state" >/dev/null || rc=$?
+  [ "$rc" -eq "$FM_AFK_OUTBOX_UNREADABLE" ] || fail "a garbled acknowledgement mark read as a value, rc=$rc"
+
+  printf '1\n' > "$state/.afk-outbox.ack"
+  [ "$(fm_afk_outbox_pending_count "$state")" -eq 1 ] \
+    || fail "the undelivered record did not stay pending across the failed mark reads"
+  pass "an unreadable or garbled acknowledgement mark fails the read instead of replaying every record"
+}
+
+# One layer deeper again: every cheap `[ -e ]` / `[ -s ]` early return only STATS
+# a path, and a stat inside a state DIRECTORY that cannot be traversed fails
+# exactly the way an absent file does. Without the state-readability guard the
+# pending read short-circuits to "read succeeded, found nothing" before the lock,
+# the file read, or the acknowledgement mark ever get a say - reopening the same
+# loss chain: a healthy reader line, a retired wedge marker, and a return gate
+# that deletes an outbox it never saw. An ABSENT state directory stays a genuine
+# empty, because no away session has written anything there yet.
+test_an_untraversable_state_directory_is_not_an_empty_outbox() {
+  local state rc out probe
+  if [ "$(id -u)" = 0 ]; then
+    pass "skipped: running as root, where mode 000 does not deny a read"
+    return 0
+  fi
+  state=$(make_inbox_case unreadable-state-dir)
+
+  rc=0; out=$(fm_afk_outbox_pending "$state/never-entered") || rc=$?
+  [ "$rc" -eq 0 ] && [ -z "$out" ] \
+    || fail "an ABSENT state directory must read as a genuine empty, got rc=$rc out='$out'"
+
+  enter_away "$state"
+  append_digest "$state" "Supervisor escalate (1 event(s)): alpha.status: blocked: needs a token"
+  chmod 000 "$state"
+
+  for probe in fm_afk_outbox_pending fm_afk_outbox_pending_report \
+    fm_afk_outbox_pending_count fm_afk_outbox_oldest_pending_epoch fm_afk_outbox_ack_seq; do
+    rc=0; out=$("$probe" "$state") || rc=$?
+    [ "$rc" -eq "$FM_AFK_OUTBOX_UNREADABLE" ] \
+      || fail "$probe must report unreadable for an untraversable state directory, got rc=$rc"
+    [ -z "$out" ] || fail "$probe printed '$out' for a state directory it could not look into"
+  done
+
+  rc=0; out=$(fm_afk_outbox_deliver "$state") || rc=$?
+  [ "$rc" -eq "$FM_AFK_OUTBOX_DELIVER_UNREADABLE" ] \
+    || fail "deliver must report unreadable for an untraversable state directory, got rc=$rc"
+
+  rc=0; out=$(run_inbox "$state" --once) || rc=$?
+  [ "$rc" -ne 0 ] || fail "the reader exited 0 on an untraversable state directory: $out"
+  case "$out" in
+    *"afk-inbox: nothing pending"*|*"afk-inbox: idle after"*|*"afk-inbox: delivered "*)
+      fail "the reader printed a healthy status line for a failed read: $out" ;;
+  esac
+
+  chmod 700 "$state"
+  [ ! -e "$state/.afk-outbox.ack" ] || fail "a failed read acknowledged records it never delivered"
+  [ "$(fm_afk_outbox_pending_count "$state")" -eq 1 ] \
+    || fail "the record did not stay pending after the failed reads"
+  pass "an untraversable state directory fails the read instead of reading as an empty outbox"
+}
+
+# The outbox must not grow for a whole away session: acknowledged records are
+# dropped so the reader's one-second poll stays proportional to what is pending.
+# Safety outranks the speedup - nothing above the mark may ever be removed, and
+# sequence numbers must never regress into an already-acknowledged range.
+test_acknowledged_records_are_compacted_without_losing_pending_ones() {
+  local state seq
+  state=$(make_inbox_case compaction)
+  enter_away "$state"
+  append_digest "$state" "Supervisor escalate (1 event(s)): alpha.status: done: PR 1"
+  append_digest "$state" "Supervisor escalate (1 event(s)): beta.status: done: PR 2"
+
+  # Acknowledge only the first record, then confirm the second survives untouched.
+  fm_afk_outbox_ack "$state" 1 || fail "could not record the acknowledgement mark"
+  [ "$(wc -l < "$state/.afk-outbox" | tr -d ' ')" -eq 1 ] \
+    || fail "compaction did not drop the acknowledged record: $(cat "$state/.afk-outbox")"
+  grep -F 'beta.status: done: PR 2' "$state/.afk-outbox" >/dev/null \
+    || fail "compaction removed a record above the acknowledgement mark"
+  grep -F 'alpha.status: done: PR 1' "$state/.afk-outbox" >/dev/null \
+    && fail "compaction kept a record the mark already covers"
+  [ "$(fm_afk_outbox_pending_count "$state")" -eq 1 ] \
+    || fail "compaction changed what is pending"
+
+  # A number already handed out must never be reused, even though its record is gone.
+  append_digest "$state" "Supervisor escalate (1 event(s)): gamma.status: done: PR 3"
+  seq=$(awk -F '\t' '$4 ~ /gamma/ { print $2 }' "$state/.afk-outbox")
+  [ "$seq" -eq 3 ] || fail "compaction let the allocator regress: gamma got sequence $seq"
+
+  # Everything acknowledged: the file compacts to empty, so the poll answers from
+  # a stat alone rather than re-locking and re-scanning the session's history.
+  run_inbox "$state" --once >/dev/null || fail "delivery of the remaining records failed"
+  [ ! -s "$state/.afk-outbox" ] || fail "a fully acknowledged outbox was not compacted: $(cat "$state/.afk-outbox")"
+  [ "$(cat "$state/.afk-outbox.ack")" = 3 ] || fail "the acknowledgement mark did not advance"
+
+  append_digest "$state" "Supervisor escalate (1 event(s)): delta.status: done: PR 4"
+  seq=$(awk -F '\t' '$4 ~ /delta/ { print $2 }' "$state/.afk-outbox")
+  [ "$seq" -eq 4 ] || fail "an emptied outbox let the allocator regress: delta got sequence $seq"
+  [ "$(fm_afk_outbox_pending_count "$state")" -eq 1 ] \
+    || fail "the record appended after compaction is not pending"
+  pass "acknowledged records are compacted away while pending ones and sequence numbers are preserved"
+}
+
+# The reader's own contract: a genuine read failure exits NON-ZERO with no
+# healthy status line, rather than printing an idle or nothing-pending line that
+# firstmate would read as a quiet, working channel.
+test_reader_exits_non_zero_when_the_outbox_cannot_be_read() {
+  local state rc out
+  state=$(make_inbox_case reader-unreadable)
+  enter_away "$state"
+  append_digest "$state" "Supervisor escalate (1 event(s)): beta.status: done: PR 2"
+
+  hold_outbox_lock "$state" 10
+  rc=0
+  out=$(FM_AFK_OUTBOX_LOCK_TRIES=2 run_inbox "$state" --once) || rc=$?
+  release_outbox_lock
+
+  # A single-shot run has no next poll to retry the acquire on, so its only honest
+  # outcome is the same loud non-zero exit any other failed read gets.
+  [ "$rc" -ne 0 ] || fail "the reader exited 0 on an outbox it could not read: $out"
+  assert_contains "$out" "could not be acquired" "the reader did not name the read failure: $out"
+  case "$out" in
+    *"afk-inbox: nothing pending"*|*"afk-inbox: idle after"*|*"afk-inbox: delivered "*)
+      fail "the reader printed a healthy status line for a failed read: $out" ;;
+  esac
+  [ "$(fm_afk_outbox_pending_count "$state")" -eq 1 ] \
+    || fail "the undelivered record did not stay pending after the failed read"
+  pass "the reader exits non-zero on an unreadable outbox and leaves the records pending"
+}
+
+# Firstmate arms one reader, but a re-arm after a context reset can leave two
+# waiting at once. Records are printed before they are acknowledged, so the loser
+# of that race must simply print NOTHING: announcing a count it did not deliver
+# would read to firstmate as an escalation that was swallowed.
+test_concurrent_readers_never_announce_what_they_did_not_deliver() {
+  local state round out1 out2 combined delivered=0
+  state=$(make_inbox_case concurrent-readers)
+  enter_away "$state"
+
+  for round in 1 2 3 4 5; do
+    FM_STATE_OVERRIDE="$state" "$INBOX" --poll 1 --timeout 6 > "$state/r1.out" 2>&1 &
+    local pid1=$!
+    FM_STATE_OVERRIDE="$state" "$INBOX" --poll 1 --timeout 6 > "$state/r2.out" 2>&1 &
+    local pid2=$!
+    sleep 1
+    append_digest "$state" "Supervisor escalate (1 event(s)): theta$round.status: done: PR $round"
+    wait_pid_exit "$pid1" 200 || fail "reader 1 did not exit in round $round"
+    wait_pid_exit "$pid2" 200 || fail "reader 2 did not exit in round $round"
+
+    out1=$(cat "$state/r1.out")
+    out2=$(cat "$state/r2.out")
+    for combined in "$out1" "$out2"; do
+      case "$combined" in
+        *"away-mode escalation(s)"*)
+          assert_contains "$combined" "theta$round.status" \
+            "a reader announced a delivery without printing any record (round $round): $combined"
+          ;;
+      esac
+    done
+    case "$out1$out2" in
+      *"theta$round.status"*) delivered=$((delivered + 1)) ;;
+    esac
+  done
+
+  [ "$delivered" -eq 5 ] || fail "concurrent readers dropped a record ($delivered/5 rounds delivered)"
+  [ "$(fm_afk_outbox_pending_count "$state")" -eq 0 ] || fail "a record was left unacknowledged after both readers exited"
+  pass "racing readers never announce a delivery they did not print, and no record is dropped"
+}
+
+# Every exit is a completed background task firstmate must react to, so each one
+# has to say whether to arm another reader. An exit that says "do not re-arm" and
+# is re-armed anyway becomes an immediate-exit loop during an unattended away
+# session; an exit that says nothing leaves firstmate guessing.
+test_every_exit_line_carries_a_re_arm_verdict() {
+  local state out last
+  assert_verdict() {  # <output> <expected-verdict> <label>
+    local text=$1 want=$2 label=$3 final
+    final=$(printf '%s\n' "$text" | grep '^afk-inbox: ' | tail -n 1)
+    [ -n "$final" ] || fail "$label produced no afk-inbox status line: $text"
+    case "$want" in
+      rearm)
+        case "$final" in
+          *"re-arm to keep listening"*) return 0 ;;
+        esac
+        fail "$label must tell firstmate to re-arm: $final"
+        ;;
+      stop)
+        case "$final" in
+          *"- do not re-arm") return 0 ;;
+        esac
+        fail "$label must tell firstmate NOT to re-arm: $final"
+        ;;
+    esac
+  }
+
+  state=$(make_inbox_case rearm-verdict)
+  out=$(run_inbox "$state" --once) || fail "reader failed outside away mode: $out"
+  assert_verdict "$out" stop "the away-mode-inactive exit"
+
+  enter_away "$state"
+  out=$(run_inbox "$state" --once) || fail "reader failed with nothing pending: $out"
+  assert_verdict "$out" rearm "the nothing-pending exit"
+
+  out=$(run_inbox "$state" --poll 1 --timeout 1) || fail "reader failed idling out: $out"
+  assert_verdict "$out" rearm "the idle-timeout exit"
+
+  append_digest "$state" "Supervisor escalate (1 event(s)): iota.status: done: PR 7"
+  out=$(run_inbox "$state" --once) || fail "reader failed delivering: $out"
+  assert_verdict "$out" rearm "the delivered exit"
+
+  fm_afk_delivery_mode_record "$state" pane || fail "could not record pane delivery mode"
+  out=$(run_inbox "$state" --once) || fail "reader failed in pane mode: $out"
+  assert_verdict "$out" stop "the pane-delivery exit"
+
+  # A record still pending outranks pane mode: it is delivered, and that exit
+  # must invite a re-arm rather than closing the channel.
+  append_digest "$state" "Supervisor escalate (1 event(s)): kappa.status: blocked: needs a token"
+  out=$(run_inbox "$state" --once) || fail "reader failed delivering a leftover in pane mode: $out"
+  assert_contains "$out" "kappa.status: blocked: needs a token" "a pending record was dropped in pane mode"
+  assert_verdict "$out" rearm "the delivered-in-pane-mode exit"
+
+  last=$out
+  assert_not_contains "$last" "do not re-arm" "a delivering exit must not also tell firstmate to stop"
+  pass "every reader exit ends with exactly one re-arm verdict firstmate can act on"
+}
+
+# The whole point, end to end: a REAL daemon with no terminal backend reachable
+# at all. It must select paneless delivery instead of typing into the legacy
+# firstmate:0 guess, and a captain-relevant status must reach the reader's stdout
+# without buffering indefinitely and without raising a wedge alarm.
+test_real_daemon_without_a_backend_delivers_to_the_reader() {
+  local state fakebin pid i=0 out log
+  state=$(make_inbox_case real-daemon)
+  fakebin="$TMP_ROOT/real-daemon/fakebin"
+  mkdir -p "$fakebin"
+  # No terminal backend is reachable: every tmux call fails the way it does with
+  # no server running, and no herdr environment is present.
+  printf '#!/usr/bin/env bash\nexit 1\n' > "$fakebin/tmux"
+  chmod +x "$fakebin/tmux"
+  make_fake_crew_state "$fakebin" >/dev/null
+  enter_away "$state"
+  printf 'done: PR https://example.test/pr/42\n' > "$state/task-w1.status"
+
+  PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_WEDGE_ALARM_EXEC=discard \
+    FM_ESCALATE_BATCH_SECS=0 FM_HOUSEKEEPING_TICK=1 FM_MAX_DEFER_SECS=5 \
+    FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 \
+    env -u TMUX_PANE -u HERDR_ENV -u HERDR_PANE_ID -u FM_SUPERVISOR_TARGET -u FM_SUPERVISOR_BACKEND \
+    "$DAEMON" > "$state/daemon.out" 2>&1 &
+  pid=$!
+
+  while [ "$(fm_afk_outbox_pending_count "$state")" -eq 0 ]; do
+    if [ "$i" -ge 300 ]; then
+      kill "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+      fail "a real backendless daemon never delivered the escalation: $(cat "$state/daemon.out" "$state/.supervise-daemon.log" 2>/dev/null)"
+    fi
+    if ! kill -0 "$pid" 2>/dev/null; then
+      fail "the daemon exited instead of switching to paneless delivery: $(cat "$state/daemon.out" 2>/dev/null)"
+    fi
+    sleep 0.1
+    i=$((i + 1))
+  done
+
+  out=$(run_inbox "$state" --once) || fail "the reader failed to deliver the daemon's escalation: $out"
+  assert_contains "$out" "PR https://example.test/pr/42" "the escalation did not reach the reader's stdout"
+  assert_contains "$out" "$FM_TEST_MARK" "the delivered digest lost its sentinel marker"
+  [ ! -e "$state/.subsuper-inject-wedged" ] || fail "paneless delivery raised a wedge alarm"
+  [ ! -s "$state/.subsuper-escalations" ] || fail "the digest stayed buffered after paneless delivery"
+  [ "$(cat "$state/.afk-delivery")" = paneless ] || fail "the daemon did not record its paneless delivery mode"
+  log=$(cat "$state/.supervise-daemon.log" 2>/dev/null || true)
+  assert_contains "$log" "delivery mode: paneless" "the daemon did not log which delivery mode it chose and why"
+
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  pass "a real daemon with no terminal backend delivers escalations to the reader, unbuffered and without a wedge alarm"
+}
+
+# A lock timeout is transient by nature: the daemon holds the outbox lock for
+# short mutations, and another reader or the return gate can hold it too. Dying on
+# one would take down the very delivery channel this path exists to provide, so
+# the reader must keep waiting and deliver as soon as the lock frees.
+test_a_transient_lock_timeout_keeps_the_reader_alive() {
+  local state pid rc out
+  state=$(make_inbox_case transient-lock)
+  enter_away "$state"
+  append_digest "$state" "Supervisor escalate (1 event(s)): mu.status: blocked: needs a token"
+
+  hold_outbox_lock "$state" 4
+  FM_STATE_OVERRIDE="$state" FM_AFK_OUTBOX_LOCK_TRIES=2 \
+    "$INBOX" --poll 1 --timeout 60 > "$state/reader.out" 2>&1 &
+  pid=$!
+  sleep 2
+  kill -0 "$pid" 2>/dev/null || fail "the reader died on a transient lock timeout: $(cat "$state/reader.out")"
+
+  release_outbox_lock
+  wait_pid_exit "$pid" 200
+  rc=$?
+  out=$(cat "$state/reader.out")
+  [ "$rc" -eq 0 ] || fail "the reader did not exit cleanly once the lock freed (rc=$rc): $out"
+  assert_contains "$out" "mu.status: blocked: needs a token" "the record was not delivered after the lock freed"
+  assert_not_contains "$out" "nothing pending" "a lock timeout was reported as an empty outbox"
+  pass "a lock timeout that clears is retried and delivered rather than killing the reader"
+}
+
+# Retrying has to be BOUNDED. A lock nobody ever releases must end in a loud
+# non-zero exit that names the lock, not a reader that looks armed forever while
+# records sit undelivered - that silence is what this whole path removes.
+test_a_lock_that_never_clears_ends_the_reader_within_its_bound() {
+  local state pid rc out started elapsed
+  state=$(make_inbox_case wedged-lock)
+  enter_away "$state"
+  append_digest "$state" "Supervisor escalate (1 event(s)): nu.status: failed: CI red"
+
+  hold_outbox_lock "$state" 60
+  started=$(date +%s)
+  FM_STATE_OVERRIDE="$state" FM_AFK_OUTBOX_LOCK_TRIES=2 FM_AFK_INBOX_LOCK_TIMEOUT_MAX=3 \
+    "$INBOX" --poll 1 --timeout 60 > "$state/reader.out" 2>&1 &
+  pid=$!
+  wait_pid_exit "$pid" 200
+  rc=$?
+  elapsed=$(( $(date +%s) - started ))
+  out=$(cat "$state/reader.out")
+  release_outbox_lock
+
+  [ "$rc" -eq 1 ] || fail "a lock that never clears must exit non-zero within the stated bound (rc=$rc): $out"
+  [ "$elapsed" -lt 20 ] || fail "the reader took ${elapsed}s to give up on a wedged lock"
+  assert_contains "$out" "$FM_AFK_OUTBOX_LOCK_NAME" "the give-up message did not name the lock it could not acquire"
+  case "$out" in
+    *"afk-inbox: nothing pending"*|*"afk-inbox: idle after"*|*"afk-inbox: delivered "*)
+      fail "the reader printed a healthy status line for a wedged lock: $out" ;;
+  esac
+  [ ! -e "$state/.afk-outbox.ack" ] || fail "a timed-out read acknowledged records it never delivered"
+  [ "$(fm_afk_outbox_pending_count "$state")" -eq 1 ] \
+    || fail "the record did not stay pending after the reader gave up"
+  pass "a lock that never clears ends the reader non-zero within its bound, outbox intact"
+}
+
+# The mktemp templates and the cleanup globs must come from the SAME constants, or
+# renaming one silently orphans temp files that fresh-entry clearing and the
+# launcher's rollback no longer remove.
+test_transient_temp_templates_track_their_artifact_constants() {
+  local state template glob matched
+  state=$(make_inbox_case temp-template-constants)
+  (
+    mktemp() { printf '%s\n' "${*##*/}" >> "$state/mktemp.args"; command mktemp "$@"; }
+    FM_AFK_OUTBOX_ACK_NAME=".renamed-ack"
+    FM_AFK_DELIVERY_MODE_NAME=".renamed-delivery"
+    fm_afk_outbox_ack "$state" 1 || exit 1
+    fm_afk_delivery_mode_record "$state" paneless || exit 1
+    FM_AFK_OUTBOX_ACK_NAME=".renamed-ack" FM_AFK_DELIVERY_MODE_NAME=".renamed-delivery" \
+      fm_afk_outbox_transient_artifact_globs > "$state/globs"
+  ) || fail "the renamed-constant probe failed"
+
+  [ -s "$state/mktemp.args" ] || fail "no temp template was recorded"
+  [ -e "$state/.renamed-ack" ] || fail "the acknowledgement mark did not follow its renamed constant"
+  [ -e "$state/.renamed-delivery" ] || fail "the delivery-mode record did not follow its renamed constant"
+
+  while IFS= read -r template; do
+    matched=0
+    while IFS= read -r glob; do
+      [ -n "$glob" ] || continue
+      # shellcheck disable=SC2254 # $glob is a pattern on purpose.
+      case "$template" in
+        $glob) matched=1; break ;;
+      esac
+    done < "$state/globs"
+    [ "$matched" -eq 1 ] \
+      || fail "temp template '$template' matches no cleanup glob; the templates and the globs have drifted apart"
+  done < "$state/mktemp.args"
+  pass "every temp template is derived from the same constant as its cleanup glob"
+}
+
+# A fresh away entry clears another session's leftover scratch, but a lock whose
+# owner process is still running is a WORKING lock, not scratch: removing it
+# breaks mutual exclusion between that live holder and the new daemon's appends.
+# A genuinely dead owner is still cleared, and a skipped live lock is not a
+# clearing failure.
+test_clearing_transients_leaves_a_live_lock_alone() {
+  local state live_lock live_owner dead_lock dead_owner sleeper status ack_temp
+  state=$(make_inbox_case clear-transient-live-lock)
+  ack_temp="$(fm_afk_outbox_ack_file "$state").pending.abc"
+
+  live_lock=$(fm_afk_outbox_lock_file "$state")
+  live_owner="$live_lock.owner.live"
+  mkdir -p "$live_owner"
+  sleep 60 &
+  sleeper=$!
+  printf '%s\n' "$sleeper" > "$live_owner/pid"
+  ln -s "$live_owner" "$live_lock"
+
+  : > "$ack_temp"
+  : > "$(fm_afk_outbox_file "$state").compact.abc"
+  : > "$(fm_afk_inbox_beacon_file "$state")"
+
+  status=0
+  fm_afk_outbox_clear_transient "$state" || status=$?
+  [ "$status" -eq 0 ] \
+    || fail "a live lock was reported as a clearing failure (status $status)"
+  [ -L "$live_lock" ] || fail "the live away-mode outbox lock was torn out from under its owner"
+  [ -f "$live_owner/pid" ] || fail "the live lock's owner record was discarded"
+  [ ! -e "$ack_temp" ] || fail "a leftover ack temp survived clearing"
+  [ ! -e "$(fm_afk_outbox_file "$state").compact.abc" ] || fail "a leftover compaction temp survived clearing"
+  [ ! -e "$(fm_afk_inbox_beacon_file "$state")" ] || fail "the stale reader beacon survived clearing"
+
+  kill "$sleeper" 2>/dev/null || true
+  wait "$sleeper" 2>/dev/null || true
+  rm -rf "$live_lock" "$live_owner"
+
+  dead_lock=$(fm_afk_outbox_lock_file "$state")
+  dead_owner="$dead_lock.owner.dead"
+  mkdir -p "$dead_owner"
+  printf '%s\n' "$sleeper" > "$dead_owner/pid"
+  ln -s "$dead_owner" "$dead_lock"
+
+  status=0
+  fm_afk_outbox_clear_transient "$state" || status=$?
+  [ "$status" -eq 0 ] || fail "clearing a dead-owner lock reported a failure (status $status)"
+  [ ! -e "$dead_lock" ] && [ ! -L "$dead_lock" ] \
+    || fail "a lock whose owner is gone was left behind as stale scratch"
+
+  pass "clearing transients skips a live lock and still clears dead scratch"
+}
+
+test_reader_delivers_pending_records_then_acknowledges_them
+test_killed_reader_loses_nothing
+test_reader_wakes_on_a_record_written_while_it_waits
+test_reader_stamps_its_liveness_beacon_while_it_waits
+test_reader_exits_immediately_when_the_daemon_uses_the_pane
+test_reader_exits_when_away_mode_is_over_but_still_delivers_leftovers
+test_reader_reports_an_idle_timeout
+test_records_survive_a_lost_sequence_counter
+test_append_failure_is_reported_rather_than_hanging
+test_an_unreadable_outbox_is_never_reported_as_an_empty_one
+test_a_present_but_unreadable_outbox_file_is_not_an_empty_one
+test_an_unreadable_acknowledgement_mark_is_not_a_zero
+test_an_untraversable_state_directory_is_not_an_empty_outbox
+test_acknowledged_records_are_compacted_without_losing_pending_ones
+test_reader_exits_non_zero_when_the_outbox_cannot_be_read
+test_concurrent_readers_never_announce_what_they_did_not_deliver
+test_every_exit_line_carries_a_re_arm_verdict
+test_a_transient_lock_timeout_keeps_the_reader_alive
+test_a_lock_that_never_clears_ends_the_reader_within_its_bound
+test_transient_temp_templates_track_their_artifact_constants
+test_clearing_transients_leaves_a_live_lock_alone
+test_real_daemon_without_a_backend_delivers_to_the_reader
