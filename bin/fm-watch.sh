@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Firstmate watcher.
 # Classifies supervision wakes in bash. In normal mode it absorbs benign wakes
-# and keeps blocking; it queues and exits only for actionable wakes.
+# and keeps blocking; it queues and exits only for actionable wakes, apart from
+# the env-gated proof-of-life "tick:" close described below, which queues nothing.
 # The no-verb signal and stale path is absorb-only-when-provably-working: a wake
 # is absorbed only when the crew shows POSITIVE evidence it is still working (an
 # actively-running no-mistakes step, or a backend busy signal), and surfaced
@@ -40,6 +41,12 @@
 #                          the host-resource sweep found CPU/memory/swap pressure
 #                          WORSE than the level firstmate was last told about.
 #                          Report-only: nothing is paused, shed or killed here.
+#   tick: <note>           env-gated proof-of-life close (FM_WATCH_ABSORB_TICK=1,
+#                          default off) for a benign-ABSORBED wake while work is
+#                          under way. Not an actionable wake: nothing is queued,
+#                          and the arm layer classifies it as a benign completion
+#                          rather than the empty-cycle failure. See absorb_tick
+#                          and docs/watcher-continuity.md
 #   heartbeat              fleet-scan backstop found an unsurfaced captain-relevant
 #                          status, unless a live away-mode daemon owns triage.
 #                          Becomes "heartbeat: host resources degraded|critical"
