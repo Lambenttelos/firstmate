@@ -1266,10 +1266,14 @@ EOF
     # Every heartbeat carries the host's latest known pressure, so a fleet review
     # is never done against a machine whose state firstmate cannot see. The value
     # is the one resource_sweep already cached, so annotating costs no probe; a
-    # healthy, unknown or disabled host annotates nothing. .resource-status is
-    # only ever written, never cleared, so a disabled monitor and a reading older
-    # than two sweeps are both ignored rather than annotating the heartbeat with
-    # pressure that may have gone away long ago. The annotated form keeps the
+    # healthy or disabled host annotates nothing. An unknown reading, on a host
+    # whose probes stopped answering, deliberately leaves the last known level in
+    # place: going quiet on a machine that was just critical would hide real
+    # pressure, and the age gate below bounds how long that can persist.
+    # .resource-status is only ever written, never cleared, so a disabled monitor
+    # and a reading older than two sweeps are both ignored rather than annotating
+    # the heartbeat with pressure that may have gone away long ago.
+    # The annotated form keeps the
     # "heartbeat:" prefix, because fm-watch-arm.sh and fm-supervise-daemon.sh both
     # recognise an actionable heartbeat by that exact prefix; any other shape
     # would silently stop being a wake precisely while the host is under pressure.

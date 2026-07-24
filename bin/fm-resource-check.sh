@@ -85,6 +85,10 @@
 # COUNT alone is min(live agents - ceiling, ordinary crews) and no shed line is
 # printed when that is zero or less. A home whose only running agents are
 # persistent secondmates therefore never produces shed advice.
+# The reading names the all-agents total ("live agents 8 (4 crew(s) + 4
+# persistent secondmate(s))") next to a ceiling labelled in agents, so the number
+# the ceiling is compared against is on the line and the shed count below it
+# needs no conversion in the reader's head.
 #
 # Every OTHER caller (bin/fm-spawn.sh before a dispatch, bin/fm-session-start.sh
 # inside its fast digest) READS that cache and never probes, so a wedged backend
@@ -270,6 +274,14 @@ probe_verdict() {  # <backend> <target> <seconds>
     printf 'unknown'
     return 0
   }
+  # The watcher exits on every wake, so a sweep is routinely signalled mid-probe;
+  # without these the temp file would survive. The signal traps still exit, so
+  # trapping does not make this path outlive a TERM it used to die on. The path
+  # is held in a non-local so the handlers read it when they fire.
+  PROBE_TMP=$out
+  trap 'rm -f "$PROBE_TMP" 2>/dev/null' EXIT
+  trap 'rm -f "$PROBE_TMP" 2>/dev/null; exit 130' INT
+  trap 'rm -f "$PROBE_TMP" 2>/dev/null; exit 143' TERM
   set -m
   ( fm_backend_agent_alive "$1" "$2" 2>/dev/null || printf 'unknown' ) > "$out" 2>/dev/null &
   pid=$!
@@ -301,6 +313,7 @@ probe_verdict() {  # <backend> <target> <seconds>
   wait "$pid" 2>/dev/null || true
   verdict=$(cat "$out" 2>/dev/null || true)
   rm -f "$out" 2>/dev/null || true
+  trap - EXIT INT TERM
   case "$verdict" in alive|dead) printf '%s' "$verdict" ;; *) printf 'unknown' ;; esac
 }
 
@@ -353,11 +366,18 @@ write_live_cache() {  # <crews> <secondmates> <partial>
   local tmp
   [ -d "$STATE" ] || return 0
   tmp=$(mktemp "$LIVE_CACHE.XXXXXX" 2>/dev/null) || return 0
+  # Same reason as probe_verdict: a sweep signalled mid-write must not leave the
+  # half-written temp file behind next to the cache it never replaced.
+  CACHE_TMP=$tmp
+  trap 'rm -f "$CACHE_TMP" 2>/dev/null' EXIT
+  trap 'rm -f "$CACHE_TMP" 2>/dev/null; exit 130' INT
+  trap 'rm -f "$CACHE_TMP" 2>/dev/null; exit 143' TERM
   if printf '%s %s %s\n' "$1" "$2" "$3" > "$tmp" 2>/dev/null; then
     mv -f "$tmp" "$LIVE_CACHE" 2>/dev/null || rm -f "$tmp" 2>/dev/null || true
   else
     rm -f "$tmp" 2>/dev/null || true
   fi
+  trap - EXIT INT TERM
 }
 
 # sweep_live_crews: the probing path, watcher-only. Caches the count AND whether
@@ -489,14 +509,15 @@ BY_CPU=$(awk -v l="$LOAD_PER_CORE_EXACT" -v n="$LIVE" 'BEGIN{
 if [ "$BY_MEM" -lt "$BY_CPU" ]; then CEILING=$BY_MEM; else CEILING=$BY_CPU; fi
 [ "$CEILING" -ge 1 ] || CEILING=1
 
-# Persistent secondmates are reported separately rather than folded into the crew
-# figure, because they are never shed candidates (see the header).
+# The all-agents total is named first, because it is the figure the ceiling and
+# the overage are measured on; crews and persistent secondmates are then broken
+# out, because only crews are ever shed candidates (see the header).
 SECONDMATE_NOTE=
 [ "$SECONDMATES" -eq 0 ] || SECONDMATE_NOTE=" + $SECONDMATES persistent secondmate(s)"
 
-printf 'resources: %s | load %s (%sx over %s cores) | avail %s MB of %s GB | swap %s%% of %sM | live crews %s%s%s | recommended ceiling %s\n' \
+printf 'resources: %s | load %s (%sx over %s cores) | avail %s MB of %s GB | swap %s%% of %sM | live agents %s (%s crew(s)%s)%s | recommended ceiling %s agents\n' \
   "$STATUS" "$LOAD1" "$LOAD_PER_CORE" "$CORES" "$AVAIL_MB" "$RAM_GB" "$SWAP_PCT" "$SWAP_TOTAL" \
-  "$CREWS" "$SECONDMATE_NOTE" "$LIVE_NOTE" "$CEILING"
+  "$LIVE" "$CREWS" "$SECONDMATE_NOTE" "$LIVE_NOTE" "$CEILING"
 
 if [ "$RC" -ne 0 ] && [ "$LIVE" -gt "$CEILING" ]; then
   SHED=$(( LIVE - CEILING ))

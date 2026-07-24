@@ -214,6 +214,7 @@ Only the watcher's sweep pays for that liveness answer, and it caches the verdic
 Two intervals rather than one is deliberate: the watcher exits on every wake and is re-armed, so a home between arms routinely has no sweep running while the other callers keep reading the cache.
 When no cached verdict is available, or it is older than that, the reading falls back to the count of recorded tasks and says so with "liveness unverified" instead of presenting it as a verified count.
 Persistent secondmates are running agents and real load, so they are counted and reported separately in the reading and they count toward the ceiling and the overage, but the number of crews the shed advice names is capped at the ordinary crews, because AGENTS.md makes an idle secondmate endpoint healthy and its retirement an explicit decision.
+The reading names the all-agents total and labels the ceiling in agents, so the number the ceiling is compared against is visible on the line and the shed advice reads as a consequence of it.
 A home whose only running agents are persistent secondmates therefore never gets shed advice.
 
 `FM_RESOURCE_SWEEP_BUDGET` is the number of seconds one sweep may spend checking crew liveness in total, defaulting to `30`, and a malformed value falls back to that default rather than disabling the budget.
@@ -227,6 +228,7 @@ Three callers consult the monitor, and all three only report:
 - [`bin/fm-spawn.sh`](../bin/fm-spawn.sh) prints the reading to stderr as a pre-dispatch `warning:` advisory when the host is degraded or critical, and still spawns.
   It reads the cached crew-liveness verdict and never probes a backend, so an unresponsive backend cannot delay a dispatch.
 - [`bin/fm-watch.sh`](../bin/fm-watch.sh) sweeps on this cadence and wakes firstmate with `check: host-resources <reading>` when pressure first gets worse than the level firstmate was last told about, and annotates a heartbeat with the last cached reading while the monitor is enabled and that reading is still recent.
+  A sweep that cannot read the host leaves the last known level in place rather than clearing it, so pressure on a machine whose probes stopped answering is not silently dropped, and the same recency gate bounds how long that annotation can survive.
 - [`bin/fm-session-start.sh`](../bin/fm-session-start.sh) prints one reading in the fleet-state digest, so a session opens knowing whether the machine can take more work.
   It reads the same cached verdict, so the digest stays fast and bounded whatever the backends are doing.
 
