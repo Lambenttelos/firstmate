@@ -119,10 +119,12 @@ test_no_mistakes_dod_wording() {
   pass "fm-brief.sh: no-mistakes DOD wording avoids the apostrophe regression"
 }
 
-# A no-mistakes brief must send the crewmate through the wrong-branch-attach
-# guard before it invokes the pipeline, with an absolute path it can run from
-# its own worktree, and must say what to do when the guard refuses. Without
-# this step a lane silently validates another lane's branch
+# A no-mistakes brief must send the crewmate through the pre-run guard before it
+# invokes the pipeline, with an absolute path it can run from its own worktree,
+# and must say what to do when the guard refuses. It must also carry the
+# drive-by-id instruction: `axi status`/`axi logs` resolve repo-wide when the
+# lane's branch has no run of its own, so a lane that reads them bare can be
+# handed a concurrent lane's run and answer findings that are not its own
 # (bin/fm-nm-preflight.sh; data/learnings.md `no-mistakes-wrong-repo-attach`).
 test_no_mistakes_dod_requires_preflight() {
   local home id brief
@@ -136,10 +138,15 @@ test_no_mistakes_dod_requires_preflight() {
     "no-mistakes DOD lost the pre-run guard step, or stopped giving it an absolute path"
   assert_grep "If it refuses, do NOT invoke /no-mistakes" "$brief" \
     "no-mistakes DOD does not say to stop when the guard refuses"
-  # The refusal must not be answered by driving the foreign run.
+  # A concurrent lane's run must never be driven from here.
   assert_grep "never respond to or abort that run" "$brief" \
     "no-mistakes DOD does not warn against driving the other lane's run"
-  pass "fm-brief.sh: no-mistakes DOD requires the wrong-branch-attach guard before the pipeline"
+  # Driving by explicit id is what makes the repo-wide display fallback harmless.
+  assert_grep "axi status --run" "$brief" \
+    "no-mistakes DOD does not tell the lane to read its run by explicit id"
+  assert_grep "axi logs --run" "$brief" \
+    "no-mistakes DOD does not tell the lane to read its logs by explicit id"
+  pass "fm-brief.sh: no-mistakes DOD requires the pre-run guard and drive-by-id reads"
 }
 
 test_ship_project_memory_wording() {

@@ -1,34 +1,42 @@
 #!/usr/bin/env bash
-# Refuse a no-mistakes run that would validate someone else's branch.
+# Clear a lane to run no-mistakes, and tell it how to drive its own run.
 #
-# `no-mistakes axi run` triggers "a pipeline run for the current branch", but
-# the run it acts on is resolved per REPO, not per branch: when the repo already
-# has a run in flight, a second lane's `axi run` ATTACHES to it silently, on
-# whatever branch that run belongs to. Observed live on 2026-07-23 from a
-# firstmate worktree on `fm/fix-nm-repo-resolution-wrong-copy`:
+# no-mistakes serializes pipeline runs per repo+branch, NOT per repo. Nothing a
+# lane invokes can reach a run on another branch:
 #
-#   $ no-mistakes axi status
-#   run:
-#     id: "01KY7JY2SA3P9ETYADZNDF07EA"
-#     branch: fm/afk-paneless-delivery
+#   axi run     internal/cli/axi_drive.go activeRunID -> GetActiveRun(repo, BRANCH),
+#               and it attaches only when the run's head SHA also matches, so a
+#               different branch always starts a fresh run
+#   axi respond internal/cli/axi_drive.go runAxiRespond -> same branch-scoped lookup;
+#               from another branch it answers "no active run to respond to"
+#   axi abort   internal/cli/axi_drive.go runAxiAbort -> same branch-scoped lookup
+#   daemon      internal/daemon/manager.go startRun locks repoID+"/"+branch and
+#               cancelActiveRuns skips runs whose branch differs, so two branches
+#               of one repo validate concurrently by design
 #
-# Nothing about the invoking branch reaches that resolution. In the incident
-# this guard is built for, the attached run was parked at an approval gate, so
-# the second lane's client was driving another lane's gate: its own branch was
-# never validated, and the findings it was being asked to answer belonged to
-# someone else. See data/learnings.md anchor `no-mistakes-wrong-repo-attach`.
+# The ONE repo-wide surface is display: internal/cli/axi_query.go resolveRun
+# falls back to the repo's newest active run when the invoking branch has no run
+# row of its own. That fallback is why a bare `axi status` in a lane whose branch
+# has never been validated shows ANOTHER lane's run - the observation behind
+# data/learnings.md anchor `no-mistakes-wrong-repo-attach`, which read as an
+# attach but was the display fallback. Verified against no-mistakes v1.34.0 (the
+# installed line) and HEAD; the resolution code is identical in both.
 #
-# The check runs in the crewmate's own worktree, immediately before
-# `/no-mistakes`, and refuses when the run no-mistakes would act on is on a
-# different branch and is not already finished. A finished run on another branch
-# is the ordinary steady state (every repo keeps its last run around) and is
-# allowed. A run on the CURRENT branch is a legitimate resume - the documented
-# way to re-validate after adding fix commits - and is always allowed.
+# So this guard does not refuse an unrelated in-flight run - refusing it queued
+# every finished lane behind one run per repo for no safety gain. It instead:
 #
-# The companion defect, a task worktree that belongs to another home's clone of
-# the same repo, is refused at launch by bin/fm-spawn.sh's clone-identity
-# assertion. --project re-asserts it here, so a checkout that moved after launch
-# is still caught before it validates into the wrong copy.
+#   - names the unrelated run so a lane never mistakes it for its own, and
+#   - tells every lane to drive its run by explicit id (`--run <id>`), which
+#     bypasses resolveRun entirely and makes the display fallback harmless.
+#
+# What it still refuses is what is genuinely unsafe: a detached HEAD (no branch
+# to validate) and a worktree belonging to another copy of the repo. The latter
+# is the real defect behind the 2026-07-23 incident - bin/fm-spawn.sh asserts
+# clone identity at launch, and --project re-asserts it here so a checkout that
+# moved after launch is still caught before it validates into the wrong copy.
+#
+# A run on the CURRENT branch is a legitimate resume - the documented way to
+# re-validate after adding fix commits - and is always allowed.
 #
 # Usage:
 #   fm-nm-preflight.sh [--project <clone-path>]
@@ -38,14 +46,14 @@
 # same clone as <clone-path>, compared by shared git directory.
 #
 # Exit contract:
-#   0  clear to run; prints one `ok:` line naming the branch and owning clone.
+#   0  clear to run; prints one `ok:` line naming the branch and owning clone,
+#      a `note:` line with the drive-by-id instruction, and - when the repo has
+#      an unrelated run in flight - a `warning:` line naming it.
 #   1  refused; the reason is on stderr and no-mistakes must not be invoked.
 #   2  usage error.
 #
-# Not being able to reach no-mistakes is not a refusal: with no pipeline there
-# is no run to attach to. A reachable pipeline that reports an unrecognized run
-# state IS a refusal, because an unknown state is exactly the in-flight case
-# this guard exists to stop.
+# Not being able to reach no-mistakes is not a refusal: with no pipeline there is
+# nothing to validate against.
 set -u
 
 PROJECT=""
@@ -122,17 +130,26 @@ if [ -z "$BRANCH" ] || [ "$BRANCH" = HEAD ]; then
   exit 1
 fi
 
-NM=${FM_NM_BIN:-no-mistakes}
-command -v "$NM" >/dev/null 2>&1 || {
-  echo "ok: $BRANCH in $OWNING_CLONE (no-mistakes not installed; nothing to attach to)"
+# The instruction that replaces the old refusal. `axi status` and `axi logs`
+# resolve repo-wide when this branch has no run row of its own, so a lane that
+# reads them bare can be handed another lane's run. Passing the run id skips
+# that resolution (internal/cli/axi_query.go resolveRun returns early on an
+# explicit id), which is what makes concurrent lanes safe to read as well as to
+# start. `axi run` prints the id it started.
+# shellcheck disable=SC2016  # backticks are literal command quoting in the message, not expansions
+DRIVE_BY_ID_NOTE='note: drive YOUR run by its id. `no-mistakes axi run` reports the run it started; from then on use `no-mistakes axi status --run <id>` and `no-mistakes axi logs --run <id> --step <step>`. A bare `axi status` resolves repo-wide whenever this branch has no run of its own and will show a run that belongs to another lane.'
+
+allow() {  # <detail>
+  echo "ok: $BRANCH in $OWNING_CLONE ($1)"
+  echo "$DRIVE_BY_ID_NOTE"
   exit 0
 }
 
+NM=${FM_NM_BIN:-no-mistakes}
+command -v "$NM" >/dev/null 2>&1 || allow "no-mistakes not installed; nothing to validate against"
+
 STATUS_OUT=$("$NM" axi status 2>&1) || STATUS_OUT=""
-if [ -z "$STATUS_OUT" ]; then
-  echo "ok: $BRANCH in $OWNING_CLONE (no existing run)"
-  exit 0
-fi
+[ -n "$STATUS_OUT" ] || allow "no existing run"
 
 # TOON key/value lines, first occurrence wins. Values may be bare or quoted.
 toon_value() {  # <key>
@@ -153,34 +170,29 @@ toon_value() {  # <key>
 }
 
 RUN_BRANCH=$(toon_value branch)
-if [ -z "$RUN_BRANCH" ]; then
-  echo "ok: $BRANCH in $OWNING_CLONE (no existing run)"
-  exit 0
-fi
+[ -n "$RUN_BRANCH" ] || allow "no existing run"
 
-if [ "$RUN_BRANCH" = "$BRANCH" ]; then
-  echo "ok: $BRANCH in $OWNING_CLONE (existing run is this branch's own)"
-  exit 0
-fi
+[ "$RUN_BRANCH" != "$BRANCH" ] || allow "existing run is this branch's own"
 
 RUN_ID=$(toon_value id)
 RUN_STATUS=$(toon_value status)
 
-# Only a finished run is safe to leave behind on another branch. Every other
-# state - including one this guard has never seen - is treated as in flight,
-# because attaching to an in-flight foreign run is the failure being prevented.
+# The run belongs to another branch, so it is not this lane's to start from,
+# answer, or abort - and it cannot be reached from here anyway. Say so out loud,
+# because it IS what a bare `axi status` here will keep showing until this branch
+# has a run of its own. Warning, not refusal: the run's existence blocks nothing.
 case "$RUN_STATUS" in
   completed|failed|cancelled|canceled|aborted)
-    echo "ok: $BRANCH in $OWNING_CLONE (last run ${RUN_ID:-unknown} on $RUN_BRANCH already $RUN_STATUS)"
-    exit 0
+    allow "last run ${RUN_ID:-unknown} on $RUN_BRANCH already $RUN_STATUS"
     ;;
 esac
 
 cat >&2 <<EOF
-error: no-mistakes has a run in flight on another branch, and starting one here would attach to it instead of validating this branch.
-  this branch:  $BRANCH
-  in-flight run: ${RUN_ID:-unknown} on $RUN_BRANCH (${RUN_STATUS:-unknown state})
-  repo copy:    $OWNING_CLONE
-Do not run, respond to, or abort that run - its findings belong to the lane that started it. Report this and stop.
+warning: this repo has an unrelated run in flight; it is not yours.
+  this branch:   $BRANCH
+  unrelated run: ${RUN_ID:-unknown} on $RUN_BRANCH (${RUN_STATUS:-unknown state})
+  repo copy:     $OWNING_CLONE
+Never respond to or abort that run - its findings belong to the lane that started it.
+It does not block you: no-mistakes serializes per repo+branch, so your branch validates alongside it.
 EOF
-exit 1
+allow "unrelated run ${RUN_ID:-unknown} on $RUN_BRANCH is ${RUN_STATUS:-in an unknown state} and is not yours"

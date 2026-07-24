@@ -57,7 +57,7 @@ The shared no-mistakes gate refusal for fleet lifecycle entrypoints is summarize
 | `fm-pending-reply-lib.sh` | Parent-owned secondmate pending-reply expectations, recovery, and one-shot escalation |
 | `fm-secondmate-report.sh` | Optional helper to append a correlated parent status or document-pointer report       |
 | `fm-gate-refuse-lib.sh`  | Shared no-mistakes gate-context refusal for fleet lifecycle entrypoints               |
-| `fm-nm-preflight.sh`     | Refuse a no-mistakes run that would attach to an in-flight run on another branch, and optionally re-assert the worktree belongs to the intended clone |
+| `fm-nm-preflight.sh`     | Clear a lane to run no-mistakes: refuse a detached HEAD, optionally re-assert the worktree belongs to the intended clone, warn about an unrelated in-flight run, and print the drive-by-id instruction |
 | `fm-watch-arm.sh`        | Verified home-scoped watcher arm wrapper with loud cycle endings and bounded lifecycle ledger |
 | `fm-watch-checkpoint.sh` | Run one bounded foreground watcher checkpoint for Codex-style supervision            |
 | `fm-watch.sh`            | Singleton-safe always-on watcher: absorb benign wakes, queue and exit on actionable ones |

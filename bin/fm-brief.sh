@@ -315,7 +315,11 @@ Firstmate will then instruct you to run /no-mistakes to validate and ship a PR.
 
 Before you invoke /no-mistakes, run \`$FM_ROOT/bin/fm-nm-preflight.sh\` from this worktree.
 If it refuses, do NOT invoke /no-mistakes: append \`blocked: {the refusal it printed}\` and stop.
-It refuses when the pipeline already has a run in flight on a different branch, because a run started here would silently attach to that one and validate that branch instead of yours - never respond to or abort that run, because its findings belong to the lane that started it.
+It refuses a detached HEAD and a worktree that belongs to another copy of the repo.
+A run in flight on a DIFFERENT branch is not a refusal: no-mistakes serializes per repo+branch, so your branch validates alongside it. The guard names that run as a warning - never respond to or abort that run, because its findings belong to the lane that started it.
+
+Drive YOUR run by its id. \`no-mistakes axi run\` reports the run it started; from then on read it with \`no-mistakes axi status --run <id>\` and \`no-mistakes axi logs --run <id> --step <step>\`.
+A bare \`axi status\` resolves repo-wide whenever your branch has no run of its own, so it can hand you a concurrent lane run as if it were yours.
 
 You drive no-mistakes by responding to its gates, not by implementing fixes.
 Follow the guidance no-mistakes itself provides for the mechanics: it loads when you invoke /no-mistakes, and \`no-mistakes axi run --help\` plus the \`help\` lines in each \`axi\` response are authoritative and version-matched to the installed binary.
