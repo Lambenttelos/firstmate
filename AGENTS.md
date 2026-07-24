@@ -79,6 +79,7 @@ data/                personal fleet records; LOCAL, gitignored as a whole
   learnings.md       fleet-local operational facts and gotchas; LOCAL, gitignored; dated, evidence-backed, curated, and updated with inspect-then-update - rewrite and prune rather than append forever, the same contract as captain.md; created lazily, absent until this home has a learning to store
   projects.md        thin fleet navigation registry; firstmate-private, parsed by fm-project-mode.sh (section 6)
   secondmates.md      secondmate routing table; firstmate-private, maintained by fm-home-seed.sh (section 6)
+  merge-queue.tsv    durable list of released-but-unmerged ship branches; firstmate-private, owned by fm-merge-queue-lib.sh, surfaced/swept by fm-merge-queue.sh (docs/merge-queue.md, section 7)
   <id>/brief.md      per-task crewmate brief, or per-secondmate charter brief when kind=secondmate
   <id>/report.md     scout task deliverable, written by the crewmate; survives teardown
 projects/            cloned repos; gitignored; READ-ONLY for you
@@ -294,8 +295,9 @@ Tell the captain the PR's full URL, always the complete `https://...` link rathe
 A captain instruction to merge is explicit authority; `yolo` is the only standing routine authority.
 For any custom `state/<id>.check.sh` you write yourself, keep it an ordinary single-link mode-`0700` file, print one line only when firstmate should wake, print nothing otherwise, finish before `FM_CHECK_TIMEOUT`, then bind its current bytes with `bin/fm-check-register.sh <id>` before the watcher may execute it.
 
-Tear down a ship task only after landing is confirmed.
-A teardown refusal for uncommitted or unlanded work is a stop-and-investigate result, never an obstacle to bypass.
+Tear down a ship task once its work is durable: teardown releases a worktree whose branch is fully pushed to origin, independent of whether it has merged, so a finished worker does not hold a memory slot waiting to merge.
+A released-but-unmerged ship branch is recorded in the durable merge queue; surface the batched set as one list of compare links with `bin/fm-merge-queue.sh list`, clear merged branches with its `sweep`, and spawn a merge worker per repo per batch on demand when a batch has accumulated and merge authority exists (never a standing merge worker; see `docs/merge-queue.md`).
+A teardown refusal for uncommitted or genuinely unpushed-and-unlanded work is a stop-and-investigate result, never an obstacle to bypass.
 Never force teardown without explicit discard authority.
 After successful teardown, record completion, retain only the configured recent Done history, and re-evaluate queued work whose blockers and time gates have cleared.
 

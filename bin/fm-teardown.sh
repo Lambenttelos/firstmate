@@ -4,8 +4,18 @@
 # clear volatile state, refresh/prune the project's clone for PR-based ship
 # tasks, then print a backlog-refresh reminder for ship and scout teardowns
 # (a secondmate teardown prints none, since secondmates are not backlog items).
-# REFUSES if the worktree holds work that has not LANDED, because cleanup
-# hard-resets/removes the worktree and kills its processes. Work has landed when it is
+# REFUSES if the worktree holds work that is NEITHER durable on a remote NOR landed,
+# because cleanup hard-resets/removes the worktree and kills its processes. The
+# worktree is disposable - so teardown releases it - when its branch is fully PUSHED
+# to origin (every commit reachable from the branch's own origin ref, verified by a
+# fresh fetch), INDEPENDENT of whether it merged: a pushed branch is durable on the
+# remote and the local copy holds nothing unique. A released-but-unmerged ship branch
+# is recorded in the durable merge queue (bin/fm-merge-queue.sh, docs/merge-queue.md)
+# so it can never be silently forgotten; that queue is the safety guard that makes
+# release-on-pushed acceptable. A branch with commits absent from its remote ref, a
+# dirty worktree, and the no-remote/offline case all still refuse (fail safe), and
+# --force remains the only discard path for genuinely unlanded work.
+# Work is also LANDED when it is
 # reachable from any remote-tracking branch (a fork counts as a remote, so
 # upstream-contribution PRs pushed to a fork satisfy this in any mode), OR - for a
 # normal ship task whose commits are not so reachable - when its PR is merged and
@@ -106,6 +116,8 @@ SUB_HOME_MARKER=".fm-secondmate-home"
 . "$SCRIPT_DIR/fm-gate-refuse-lib.sh"
 # shellcheck source=bin/fm-pr-lib.sh
 . "$SCRIPT_DIR/fm-pr-lib.sh"
+# shellcheck source=bin/fm-merge-queue-lib.sh
+. "$SCRIPT_DIR/fm-merge-queue-lib.sh"
 if [ "$#" -lt 1 ] || ! fm_task_id_path_safe "$1"; then
   echo "error: invalid teardown request" >&2
   exit 2
@@ -398,6 +410,45 @@ work_is_landed() {
   local branch=$1
   pr_is_merged "$branch" && return 0
   content_in_default
+}
+
+# Is every commit on the branch reachable from the branch's OWN remote-tracking ref
+# on origin, verified by a FRESH fetch (not a possibly-stale local ref)? A pushed
+# branch is durable on the remote, so the local worktree holds nothing unique and is
+# disposable, INDEPENDENT of whether it merged. Returns non-zero - so the caller
+# still refuses - when there is no origin, the branch does not exist on origin, the
+# fetch fails (e.g. offline), or HEAD is not contained in the fetched head. This
+# never releases on an unverifiable claim.
+branch_fully_pushed_to_origin() {
+  local branch=$1 head current
+  [ -n "$branch" ] && [ "$branch" != HEAD ] || return 1
+  git -C "$WT" remote get-url origin >/dev/null 2>&1 || return 1
+  git -C "$WT" fetch --quiet origin "+refs/heads/$branch:refs/remotes/origin/$branch" >/dev/null 2>&1 || return 1
+  head=$(git -C "$WT" rev-parse --quiet --verify "refs/remotes/origin/$branch^{commit}" 2>/dev/null) || return 1
+  [ -n "$head" ] || return 1
+  current=$(git -C "$WT" rev-parse --verify HEAD 2>/dev/null) || return 1
+  git -C "$WT" merge-base --is-ancestor "$current" "$head" 2>/dev/null
+}
+
+# Record a released-but-unmerged ship branch in the durable merge queue. Called once
+# from the main flow (never from the idempotent safety check) after safety passes and
+# while the worktree still exists. Skips work that is not on origin or already merged,
+# so only genuinely pushed-but-unmerged branches are queued. Best-effort: a recording
+# failure never blocks teardown.
+record_pushed_unmerged_to_merge_queue() {
+  local branch head base remote url
+  branch=${TEARDOWN_WORKTREE_BRANCH_FOR_SAFETY:-}
+  [ -n "$branch" ] || branch=$(git -C "$WT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)
+  [ "$branch" != HEAD ] || return 0
+  branch_fully_pushed_to_origin "$branch" || return 0
+  if pr_is_merged "$branch" || content_in_default; then
+    return 0
+  fi
+  head=$(git -C "$WT" rev-parse --verify HEAD 2>/dev/null) || return 0
+  base=$(default_branch) || return 0
+  remote=$(git -C "$WT" remote get-url origin 2>/dev/null) || return 0
+  url=$(fm_merge_queue_compare_url "$remote" "$base" "$branch") || return 0
+  fm_merge_queue_record "$DATA" "$ID" "$PROJ" "$branch" "$head" "$base" "$url" || true
 }
 
 backlog_refresh_reminder() {
@@ -702,7 +753,12 @@ validate_worktree_teardown_safety() {
       branch=$(git -C "$WT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)
       TEARDOWN_WORKTREE_BRANCH_FOR_SAFETY=$branch
     fi
-    if ! work_is_landed "$branch"; then
+    # Release when the work has LANDED (merged) OR the branch is fully pushed to its
+    # own origin ref: a pushed branch is durable on the remote, so the local copy is
+    # disposable even before it merges. The merge queue (recorded from the main flow)
+    # keeps the released-but-unmerged branch visible. A branch with commits absent
+    # from its remote ref still fails both checks and refuses.
+    if ! work_is_landed "$branch" && ! branch_fully_pushed_to_origin "$branch"; then
       echo "REFUSED: worktree $WT has work not on any remote and not landed." >&2
       printf 'unpushed commits:\n%s\n' "$unpushed" >&2
       echo "Push the branch, land its PR, or get the captain's explicit OK to discard, then --force." >&2
@@ -1088,6 +1144,14 @@ if [ -d "$WT" ] && [ "$FORCE" != "--force" ]; then
       exit 1
     fi
   fi
+fi
+
+# Safety passed. Before the worktree is destroyed, record a pushed-but-unmerged ship
+# branch in the durable merge queue so a released-yet-unmerged branch is never
+# silently forgotten (see bin/fm-merge-queue.sh, docs/merge-queue.md).
+if [ "$FORCE" != "--force" ] && [ "$KIND" != scout ] && [ "$KIND" != secondmate ] \
+   && [ "$MODE" != local-only ] && [ -d "$WT" ]; then
+  record_pushed_unmerged_to_merge_queue || true
 fi
 
 # Best-effort: drop the local task branch so the shared repo does not accumulate refs.
