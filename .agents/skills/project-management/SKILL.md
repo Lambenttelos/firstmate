@@ -60,7 +60,7 @@ The captain's request to create that local project authorizes this local initial
 
 ## Initialize
 
-Run no-mistakes initialization only for `no-mistakes` projects:
+Run no-mistakes initialization only for `no-mistakes` and `direct-push` projects, since both run the full pipeline:
 
 ```sh
 cd projects/<name> && no-mistakes init && no-mistakes doctor

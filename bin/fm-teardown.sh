@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Tear down a finished task: return the treehouse worktree, release the Orca
 # worktree, or retire a secondmate home; kill the recorded runtime endpoint,
-# clear volatile state, refresh/prune the project's clone for PR-based ship
+# clear volatile state, refresh/prune the project's clone for remote-backed ship
 # tasks, then print a backlog-refresh reminder for ship and scout teardowns
 # (a secondmate teardown prints none, since secondmates are not backlog items).
 # REFUSES if the worktree holds work that is NEITHER durable on a remote NOR landed,
