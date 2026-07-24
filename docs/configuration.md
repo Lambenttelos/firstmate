@@ -212,10 +212,13 @@ For the same reason the reading is a host total and never attributes load to a p
 The crew count in the reading is the number of crews whose agent is actually running, not the number of recorded tasks, so a task that has stopped but has not been cleaned up yet no longer inflates the count or the shed advice.
 Only the watcher's sweep pays for that liveness answer, and it caches the verdict, so the count every other caller shows is at most one sweep interval old (`FM_RESOURCE_INTERVAL`, default 900 seconds).
 When no cached verdict is available, or it is older than two sweep intervals, the reading falls back to the count of recorded tasks and says so with "liveness unverified" instead of presenting it as a verified count.
+Persistent secondmates are running agents, so they are counted and reported separately in the reading, and they are excluded from the shed advice because AGENTS.md makes an idle secondmate endpoint healthy and its retirement an explicit decision.
 
 `FM_RESOURCE_SWEEP_BUDGET` is the number of seconds one sweep may spend checking crew liveness in total, defaulting to `30`, and a malformed value falls back to that default rather than disabling the budget.
 It bounds the watcher's poll loop however many crews are recorded and however unresponsive a backend is, since bounding each check on its own would still allow one timeout per recorded crew.
+A check started near the deadline gets only the time the budget has left, so the worst case is the budget plus a sub-second stop grace rather than the budget plus one whole per-check timeout.
 Crews left unchecked when the budget runs out count toward the live total anyway, the same conservative direction an unanswered check already takes, and the reading says "liveness partly unverified" so a partly checked count is never shown as a fully verified one.
+That marker is cached with the count, so a partly checked count keeps the same label on the later synchronous readings that reuse it.
 
 Three callers consult the monitor, and all three only report:
 
@@ -229,7 +232,7 @@ Nothing in this path pauses, sheds, or kills anything.
 Shedding load is the captain's decision, so the monitor's job ends at reporting the pressure and the crew count the host can support.
 An unknown reading, on a host where no kernel-wide probe answers, and a disabled monitor both stay silent instead of alarming, the same never-wake-on-an-unreadable-probe rule the secondmate context monitor follows.
 
-The watcher keeps its sweep state in `state/.last-resource` (sweep cadence), `state/.resource-status` (latest reading, read by the heartbeat annotation), `state/.resource-live` (last verified running-crew count, read by the synchronous callers), and `state/.resource-surfaced` (worst level already reported, so recovery to healthy re-arms the monitor silently).
+The watcher keeps its sweep state in `state/.last-resource` (sweep cadence), `state/.resource-status` (latest reading, read by the heartbeat annotation), `state/.resource-live` (last running-agent counts and whether the sweep could check them all, read by the synchronous callers), and `state/.resource-surfaced` (worst level already reported, so recovery to healthy re-arms the monitor silently).
 These are watcher internals; never edit them by hand.
 
 ## Crew dispatch profiles (config/crew-dispatch.json)

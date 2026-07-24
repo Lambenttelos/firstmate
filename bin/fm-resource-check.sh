@@ -49,14 +49,14 @@
 #              the binding constraint on a laptop-class host, and available
 #              memory deliberately excludes anything that only exists because the
 #              kernel is already swapping.
-#   by CPU:    the current live-crew count adjusted by load per core (+3 under
+#   by CPU:    the current live-agent count adjusted by load per core (+3 under
 #              1.0, +1 under 2.0, -1 under 4.0, halved at or above 4.0), floor 1.
-# Live crews are the RUNNING ones, and ONLY the watcher's slow sweep pays for
+# Live agents are the RUNNING ones, and ONLY the watcher's slow sweep pays for
 # that answer. Under --sweep every state/*.meta is probed with bin/fm-backend.sh's
 # fm_backend_agent_alive, only a CONFIDENT `dead` verdict is excluded - so a meta
 # whose agent has exited but which has not been torn down yet stops inflating the
 # count and the shed advice - and the resulting count is cached in
-# state/.resource-live. An ambiguous or unreadable probe counts that one crew as
+# state/.resource-live. An ambiguous or unreadable probe counts that one agent as
 # live rather than discarding the whole reading; each probe is bounded by
 # FM_RESOURCE_PROBE_TIMEOUT seconds (default 5, malformed values falling back to
 # it) and is terminated as a process group, so a wedged backend leaks no stuck
@@ -64,12 +64,22 @@
 # Probing for the sweep AS A WHOLE is bounded by FM_RESOURCE_SWEEP_BUDGET seconds
 # (default 30, malformed values falling back to it), because per-probe bounding
 # alone still lets a wedged backend hold the watcher's poll loop for one timeout
-# per recorded crew. Once the budget is spent the sweep stops probing and every
-# remaining crew degrades to unknown, which counts it as live under the same
-# only-a-confident-dead-verdict-excludes rule; the reading then says "liveness
-# partly unverified" so a partly probed count is never shown as a fully verified
-# one. The budget therefore bounds the sweep no matter how many crews are
-# recorded or how wedged the backend is.
+# per recorded crew. A probe started near the deadline gets only the budget that
+# is left, so total probing costs the budget plus a sub-second stop grace however
+# many crews are recorded and however wedged the backend is. Once the budget is
+# spent the sweep stops probing and every remaining crew degrades to unknown,
+# which counts it as live under the same only-a-confident-dead-verdict-excludes
+# rule; the reading then says "liveness partly unverified", and that marker is
+# cached with the count so a partly probed count is never shown as a fully
+# verified one on any later synchronous reading either.
+#
+# CREWS vs PERSISTENT SECONDMATES - a kind=secondmate meta is a running agent, so
+# it counts toward the reported live figure and toward the CPU ceiling, and the
+# reading labels it separately. It is never a shed candidate (AGENTS.md sections
+# 7 and 8: an idle secondmate endpoint is healthy and retirement is an explicit
+# captain or main-firstmate decision), so the SHED overage and the over-ceiling
+# comparison that triggers it are computed from ORDINARY CREWS ONLY. A home whose
+# only running agents are persistent secondmates never produces shed advice.
 #
 # Every OTHER caller (bin/fm-spawn.sh before a dispatch, bin/fm-session-start.sh
 # inside its fast digest) READS that cache and never probes, so a wedged backend
@@ -78,15 +88,18 @@
 # that is missing, unreadable or older than two sweep intervals degrades
 # immediately to the cheap count of recorded state/*.meta files, and the reading
 # then says "liveness unverified" rather than passing recorded work off as a
-# verified count. The same honest label is used when bin/fm-backend.sh cannot be
-# sourced during a sweep. An IDLE agent is cheap; concurrent test and browser
-# runs are what exhaust a host, so the SHED line names those first.
+# verified count, and a cached count the sweep could only partly probe keeps its
+# "liveness partly unverified" label wherever it is read. The same honest label
+# is used when bin/fm-backend.sh cannot be sourced during a sweep. An IDLE agent
+# is cheap; concurrent test and browser runs are what exhaust a host, so the SHED
+# line names those first.
 #
 # Every reading can be injected for tests via FM_RESOURCE_CORES,
 # FM_RESOURCE_RAM_GB, FM_RESOURCE_LOAD1, FM_RESOURCE_AVAIL_MB,
 # FM_RESOURCE_SWAP_USED_MB, FM_RESOURCE_SWAP_TOTAL_MB, FM_RESOURCE_LIVE, and
-# FM_RESOURCE_PROC_ROOT (alternate /proc root). Injection is a test seam, not an
-# operating knob: an injected reading is used verbatim and never probed for.
+# FM_RESOURCE_PROC_ROOT (alternate /proc root). FM_RESOURCE_LIVE injects the
+# ordinary-crew count, with no persistent secondmates. Injection is a test seam,
+# not an operating knob: an injected reading is used verbatim and never probed for.
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -235,8 +248,15 @@ read_swap_total_mb() {
 PROBE_TIMEOUT_DEFAULT=5
 PROBE_TIMEOUT=${FM_RESOURCE_PROBE_TIMEOUT:-$PROBE_TIMEOUT_DEFAULT}
 case "$PROBE_TIMEOUT" in ''|0|*[!0-9]*) PROBE_TIMEOUT=$PROBE_TIMEOUT_DEFAULT ;; esac
-probe_verdict() {  # <backend> <target>
-  local out pid pgid waited=0 limit step inc verdict
+probe_signal() {  # <signal> <pid> <pgid>
+  if [ -n "$3" ] && [ "$3" = "$2" ]; then
+    kill -"$1" -"$3" 2>/dev/null || true
+  else
+    kill -"$1" "$2" 2>/dev/null || true
+  fi
+}
+probe_verdict() {  # <backend> <target> <seconds>
+  local out pid pgid waited=0 limit step inc verdict grace=0
   out=$(mktemp "${TMPDIR:-/tmp}/fm-resource-probe.XXXXXX" 2>/dev/null) || {
     printf 'unknown'
     return 0
@@ -248,16 +268,21 @@ probe_verdict() {  # <backend> <target>
   # Only signal the group once the child is confirmed to lead its own, the way
   # run_check_capture verifies it; otherwise a group kill would reach the watcher.
   pgid=$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d '[:space:]')
-  limit=$(( PROBE_TIMEOUT * 100 ))
+  limit=$(( $3 * 100 ))
+  [ "$limit" -ge 1 ] || limit=1
   # Centisecond slices, fine-grained at first so a backend that answers instantly
   # is not held for a fixed floor, coarser once the probe is clearly slow.
   while kill -0 "$pid" 2>/dev/null; do
     if [ "$waited" -ge "$limit" ]; then
-      if [ -n "$pgid" ] && [ "$pgid" = "$pid" ]; then
-        kill -TERM -"$pgid" 2>/dev/null || true
-      else
-        kill -TERM "$pid" 2>/dev/null || true
-      fi
+      probe_signal TERM "$pid" "$pgid"
+      # A short stop grace, then KILL: the wait below must never block on a
+      # backend command that ignores TERM, or on a child whose own group could
+      # not be confirmed above.
+      while [ "$grace" -lt 50 ] && kill -0 "$pid" 2>/dev/null; do
+        sleep 0.01
+        grace=$((grace + 1))
+      done
+      probe_signal KILL "$pid" "$pgid"
       break
     fi
     if [ "$waited" -lt 20 ]; then step=0.01; inc=1; else step=0.1; inc=10; fi
@@ -270,20 +295,28 @@ probe_verdict() {  # <backend> <target>
   case "$verdict" in alive|dead) printf '%s' "$verdict" ;; *) printf 'unknown' ;; esac
 }
 
-# The live-crew readers run inside a command substitution, so they cannot set a
-# variable for the caller: each prints "<note><TAB><count>" and the caller splits
-# it. The note comes first because a command substitution strips trailing
-# whitespace; it is empty for a verified count and names the degradation
-# otherwise, so a recorded-work count is never displayed as a verified one.
+# The live-agent readers run inside a command substitution, so they cannot set a
+# variable for the caller: each prints "<note><TAB><crews><TAB><secondmates>" and
+# the caller splits it. The note comes first because a command substitution
+# strips trailing whitespace; it is empty for a verified count and names the
+# degradation otherwise, so a recorded-work count is never displayed as a
+# verified one.
 UNVERIFIED_NOTE=' (recorded work, liveness unverified)'
 PARTIAL_NOTE=' (liveness partly unverified, probe budget spent)'
 
+is_secondmate_meta() { grep -q '^kind=secondmate$' "$1" 2>/dev/null; }
+
 count_metas() {  # <note>
-  local meta n=0
+  local meta crews=0 smates=0
   for meta in "$STATE"/*.meta; do
-    [ -f "$meta" ] && n=$((n + 1))
+    [ -f "$meta" ] || continue
+    if is_secondmate_meta "$meta"; then
+      smates=$((smates + 1))
+    else
+      crews=$((crews + 1))
+    fi
   done
-  printf '%s\t%s' "$1" "$n"
+  printf '%s\t%s\t%s' "$1" "$crews" "$smates"
 }
 
 mtime_of() {  # epoch seconds of <file>, empty when unreadable
@@ -302,12 +335,14 @@ SWEEP_BUDGET_DEFAULT=30
 SWEEP_BUDGET=${FM_RESOURCE_SWEEP_BUDGET:-$SWEEP_BUDGET_DEFAULT}
 case "$SWEEP_BUDGET" in ''|0|*[!0-9]*) SWEEP_BUDGET=$SWEEP_BUDGET_DEFAULT ;; esac
 
-# sweep_live_crews: the probing path, watcher-only. Caches the verified count so
-# every synchronous caller can read it without touching a backend. Crews left
-# unprobed when the total budget runs out degrade to unknown, which counts them
-# as live, and the note says the count is only partly verified.
+# sweep_live_crews: the probing path, watcher-only. Caches the count AND whether
+# it was fully probed, so every synchronous caller can read it without touching a
+# backend and still sees an honest label. Crews left unprobed when the total
+# budget runs out degrade to unknown, which counts them as live, and the note
+# says the count is only partly verified. Each probe gets only the budget that is
+# left, so the last probe cannot run past the deadline.
 sweep_live_crews() {
-  local meta backend target n=0 deadline partial='' note=''
+  local meta backend target crews=0 smates=0 deadline left partial='' note='' probe
   # shellcheck source=bin/fm-backend.sh
   . "$FM_ROOT/bin/fm-backend.sh" 2>/dev/null || {
     count_metas "$UNVERIFIED_NOTE"
@@ -316,35 +351,46 @@ sweep_live_crews() {
   deadline=$(( $(date +%s) + SWEEP_BUDGET ))
   for meta in "$STATE"/*.meta; do
     [ -f "$meta" ] || continue
-    if [ -z "$partial" ] && [ "$(date +%s)" -ge "$deadline" ]; then
-      partial=1
-    fi
+    left=$(( deadline - $(date +%s) ))
+    [ "$left" -gt 0 ] || partial=1
     if [ -z "$partial" ]; then
+      if [ "$left" -lt "$PROBE_TIMEOUT" ]; then probe=$left; else probe=$PROBE_TIMEOUT; fi
       backend=$(fm_backend_of_meta "$meta")
       target=$(fm_backend_target_of_meta "$meta")
-      if [ -n "$target" ] && [ "$(probe_verdict "$backend" "$target")" = dead ]; then
+      if [ -n "$target" ] && [ "$(probe_verdict "$backend" "$target" "$probe")" = dead ]; then
         continue
       fi
     fi
-    n=$((n + 1))
+    if is_secondmate_meta "$meta"; then
+      smates=$((smates + 1))
+    else
+      crews=$((crews + 1))
+    fi
   done
   [ -z "$partial" ] || note=$PARTIAL_NOTE
-  [ -d "$STATE" ] && printf '%s\n' "$n" > "$LIVE_CACHE" 2>/dev/null
-  printf '%s\t%s' "$note" "$n"
+  [ -d "$STATE" ] \
+    && printf '%s %s %s\n' "$crews" "$smates" "${partial:-0}" > "$LIVE_CACHE" 2>/dev/null
+  printf '%s\t%s\t%s' "$note" "$crews" "$smates"
 }
 
 # cached_live_crews: the synchronous path. Reads the sweep's verdict and NEVER
-# probes, so a wedged backend cannot delay a dispatch or a session start.
+# probes, so a wedged backend cannot delay a dispatch or a session start. The
+# sweep's partly-probed marker is cached with the counts and replayed here, so a
+# budget-truncated count is never presented as a fully verified one.
 cached_live_crews() {
-  local cached age m now
+  local cached age m now crews smates partial
   cached=$(cat "$LIVE_CACHE" 2>/dev/null || true)
   m=$(mtime_of "$LIVE_CACHE")
   now=$(date +%s)
   age=999999
   case "$m" in ''|*[!0-9]*) : ;; *) age=$(( now - m )) ;; esac
-  if is_uint "$cached" && [ "$age" -lt $(( $(resolve_interval) * 2 )) ]; then
-    printf '\t%s' "$cached"
-    return 0
+  read -r crews smates partial <<<"$cached"
+  if is_uint "${crews:-}" && is_uint "${smates:-}" \
+    && [ "$age" -lt $(( $(resolve_interval) * 2 )) ]; then
+    case "${partial:-}" in
+      0) printf '\t%s\t%s' "$crews" "$smates"; return 0 ;;
+      1) printf '%s\t%s\t%s' "$PARTIAL_NOTE" "$crews" "$smates"; return 0 ;;
+    esac
   fi
   count_metas "$UNVERIFIED_NOTE"
 }
@@ -354,7 +400,7 @@ read_live_crews() {
   local v
   v=${FM_RESOURCE_LIVE:-}
   if [ -n "$v" ]; then
-    printf '\t%s' "$v"
+    printf '\t%s\t%s' "$v" 0
     return 0
   fi
   if [ "$SWEEP" = 1 ]; then
@@ -371,12 +417,15 @@ AVAIL_MB=$(read_avail_mb)
 SWAP_USED=$(read_swap_used_mb)
 SWAP_TOTAL=$(read_swap_total_mb)
 LIVE_READING=$(read_live_crews)
-LIVE=${LIVE_READING##*$'\t'}
-LIVE_NOTE=${LIVE_READING%$'\t'*}
+LIVE_NOTE=${LIVE_READING%%$'\t'*}
+LIVE_COUNTS=${LIVE_READING#*$'\t'}
+CREWS=${LIVE_COUNTS%%$'\t'*}
+SECONDMATES=${LIVE_COUNTS##*$'\t'}
 
 if ! is_uint "$CORES" || [ "$CORES" -lt 1 ] \
   || ! is_num "$LOAD1" || ! is_num "$AVAIL_MB" \
-  || ! is_num "$SWAP_USED" || ! is_num "$SWAP_TOTAL" || ! is_uint "$LIVE"; then
+  || ! is_num "$SWAP_USED" || ! is_num "$SWAP_TOTAL" \
+  || ! is_uint "$CREWS" || ! is_uint "$SECONDMATES"; then
   printf 'resources: unknown - no kernel-wide load/memory/swap reading is available on this host\n'
   exit 3
 fi
@@ -407,6 +456,7 @@ elif [ "$SWAP_CLASS" = deg ] && [ "$RC" -lt 1 ]; then
   STATUS=degraded; RC=1
 fi
 
+LIVE=$(( CREWS + SECONDMATES ))
 BY_MEM=$(awk -v a="$AVAIL_MB" 'BEGIN{c=int(a/1024); print (c < 1 ? 1 : c)}')
 BY_CPU=$(awk -v l="$LOAD_PER_CORE_EXACT" -v n="$LIVE" 'BEGIN{
   if (l < 1.0) print n+3;
@@ -416,12 +466,18 @@ BY_CPU=$(awk -v l="$LOAD_PER_CORE_EXACT" -v n="$LIVE" 'BEGIN{
 if [ "$BY_MEM" -lt "$BY_CPU" ]; then CEILING=$BY_MEM; else CEILING=$BY_CPU; fi
 [ "$CEILING" -ge 1 ] || CEILING=1
 
-printf 'resources: %s | load %s (%sx over %s cores) | avail %s MB of %s GB | swap %s%% of %sM | live crews %s%s | recommended ceiling %s\n' \
-  "$STATUS" "$LOAD1" "$LOAD_PER_CORE" "$CORES" "$AVAIL_MB" "$RAM_GB" "$SWAP_PCT" "$SWAP_TOTAL" "$LIVE" "$LIVE_NOTE" "$CEILING"
+# Persistent secondmates are reported separately rather than folded into the crew
+# figure, because they are never shed candidates (see the header).
+SECONDMATE_NOTE=
+[ "$SECONDMATES" -eq 0 ] || SECONDMATE_NOTE=" + $SECONDMATES persistent secondmate(s)"
 
-if [ "$RC" -ne 0 ] && [ "$LIVE" -gt "$CEILING" ]; then
+printf 'resources: %s | load %s (%sx over %s cores) | avail %s MB of %s GB | swap %s%% of %sM | live crews %s%s%s | recommended ceiling %s\n' \
+  "$STATUS" "$LOAD1" "$LOAD_PER_CORE" "$CORES" "$AVAIL_MB" "$RAM_GB" "$SWAP_PCT" "$SWAP_TOTAL" \
+  "$CREWS" "$SECONDMATE_NOTE" "$LIVE_NOTE" "$CEILING"
+
+if [ "$RC" -ne 0 ] && [ "$CREWS" -gt "$CEILING" ]; then
   printf 'resources: SHED %s crew(s) - stop the heaviest test and browser runs first, they cost far more than an idle agent\n' \
-    "$(( LIVE - CEILING ))"
+    "$(( CREWS - CEILING ))"
 fi
 
 exit "$RC"

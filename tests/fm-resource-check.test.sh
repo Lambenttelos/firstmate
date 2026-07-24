@@ -224,7 +224,7 @@ test_live_crew_count_excludes_agents_that_are_not_running() {
     "recorded work whose agent has exited must not count as a live crew"
   assert_not_contains "$OUT" "liveness unverified" \
     "a probed sweep reports a verified count"
-  [ "$(cat "$home/state/.resource-live")" = 1 ] \
+  [ "$(cat "$home/state/.resource-live")" = "1 0 0" ] \
     || fail "the sweep must cache its verified count for the synchronous callers"
   pass "the live-crew count follows running agents, not recorded task files"
 }
@@ -236,7 +236,7 @@ test_synchronous_reading_uses_the_cached_verdict() {
   fm_write_meta "$home/state/alpha.meta" "window=firstmate:fm-alpha" "harness=claude"
   fm_write_meta "$home/state/beta.meta" "window=firstmate:fm-beta" "harness=claude"
   fm_write_meta "$home/state/gamma.meta" "window=firstmate:fm-gamma" "harness=claude"
-  printf '1\n' > "$home/state/.resource-live"
+  printf '1 0 0\n' > "$home/state/.resource-live"
   run_in_home "$home" "$fakebin"
   expect_code 0 "$RC" "cached live-count exit"
   assert_contains "$OUT" "live crews 1" \
@@ -269,13 +269,71 @@ test_stale_cached_verdict_degrades_honestly() {
   fakebin=$(fake_tmux "$TMP_ROOT/live-count-stale-bin" fm-alpha)
   fm_write_meta "$home/state/alpha.meta" "window=firstmate:fm-alpha" "harness=claude"
   fm_write_meta "$home/state/beta.meta" "window=firstmate:fm-beta" "harness=claude"
-  printf '1\n' > "$home/state/.resource-live"
+  printf '1 0 0\n' > "$home/state/.resource-live"
   touch -t 202001010000 "$home/state/.resource-live"
   run_in_home "$home" "$fakebin"
   expect_code 0 "$RC" "stale cached live-count exit"
   assert_contains "$OUT" "live crews 2 (recorded work, liveness unverified)" \
     "a verdict older than two sweeps must not pass as a verified count"
   pass "a cached verdict older than two sweep intervals degrades and says so"
+}
+
+test_cached_partial_verdict_stays_labelled_partial() {
+  local home fakebin i started elapsed
+  home=$(make_home live-count-cached-partial)
+  fakebin=$(fm_fakebin "$TMP_ROOT/live-count-cached-partial-bin")
+  printf '#!/usr/bin/env bash\nsleep 4715\n' > "$fakebin/tmux"
+  chmod +x "$fakebin/tmux"
+  for i in 1 2 3; do
+    fm_write_meta "$home/state/task$i.meta" "window=firstmate:fm-task$i" "harness=claude"
+  done
+  run_in_home "$home" "$fakebin" --sweep FM_RESOURCE_PROBE_TIMEOUT=1 FM_RESOURCE_SWEEP_BUDGET=1
+  expect_code 0 "$RC" "partial sweep exit"
+  assert_contains "$OUT" "live crews 3 (liveness partly unverified, probe budget spent)" \
+    "the sweep itself must label a budget-truncated count"
+  started=$SECONDS
+  run_in_home "$home" "$fakebin"
+  elapsed=$((SECONDS - started))
+  expect_code 0 "$RC" "cached partial exit"
+  [ "$elapsed" -lt 10 ] || fail "the cached path waited ${elapsed}s on a wedged backend"
+  assert_contains "$OUT" "live crews 3 (liveness partly unverified, probe budget spent)" \
+    "a cached partly probed count must not be replayed as a verified one"
+  pkill -f 'sleep 4715' >/dev/null 2>&1 || true
+  pass "a partly probed count keeps its label on every later cached reading"
+}
+
+test_persistent_secondmates_are_counted_but_never_shed() {
+  local home fakebin
+  home=$(make_home live-count-secondmate)
+  fakebin=$(fake_tmux "$TMP_ROOT/live-count-secondmate-bin")
+  fm_write_meta "$home/state/alpha.meta" "window=firstmate:fm-alpha" "harness=claude"
+  fm_write_meta "$home/state/beta.meta" "window=firstmate:fm-beta" "harness=claude"
+  fm_write_meta "$home/state/sm1.meta" "window=firstmate:fm-sm1" "harness=claude" \
+    "kind=secondmate"
+  run_in_home "$home" "$fakebin" --sweep FM_RESOURCE_LOAD1=40 FM_RESOURCE_AVAIL_MB=3000
+  expect_code 2 "$RC" "critical exit with a secondmate present"
+  assert_contains "$OUT" "live crews 2 + 1 persistent secondmate(s)" \
+    "the reading must report crews and persistent secondmates separately"
+  assert_contains "$OUT" "SHED 1 crew(s)" \
+    "the overage must come from ordinary crews only, not from the secondmate"
+  pass "a persistent secondmate is reported in the reading but never in the overage"
+}
+
+test_a_home_of_only_secondmates_never_advises_shedding() {
+  local home fakebin
+  home=$(make_home live-count-secondmate-only)
+  fakebin=$(fake_tmux "$TMP_ROOT/live-count-secondmate-only-bin")
+  fm_write_meta "$home/state/sm1.meta" "window=firstmate:fm-sm1" "harness=claude" \
+    "kind=secondmate"
+  fm_write_meta "$home/state/sm2.meta" "window=firstmate:fm-sm2" "harness=claude" \
+    "kind=secondmate"
+  run_in_home "$home" "$fakebin" --sweep FM_RESOURCE_LOAD1=40 FM_RESOURCE_AVAIL_MB=3000
+  expect_code 2 "$RC" "critical exit with only secondmates recorded"
+  assert_contains "$OUT" "live crews 0 + 2 persistent secondmate(s)" \
+    "persistent secondmates must still be visible in the reading"
+  assert_not_contains "$OUT" "SHED" \
+    "a home whose only running agents are secondmates has nothing to shed"
+  pass "persistent secondmates alone never produce shed advice, however loaded the host"
 }
 
 test_sweep_without_the_backend_library_labels_its_count() {
@@ -659,6 +717,9 @@ test_live_crew_count_excludes_agents_that_are_not_running
 test_synchronous_reading_uses_the_cached_verdict
 test_synchronous_reading_never_probes_a_wedged_backend
 test_stale_cached_verdict_degrades_honestly
+test_cached_partial_verdict_stays_labelled_partial
+test_persistent_secondmates_are_counted_but_never_shed
+test_a_home_of_only_secondmates_never_advises_shedding
 test_sweep_without_the_backend_library_labels_its_count
 test_probe_timeout_leaves_no_stuck_backend_process
 test_sweep_probing_is_bounded_as_a_whole

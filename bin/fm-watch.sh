@@ -142,12 +142,17 @@ CHECK_TIMEOUT=${FM_CHECK_TIMEOUT:-30}     # seconds allowed per *.check.sh
 # fallback is logged once at startup so the condition is visible.
 # Mirror of bin/fm-resource-check.sh's RESOURCE_INTERVAL_DEFAULT, which is the
 # single source of truth for this number; keep the two in step.
+# The flag is kept separate from the offending value, because the case this
+# fallback exists for - a resolver that cannot run at all - yields an EMPTY
+# value, and an emptiness test would suppress exactly that log line.
 RESOURCE_INTERVAL_DEFAULT=900
-RESOURCE_INTERVAL_FELL_BACK=
-RESOURCE_INTERVAL=$("$SCRIPT_DIR/fm-resource-check.sh" --interval 2>/dev/null || printf '')
+RESOURCE_INTERVAL_FELL_BACK=0
+RESOURCE_INTERVAL_RAW=$("$SCRIPT_DIR/fm-resource-check.sh" --interval 2>/dev/null || printf '')
+RESOURCE_INTERVAL=$RESOURCE_INTERVAL_RAW
 case "$RESOURCE_INTERVAL" in
   ''|*[!0-9]*)
-    RESOURCE_INTERVAL_FELL_BACK=$RESOURCE_INTERVAL
+    RESOURCE_INTERVAL_FELL_BACK=1
+    [ -n "$RESOURCE_INTERVAL_RAW" ] || RESOURCE_INTERVAL_RAW='<empty>'
     RESOURCE_INTERVAL=$RESOURCE_INTERVAL_DEFAULT
     ;;
 esac
@@ -920,8 +925,8 @@ fm_pid_identity "$WATCHER_PID" > "$WATCH_LOCK/pid-identity" 2>/dev/null || true
 
 [ -e "$STATE/.last-heartbeat" ] || touch "$STATE/.last-heartbeat"
 
-[ -z "$RESOURCE_INTERVAL_FELL_BACK" ] || triage_log \
-  "host-resource cadence unresolved ('$RESOURCE_INTERVAL_FELL_BACK'), using default ${RESOURCE_INTERVAL}s"
+[ "$RESOURCE_INTERVAL_FELL_BACK" = 0 ] || triage_log \
+  "host-resource cadence unresolved ('$RESOURCE_INTERVAL_RAW'), using default ${RESOURCE_INTERVAL}s"
 
 while :; do
   # Self-eviction: if the singleton lock no longer names this process, a second
