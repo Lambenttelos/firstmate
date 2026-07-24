@@ -177,6 +177,40 @@ desk_title() {
     | desk_esc
 }
 
+# desk_show_field: the FULL value of a named tasks-axi field for one id, read
+# from `tasks-axi show <id> --full` so the desk never inherits the snapshot's
+# 60-char description truncation. Prints nothing when the record or field is
+# absent, so callers can fall back. The field value may be quoted and may carry
+# escaped newlines from the backend; collapse them to spaces for one-line cards.
+desk_show_field() {
+  local id="$1" field="$2"
+  (cd "$FM_HOME" 2>/dev/null && desk_bound tasks-axi show "$id" --full 2>/dev/null) \
+    | awk -v f="$field" '
+        $0 ~ "^[[:space:]]*" f ":" {
+          sub("^[[:space:]]*" f ":[[:space:]]*", "")
+          sub(/^"/, ""); sub(/"[[:space:]]*$/, "")
+          gsub(/\\n/, " "); gsub(/[[:space:]]+/, " ")
+          print; exit
+        }'
+}
+
+# desk_full_title / desk_full_reason: full title / hold reason for an id,
+# translated and escaped, falling back to the (possibly truncated) value the
+# snapshot already provided when the record cannot be read.
+desk_full_title() {
+  local id="$1" fallback="$2" full
+  full=$(desk_show_field "$id" title)
+  [ -n "$full" ] && { printf '%s' "$full" | desk_plain | desk_esc; return 0; }
+  desk_text "$fallback"
+}
+desk_full_reason() {
+  local id="$1" fallback="$2" full
+  full=$(desk_show_field "$id" hold_reason)
+  [ -n "$full" ] && [ "$full" != "-" ] && { printf '%s' "$full" | desk_plain | desk_esc; return 0; }
+  [ "$fallback" = "-" ] && return 0
+  desk_text "$fallback"
+}
+
 # desk_state: the captain-facing rendering of a recorded work state.
 desk_state() {
   case "$1" in
@@ -488,7 +522,7 @@ render_decisions() {
             <h3 class="card-title text-base">$(desk_title "$id")</h3>
             <span class="badge badge-warning badge-sm shrink-0">your call</span>
           </div>
-          <p class="text-sm opacity-80">$(desk_text "$summary")</p>
+          <p class="text-sm opacity-80">$(desk_full_reason "$id" "$summary")</p>
           <div class="text-xs opacity-50">$(desk_text "$owner")</div>
         </div>
       </div>
@@ -552,7 +586,7 @@ render_parked() {
       <div class="card bg-base-200/60">
         <div class="card-body py-4 gap-1">
           <h3 class="font-medium text-sm">$(desk_title "$id")</h3>
-          <p class="text-sm opacity-70">$(desk_text "$title") $(desk_text "$reason")</p>
+          <p class="text-sm opacity-70">$(desk_full_title "$id" "$title") $(desk_full_reason "$id" "$reason")</p>
           <p class="text-xs opacity-50">${waiting}</p>
         </div>
       </div>
@@ -578,7 +612,7 @@ render_finished() {
     cat <<HTML
       <li class="flex gap-3">
         <span class="badge badge-success badge-sm shrink-0 mt-0.5">closed</span>
-        <span><strong>$(desk_title "$id")</strong> &mdash; $(desk_text "$what")</span>
+        <span><strong>$(desk_title "$id")</strong> &mdash; $(desk_full_title "$id" "$what")</span>
       </li>
 HTML
   done
