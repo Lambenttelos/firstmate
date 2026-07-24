@@ -19,22 +19,21 @@
 # atomic (tmp + mv). Field values may not contain a tab or newline.
 
 FM_MERGE_QUEUE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=bin/fm-mutex-lib.sh
+. "$FM_MERGE_QUEUE_LIB_DIR/fm-mutex-lib.sh"
 
 # Serialize the read-modify-write in record/remove so two concurrent teardowns
-# cannot lose an entry. The lock primitives live in bin/fm-wake-lib.sh (one owner
-# for portable locking); it is sourced lazily so this leaf lib stays cheap for
-# read-only callers. A lock that cannot be taken within the bounded wait is not a
-# reason to drop a record: the write itself is atomic (tmp + mv), so proceed.
+# cannot lose an entry. The mutex primitives come from bin/fm-mutex-lib.sh, a leaf
+# lib with NO top-level side effects, so sourcing it never repoints a caller's
+# FM_ROOT, FM_HOME, or STATE. A lock that cannot be taken within the bounded wait
+# fails the record or remove: atomic writes do not prevent a lost update, and a
+# refused record is safer than a silently dropped entry.
 fm_merge_queue_lock_path() {
   printf '%s\n' "$1/.merge-queue.lock"
 }
 
 fm_merge_queue_lock() {
   local data_dir=$1 lock attempt=0
-  command -v fm_lock_try_acquire >/dev/null 2>&1 || {
-    # shellcheck source=bin/fm-wake-lib.sh
-    . "$FM_MERGE_QUEUE_LIB_DIR/fm-wake-lib.sh"
-  }
   lock=$(fm_merge_queue_lock_path "$data_dir")
   while [ "$attempt" -lt 100 ]; do
     if fm_lock_try_acquire "$lock"; then
@@ -101,8 +100,10 @@ fm_merge_queue_record() {
   done
   mkdir -p "$data_dir" || return 1
   file=$(fm_merge_queue_file "$data_dir")
-  local locked=0
-  fm_merge_queue_lock "$data_dir" && locked=1
+  fm_merge_queue_lock "$data_dir" || {
+    echo "merge-queue: could not take the queue lock; not recording $id" >&2
+    return 1
+  }
   tmp="$file.tmp.$$"
   {
     if [ -f "$file" ]; then
@@ -116,12 +117,13 @@ fm_merge_queue_record() {
     printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$id" "$project" "$branch" "$head" "$base" "$url"
   } > "$tmp" || {
     rm -f "$tmp"
-    [ "$locked" -eq 1 ] && fm_merge_queue_unlock "$data_dir"
+    fm_merge_queue_unlock "$data_dir"
     return 1
   }
-  mv "$tmp" "$file"
-  local rc=$?
-  [ "$locked" -eq 1 ] && fm_merge_queue_unlock "$data_dir"
+  local rc=0
+  mv "$tmp" "$file" || rc=$?
+  [ "$rc" -eq 0 ] || rm -f "$tmp"
+  fm_merge_queue_unlock "$data_dir"
   return "$rc"
 }
 
@@ -131,13 +133,41 @@ fm_merge_queue_remove() {
   fm_merge_queue_id_safe "$id" || return 1
   file=$(fm_merge_queue_file "$data_dir")
   [ -f "$file" ] || return 0
-  local locked=0
-  fm_merge_queue_lock "$data_dir" && locked=1
+  fm_merge_queue_lock "$data_dir" || {
+    echo "merge-queue: could not take the queue lock; not removing $id" >&2
+    return 1
+  }
   tmp="$file.tmp.$$"
-  fm_merge_queue_drop_id "$file" "$id" > "$tmp" || true
-  mv "$tmp" "$file"
-  local rc=$?
-  [ "$locked" -eq 1 ] && fm_merge_queue_unlock "$data_dir"
+  local had matched wrote rc=0
+  had=$(wc -l < "$file" 2>/dev/null | tr -d ' ')
+  matched=$(awk -F'\t' -v id="$id" '$1 == id' "$file" 2>/dev/null | wc -l | tr -d ' ')
+  fm_merge_queue_drop_id "$file" "$id" > "$tmp" || {
+    rm -f "$tmp"
+    fm_merge_queue_unlock "$data_dir"
+    echo "merge-queue: failed to rewrite the queue; kept it intact" >&2
+    return 1
+  }
+  # Never accept a short write: a truncated rewrite would erase every other queued
+  # branch, the one outcome this guard exists to prevent. The replacement must have
+  # exactly the lines the source had minus the ones belonging to this id.
+  wrote=$(wc -l < "$tmp" 2>/dev/null | tr -d ' ')
+  case "$had$matched$wrote" in
+    ''|*[!0-9]*)
+      rm -f "$tmp"
+      fm_merge_queue_unlock "$data_dir"
+      echo "merge-queue: could not verify the rewritten queue; kept it intact" >&2
+      return 1
+      ;;
+  esac
+  if [ "$wrote" -ne $((had - matched)) ]; then
+    rm -f "$tmp"
+    fm_merge_queue_unlock "$data_dir"
+    echo "merge-queue: refusing a short rewrite of the queue for $id" >&2
+    return 1
+  fi
+  mv "$tmp" "$file" || rc=$?
+  [ "$rc" -eq 0 ] || rm -f "$tmp"
+  fm_merge_queue_unlock "$data_dir"
   return "$rc"
 }
 
@@ -154,21 +184,27 @@ fm_merge_queue_branch_gone_from_origin() {
   [ "$rc" -eq 2 ]
 }
 
+# Distinct status for "cleared because origin no longer carries the branch, merge
+# NOT verified" so callers never report it as a confirmed merge.
+FM_MERGE_QUEUE_BRANCH_GONE=3
+
 # True when <branch>'s work (tip <head>) is confirmed merged into <base> on origin.
 # Repo-agnostic and safe for Bitbucket repos with no PR automation: it checks
 # content-in-base against the real base branch, never a PR-state lookup. Fetches the
 # base fresh, then accepts either head reachable from origin/<base> (ordinary merge)
 # or the branch introducing nothing origin/<base> lacks (squash/rebase merge). Any
 # inconclusive result (no origin, fetch failure, conflict) returns non-zero so the
-# entry is KEPT rather than cleared on an unverifiable claim.
+# entry is KEPT rather than cleared on an unverifiable claim. Returns 0 for a
+# confirmed merge, $FM_MERGE_QUEUE_BRANCH_GONE when only the branch-gone fallback
+# applies, and 1 otherwise.
 fm_merge_queue_branch_merged() {
   local project=$1 branch=$2 head=$3 base=$4 ref base_tree merged_tree
   [ -n "$project" ] && [ -d "$project" ] || return 1
   [ -n "$base" ] || return 1
   git -C "$project" remote get-url origin >/dev/null 2>&1 || return 1
   if ! git -C "$project" cat-file -e "$head^{commit}" 2>/dev/null; then
-    fm_merge_queue_branch_gone_from_origin "$project" "$branch"
-    return
+    fm_merge_queue_branch_gone_from_origin "$project" "$branch" || return 1
+    return "$FM_MERGE_QUEUE_BRANCH_GONE"
   fi
   git -C "$project" fetch --quiet origin "+refs/heads/$base:refs/remotes/origin/$base" >/dev/null 2>&1 || return 1
   ref="refs/remotes/origin/$base"

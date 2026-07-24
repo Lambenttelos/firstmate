@@ -58,10 +58,18 @@ case "$cmd" in
     removed=0
     while IFS='	' read -r id project branch head base url; do
       [ -n "$id" ] || continue
-      if fm_merge_queue_branch_merged "$project" "$branch" "$head" "$base"; then
-        fm_merge_queue_remove "$DATA" "$id"
-        echo "cleared: $id ($branch merged into $base)"
+      rc=0
+      fm_merge_queue_branch_merged "$project" "$branch" "$head" "$base" || rc=$?
+      case "$rc" in
+        0) reason="$branch merged into $base" ;;
+        "$FM_MERGE_QUEUE_BRANCH_GONE") reason="$branch gone from origin, merge unverified" ;;
+        *) continue ;;
+      esac
+      if fm_merge_queue_remove "$DATA" "$id"; then
+        echo "cleared: $id ($reason)"
         removed=$((removed + 1))
+      else
+        echo "kept: $id ($reason, but the queue could not be updated)" >&2
       fi
     done <<EOF
 $entries

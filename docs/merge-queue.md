@@ -64,6 +64,19 @@ or hand-edits the file.
   A network or authentication failure during that probe is inconclusive and keeps the
   entry, so the queue can neither clear on an unverifiable claim nor accumulate stale
   entries forever.
+  That fallback is reported with its own wording, `branch gone from origin, merge
+  unverified`, so it never reads as a confirmed merge.
+
+### Write safety
+
+Recording and removal take a queue-file mutex from `bin/fm-mutex-lib.sh`, a leaf lib
+with no top-level side effects, so taking a lock never repoints a caller's home.
+A lock that cannot be taken within the bounded wait fails the write instead of
+proceeding unlocked, because an unlocked read-modify-write can silently lose another
+task's entry.
+A removal that cannot produce exactly the source lines minus the removed id is
+refused and the queue is left intact, so a short or failed write can never erase the
+rest of the queue.
 
 ### Project-write boundary
 

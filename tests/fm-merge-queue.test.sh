@@ -16,6 +16,9 @@
 #   - task ids are matched literally, so a dotted id cannot clobber another entry
 #   - an entry whose head object is gone clears only when origin provably no longer
 #     carries the branch, and is kept on an inconclusive probe
+#   - a rewrite that would truncate the queue is refused, keeping the file intact
+#   - record and remove fail rather than proceed unlocked when the lock is held
+#   - a branch-gone sweep clears with distinct wording, never worded as a merge
 #   - compare-url builds github and bitbucket links and falls back for unknown hosts
 set -u
 
@@ -27,6 +30,13 @@ fm_git_identity fmtest fmtest@example.invalid
 . "$ROOT/bin/fm-merge-queue-lib.sh"
 CLI="$ROOT/bin/fm-merge-queue.sh"
 TMP_ROOT=$(fm_test_tmproot fm-merge-queue-tests)
+
+# Re-source the lib so a test that stubs one of its functions cannot leak that stub
+# into later tests.
+restore_lib() {
+  # shellcheck source=bin/fm-merge-queue-lib.sh disable=SC1091
+  . "$ROOT/bin/fm-merge-queue-lib.sh"
+}
 
 run_cli() {
   local data=$1; shift
@@ -197,6 +207,60 @@ test_sweep_keeps_when_origin_unreachable() {
   pass "sweep keeps an entry when the origin probe is inconclusive"
 }
 
+test_remove_refuses_short_rewrite() {
+  # A truncated rewrite would erase every other queued branch, the worst possible
+  # failure for a guard whose whole purpose is that nothing is forgotten.
+  local data="$TMP_ROOT/short/data"
+  mkdir -p "$data"
+  fm_merge_queue_record "$data" task-s1 /proj fm/s1 c1 main url-1
+  fm_merge_queue_record "$data" task-s2 /proj fm/s2 c2 main url-2
+  local before
+  before=$(cat "$data/merge-queue.tsv")
+  fm_merge_queue_drop_id() { printf ''; }
+  if fm_merge_queue_remove "$data" task-s1 2>/dev/null; then
+    restore_lib
+    fail "remove accepted a truncating rewrite"
+  fi
+  restore_lib
+  [ "$(cat "$data/merge-queue.tsv")" = "$before" ] || fail "queue was modified by a refused remove"
+  pass "remove refuses a short rewrite and keeps the queue intact"
+}
+
+test_lock_timeout_fails_closed() {
+  # An unlocked read-modify-write can lose an entry, so a lock that cannot be taken
+  # must fail the record and the remove rather than proceed racy.
+  local data="$TMP_ROOT/lock/data"
+  mkdir -p "$data"
+  fm_merge_queue_record "$data" task-l1 /proj fm/l1 c1 main url-l1
+  fm_merge_queue_lock() { return 1; }
+  if fm_merge_queue_record "$data" task-l2 /proj fm/l2 c2 main url-l2 2>/dev/null; then
+    restore_lib
+    fail "record proceeded without the lock"
+  fi
+  if fm_merge_queue_remove "$data" task-l1 2>/dev/null; then
+    restore_lib
+    fail "remove proceeded without the lock"
+  fi
+  restore_lib
+  run_cli "$data" list --raw | grep -F task-l1 >/dev/null || fail "existing entry lost by a refused write"
+  run_cli "$data" list --raw | grep -F task-l2 >/dev/null && fail "entry recorded despite a refused lock"
+  pass "record and remove fail closed when the queue lock cannot be taken"
+}
+
+test_sweep_branch_gone_wording_is_distinct() {
+  # Clearing because origin no longer carries the branch is NOT a verified merge and
+  # must never read like one.
+  local data="$TMP_ROOT/wording/data" repo="$TMP_ROOT/wording/repo" out
+  mkdir -p "$data" "$repo"
+  make_repo_with_pushed_branch "$repo" fm/word
+  git -C "$repo/origin.git" update-ref -d refs/heads/fm/word
+  fm_merge_queue_record "$data" task-w "$repo/clone" fm/word 0000000000000000000000000000000000000000 main url-w
+  out=$(run_cli "$data" sweep)
+  printf '%s\n' "$out" | grep -F 'merge unverified' >/dev/null || fail "branch-gone sweep missing distinct wording: $out"
+  printf '%s\n' "$out" | grep -F 'merged into' >/dev/null && fail "branch-gone sweep claimed a merge: $out"
+  pass "sweep reports a branch-gone clear distinctly from a verified merge"
+}
+
 test_compare_url_hosts() {
   local u
   u=$(fm_merge_queue_compare_url 'git@github.com:yjuyjuy/firstmate.git' main fm/x)
@@ -220,4 +284,7 @@ test_id_is_matched_literally
 test_sweep_clears_when_head_gone_and_branch_deleted
 test_sweep_keeps_when_head_gone_but_branch_alive
 test_sweep_keeps_when_origin_unreachable
+test_remove_refuses_short_rewrite
+test_lock_timeout_fails_closed
+test_sweep_branch_gone_wording_is_distinct
 test_compare_url_hosts

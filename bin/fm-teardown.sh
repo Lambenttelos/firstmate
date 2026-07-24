@@ -448,7 +448,10 @@ record_pushed_unmerged_to_merge_queue() {
   base=$(default_branch) || return 0
   remote=$(git -C "$WT" remote get-url origin 2>/dev/null) || return 0
   url=$(fm_merge_queue_compare_url "$remote" "$base" "$branch") || return 0
-  fm_merge_queue_record "$DATA" "$ID" "$PROJ" "$branch" "$head" "$base" "$url" || true
+  fm_merge_queue_record "$DATA" "$ID" "$PROJ" "$branch" "$head" "$base" "$url" || {
+    echo "teardown: WARNING could not record $branch in the merge queue; track it manually" >&2
+    return 0
+  }
 }
 
 backlog_refresh_reminder() {
