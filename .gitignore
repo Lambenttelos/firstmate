@@ -18,4 +18,5 @@ config/cmux-socket-password
 config/wedge-alarm
 config/secondmate-context-threshold
 config/herdr-presentation-spaces
+config/heavy-run-slots
 .codex/skills

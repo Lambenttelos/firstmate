@@ -1,0 +1,333 @@
+#!/usr/bin/env bash
+# Behavior tests for bin/fm-heavy-run.sh, the fleet's heavy-run serialization
+# point.
+#
+# The load these tests place on the host is deliberately tiny (short `sleep`s,
+# no suites), because the failure this script exists to prevent is exactly a
+# host thrashing under concurrent suite runs.
+#
+# The concurrency proofs are paired on purpose: serialization at ceiling 1 is
+# only meaningful next to observed overlap at ceiling 2, otherwise a runner that
+# never runs anything concurrently would pass the serialization test vacuously.
+set -u
+
+# shellcheck source=tests/lib.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+
+TMP_ROOT=$(fm_test_tmproot fm-heavy-run)
+HOME_DIR="$TMP_ROOT/home"
+mkdir -p "$HOME_DIR/state" "$HOME_DIR/config"
+QUEUE="$HOME_DIR/state/heavy-runs/q"
+HR="$ROOT/bin/fm-heavy-run.sh"
+
+export FM_STATE_OVERRIDE="$HOME_DIR/state"
+export FM_CONFIG_OVERRIDE="$HOME_DIR/config"
+# Poll fast and notice often so waiting states are observable within a test.
+export FM_HEAVY_POLL=0.2
+export FM_HEAVY_NOTICE=1
+
+# Processes started by a test must never outlive it, or a later test inherits a
+# held slot.
+STRAYS=()
+heavy_cleanup() {
+  local pid
+  for pid in "${STRAYS[@]:-}"; do
+    [ -n "$pid" ] && kill -9 "$pid" 2>/dev/null
+  done
+  fm_test_cleanup
+}
+trap heavy_cleanup EXIT
+
+# --- helpers ----------------------------------------------------------------
+
+status_field() {  # <key>
+  "$HR" --status 2>/dev/null | awk -F= -v k="$1" '$1 == k { print $2; exit }'
+}
+
+# wait_status <key> <value> <seconds>: poll --status until the field matches.
+wait_status() {
+  local key=$1 want=$2 limit=$3 i=0
+  while [ "$i" -lt "$((limit * 10))" ]; do
+    [ "$(status_field "$key")" = "$want" ] && return 0
+    sleep 0.1
+    i=$((i + 1))
+  done
+  return 1
+}
+
+# wait_pid_gone <pid> <seconds>
+wait_pid_gone() {
+  local pid=$1 limit=$2 i=0
+  while [ "$i" -lt "$((limit * 10))" ]; do
+    kill -0 "$pid" 2>/dev/null || return 0
+    sleep 0.1
+    i=$((i + 1))
+  done
+  return 1
+}
+
+reset_queue() {
+  rm -rf "$HOME_DIR/state/heavy-runs"
+  rm -f "$HOME_DIR/config/heavy-run-slots"
+  unset FM_HEAVY_SLOTS
+}
+
+# --- contract ---------------------------------------------------------------
+
+test_script_parses() {
+  local out rc
+  out=$(bash -n "$HR" 2>&1); rc=$?
+  expect_code 0 "$rc" "bash -n bin/fm-heavy-run.sh must parse cleanly (got: $out)"
+  pass "fm-heavy-run.sh: bash -n succeeds"
+}
+
+test_help_includes_entire_header() {
+  local help
+  help=$("$HR" --help)
+  assert_contains "$help" "WHY IT IS NOT THE RESOURCE GUARD." "--help lost the design rationale"
+  assert_contains "$help" "this header owns the mechanism." "--help truncated before the header's last line"
+  pass "fm-heavy-run.sh: --help renders the complete header"
+}
+
+test_usage_error_runs_nothing() {
+  local marker out rc
+  reset_queue
+  marker="$TMP_ROOT/never"
+  out=$("$HR" --max-wait 2>&1); rc=$?
+  expect_code 64 "$rc" "a flag with no value must be a usage error"
+  out=$("$HR" 2>&1); rc=$?
+  expect_code 64 "$rc" "no command must be a usage error"
+  assert_contains "$out" "no command given" "the usage error must say what was missing"
+  out=$("$HR" --status -- touch "$marker" 2>&1); rc=$?
+  expect_code 64 "$rc" "--status with a command must be a usage error"
+  assert_absent "$marker" "a usage error must never run the command"
+  pass "fm-heavy-run.sh: usage errors exit 64 and run nothing"
+}
+
+test_passes_through_output_and_status() {
+  local out rc
+  reset_queue
+  out=$("$HR" -- sh -c 'echo to-stdout; echo to-stderr >&2; exit 7' 2>&1); rc=$?
+  expect_code 7 "$rc" "the requester must receive the command's real exit status"
+  assert_contains "$out" "to-stdout" "the command's stdout must reach the requester"
+  assert_contains "$out" "to-stderr" "the command's stderr must reach the requester"
+  pass "fm-heavy-run.sh: the requester gets the run's real output and exit status"
+}
+
+# --- the ceiling ------------------------------------------------------------
+
+# Both jobs append start/end markers to one trace file. At ceiling 1 the trace
+# must be two complete, non-overlapping runs.
+run_trace_pair() {  # <trace-file>
+  local trace=$1
+  : > "$trace"
+  "$HR" --task alpha -- sh -c "echo start-alpha >> '$trace'; sleep 2; echo end-alpha >> '$trace'" &
+  local a=$!
+  "$HR" --task beta -- sh -c "echo start-beta >> '$trace'; sleep 2; echo end-beta >> '$trace'" &
+  local b=$!
+  wait "$a"
+  wait "$b"
+}
+
+test_ceiling_one_serializes() {
+  local trace first second
+  reset_queue
+  printf '1\n' > "$HOME_DIR/config/heavy-run-slots"
+  trace="$TMP_ROOT/trace-serial"
+  run_trace_pair "$trace"
+  [ "$(grep -c . "$trace")" -eq 4 ] || fail "expected 4 trace lines, got: $(cat "$trace")"
+  first=$(sed -n '1p' "$trace"); second=$(sed -n '2p' "$trace")
+  [ "start-${second#end-}" = "$first" ] \
+    || fail "ceiling 1 must not interleave runs; trace was:"$'\n'"$(cat "$trace")"
+  first=$(sed -n '3p' "$trace"); second=$(sed -n '4p' "$trace")
+  [ "start-${second#end-}" = "$first" ] \
+    || fail "ceiling 1 must not interleave runs; trace was:"$'\n'"$(cat "$trace")"
+  pass "fm-heavy-run.sh: two simultaneous requests serialize at ceiling 1"
+}
+
+test_ceiling_two_overlaps() {
+  local trace
+  reset_queue
+  printf '2\n' > "$HOME_DIR/config/heavy-run-slots"
+  trace="$TMP_ROOT/trace-parallel"
+  run_trace_pair "$trace"
+  case "$(sed -n '1p' "$trace")$(sed -n '2p' "$trace")" in
+    start-*start-*) : ;;
+    *) fail "ceiling 2 must let both runs start; trace was:"$'\n'"$(cat "$trace")" ;;
+  esac
+  pass "fm-heavy-run.sh: the ceiling is a real knob - at 2 both runs overlap"
+}
+
+test_malformed_ceiling_falls_back_to_one() {
+  local out
+  reset_queue
+  printf 'lots\n' > "$HOME_DIR/config/heavy-run-slots"
+  out=$("$HR" --slots 2>&1)
+  assert_contains "$out" "malformed heavy-run ceiling" "a malformed ceiling must warn"
+  [ "$("$HR" --slots 2>/dev/null)" = 1 ] || fail "a malformed ceiling must fall back to 1, not to a permissive value"
+  printf '0\n' > "$HOME_DIR/config/heavy-run-slots"
+  [ "$("$HR" --slots 2>/dev/null)" = 1 ] || fail "a below-floor ceiling must fall back to 1"
+  pass "fm-heavy-run.sh: an unusable ceiling falls back to the safest value"
+}
+
+# --- queue visibility -------------------------------------------------------
+
+test_status_shows_queue_depth_and_order() {
+  local holder first second status
+  reset_queue
+  printf '1\n' > "$HOME_DIR/config/heavy-run-slots"
+  "$HR" --task holder --label suite -- sleep 4 & holder=$!
+  STRAYS+=("$holder")
+  wait_status running 1 10 || fail "the holding run never showed as running"
+  "$HR" --task first -- true & first=$!
+  STRAYS+=("$first")
+  wait_status waiting 1 10 || fail "the first waiter never showed as waiting"
+  "$HR" --task second -- true & second=$!
+  STRAYS+=("$second")
+  wait_status waiting 2 10 || fail "the second waiter never showed as waiting"
+
+  status=$("$HR" --status)
+  assert_contains "$status" "ceiling=1" "--status must report the ceiling"
+  assert_contains "$status" "task=holder" "--status must name the running task"
+  assert_contains "$status" "label=suite" "--status must carry the run's label"
+  assert_contains "$status" "task=first position=1" "the earlier waiter must hold queue position 1"
+  assert_contains "$status" "task=second position=2" "the later waiter must queue behind it"
+
+  wait "$holder"; wait "$first"; wait "$second"
+  pass "fm-heavy-run.sh: --status shows the ceiling, the running run, and ordered queue depth"
+}
+
+test_waiter_reports_that_it_is_queued() {
+  local holder out
+  reset_queue
+  printf '1\n' > "$HOME_DIR/config/heavy-run-slots"
+  "$HR" --task holder -- sleep 3 & holder=$!
+  STRAYS+=("$holder")
+  wait_status running 1 10 || fail "the holding run never showed as running"
+  out=$("$HR" --task waiter -- true 2>&1)
+  assert_contains "$out" "queued: position 1" "a queued requester must say it is queued"
+  assert_contains "$out" "waiting, not hung" "a queued requester must distinguish itself from a hang"
+  wait "$holder"
+  pass "fm-heavy-run.sh: a waiting requester reports that it is queued, not hung"
+}
+
+test_max_wait_refuses_without_running() {
+  local holder marker rc out
+  reset_queue
+  printf '1\n' > "$HOME_DIR/config/heavy-run-slots"
+  marker="$TMP_ROOT/max-wait-ran"
+  "$HR" --task holder -- sleep 5 & holder=$!
+  STRAYS+=("$holder")
+  wait_status running 1 10 || fail "the holding run never showed as running"
+  out=$("$HR" --max-wait 1 -- touch "$marker" 2>&1); rc=$?
+  expect_code 75 "$rc" "an exceeded --max-wait must refuse with its own status"
+  assert_absent "$marker" "an exceeded --max-wait must never run the command unserialized"
+  assert_contains "$out" "--max-wait is 1s" "the refusal must name the limit it hit"
+  kill "$holder" 2>/dev/null
+  wait "$holder" 2>/dev/null || true
+  pass "fm-heavy-run.sh: --max-wait refuses rather than running unserialized"
+}
+
+# --- death and wedge safety -------------------------------------------------
+
+write_record() {  # <seq> <pid> <identity> <state>
+  mkdir -p "$QUEUE"
+  {
+    printf 'seq=%s\n' "$1"
+    printf 'pid=%s\n' "$2"
+    printf 'identity=%s\n' "$3"
+    printf 'state=%s\n' "$4"
+    printf 'started=%s\n' "$(date +%s)"
+    printf 'task=%s\n' fixture
+    printf 'label=-\n'
+    printf 'cmd=fixture\n'
+  } > "$(printf '%s/%012d.entry' "$QUEUE" "$1")"
+}
+
+test_dead_holder_does_not_wedge_the_queue() {
+  local dead rc
+  reset_queue
+  printf '1\n' > "$HOME_DIR/config/heavy-run-slots"
+  sh -c 'exit 0' & dead=$!
+  wait "$dead" 2>/dev/null || true
+  write_record 1 "$dead" "dead-holder-identity" running
+  "$HR" --max-wait 5 -- true; rc=$?
+  expect_code 0 "$rc" "a slot held by a dead process must be reclaimed, not wedged"
+  assert_absent "$(printf '%s/%012d.entry' "$QUEUE" 1)" "the dead holder's record must be removed"
+  pass "fm-heavy-run.sh: a run whose owner died frees its slot"
+}
+
+test_reap_removes_the_record_but_never_the_process() {
+  local victim rc
+  reset_queue
+  printf '1\n' > "$HOME_DIR/config/heavy-run-slots"
+  # A live process this script does not own, recorded under a stale identity -
+  # exactly the PID-reuse case. The record must go; the process must not.
+  sleep 20 & victim=$!
+  STRAYS+=("$victim")
+  write_record 1 "$victim" "identity-of-some-long-gone-process" running
+  "$HR" --max-wait 5 -- true; rc=$?
+  expect_code 0 "$rc" "a record whose PID was reused must not hold a slot"
+  assert_absent "$(printf '%s/%012d.entry' "$QUEUE" 1)" "the stale record must be removed"
+  kill -0 "$victim" 2>/dev/null || fail "reaping a record must never signal the process it names"
+  kill "$victim" 2>/dev/null
+  wait "$victim" 2>/dev/null || true
+  pass "fm-heavy-run.sh: reaping removes the record only, never the process behind it"
+}
+
+test_killed_waiter_does_not_wedge_the_queue() {
+  local holder waiter marker rc
+  reset_queue
+  printf '1\n' > "$HOME_DIR/config/heavy-run-slots"
+  marker="$TMP_ROOT/killed-waiter-ran"
+  "$HR" --task holder -- sleep 3 & holder=$!
+  STRAYS+=("$holder")
+  wait_status running 1 10 || fail "the holding run never showed as running"
+  "$HR" --task doomed -- touch "$marker" & waiter=$!
+  STRAYS+=("$waiter")
+  wait_status waiting 1 10 || fail "the doomed waiter never showed as waiting"
+  # SIGKILL leaves no chance to clean up, so only the liveness reap can free it.
+  # Nothing inspects the queue between here and the next run, so that reap is
+  # what the following request depends on.
+  kill -9 "$waiter" 2>/dev/null
+  wait_pid_gone "$waiter" 5 || fail "the doomed waiter did not die"
+  "$HR" --task after --max-wait 15 -- true; rc=$?
+  expect_code 0 "$rc" "a queue entry left by a killed waiter must not wedge later runs"
+  assert_absent "$marker" "a killed waiter's command must never run later on its behalf"
+  wait "$holder" 2>/dev/null || true
+  [ "$(status_field waiting)" = 0 ] || fail "the killed waiter's record must be gone"
+  pass "fm-heavy-run.sh: a crewmate killed while queued does not wedge the queue"
+}
+
+test_killed_requester_does_not_orphan_its_run() {
+  local requester child rc
+  reset_queue
+  printf '1\n' > "$HOME_DIR/config/heavy-run-slots"
+  "$HR" --task orphan-check -- sleep 30 & requester=$!
+  STRAYS+=("$requester")
+  wait_status running 1 10 || fail "the run never started"
+  child=$(pgrep -P "$requester" 2>/dev/null | head -n 1)
+  [ -n "$child" ] || fail "could not find the run's child process"
+  kill -TERM "$requester" 2>/dev/null
+  wait_pid_gone "$requester" 10 || fail "the requester ignored TERM"
+  wait_pid_gone "$child" 10 || fail "a terminated requester must take its run down, not orphan it"
+  wait_status running 0 10 || fail "the terminated requester's slot was never freed"
+  "$HR" --max-wait 5 -- true; rc=$?
+  expect_code 0 "$rc" "the freed slot must be usable again"
+  pass "fm-heavy-run.sh: a terminated requester takes its run down and frees its slot"
+}
+
+test_script_parses
+test_help_includes_entire_header
+test_usage_error_runs_nothing
+test_passes_through_output_and_status
+test_ceiling_one_serializes
+test_ceiling_two_overlaps
+test_malformed_ceiling_falls_back_to_one
+test_status_shows_queue_depth_and_order
+test_waiter_reports_that_it_is_queued
+test_max_wait_refuses_without_running
+test_dead_holder_does_not_wedge_the_queue
+test_reap_removes_the_record_but_never_the_process
+test_killed_waiter_does_not_wedge_the_queue
+test_killed_requester_does_not_orphan_its_run

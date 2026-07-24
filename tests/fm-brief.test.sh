@@ -410,6 +410,72 @@ test_scout_and_secondmate_scaffold() {
   pass "fm-brief: scout and secondmate code paths still scaffold well-formed briefs"
 }
 
+# The heavy-run serialization point only helps if crewmates actually route
+# through it, so the generated ship and scout briefs must carry the instruction.
+test_briefs_route_heavy_runs_through_the_runner() {
+  local home brief
+  home="$TMP_ROOT/heavy-run-home"
+  mkdir -p "$home/data"
+  FM_HOME="$home" "$ROOT/bin/fm-brief.sh" brief-heavy-ship some-proj >/dev/null 2>&1 \
+    || fail "fm-brief.sh ship scaffold exited non-zero"
+  brief="$home/data/brief-heavy-ship/brief.md"
+  assert_grep "bin/fm-heavy-run.sh --task brief-heavy-ship --" "$brief" \
+    "ship brief must route heavy runs through fm-heavy-run.sh with its own task id"
+  assert_grep "queued notice while you wait; that is normal, not a hang" "$brief" \
+    "ship brief must tell the crewmate a queued run is not a hang"
+
+  FM_HOME="$home" "$ROOT/bin/fm-brief.sh" brief-heavy-scout some-proj --scout >/dev/null 2>&1 \
+    || fail "fm-brief.sh scout scaffold exited non-zero"
+  brief="$home/data/brief-heavy-scout/brief.md"
+  assert_grep "bin/fm-heavy-run.sh --task brief-heavy-scout --" "$brief" \
+    "scout brief must route heavy runs through fm-heavy-run.sh too"
+  pass "fm-brief.sh: ship and scout briefs route heavy runs through the serialization point"
+}
+
+# These four standing captain rules used to exist only as hand-typed steers, so a
+# freshly spawned crewmate never saw them. They must be structural in the scaffold.
+test_briefs_bind_the_shared_machine_rules() {
+  local home brief kind
+  home="$TMP_ROOT/shared-machine-home"
+  mkdir -p "$home/data"
+  for kind in ship scout; do
+    if [ "$kind" = ship ]; then
+      FM_HOME="$home" "$ROOT/bin/fm-brief.sh" brief-rules-ship some-proj >/dev/null 2>&1 \
+        || fail "fm-brief.sh ship scaffold exited non-zero"
+      brief="$home/data/brief-rules-ship/brief.md"
+    else
+      FM_HOME="$home" "$ROOT/bin/fm-brief.sh" brief-rules-scout some-proj --scout >/dev/null 2>&1 \
+        || fail "fm-brief.sh scout scaffold exited non-zero"
+      brief="$home/data/brief-rules-scout/brief.md"
+    fi
+    assert_grep 'VITEST_MAX_WORKERS=2' "$brief" \
+      "$kind brief must cap test parallelism at 2 workers"
+    assert_no_grep 'VITEST_MAX_WORKERS=4' "$brief" \
+      "$kind brief must never emit the 4-worker cap"
+    assert_grep 'working: TEST START' "$brief" \
+      "$kind brief must require a TEST START announcement"
+    assert_grep 'working: TEST END' "$brief" \
+      "$kind brief must require a TEST END announcement"
+    assert_grep 'TWO live browser reproductions' "$brief" \
+      "$kind brief must state the fleet-wide two-browser ceiling"
+    assert_grep 'working: BROWSER WAIT' "$brief" \
+      "$kind brief must make the crewmate wait for a browser go-ahead"
+    assert_grep 'working: BROWSER END' "$brief" \
+      "$kind brief must release the browser slot when the run finishes"
+  done
+
+  brief="$home/data/brief-rules-ship/brief.md"
+  assert_grep '# Test coverage declaration' "$brief" \
+    "ship brief must carry the coverage declaration section"
+  assert_grep 'built this change test-first' "$brief" \
+    "ship brief must require a test-first statement in the final report"
+  assert_grep 'end-to-end coverage' "$brief" \
+    "ship brief must require an end-to-end coverage statement"
+  assert_grep 'does not block the merge' "$brief" \
+    "a declared coverage gap must be stated, not treated as a merge blocker"
+  pass "fm-brief.sh: ship and scout briefs bind the shared-machine and coverage rules"
+}
+
 test_script_parses
 test_help_includes_entire_header
 test_ship_modes_generate_clean_briefs
@@ -426,3 +492,5 @@ test_secondmate_no_projects_charter
 test_pause_verb_override_renders_all_brief_scaffolds
 test_scout_and_secondmate_load_decision_hold_policy
 test_scout_and_secondmate_scaffold
+test_briefs_route_heavy_runs_through_the_runner
+test_briefs_bind_the_shared_machine_rules
