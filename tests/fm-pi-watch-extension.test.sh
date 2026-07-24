@@ -684,6 +684,72 @@ EOF
   pass "Pi late unretired closes resume classified supervision"
 }
 
+test_pi_tick_close_is_benign_and_keeps_continuity() {
+  local repo home plugin log stop out status
+  repo="$TMP_ROOT/pi-tick-close-root"
+  home="$TMP_ROOT/pi-tick-close-home"
+  log="$TMP_ROOT/pi-tick-close.log"
+  stop="$TMP_ROOT/pi-tick-close.stop"
+  mkdir -p "$repo/bin" "$home/state" "$home/config"
+  install_pi_watch_extension_fixture "$repo"
+  plugin="$repo/.pi/extensions/fm-primary-pi-watch.ts"
+  cat > "$repo/bin/fm-watch-arm.sh" <<'SH'
+#!/usr/bin/env bash
+printf 'arm=%s predecessor=%s\n' "$$" "${FM_WATCH_PREDECESSOR_ARM_PID:-none}" >> "${FM_ARM_LOG:?}"
+count=$(wc -l < "$FM_ARM_LOG" | tr -d '[:space:]')
+printf 'watcher: started pid=%s (beacon fresh)\n' "$$"
+if [ "$count" -eq 1 ]; then
+  printf 'tick: watcher absorbed a benign wake\n'
+  exit 0
+fi
+trap 'exit 0' TERM INT
+while [ ! -e "$FM_STOP_FILE" ]; do sleep 0.02; done
+SH
+  chmod +x "$repo/bin/fm-watch-arm.sh"
+  out=$(PLUGIN="$plugin" FM_HOME="$home" FM_ROOT_OVERRIDE="$repo" FM_ARM_LOG="$log" FM_STOP_FILE="$stop" node --input-type=module 2>&1 <<'EOF'
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+let tool = null;
+const messages = [];
+const pi = {
+  on() {},
+  registerCommand() {},
+  registerTool(candidate) {
+    if (candidate.name === "fm_watch_arm_pi") tool = candidate;
+  },
+  sendUserMessage: async (content) => {
+    messages.push(String(content));
+  },
+};
+writeFileSync(`${process.env.FM_HOME}/state/.lock`, `${process.pid}\n`);
+const mod = await import(pathToFileURL(process.env.PLUGIN).href);
+mod.default(pi);
+await tool.execute("tool-call-tick", {}, undefined, undefined, {});
+for (let i = 0; i < 250; i += 1) {
+  const rows = existsSync(process.env.FM_ARM_LOG)
+    ? readFileSync(process.env.FM_ARM_LOG, "utf8").trim().split("\n")
+    : [];
+  if (rows.length >= 2 && messages.length >= 1) break;
+  await new Promise((resolve) => setTimeout(resolve, 10));
+}
+const rows = readFileSync(process.env.FM_ARM_LOG, "utf8").trim().split("\n");
+if (rows.length !== 2) throw new Error(`tick close broke continuity: ${rows.join(" | ")}`);
+if (messages.length !== 1) throw new Error(`expected one delivered tick, got ${messages.length}`);
+if (!/tick: watcher absorbed a benign wake/.test(messages[0])) throw new Error(`tick text was not delivered: ${messages[0]}`);
+if (/FAILED/.test(messages[0])) throw new Error(`tick close reported a failure: ${messages[0]}`);
+if (/fm-wake-drain\.sh/.test(messages[0])) throw new Error(`tick prompt must not order a drain: ${messages[0]}`);
+if (!/single literal word tick/.test(messages[0])) throw new Error(`tick prompt must ask for the tick reply: ${messages[0]}`);
+writeFileSync(process.env.FM_STOP_FILE, "stop\n");
+process.exit(0);
+EOF
+  )
+  status=$?
+  expect_code 0 "$status" "Pi tick close must be benign and keep continuity"
+  [ -z "$out" ] || fail "Pi tick-close test printed output: $out"
+  pass "Pi tick close delivers the tick and re-arms without a failure"
+}
+
 test_pi_empty_close_retries_instead_of_disappearing() {
   local repo home plugin log stop out status
   repo="$TMP_ROOT/pi-empty-close-root"
@@ -1777,6 +1843,145 @@ EOF
   pass "OpenCode late unretired closes resume classified supervision"
 }
 
+test_opencode_tick_close_is_benign_and_keeps_continuity() {
+  local plugin repo home log stop out status
+  plugin="$ROOT/.opencode/plugins/fm-primary-watch-arm.js"
+  repo="$TMP_ROOT/opencode-tick-close-root"
+  home="$TMP_ROOT/opencode-tick-close-home"
+  log="$TMP_ROOT/opencode-tick-close.log"
+  stop="$TMP_ROOT/opencode-tick-close.stop"
+  mkdir -p "$repo/bin" "$home/state" "$home/config"
+  git init -q "$repo"
+  : > "$repo/AGENTS.md"
+  : > "$home/state/task.meta"
+  cat > "$repo/bin/fm-watch-arm.sh" <<'SH'
+#!/usr/bin/env bash
+printf 'arm=%s predecessor=%s\n' "$$" "${FM_WATCH_PREDECESSOR_ARM_PID:-none}" >> "${FM_ARM_LOG:?}"
+count=$(wc -l < "$FM_ARM_LOG" | tr -d '[:space:]')
+printf 'watcher: started pid=%s (beacon fresh)\n' "$$"
+if [ "$count" -eq 1 ]; then
+  printf 'tick: watcher absorbed a benign wake\n'
+  exit 0
+fi
+trap 'exit 0' TERM INT
+while [ ! -e "$FM_STOP_FILE" ]; do sleep 0.02; done
+SH
+  chmod +x "$repo/bin/fm-watch-arm.sh"
+  out=$(PLUGIN="$plugin" WORKTREE="$repo" FM_HOME="$home" FM_ARM_LOG="$log" FM_STOP_FILE="$stop" node 2>&1 <<'EOF'
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+const mod = await import(pathToFileURL(process.env.PLUGIN).href);
+const prompts = [];
+const client = {
+  session: {
+    promptAsync: async (request) => {
+      prompts.push(JSON.stringify(request));
+    },
+  },
+};
+const hooks = await mod.FmPrimaryWatchArm({
+  client,
+  directory: process.env.WORKTREE,
+  worktree: process.env.WORKTREE,
+});
+const event = { event: { type: "session.idle", properties: { sessionID: "session-test" } } };
+writeFileSync(`${process.env.FM_HOME}/state/.lock`, `${process.pid}\n`);
+await hooks.event(event);
+for (let i = 0; i < 250; i += 1) {
+  const rows = existsSync(process.env.FM_ARM_LOG)
+    ? readFileSync(process.env.FM_ARM_LOG, "utf8").trim().split("\n")
+    : [];
+  if (rows.length >= 2 && prompts.length >= 1) break;
+  await new Promise((resolve) => setTimeout(resolve, 10));
+}
+const rows = readFileSync(process.env.FM_ARM_LOG, "utf8").trim().split("\n");
+if (rows.length !== 2) throw new Error(`tick close broke continuity: ${rows.join(" | ")}`);
+if (prompts.length !== 1) throw new Error(`expected one delivered tick, got ${prompts.length}`);
+if (!/tick: watcher absorbed a benign wake/.test(prompts[0])) throw new Error(`tick text was not delivered: ${prompts[0]}`);
+if (/FAILED/.test(prompts[0])) throw new Error(`tick close reported a failure: ${prompts[0]}`);
+if (/fm-wake-drain\.sh/.test(prompts[0])) throw new Error(`tick prompt must not order a drain: ${prompts[0]}`);
+if (!/single literal word tick/.test(prompts[0])) throw new Error(`tick prompt must ask for the tick reply: ${prompts[0]}`);
+writeFileSync(process.env.FM_STOP_FILE, "stop\n");
+EOF
+  )
+  status=$?
+  [ "$status" -eq 0 ] || fail "OpenCode tick close must be benign and keep continuity: $out"
+  [ -z "$out" ] || fail "OpenCode tick-close test printed output: $out"
+  pass "OpenCode tick close delivers the tick and re-arms without a failure"
+}
+
+# The streaming observer must classify a tick exactly like the close handler does:
+# a successor arm whose only streamed line is a tick counts as ready, so continuity
+# is verified without a spurious "could not verify a ready successor" failure.
+test_opencode_streamed_tick_counts_as_ready() {
+  local plugin repo home log stop out status
+  plugin="$ROOT/.opencode/plugins/fm-primary-watch-arm.js"
+  repo="$TMP_ROOT/opencode-tick-stream-root"
+  home="$TMP_ROOT/opencode-tick-stream-home"
+  log="$TMP_ROOT/opencode-tick-stream.log"
+  stop="$TMP_ROOT/opencode-tick-stream.stop"
+  mkdir -p "$repo/bin" "$home/state" "$home/config"
+  git init -q "$repo"
+  : > "$repo/AGENTS.md"
+  : > "$home/state/task.meta"
+  cat > "$repo/bin/fm-watch-arm.sh" <<'SH'
+#!/usr/bin/env bash
+printf 'arm=%s predecessor=%s\n' "$$" "${FM_WATCH_PREDECESSOR_ARM_PID:-none}" >> "${FM_ARM_LOG:?}"
+count=$(wc -l < "$FM_ARM_LOG" | tr -d '[:space:]')
+if [ "$count" -eq 1 ]; then
+  printf 'watcher: started pid=%s (beacon fresh)\n' "$$"
+  printf 'tick: watcher absorbed a benign wake\n'
+  exit 0
+fi
+if [ "$count" -eq 2 ]; then
+  printf 'tick: successor watcher absorbed a benign wake\n'
+fi
+trap 'exit 0' TERM INT
+while [ ! -e "$FM_STOP_FILE" ]; do sleep 0.02; done
+SH
+  chmod +x "$repo/bin/fm-watch-arm.sh"
+  out=$(PLUGIN="$plugin" WORKTREE="$repo" FM_HOME="$home" FM_ARM_LOG="$log" FM_STOP_FILE="$stop" node 2>&1 <<'EOF'
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+const mod = await import(pathToFileURL(process.env.PLUGIN).href);
+const prompts = [];
+const client = {
+  session: {
+    promptAsync: async (request) => {
+      prompts.push(JSON.stringify(request));
+    },
+  },
+};
+const hooks = await mod.FmPrimaryWatchArm({
+  client,
+  directory: process.env.WORKTREE,
+  worktree: process.env.WORKTREE,
+});
+const event = { event: { type: "session.idle", properties: { sessionID: "session-test" } } };
+writeFileSync(`${process.env.FM_HOME}/state/.lock`, `${process.pid}\n`);
+await hooks.event(event);
+for (let i = 0; i < 250; i += 1) {
+  const rows = existsSync(process.env.FM_ARM_LOG)
+    ? readFileSync(process.env.FM_ARM_LOG, "utf8").trim().split("\n")
+    : [];
+  if (rows.length >= 2 && prompts.length >= 1) break;
+  await new Promise((resolve) => setTimeout(resolve, 10));
+}
+const rows = readFileSync(process.env.FM_ARM_LOG, "utf8").trim().split("\n");
+if (rows.length !== 2) throw new Error(`streamed tick broke continuity: ${rows.join(" | ")}`);
+if (prompts.length !== 1) throw new Error(`expected one delivered tick, got ${prompts.length}`);
+if (/FAILED/.test(prompts[0])) throw new Error(`streamed tick was not accepted as ready: ${prompts[0]}`);
+writeFileSync(process.env.FM_STOP_FILE, "stop\n");
+EOF
+  )
+  status=$?
+  [ "$status" -eq 0 ] || fail "OpenCode streaming observer must accept a tick as ready: $out"
+  [ -z "$out" ] || fail "OpenCode streamed-tick test printed output: $out"
+  pass "OpenCode streaming observer and close handler agree on a tick"
+}
+
 test_opencode_empty_close_retries_instead_of_disappearing() {
   local plugin repo home log stop out status
   plugin="$ROOT/.opencode/plugins/fm-primary-watch-arm.js"
@@ -2115,6 +2320,7 @@ test_pi_actionable_close_starts_single_successor_before_delivery
 test_pi_hung_successor_falls_back_to_typed_wake
 test_pi_unretired_successor_falls_back_without_retry
 test_pi_late_unretired_close_resumes_supervision
+test_pi_tick_close_is_benign_and_keeps_continuity
 test_pi_empty_close_retries_instead_of_disappearing
 test_pi_established_empty_close_honors_retry_limit
 test_pi_actionable_close_rechecks_session_lock
@@ -2134,6 +2340,8 @@ test_opencode_pre_ready_actionable_close_preserves_its_successor
 test_opencode_hung_successor_falls_back_to_typed_wake
 test_opencode_unretired_successor_falls_back_without_retry
 test_opencode_late_unretired_close_resumes_supervision
+test_opencode_tick_close_is_benign_and_keeps_continuity
+test_opencode_streamed_tick_counts_as_ready
 test_opencode_empty_close_retries_instead_of_disappearing
 test_opencode_established_empty_close_honors_retry_limit
 test_opencode_actionable_close_rechecks_session_lock

@@ -35,6 +35,10 @@ An actionable child output returns that reason normally.
 A zero/empty child return rechecks the home lock and beacon, attaches to a verified healthy successor when one exists, or emits `watcher: FAILED - cycle ended without an actionable reason` and exits nonzero.
 An attached arm follows verified identity-matched successors and reports the same typed failure if that chain ends without one.
 
+A started child may instead close with a `tick:` line, the env-gated proof-of-life exit described under [Absorbed-wake proof-of-life tick](#absorbed-wake-proof-of-life-tick).
+The arm layer classifies that close as a benign completion: it prints the line, records `reason=tick` in the cycle ledger, and returns success, distinct from both an actionable wake and the empty-cycle failure.
+A tick only ever reaches the session through the owning arm that captured the child's output; an arm merely attached to another home's watcher cannot read that output and just follows the cycle boundary as usual.
+
 The arm layer appends one tab-separated record per observed cycle to `state/.watch-cycle-exits.log`.
 Each record includes arm and watcher PIDs, start and end timestamps, exit code and signal, classified reason, beacon age, lock identity before and after close, and successor disposition.
 The file is size-capped through `FM_WATCH_CYCLE_LOG_MAX_BYTES` and `FM_WATCH_CYCLE_LOG_KEEP_LINES`.
@@ -43,10 +47,38 @@ The file is size-capped through `FM_WATCH_CYCLE_LOG_MAX_BYTES` and `FM_WATCH_CYC
 The default 300-second grace is unchanged.
 Only the watcher process touches `state/.last-watcher-beat`; no helper process can make a wedged watcher appear healthy.
 
+## Absorbed-wake proof-of-life tick
+
+By default the watcher absorbs a benign wake silently: it advances the wake's suppressor, logs one line to `state/.watch-triage.log`, and keeps blocking without exiting.
+From the supervising session's view an absorbed wake and a dead watcher are then indistinguishable, because both produce no cycle close.
+
+`FM_WATCH_ABSORB_TICK` makes that liveness provable, and ships default off.
+`docs/configuration.md` owns the knob's default and precedence; this section owns the mechanism.
+When it is unset or any value other than `1`, behavior is byte-identical to today.
+When it is `1`, a benign-absorbed wake ends the cycle with a distinguishable `tick: <note>` reason line and a zero exit instead of absorbing silently.
+
+A tick is deliberately cheap and safe:
+
+- It enqueues no durable wake record, so `bin/fm-wake-drain.sh` finds nothing, and neither the continuity guard nor the turn-end guard sees any actionable work.
+  A tick ends the cycle, but it fires only while work is under way, which is exactly the state in which the turn-end guard already requires a healthy watcher and forces a re-arm, so no guard needs to know about the knob and none was changed.
+  A signal presupposes a task, and the absorbed-heartbeat site gates on the same in-flight count the guards use (`fm_supervision_status`), so the watcher and the guards cannot disagree about what "work under way" means.
+  With nothing in flight the watcher keeps absorbing silently and never exits, self-sustaining exactly as it did before this knob existed.
+- `bin/fm-watch-arm.sh` classifies the `tick:` close as a benign completion, separate from an actionable wake (`signal:`/`stale:`/`check:`/`heartbeat`) and from a failure (nonzero exit), so a live-but-quiet watcher never reads as the empty-cycle failure.
+- It fires at most once per absorbed-wake event, never once per poll.
+  Only two absorb points emit it, and both first advance their suppression state so the same event cannot re-fire: a benign signal whose `.seen-*` signature is written, and an absorbed heartbeat whose schedule and exponential backoff are advanced.
+  Per-poll re-evaluations of an unchanged or churning stale pane deliberately do not tick, so a static or redrawing fleet cannot storm.
+
+On a tick-enabled home the standing convention is a single literal `tick` reply: the session wakes on the proof-of-life close, sees the tick, answers `tick`, and re-arms the watcher exactly as it would after any cycle close.
+The heartbeat's backoff bounds the quiet-fleet cadence (base `FM_HEARTBEAT`, doubling to `FM_HEARTBEAT_MAX`), so a quiet-but-supervised fleet ticks on that lengthening interval rather than continuously.
+Verified for the Claude native tracked-background path; the Pi, OpenCode, Codex, and Grok adapters are inert while the knob is off.
+The Pi extension and the OpenCode plugin classify a clean tick-only close as a third benign category of their own, mirroring the arm layer's precedence (an actionable line always wins), so they re-arm and deliver the tick text instead of reporting a cycle failure; a clean close with no reason line at all still takes the typed empty-cycle failure path.
+Both deliver a tick under its own minimal prompt, which states that nothing is queued, orders no wake drain, and asks only for the single literal `tick` reply; OpenCode's streaming observer classifies a tick the same way its close handler does, so a streamed tick counts as a ready successor rather than disagreeing with the close.
+
 ## Regression coverage
 
-`tests/fm-pi-watch-extension.test.sh` checks Pi's first-cycle-or-explicit-repair tool metadata and ownership-based redundant-call no-ops, then simulates actionable and empty child closes against the actual Pi and OpenCode close handlers, blocks prompt delivery to prove the successor launches first, verifies single-flight behavior, changes the session lock before close to prove ownership is rechecked, and hangs each successor arm to prove bounded fallback delivery includes the typed restoration failure.
-`tests/fm-watcher-lock.test.sh` covers verified-successor attach, the typed self-eviction failure, bounded and successor-linked lifecycle rows, and a SIGSTOP counterfactual that distinguishes a live PID from a stale beacon before classifying termination.
+`tests/fm-pi-watch-extension.test.sh` checks Pi's first-cycle-or-explicit-repair tool metadata and ownership-based redundant-call no-ops, then simulates actionable, tick-only, and empty child closes against the actual Pi and OpenCode close handlers, proving a tick-only close is delivered as a benign completion with continuity intact rather than as a cycle failure, that its prompt is the minimal no-drain tick form in both adapters, and that OpenCode's streaming observer accepts a tick-only successor as ready, blocks prompt delivery to prove the successor launches first, verifies single-flight behavior, changes the session lock before close to prove ownership is rechecked, and hangs each successor arm to prove bounded fallback delivery includes the typed restoration failure.
+`tests/fm-watcher-lock.test.sh` covers verified-successor attach, the typed self-eviction failure, bounded and successor-linked lifecycle rows, a SIGSTOP counterfactual that distinguishes a live PID from a stale beacon before classifying termination, and the arm layer's tick classification: a clean tick-only close returns success, prints the tick line, and is recorded as `reason=tick`, while a clean close with no reason line at all still takes the typed empty-cycle failure path with the knob on.
+`tests/fm-watch-triage.test.sh` covers the watcher side of the proof-of-life tick: with `FM_WATCH_ABSORB_TICK` unset a benign-absorbed wake stays silent and blocking, with the knob on a benign signal and a no-change heartbeat each end the cycle with exactly one `tick:` line and no durable wake record while the heartbeat still backs off its cadence, an idle home with nothing under way never ticks, and an actionable wake is still surfaced and queued rather than ticked.
 `tests/fm-continuity-pretool-check.test.sh` proves the Claude gate rejects only non-recovery fleet execution in the precise unhealthy state and preserves the existing Stop registration.
 
 ## Sanitized live evidence, 2026-07-17

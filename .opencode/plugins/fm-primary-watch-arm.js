@@ -171,6 +171,10 @@ function classifyArmClose(stdout, stderr, code, signal) {
   const combined = `${stdout}\n${stderr}`;
   const reason = combined.split(/\r?\n/).find((line) => /^(signal:|stale:|check:|heartbeat($|:))/.test(line));
   if (reason) return { kind: "actionable", message: reason };
+  if (!signal && (code ?? 0) === 0) {
+    const tick = combined.split(/\r?\n/).find((line) => /^tick:/.test(line));
+    if (tick) return { kind: "tick", message: tick };
+  }
   const healthy = combined.split(/\r?\n/).find((line) => /^watcher: healthy\b/.test(line));
   if (healthy) {
     return {
@@ -205,6 +209,11 @@ function observeArmOutput(stdout, stderr, settleReadiness) {
     settleReadiness("wake");
     return;
   }
+  if (combined.split(/\r?\n/).some((line) => /^tick:/.test(line))) {
+    setArmStatus("wake");
+    settleReadiness("wake");
+    return;
+  }
   if (combined.split(/\r?\n/).some((line) => /^watcher: (?:started|attached)\b/.test(line))) {
     setArmStatus("armed");
     settleReadiness("armed");
@@ -233,6 +242,10 @@ async function sendPrompt(paths, client, sessionID, text) {
 
 function wakePrompt(reason) {
   return `WATCHER FIRED - drain queued wakes with bin/fm-wake-drain.sh and handle the reported wake. Watcher continuity is plugin-owned.\n\n${reason}`;
+}
+
+function tickPrompt(reason) {
+  return `WATCHER TICK - the watcher absorbed a benign wake while alive. Nothing is queued, so do not drain. Reply with the single literal word tick. Watcher continuity is plugin-owned.\n\n${reason}`;
 }
 
 function surfaceFailure(paths, client, sessionID, reason) {
@@ -370,9 +383,10 @@ function spawnArm(paths, sessionID, client, predecessorArmPid = "") {
     resolveClosed();
     releaseChild();
     const classification = classifyArmClose(stdout, stderr, code, signal);
-    settleReadiness(classification.kind === "actionable" ? "wake" : "failed");
+    const benignClose = classification.kind === "actionable" || classification.kind === "tick";
+    settleReadiness(benignClose ? "wake" : "failed");
     const predecessor = String(armChild.pid ?? "");
-    if (classification.kind === "actionable") {
+    if (benignClose) {
       retryFailures = 0;
       setArmStatus("wake");
       const previousRestoration = restorationInFlight;
@@ -383,7 +397,8 @@ function spawnArm(paths, sessionID, client, predecessorArmPid = "") {
       void restoration.then((failure) => {
         if (restorationInFlight === restoration) restorationInFlight = null;
         const message = failure ? `${classification.message}\n\n${failure}` : classification.message;
-        return sendPrompt(paths, client, sessionID, wakePrompt(message));
+        const prompt = classification.kind === "tick" && !failure ? tickPrompt(message) : wakePrompt(message);
+        return sendPrompt(paths, client, sessionID, prompt);
       }).catch(() => {
       });
       return;

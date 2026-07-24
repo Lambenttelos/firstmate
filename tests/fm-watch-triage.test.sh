@@ -1537,6 +1537,106 @@ test_secondmate_unknown_context_fails_closed() {
   pass "an unreadable (non-claude) secondmate context never wakes (fails closed)"
 }
 
+# --- FM_WATCH_ABSORB_TICK proof-of-life tick ---------------------------------
+# Default OFF: a benign-absorbed wake stays silent and blocking (byte-identical).
+# ON: a benign-absorbed wake ends the cycle with a distinguishable "tick:" line and
+# no durable wake record; actionable wakes are unchanged.
+
+test_absorb_tick_off_is_silent() {
+  local dir state fakebin out pid
+  dir=$(make_case absorb-tick-off); state="$dir/state"; fakebin="$dir/fakebin"; out="$dir/watch.out"
+  printf 'working: compiling step 2\n' > "$state/task.status"
+  export FM_FAKE_CREW_STATE='state: working · source: run-step · validating (running)'
+  # Knob unset (default off): the provably-working signal must be absorbed silently -
+  # the watcher stays alive, prints nothing, and never emits a tick.
+  watch_bg "$state" "$fakebin" "$out"
+  pid=$!
+  i=0
+  while [ "$i" -lt 40 ]; do
+    kill -0 "$pid" 2>/dev/null || { reap "$pid"; fail "watcher exited with the tick knob off (should absorb silently): $(cat "$out")"; }
+    [ -s "$state/.seen-task_status" ] && break
+    sleep 0.1; i=$((i + 1))
+  done
+  [ -s "$state/.seen-task_status" ] || { reap "$pid"; fail "knob-off benign signal did not advance its suppressor"; }
+  [ ! -s "$out" ] || { reap "$pid"; fail "knob-off benign signal printed output (expected silence): $(cat "$out")"; }
+  [ ! -s "$state/.wake-queue" ] || { reap "$pid"; fail "knob-off benign signal enqueued a wake record"; }
+  reap "$pid"
+  pass "with FM_WATCH_ABSORB_TICK unset a benign-absorbed signal stays silent and blocking (byte-identical)"
+}
+
+test_absorb_tick_on_signal_emits_one_tick() {
+  local dir state fakebin out drain_out pid
+  dir=$(make_case absorb-tick-signal); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; drain_out="$dir/drain.out"
+  printf 'working: compiling step 2\n' > "$state/task.status"
+  export FM_FAKE_CREW_STATE='state: working · source: run-step · validating (running)'
+  watch_bg "$state" "$fakebin" "$out" env FM_WATCH_ABSORB_TICK=1
+  pid=$!
+  wait_for_exit "$pid" 40 || { reap "$pid"; fail "tick-enabled watcher did not end the cycle for a benign signal: $(cat "$out")"; }
+  grep -Eq '^tick:' "$out" || fail "tick-enabled benign signal did not print a tick reason: $(cat "$out")"
+  grep -Eq '^(signal:|stale:|check:|heartbeat)' "$out" && fail "a tick was misclassified as an actionable wake: $(cat "$out")"
+  [ -s "$state/.seen-task_status" ] || fail "tick-enabled benign signal did not advance its suppressor"
+  [ ! -s "$state/.wake-queue" ] || fail "a proof-of-life tick enqueued a durable wake record"
+  FM_STATE_OVERRIDE="$state" "$DRAIN" > "$drain_out" 2>/dev/null || fail "drain after a tick failed"
+  [ ! -s "$drain_out" ] || fail "a tick left a record for the wake drain to surface: $(cat "$drain_out")"
+  pass "with FM_WATCH_ABSORB_TICK=1 a benign signal ends the cycle with one tick and no wake record"
+}
+
+test_absorb_tick_on_heartbeat_emits_tick() {
+  local dir state fakebin out pid
+  dir=$(make_case absorb-tick-heartbeat); state="$dir/state"; fakebin="$dir/fakebin"; out="$dir/watch.out"
+  # A quiet fleet (no statuses) with work under way, a fast heartbeat cadence, and the
+  # knob on. Work under way is required: an idle home never ticks (see the next case).
+  printf 'window=task\n' > "$state/task.meta"
+  PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=1 FM_WATCH_ABSORB_TICK=1 "$WATCH" > "$out" &
+  pid=$!
+  wait_for_exit "$pid" 40 || { reap "$pid"; fail "tick-enabled watcher did not end the cycle on a no-change heartbeat: $(cat "$out")"; }
+  grep -Eq '^tick:' "$out" || fail "tick-enabled no-change heartbeat did not print a tick reason: $(cat "$out")"
+  [ ! -s "$state/.wake-queue" ] || fail "a heartbeat tick enqueued a durable wake record"
+  [ "$(cat "$state/.heartbeat-streak" 2>/dev/null || echo 0)" -ge 1 ] || fail "heartbeat backoff streak did not advance before ticking"
+  pass "with FM_WATCH_ABSORB_TICK=1 a no-change heartbeat ticks once and still backs off its cadence"
+}
+
+test_absorb_tick_idle_home_never_ticks() {
+  local dir state fakebin out pid i
+  dir=$(make_case absorb-tick-idle); state="$dir/state"; fakebin="$dir/fakebin"; out="$dir/watch.out"
+  # Knob on, but NOTHING under way (no state/*.meta). A tick would end the cycle with
+  # nothing queued, and with no in-flight work no guard forces a re-arm, so the home
+  # would go dark. The heartbeat must stay absorbed silently and the watcher must live.
+  PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=1 FM_WATCH_ABSORB_TICK=1 "$WATCH" > "$out" &
+  pid=$!
+  i=0
+  while [ "$i" -lt 40 ]; do
+    kill -0 "$pid" 2>/dev/null || { reap "$pid"; fail "idle tick-enabled watcher exited (should absorb silently): $(cat "$out")"; }
+    [ "$(cat "$state/.heartbeat-streak" 2>/dev/null || echo 0)" -ge 2 ] && break
+    sleep 0.1; i=$((i + 1))
+  done
+  [ "$(cat "$state/.heartbeat-streak" 2>/dev/null || echo 0)" -ge 2 ] || { reap "$pid"; fail "idle watcher did not absorb repeated heartbeats within the bound"; }
+  [ ! -s "$out" ] || { reap "$pid"; fail "idle tick-enabled home printed output (expected silence): $(cat "$out")"; }
+  reap "$pid"
+  pass "with FM_WATCH_ABSORB_TICK=1 an idle home never ticks and its watcher keeps absorbing"
+}
+
+test_absorb_tick_on_actionable_signal_unchanged() {
+  local dir state fakebin out drain_out pid
+  dir=$(make_case absorb-tick-actionable); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; drain_out="$dir/drain.out"
+  : > "$state/task.turn-ended"
+  # Stopped crew (no running pipeline, no busy pane): an actionable wake. Even with the
+  # tick knob on it must surface as a real signal and queue, never as a tick.
+  export FM_FAKE_CREW_STATE='state: unknown · source: none · no current-state source available'
+  watch_bg "$state" "$fakebin" "$out" env FM_WATCH_ABSORB_TICK=1
+  pid=$!
+  wait_for_exit "$pid" 40 || fail "tick-enabled watcher did not surface an actionable turn-end: $(cat "$out")"
+  grep -F "signal: $state/task.turn-ended" "$out" >/dev/null || fail "actionable turn-end did not print its signal (tick misfired?): $(cat "$out")"
+  grep -Eq '^tick:' "$out" && fail "an actionable wake was emitted as a tick: $(cat "$out")"
+  FM_STATE_OVERRIDE="$state" "$DRAIN" > "$drain_out" 2>/dev/null || fail "drain after the actionable turn-end failed"
+  grep "$(printf '\tsignal\t')" "$drain_out" | grep -F "$state/task.turn-ended" >/dev/null || fail "actionable turn-end was not queued with the knob on"
+  pass "with FM_WATCH_ABSORB_TICK=1 an actionable wake is unchanged: surfaced and queued, never a tick"
+}
+
 test_signal_reason_is_actionable_classifier
 test_stale_is_terminal_classifier
 test_scan_captain_relevant_statuses_classifier
@@ -1578,3 +1678,8 @@ test_afk_paused_changed_pane_hands_off_plain_stale
 test_secondmate_over_context_threshold_surfaced
 test_secondmate_under_context_threshold_absorbed
 test_secondmate_unknown_context_fails_closed
+test_absorb_tick_off_is_silent
+test_absorb_tick_on_signal_emits_one_tick
+test_absorb_tick_on_heartbeat_emits_tick
+test_absorb_tick_idle_home_never_ticks
+test_absorb_tick_on_actionable_signal_unchanged

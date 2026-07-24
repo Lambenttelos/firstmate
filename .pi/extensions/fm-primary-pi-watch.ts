@@ -22,7 +22,7 @@ type ArmResult = {
 type LockOwnership = "owned" | "missing" | "other";
 
 type CloseClassification = {
-  kind: "actionable" | "failure";
+  kind: "actionable" | "tick" | "failure";
   message: string;
 };
 
@@ -131,10 +131,19 @@ function actionableLine(output: string): string {
   return lines.find((line) => /^(signal:|stale:|check:|heartbeat($|:))/.test(line)) || "";
 }
 
+function tickLine(output: string): string {
+  const lines = output.split(/\r?\n/);
+  return lines.find((line) => /^tick:/.test(line)) || "";
+}
+
 function classifyClose(stdout: string, stderr: string, code: number | null, signal: NodeJS.Signals | null): CloseClassification {
   const combined = `${stdout}\n${stderr}`.trim();
   const reason = actionableLine(combined);
   if (reason) return { kind: "actionable", message: reason };
+  if (!signal && (code ?? 0) === 0) {
+    const tick = tickLine(combined);
+    if (tick) return { kind: "tick", message: tick };
+  }
   const healthy = combined.split(/\r?\n/).find((line) => /^watcher: healthy\b/.test(line));
   if (healthy) {
     return {
@@ -196,6 +205,14 @@ export default function (pi: ExtensionAPI) {
     const content = encodeFirstmateOperationalInput(
       "watcher",
       `FIRSTMATE WATCHER WAKE: ${message}\n\nRun bin/fm-wake-drain.sh first and handle the queued wake. Watcher continuity is extension-owned.`,
+    );
+    await pi.sendUserMessage(content, { deliverAs: "followUp" });
+  }
+
+  async function sendTick(message: string): Promise<void> {
+    const content = encodeFirstmateOperationalInput(
+      "watcher",
+      `FIRSTMATE WATCHER TICK: ${message}\n\nThe watcher absorbed a benign wake while alive. Nothing is queued, so do not drain. Reply with the single literal word tick. Watcher continuity is extension-owned.`,
     );
     await pi.sendUserMessage(content, { deliverAs: "followUp" });
   }
@@ -374,7 +391,7 @@ export default function (pi: ExtensionAPI) {
       if (stopping) return;
       const classification = classifyClose(stdout, stderr, code, signal);
       const predecessor = String(armChild.pid ?? "");
-      if (classification.kind === "actionable") {
+      if (classification.kind === "actionable" || classification.kind === "tick") {
         retryFailures = 0;
         restoring = true;
         void (async () => {
@@ -382,7 +399,11 @@ export default function (pi: ExtensionAPI) {
           restoring = false;
           if (stopping) return;
           const message = failure ? `${classification.message}\n\n${failure}` : classification.message;
-          await sendWake(message);
+          if (classification.kind === "tick" && !failure) {
+            await sendTick(message);
+          } else {
+            await sendWake(message);
+          }
         })().catch(() => {
         });
         return;

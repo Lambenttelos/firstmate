@@ -25,7 +25,9 @@ When you see a background-task-completed system reminder for the arm:
 2. Optionally fetch arm output with `get_command_or_subagent_output(<task_id>)` for the reason line.
 3. Handle `signal`, `stale`, `check`, or `heartbeat` using the harness-neutral contract in `AGENTS.md`.
 4. Ordinary wake: re-arm the next cycle with the same background `bin/fm-watch-arm.sh` call if work remains in flight or X mode still needs polling.
-5. Do not invent a wake from an attach-status line alone.
+5. Benign tick close (only with `FM_WATCH_ABSORB_TICK=1`, off by default): a `tick:` reason line is proof of life for an absorbed wake, not an actionable wake and not a failure; reply with the single literal word `tick`, re-arm the next background cycle, and never run watcher repair.
+   See [`watcher-continuity.md`](../watcher-continuity.md) for the mechanism.
+6. Do not invent a wake from an attach-status line alone.
    Drain the queue and act only on real wake records or a real watcher reason line.
    Re-arm attaches to an existing healthy cycle when one is already present and follows its verified successor chain.
    See [`watcher-continuity.md`](../watcher-continuity.md) for the arm-layer successor and clean-close failure contract.

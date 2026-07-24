@@ -576,6 +576,56 @@ test_arm_self_eviction_is_loud_without_successor() {
   pass "arm turns clean self-eviction without a successor into a typed failure"
 }
 
+test_arm_classifies_tick_close_as_benign_completion() {
+  local dir state fakebin armout armpid status
+  dir=$(make_case arm-tick)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  armout="$dir/arm.out"
+  mark_pr_check_migration_complete "$state"
+  # A quiet fleet with work under way (the tick fires only then), a fast heartbeat
+  # cadence, and the proof-of-life knob on: the child ends its cycle with a "tick:"
+  # line only. The arm must treat that clean close as a benign completion, not as the
+  # empty-cycle failure.
+  printf 'window=task\n' > "$state/task.meta"
+  PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=1 FM_WATCH_ABSORB_TICK=1 FM_ARM_CONFIRM_TIMEOUT=1 "$WATCH_ARM" > "$armout" &
+  armpid=$!
+  wait_for_exit "$armpid" 80
+  status=$?
+  [ "$status" -eq 0 ] || fail "arm did not return success for a benign tick close (status $status): $(cat "$armout")"
+  grep -Eq '^tick:' "$armout" || fail "arm did not print the tick line to the session: $(cat "$armout")"
+  ! grep -qF 'watcher: FAILED' "$armout" || fail "arm took the failure path for a benign tick close: $(cat "$armout")"
+  grep -q 'reason=tick' "$state/.watch-cycle-exits.log" || fail "tick close was not recorded as reason=tick in the cycle ledger"
+  pass "arm classifies a clean tick-only child close as a benign completion"
+
+  # Negative: with the same knob on, a clean close carrying NO reason line at all must
+  # still take the empty-cycle failure path, so the tick branch did not weaken the guard.
+  local dir2 state2 fakebin2 armout2 armpid2 status2 i
+  dir2=$(make_case arm-tick-empty-close)
+  state2="$dir2/state"
+  fakebin2="$dir2/fakebin"
+  armout2="$dir2/arm.out"
+  mark_pr_check_migration_complete "$state2"
+  PATH="$fakebin2:$PATH" FM_STATE_OVERRIDE="$state2" FM_POLL=0.2 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 FM_WATCH_ABSORB_TICK=1 FM_ARM_CONFIRM_TIMEOUT=1 "$WATCH_ARM" > "$armout2" &
+  armpid2=$!
+  i=0
+  while [ "$i" -lt 80 ]; do
+    grep -qF 'watcher: started pid=' "$armout2" 2>/dev/null && break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  grep -qF 'watcher: started pid=' "$armout2" || fail "arm did not start before the empty-close check"
+  printf '%s\n' "$$" > "$state2/.watch.lock/pid"
+  wait_for_exit "$armpid2" 80
+  status2=$?
+  [ "$status2" -ne 0 ] && [ "$status2" -ne 124 ] || fail "reasonless clean close returned success with the tick knob on (status $status2)"
+  grep -qF 'watcher: FAILED - cycle ended without an actionable reason' "$armout2" || fail "reasonless clean close lost the typed cycle-end failure"
+  ! grep -q 'reason=tick' "$state2/.watch-cycle-exits.log" || fail "reasonless clean close was misrecorded as a tick"
+  pass "a clean close with no reason line still fails loudly with the tick knob on"
+}
+
 test_arm_attaches_and_waits_for_live_fresh_watcher() {
   local dir state fakebin out armout i wpid armpid status
   dir=$(make_case arm-attach)
@@ -1018,6 +1068,7 @@ test_watch_restart_attaches_to_healthy_peer
 test_watch_restart_force_clears_wedged_watcher
 test_watcher_self_evicts_on_lock_takeover
 test_arm_self_eviction_is_loud_without_successor
+test_arm_classifies_tick_close_as_benign_completion
 test_arm_attaches_and_waits_for_live_fresh_watcher
 test_attached_arm_signal_is_recorded_in_cycle_ledger
 test_arm_starts_and_self_heals

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Firstmate watcher.
 # Classifies supervision wakes in bash. In normal mode it absorbs benign wakes
-# and keeps blocking; it queues and exits only for actionable wakes.
+# and keeps blocking; it queues and exits only for actionable wakes, apart from
+# the env-gated proof-of-life "tick:" close described below, which queues nothing.
 # The no-verb signal and stale path is absorb-only-when-provably-working: a wake
 # is absorbed only when the crew shows POSITIVE evidence it is still working (an
 # actively-running no-mistakes step, or a backend busy signal), and surfaced
@@ -40,6 +41,12 @@
 #                          the host-resource sweep found CPU/memory/swap pressure
 #                          WORSE than the level firstmate was last told about.
 #                          Report-only: nothing is paused, shed or killed here.
+#   tick: <note>           env-gated proof-of-life close (FM_WATCH_ABSORB_TICK=1,
+#                          default off) for a benign-ABSORBED wake while work is
+#                          under way. Not an actionable wake: nothing is queued,
+#                          and the arm layer classifies it as a benign completion
+#                          rather than the empty-cycle failure. See absorb_tick
+#                          and docs/watcher-continuity.md
 #   heartbeat              fleet-scan backstop found an unsurfaced captain-relevant
 #                          status, unless a live away-mode daemon owns triage.
 #                          Becomes "heartbeat: host resources degraded|critical"
@@ -62,6 +69,10 @@ mkdir -p "$STATE"
 
 # shellcheck source=bin/fm-wake-lib.sh
 . "$SCRIPT_DIR/fm-wake-lib.sh"
+# Same in-flight count the guards use, so the watcher and they cannot disagree
+# about what "work under way" means (see absorb_tick).
+# shellcheck source=bin/fm-supervision-lib.sh
+. "$SCRIPT_DIR/fm-supervision-lib.sh"
 # Shared wake classifier (captain-relevant verbs + signal/stale/heartbeat
 # predicates), the SAME library the away-mode daemon uses, so the triage policy
 # has one definition.
@@ -426,6 +437,37 @@ wake() {
     *) echo 0 > "$STATE/.heartbeat-streak" ;;
   esac
   echo "$1"
+  exit 0
+}
+
+# Proof-of-life "tick" for a benign-ABSORBED wake. Default OFF: with
+# FM_WATCH_ABSORB_TICK unset or any value other than 1 this is a no-op that RETURNS,
+# so the caller keeps blocking exactly as before and behavior is byte-identical. When
+# set to 1, a benign-absorbed wake instead ENDS the cycle with a distinguishable
+# "tick: <note>" reason line and exit 0, so the arming session can tell a
+# live-but-quiet watcher from a dead one at minimal token cost (the standing rule on a
+# tick-enabled home is a single literal "tick" reply). A tick enqueues NO durable wake
+# record, so bin/fm-wake-drain.sh, the continuity guard, and the turn-end guard see no
+# actionable work; bin/fm-watch-arm.sh classifies the "tick:" line as a benign
+# completion, distinct from an actionable wake (signal/stale/check/heartbeat) and from
+# a failure (nonzero exit). Call ONLY from one-shot absorb points that have already
+# advanced their suppression state (a benign signal whose .seen-* signature is
+# written, an absorbed heartbeat whose schedule and backoff are advanced), never from
+# a per-poll re-evaluation of an unchanged pane, so it fires at most once per
+# absorbed-wake event and never storms on a static fleet. A tick also fires ONLY while
+# work is under way: a signal presupposes a task, and the absorbed-heartbeat caller
+# gates on the shared in-flight count. That is exactly the state in which the turn-end
+# guard already forces a re-arm, so ending the cycle can never leave a home without
+# supervision and no guard needs to know about this knob. With nothing under way the
+# watcher keeps absorbing silently and self-sustains as it always has.
+# This function itself never
+# writes .heartbeat-streak and never enqueues anything, because a tick is not an
+# actionable wake; the absorbed-heartbeat caller deliberately bumps the streak just
+# before calling here, since that bump is what drives the heartbeat backoff.
+FM_WATCH_ABSORB_TICK=${FM_WATCH_ABSORB_TICK:-0}
+absorb_tick() {  # <note>
+  [ "$FM_WATCH_ABSORB_TICK" = 1 ] || return 0
+  echo "tick: $1"
   exit 0
 }
 
@@ -1098,6 +1140,9 @@ EOF
 $pending
 EOF
       triage_log "absorbed benign $reason"
+      # Suppressors are advanced above, so this benign signal will not re-fire; a
+      # tick (when enabled) surfaces it once as proof of life instead of exiting.
+      absorb_tick "signal absorbed"
     fi
   fi
 
@@ -1325,6 +1370,15 @@ EOF
       touch "$STATE/.last-heartbeat"
       echo $(( $(cat "$STATE/.heartbeat-streak" 2>/dev/null || echo 0) + 1 )) > "$STATE/.heartbeat-streak"
       triage_log "absorbed heartbeat (no captain-relevant change)"
+      # Schedule and backoff are advanced above, so the next heartbeat is bounded and
+      # further out; a tick (when enabled) makes this quiet-fleet proof of life
+      # visible once per heartbeat cadence instead of only in the debug log. Only
+      # while work is under way: with nothing in flight nothing forces a re-arm, so
+      # an idle home keeps absorbing silently and its watcher self-sustains.
+      fm_supervision_status "$STATE"
+      if [ "$FM_SUP_IN_FLIGHT" -gt 0 ]; then
+        absorb_tick "heartbeat absorbed"
+      fi
     fi
   fi
 
