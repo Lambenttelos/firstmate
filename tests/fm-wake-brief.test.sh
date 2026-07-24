@@ -26,6 +26,7 @@ make_home() {
 #!/usr/bin/env bash
 set -u
 if [ "${1:-}" = "list-windows" ]; then
+  [ -n "${FM_FAKE_TMUX_CALLS:-}" ] && printf 'x\n' >> "$FM_FAKE_TMUX_CALLS"
   [ -n "${FM_FAKE_TMUX_WINDOWS:-}" ] && printf '%s\n' "$FM_FAKE_TMUX_WINDOWS"
   exit 0
 fi
@@ -319,8 +320,117 @@ $drain_footprint"
   pass "wake brief writes nothing in state/ beyond the already-approved drain it runs"
 }
 
+test_failed_drain_is_distinct_from_an_empty_queue() {
+  local home state stub out status spool
+  home=$(make_home drainfail)
+  state="$home/state"
+  stub="$home/fakebin/failing-drain.sh"
+  cat > "$stub" <<'SH'
+#!/usr/bin/env bash
+echo "fm-wake-drain: could not acquire the queue lock" >&2
+exit 1
+SH
+  chmod +x "$stub"
+
+  status=0
+  out=$(FM_WAKE_DRAIN_BIN="$stub" run_brief "$home") || status=$?
+  [ "$status" -ne 0 ] || fail "a failed drain must fail the brief, got exit 0: $out"
+  case "$out" in
+    *"DRAIN FAILED (exit 1)"*) ;;
+    *) fail "a failed drain must be marked explicitly: $out" ;;
+  esac
+  case "$out" in
+    *"(no queued wakes)"*) fail "a failed drain must not read as an empty queue: $out" ;;
+  esac
+  # The spool the marker names is retained: on a failed drain it is the only
+  # copy of anything the drain may already have emitted.
+  spool=$(printf '%s\n' "$out" | sed -n 's/.*retained in \(.*\)$/\1/p')
+  [ -n "$spool" ] || fail "the failure marker must name the retained spool: $out"
+  [ -f "$spool" ] || fail "the spool must survive a failed drain: $spool"
+  rm -f "$spool"
+  pass "wake brief reports a failed drain distinctly, keeps its spool, and exits non-zero"
+}
+
+test_drain_spool_is_removed_only_after_the_records_are_printed() {
+  local home state out spools_before spools_after
+  home=$(make_home spool)
+  state="$home/state"
+  fm_write_meta "$state/zeta.meta" 'window=firstmate:fm-zeta'
+  printf 'working: going\n' > "$state/zeta.status"
+  append_wake "$state" signal zeta.status 'signal: zeta.status'
+
+  spools_before=$(find "${TMPDIR:-/tmp}" -maxdepth 1 -name 'fm-wake-brief.*' 2>/dev/null | wc -l)
+  out=$(run_brief "$home") || fail "brief must exit 0"
+  spools_after=$(find "${TMPDIR:-/tmp}" -maxdepth 1 -name 'fm-wake-brief.*' 2>/dev/null | wc -l)
+  [ "$spools_before" -eq "$spools_after" ] || fail "a successful drain must leave no spool behind"
+  case "$out" in
+    *"--- zeta ---"*) ;;
+    *) fail "the spooled records must still name their task: $out" ;;
+  esac
+  pass "wake brief spools the drained records to disk and removes the spool only after printing them"
+}
+
+test_invalid_explicit_id_is_reported_not_dropped() {
+  local home out
+  home=$(make_home rejected)
+  out=$(run_brief "$home" '../escape' 'ok-id') || fail "brief must exit 0"
+  case "$out" in
+    *"REJECTED id ../escape"*) ;;
+    *) fail "an unusable id must be reported, not silently dropped: $out" ;;
+  esac
+  case "$out" in
+    *"--- ok-id ---"*) ;;
+    *) fail "a valid id alongside a rejected one must still be briefed: $out" ;;
+  esac
+  case "$out" in
+    *"--- ../escape ---"*) fail "a rejected id must not be briefed: $out" ;;
+  esac
+  pass "wake brief reports an unusable explicit id instead of silently dropping it"
+}
+
+test_glob_like_id_is_not_expanded_against_the_working_dir() {
+  local home out
+  home=$(make_home globby)
+  out=$(cd "$home" && run_brief "$home" '*') || fail "brief must exit 0"
+  case "$out" in
+    *"REJECTED id *"*) ;;
+    *) fail "a glob argument must be rejected as written, not expanded: $out" ;;
+  esac
+  case "$out" in
+    *fakebin*) fail "a glob argument must not match working-dir entries: $out" ;;
+  esac
+  pass "wake brief validates a glob-like id as written instead of expanding it"
+}
+
+test_tmux_listing_is_read_once_for_the_whole_sweep() {
+  local home state out calls
+  home=$(make_home tmuxonce)
+  state="$home/state"
+  fm_write_meta "$state/t1.meta" 'window=firstmate:fm-t1'
+  fm_write_meta "$state/t2.meta" 'window=firstmate:fm-t2'
+  fm_write_meta "$state/t3.meta" 'window=firstmate:fm-t3'
+  calls="$home/tmux-calls"
+  : > "$calls"
+
+  out=$(FM_FAKE_TMUX_CALLS="$calls" FM_FAKE_TMUX_WINDOWS="firstmate:fm-t1	claude
+firstmate:fm-t2	claude" run_brief "$home") || fail "brief must exit 0"
+
+  case "$out" in
+    *"t3 backend=tmux window=firstmate:fm-t3 endpoint=dead"*) ;;
+    *) fail "the cached listing must still resolve a missing window as dead: $out" ;;
+  esac
+  [ "$(wc -l < "$calls")" -eq 1 ] \
+    || fail "the tmux listing must be read exactly once for the whole sweep, got $(wc -l < "$calls")"
+  pass "wake brief takes exactly one tmux listing for the whole endpoint sweep"
+}
+
 test_empty_queue_and_empty_home
 test_drained_wakes_brief_their_tasks
+test_failed_drain_is_distinct_from_an_empty_queue
+test_drain_spool_is_removed_only_after_the_records_are_printed
+test_invalid_explicit_id_is_reported_not_dropped
+test_glob_like_id_is_not_expanded_against_the_working_dir
+test_tmux_listing_is_read_once_for_the_whole_sweep
 test_bounded_tail_is_configurable
 test_absent_files_are_marked_not_skipped
 test_explicit_ids_join_the_wake_named_ones

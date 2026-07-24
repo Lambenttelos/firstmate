@@ -34,7 +34,10 @@
 #
 # Exit status is 0 whenever the reads themselves succeed. A missing file is a
 # fact about the fleet, not an error: it prints an explicit ABSENT marker rather
-# than failing the brief or silently omitting the task.
+# than failing the brief or silently omitting the task. A FAILED DRAIN is the
+# exception: the queue is still full and this turn's work is unknown, so it
+# prints an explicit DRAIN FAILED marker, keeps the spooled records, and exits
+# non-zero rather than reading like an empty queue.
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -48,6 +51,9 @@ STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 # Same stub seam bin/fm-classify-lib.sh already publishes, so a test can fix the
 # reconciled verdict without a real worktree or a real no-mistakes run.
 CREW_STATE_BIN="${FM_CREW_STATE_BIN:-$SCRIPT_DIR/fm-crew-state.sh}"
+# Same shape of stub seam for the drain, so a test can exercise the failed-drain
+# path without corrupting a real queue or wedging a real lock.
+DRAIN_BIN="${FM_WAKE_DRAIN_BIN:-$SCRIPT_DIR/fm-wake-drain.sh}"
 
 TAIL_LINES=${FM_WAKE_BRIEF_TAIL:-5}
 case "$TAIL_LINES" in
@@ -122,16 +128,31 @@ id_for_wake_key() {
 # --- 1. wake queue ----------------------------------------------------------
 # Print the drained records first and verbatim: they are this turn's work queue,
 # and fm-wake-drain.sh's own annotation lines are part of its output contract.
+#
+# The drain deletes the durable queue as it prints, so its output must never
+# live only in this process's memory: it is spooled to a file on disk that is
+# removed ONLY after the records have been printed and mined. If this script is
+# interrupted before that, the spool still holds the drained records.
 section "WAKE QUEUE (drained)"
-DRAIN_OUT=$("$SCRIPT_DIR/fm-wake-drain.sh" 2>&1)
-if [ -n "$DRAIN_OUT" ]; then
-  printf '%s\n' "$DRAIN_OUT"
-else
+DRAIN_SPOOL=$(mktemp "${TMPDIR:-/tmp}/fm-wake-brief.XXXXXX") || {
+  echo "fm-wake-brief: cannot create the drain spool file" >&2
+  exit 1
+}
+DRAIN_STATUS=0
+"$DRAIN_BIN" >"$DRAIN_SPOOL" 2>&1 || DRAIN_STATUS=$?
+if [ -s "$DRAIN_SPOOL" ]; then
+  cat "$DRAIN_SPOOL"
+elif [ "$DRAIN_STATUS" -eq 0 ]; then
   printf '(no queued wakes)\n'
+fi
+if [ "$DRAIN_STATUS" -ne 0 ]; then
+  printf 'DRAIN FAILED (exit %s): the queue was NOT drained, so this is not an empty queue. Any text above is the drain error, not wakes. Drained records, if any, are retained in %s\n' \
+    "$DRAIN_STATUS" "$DRAIN_SPOOL"
 fi
 
 # --- 2. tasks named by the wakes -------------------------------------------
 IDS=
+REJECTED_IDS=
 add_id() {
   local id=$1 seen
   valid_id "$id" || return 0
@@ -141,22 +162,41 @@ add_id() {
   IDS="$IDS $id"
 }
 
+# Ids arrive as whitespace-separated words, so disable pathname expansion while
+# iterating them: an argument or wake key containing a glob character must be
+# validated as written, never silently rewritten by matching the working dir.
+set -f
 for id in $EXPLICIT_IDS; do
-  add_id "$id"
+  if valid_id "$id"; then
+    add_id "$id"
+  else
+    REJECTED_IDS="$REJECTED_IDS $id"
+  fi
 done
 
 # Only the raw TSV records carry a key; the annotation lines fm-wake-drain.sh
 # appends are prose and are deliberately not mined for ids.
-WAKE_KEYS=$(printf '%s\n' "$DRAIN_OUT" | awk -F '\t' 'NF >= 5 { print $4 }')
+WAKE_KEYS=$(awk -F '\t' 'NF >= 5 { print $4 }' "$DRAIN_SPOOL")
 for key in $WAKE_KEYS; do
   resolved=$(id_for_wake_key "$key") || continue
   add_id "$resolved"
 done
+set +f
+
+# The records have been printed and mined; the spool has served its purpose. A
+# failed drain keeps its spool, because then it is the only copy that exists.
+[ "$DRAIN_STATUS" -eq 0 ] && rm -f "$DRAIN_SPOOL"
 
 section "TASKS"
+set -f
+for id in $REJECTED_IDS; do
+  printf 'REJECTED id %s: not a usable task id, so it was not briefed\n' "$id"
+done
+set +f
 if [ -z "$IDS" ]; then
   printf '(no task named by a drained wake, and no id given)\n'
 fi
+set -f
 for id in $IDS; do
   printf '\n--- %s ---\n' "$id"
 
@@ -185,6 +225,7 @@ for id in $IDS; do
     printf 'meta: ABSENT (%s)\n' "$meta"
   fi
 done
+set +f
 
 # --- 3. host resources ------------------------------------------------------
 # No --sweep: that flag belongs to the watcher's own slow sweep, which is the
@@ -219,21 +260,29 @@ tmux_windows_load() {
   TMUX_WINDOWS=$(tmux list-windows -a -F "#{session_name}:#{window_name}${TAB}#{pane_current_command}" 2>/dev/null) || TMUX_WINDOWS=
 }
 
-# Print "<presence> <command>" for an exact recorded window, or "absent -".
+# Resolve an exact recorded window against the one listing into TMUX_ROW_STATE
+# and TMUX_ROW_CMD. Deliberately assigns globals rather than printing into a
+# command substitution: a substitution runs in a subshell, which would discard
+# the cached listing and turn the single reading into one fork per task.
+TMUX_ROW_STATE=dead
+TMUX_ROW_CMD=-
 tmux_window_row() {
   local want=$1 line name command
   tmux_windows_load
+  TMUX_ROW_STATE=dead
+  TMUX_ROW_CMD=-
   while IFS= read -r line; do
     [ -n "$line" ] || continue
     name=${line%%"$TAB"*}
     command=${line#*"$TAB"}
     [ "$name" = "$want" ] || continue
-    printf 'alive %s' "${command:--}"
+    TMUX_ROW_STATE=alive
+    TMUX_ROW_CMD=${command:--}
     return 0
   done <<EOF
 $TMUX_WINDOWS
 EOF
-  printf 'dead -'
+  return 0
 }
 
 META_FOUND=0
@@ -249,9 +298,9 @@ for meta in "$STATE"/*.meta; do
     continue
   fi
   if [ "$backend" = tmux ]; then
-    row=$(tmux_window_row "${target:-$window}")
+    tmux_window_row "${target:-$window}"
     printf '%s backend=tmux window=%s endpoint=%s pane=%s\n' \
-      "$id" "$window" "${row%% *}" "${row#* }"
+      "$id" "$window" "$TMUX_ROW_STATE" "$TMUX_ROW_CMD"
   else
     # Non-tmux backends expose no equivalent single-listing sweep, so reuse the
     # liveness primitives bin/fm-backend.sh already publishes rather than
@@ -267,4 +316,7 @@ for meta in "$STATE"/*.meta; do
 done
 [ "$META_FOUND" -eq 1 ] || printf '(no recorded endpoints)\n'
 
+# A failed drain is the one read that cannot be reported as a fleet fact: the
+# queue is still full and this turn's work is unknown, so it fails the brief.
+[ "$DRAIN_STATUS" -eq 0 ] || exit 1
 exit 0
