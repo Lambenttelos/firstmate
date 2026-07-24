@@ -85,7 +85,15 @@ fm_primary_scope_matches "$FM_ROOT" "$STATE" || exit 0
 . "$SCRIPT_DIR/fm-afk-daemon-lib.sh"
 
 fm_supervision_status "$STATE" "$GRACE"
-[ "$FM_SUP_IN_FLIGHT" -gt 0 ] || exit 0
+
+# A tick-enabled home (FM_WATCH_ABSORB_TICK=1, read exactly as bin/fm-watch.sh reads
+# it so the two agree) ENDS its watcher cycle on a benign-absorbed wake without
+# queuing anything, so an idle home - an X-mode-only home, say - can go dark with zero
+# tasks in flight and nothing else would notice. Keep guarding such a home. With the
+# knob unset or any other value the zero-in-flight early return is unchanged.
+if [ "${FM_WATCH_ABSORB_TICK:-0}" != 1 ]; then
+  [ "$FM_SUP_IN_FLIGHT" -gt 0 ] || exit 0
+fi
 fm_watcher_healthy "$STATE" "$WATCH" "$GRACE" "$FM_HOME" && exit 0
 
 # Away mode alone does NOT mean a daemon owns supervision. A home whose captain

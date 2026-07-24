@@ -209,6 +209,14 @@ export default function (pi: ExtensionAPI) {
     await pi.sendUserMessage(content, { deliverAs: "followUp" });
   }
 
+  async function sendTick(message: string): Promise<void> {
+    const content = encodeFirstmateOperationalInput(
+      "watcher",
+      `FIRSTMATE WATCHER TICK: ${message}\n\nThe watcher absorbed a benign wake while alive. Nothing is queued, so do not drain. Reply with the single literal word tick. Watcher continuity is extension-owned.`,
+    );
+    await pi.sendUserMessage(content, { deliverAs: "followUp" });
+  }
+
   function surfaceFailure(message: string): void {
     void sendWake(message).catch(() => {
       // Pi owns delivery errors; continuity restoration never waits on prompting.
@@ -391,7 +399,11 @@ export default function (pi: ExtensionAPI) {
           restoring = false;
           if (stopping) return;
           const message = failure ? `${classification.message}\n\n${failure}` : classification.message;
-          await sendWake(message);
+          if (classification.kind === "tick" && !failure) {
+            await sendTick(message);
+          } else {
+            await sendWake(message);
+          }
         })().catch(() => {
         });
         return;

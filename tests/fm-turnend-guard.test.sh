@@ -208,6 +208,57 @@ test_hook_silent_when_no_work_in_flight() {
   pass "fm-turnend-guard: silent no-op with nothing in flight"
 }
 
+# FM_WATCH_ABSORB_TICK=1 ends the watcher cycle on a benign-absorbed wake without
+# queuing anything, so a tick-enabled home must stay guarded even with nothing in
+# flight; every other value keeps the zero-in-flight early return byte-identical.
+run_hook_tick() {
+  local dir=$1 knob=$2 home
+  home=$(cd "$dir" && pwd)
+  printf '{"stop_hook_active":false}' \
+    | CLAUDECODE=1 FM_HOME="$home" FM_WATCH_ABSORB_TICK="$knob" bash "$dir/bin/fm-turnend-guard.sh" 2>&1
+}
+
+test_hook_tick_off_silent_with_no_work_in_flight() {
+  local dir out status
+  dir=$(make_primary_dir "$TMP_ROOT/hook-tick-off")
+  out=$(run_hook_tick "$dir" 0); status=$?
+  expect_code 0 "$status" "hook must keep the zero-in-flight early return with the tick knob off"
+  [ -z "$out" ] || fail "tick-off hook produced output with no in-flight work: $out"
+  out=$(run_hook_tick "$dir" true); status=$?
+  expect_code 0 "$status" "only the literal 1 enables tick coverage"
+  [ -z "$out" ] || fail "non-1 tick knob produced output with no in-flight work: $out"
+  pass "fm-turnend-guard: zero-in-flight early return unchanged unless the tick knob is exactly 1"
+}
+
+test_hook_tick_on_blocks_idle_home_without_watcher() {
+  local dir out status
+  dir=$(make_primary_dir "$TMP_ROOT/hook-tick-idle-block")
+  out=$(run_hook_tick "$dir" 1); status=$?
+  expect_code 2 "$status" "a tick-enabled home must block on an unhealthy watcher even with nothing in flight"
+  assert_contains "$out" "$REQUIRED_REASON" "block reason must contain the exact required instruction"
+  pass "fm-turnend-guard: tick-enabled idle home blocks when no live watcher holds the lock"
+}
+
+test_hook_tick_on_silent_idle_home_with_watcher() {
+  local dir pid identity out status
+  dir=$(make_primary_dir "$TMP_ROOT/hook-tick-idle-pass")
+  sleep 60 &
+  pid=$!
+  identity=$(watcher_identity "$dir" "$pid") || {
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    fail "could not identify live watcher holder"
+  }
+  record_watcher_lock "$dir" "$pid" "$identity"
+  touch "$dir/state/.last-watcher-beat"
+  out=$(run_hook_tick "$dir" 1); status=$?
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  expect_code 0 "$status" "a tick-enabled idle home with a healthy watcher must stay silent"
+  [ -z "$out" ] || fail "tick-enabled idle home with a healthy watcher produced output: $out"
+  pass "fm-turnend-guard: tick-enabled idle home passes with a live watcher and fresh beacon"
+}
+
 test_hook_blocks_when_fresh_beacon_has_no_live_lock() {
   local dir out status
   dir=$(make_primary_dir "$TMP_ROOT/hook-fresh-no-lock")
@@ -1216,6 +1267,9 @@ test_predicate_unhealthy_stale_beacon
 test_predicate_healthy_fresh_beacon
 test_predicate_queue_pending_flag
 test_hook_silent_when_no_work_in_flight
+test_hook_tick_off_silent_with_no_work_in_flight
+test_hook_tick_on_blocks_idle_home_without_watcher
+test_hook_tick_on_silent_idle_home_with_watcher
 test_hook_blocks_when_fresh_beacon_has_no_live_lock
 test_hook_blocks_when_dead_lock_has_fresh_beacon
 test_hook_silent_with_live_lock_and_fresh_beacon
