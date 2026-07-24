@@ -22,7 +22,7 @@ type ArmResult = {
 type LockOwnership = "owned" | "missing" | "other";
 
 type CloseClassification = {
-  kind: "actionable" | "failure";
+  kind: "actionable" | "tick" | "failure";
   message: string;
 };
 
@@ -131,10 +131,19 @@ function actionableLine(output: string): string {
   return lines.find((line) => /^(signal:|stale:|check:|heartbeat($|:))/.test(line)) || "";
 }
 
+function tickLine(output: string): string {
+  const lines = output.split(/\r?\n/);
+  return lines.find((line) => /^tick:/.test(line)) || "";
+}
+
 function classifyClose(stdout: string, stderr: string, code: number | null, signal: NodeJS.Signals | null): CloseClassification {
   const combined = `${stdout}\n${stderr}`.trim();
   const reason = actionableLine(combined);
   if (reason) return { kind: "actionable", message: reason };
+  if (!signal && (code ?? 0) === 0) {
+    const tick = tickLine(combined);
+    if (tick) return { kind: "tick", message: tick };
+  }
   const healthy = combined.split(/\r?\n/).find((line) => /^watcher: healthy\b/.test(line));
   if (healthy) {
     return {
@@ -374,7 +383,7 @@ export default function (pi: ExtensionAPI) {
       if (stopping) return;
       const classification = classifyClose(stdout, stderr, code, signal);
       const predecessor = String(armChild.pid ?? "");
-      if (classification.kind === "actionable") {
+      if (classification.kind === "actionable" || classification.kind === "tick") {
         retryFailures = 0;
         restoring = true;
         void (async () => {

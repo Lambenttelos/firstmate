@@ -171,6 +171,10 @@ function classifyArmClose(stdout, stderr, code, signal) {
   const combined = `${stdout}\n${stderr}`;
   const reason = combined.split(/\r?\n/).find((line) => /^(signal:|stale:|check:|heartbeat($|:))/.test(line));
   if (reason) return { kind: "actionable", message: reason };
+  if (!signal && (code ?? 0) === 0) {
+    const tick = combined.split(/\r?\n/).find((line) => /^tick:/.test(line));
+    if (tick) return { kind: "tick", message: tick };
+  }
   const healthy = combined.split(/\r?\n/).find((line) => /^watcher: healthy\b/.test(line));
   if (healthy) {
     return {
@@ -370,9 +374,10 @@ function spawnArm(paths, sessionID, client, predecessorArmPid = "") {
     resolveClosed();
     releaseChild();
     const classification = classifyArmClose(stdout, stderr, code, signal);
-    settleReadiness(classification.kind === "actionable" ? "wake" : "failed");
+    const benignClose = classification.kind === "actionable" || classification.kind === "tick";
+    settleReadiness(benignClose ? "wake" : "failed");
     const predecessor = String(armChild.pid ?? "");
-    if (classification.kind === "actionable") {
+    if (benignClose) {
       retryFailures = 0;
       setArmStatus("wake");
       const previousRestoration = restorationInFlight;

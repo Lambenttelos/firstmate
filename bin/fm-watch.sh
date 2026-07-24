@@ -443,8 +443,10 @@ wake() {
 # advanced their suppression state (a benign signal whose .seen-* signature is
 # written, an absorbed heartbeat whose schedule and backoff are advanced), never from
 # a per-poll re-evaluation of an unchanged pane, so it fires at most once per
-# absorbed-wake event and never storms on a static fleet. Deliberately does not touch
-# the heartbeat streak or enqueue anything: a tick is not an actionable wake.
+# absorbed-wake event and never storms on a static fleet. This function itself never
+# writes .heartbeat-streak and never enqueues anything, because a tick is not an
+# actionable wake; the absorbed-heartbeat caller deliberately bumps the streak just
+# before calling here, since that bump is what drives the heartbeat backoff.
 FM_WATCH_ABSORB_TICK=${FM_WATCH_ABSORB_TICK:-0}
 absorb_tick() {  # <note>
   [ "$FM_WATCH_ABSORB_TICK" = 1 ] || return 0

@@ -68,11 +68,12 @@ A tick is deliberately cheap and safe:
 
 On a tick-enabled home the standing convention is a single literal `tick` reply: the session wakes on the proof-of-life close, sees the tick, answers `tick`, and re-arms the watcher exactly as it would after any cycle close.
 The heartbeat's backoff bounds the quiet-fleet cadence (base `FM_HEARTBEAT`, doubling to `FM_HEARTBEAT_MAX`), so a fully idle-but-supervised fleet ticks on that lengthening interval rather than continuously.
-Verified for the Claude native tracked-background path; the Pi, OpenCode, Codex, and Grok adapters are inert while the knob is off and, when it is on, treat a tick close like any other cycle close (re-arm, then deliver the tick text).
+Verified for the Claude native tracked-background path; the Pi, OpenCode, Codex, and Grok adapters are inert while the knob is off.
+The Pi extension and the OpenCode plugin classify a clean tick-only close as a third benign category of their own, mirroring the arm layer's precedence (an actionable line always wins), so they re-arm and deliver the tick text instead of reporting a cycle failure; a clean close with no reason line at all still takes the typed empty-cycle failure path.
 
 ## Regression coverage
 
-`tests/fm-pi-watch-extension.test.sh` checks Pi's first-cycle-or-explicit-repair tool metadata and ownership-based redundant-call no-ops, then simulates actionable and empty child closes against the actual Pi and OpenCode close handlers, blocks prompt delivery to prove the successor launches first, verifies single-flight behavior, changes the session lock before close to prove ownership is rechecked, and hangs each successor arm to prove bounded fallback delivery includes the typed restoration failure.
+`tests/fm-pi-watch-extension.test.sh` checks Pi's first-cycle-or-explicit-repair tool metadata and ownership-based redundant-call no-ops, then simulates actionable, tick-only, and empty child closes against the actual Pi and OpenCode close handlers, proving a tick-only close is delivered as a benign completion with continuity intact rather than as a cycle failure, blocks prompt delivery to prove the successor launches first, verifies single-flight behavior, changes the session lock before close to prove ownership is rechecked, and hangs each successor arm to prove bounded fallback delivery includes the typed restoration failure.
 `tests/fm-watcher-lock.test.sh` covers verified-successor attach, the typed self-eviction failure, bounded and successor-linked lifecycle rows, and a SIGSTOP counterfactual that distinguishes a live PID from a stale beacon before classifying termination.
 `tests/fm-continuity-pretool-check.test.sh` proves the Claude gate rejects only non-recovery fleet execution in the precise unhealthy state and preserves the existing Stop registration.
 
