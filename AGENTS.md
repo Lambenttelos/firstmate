@@ -106,6 +106,7 @@ state/               volatile runtime signals; gitignored
   .afk               durable away-mode flag; present = the away posture, so a live sub-supervisor daemon may inject escalations, while supervision ownership follows an actually-live daemon rather than this flag (bin/fm-afk-daemon-lib.sh; set by /afk, cleared on user return)
   .afk-delivery .afk-outbox* .afk-inbox.beat  away-mode delivery mode, the durable pull-delivery records used when no supervisor pane exists, and the reader's liveness beacon; acknowledged only by bin/fm-afk-inbox.sh (docs/configuration.md)
   .watch.lock .wake-queue.lock watcher singleton and queue serialization locks
+  .wake-brief-spool-*  bin/fm-wake-brief.sh's drained-record spool; removed after a successful brief, kept and named in the output when the drain failed because it is then the only copy of those records
   .hash-* .count-* .stale-* .stale-since-* .paused-* .wedge-escalations-* .seen-* .hb-surfaced-* .last-* .resource-* .heartbeat-streak   watcher internals; never touch
   .watch-triage.log  watcher's absorbed-wake debug log (size-capped); never relied on, safe to delete
   .last-watcher-beat watcher liveness beacon, touched every poll (including while absorbing benign wakes); guard scripts read it
