@@ -264,6 +264,7 @@ The path's worker, automated gates, and captain approval remain authoritative:
 
 - **no-mistakes** runs the full pipeline through a PR, then waits for the configured merge authority.
 - **direct-PR** has the worker push and open a PR without the no-mistakes pipeline, then waits for the configured merge authority.
+- **direct-push** runs the full no-mistakes pipeline on a forge firstmate cannot open PRs on (the pipeline's PR and CI steps not applying is expected, a `passed` run with them skipped is complete, and a `missing NO_MISTAKES_BITBUCKET_EMAIL` report is never a blocker), then has the worker push the validated branch to `origin` and report its head; landing stays with the configured merge authority on the forge, and firstmate verifies the branch with `git ls-remote origin refs/heads/<branch>` before relaying, never waiting on a PR url or CI.
 - **local-only** has the worker stop with a clean ready branch, then waits for the configured merge authority before firstmate uses the guarded fast-forward merge path.
 
 Delivery mode and `yolo` are orthogonal.

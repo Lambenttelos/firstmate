@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Tear down a finished task: return the treehouse worktree, release the Orca
 # worktree, or retire a secondmate home; kill the recorded runtime endpoint,
-# clear volatile state, refresh/prune the project's clone for PR-based ship
+# clear volatile state, refresh/prune the project's clone for remote-backed ship
 # tasks, then print a backlog-refresh reminder for ship and scout teardowns
 # (a secondmate teardown prints none, since secondmates are not backlog items).
 # REFUSES if the worktree holds work that is NEITHER durable on a remote NOR landed,
@@ -32,6 +32,10 @@
 # A gh lookup error falls back to the content check; if that is also inconclusive,
 # teardown refuses rather than risk discarding unlanded work.
 # Uncommitted changes are never landed.
+# direct-push projects additionally require positive proof that the task branch
+# exists on origin (git ls-remote origin refs/heads/<branch>), because that mode
+# has no PR or merge confirmation and the no-mistakes pipeline's internal
+# validation remote never counts as landed. An ls-remote failure refuses too.
 # local-only projects additionally accept work merged into the local default
 # branch (firstmate performs that merge after configured approval) as a fallback
 # for the common case where there is no remote at all.
@@ -466,6 +470,8 @@ backlog_refresh_reminder() {
       *)
         if [ "$MODE" = local-only ]; then
           done_cmd="tasks-axi done $ID --note \"local main\""
+        elif [ "$MODE" = direct-push ]; then
+          done_cmd="tasks-axi done $ID --note \"pushed to origin\""
         else
           pr=$PR_URL
           if [ -n "$pr" ]; then
@@ -590,6 +596,15 @@ worktree_git_lock_path() {
 # Teardown passes the worktree dir as the companion directory and its own
 # STALE_WORKTREE_LOCK_AGE_SECS threshold.
 
+# Resolves the worktree's branch once and caches it in
+# TEARDOWN_WORKTREE_BRANCH_FOR_SAFETY, which the caller reads after the call.
+worktree_safety_branch() {
+  local dir=$1
+  if [ -z "${TEARDOWN_WORKTREE_BRANCH_FOR_SAFETY:-}" ]; then
+    TEARDOWN_WORKTREE_BRANCH_FOR_SAFETY=$(git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)
+  fi
+}
+
 worktree_safety_blocked_by_lock() {
   local reason=$1 lock
   lock=$(worktree_git_lock_path "$WT") || lock=""
@@ -700,7 +715,7 @@ teardown_treehouse_return() {
 }
 
 validate_worktree_teardown_safety() {
-  local dirty_raw dirty unpushed_raw unpushed DEFAULT unmerged_raw unmerged branch
+  local dirty_raw dirty unpushed_raw unpushed DEFAULT unmerged_raw unmerged branch origin_ref
   [ -d "$WT" ] || return 0
   [ "$FORCE" != "--force" ] || return 0
   case "$KIND" in
@@ -751,11 +766,8 @@ validate_worktree_teardown_safety() {
     echo "Commit them (or get the captain's explicit OK to discard, then --force)." >&2
     return 1
   elif [ -n "$unpushed" ]; then
-    branch=${TEARDOWN_WORKTREE_BRANCH_FOR_SAFETY:-}
-    if [ -z "$branch" ]; then
-      branch=$(git -C "$WT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)
-      TEARDOWN_WORKTREE_BRANCH_FOR_SAFETY=$branch
-    fi
+    worktree_safety_branch "$WT"
+    branch=$TEARDOWN_WORKTREE_BRANCH_FOR_SAFETY
     # Release when the work has LANDED (merged) OR the branch is fully pushed to its
     # own origin ref: a pushed branch is durable on the remote, so the local copy is
     # disposable even before it merges. The merge queue (recorded from the main flow)
@@ -765,6 +777,48 @@ validate_worktree_teardown_safety() {
       echo "REFUSED: worktree $WT has work not on any remote and not landed." >&2
       printf 'unpushed commits:\n%s\n' "$unpushed" >&2
       echo "Push the branch, land its PR, or get the captain's explicit OK to discard, then --force." >&2
+      return 1
+    fi
+  fi
+
+  # direct-push has no PR or merge confirmation to catch a skipped push, and the
+  # no-mistakes pipeline's internal validation remote never counts as landed, so
+  # require positive proof that the branch reached origin.
+  if [ "$MODE" = direct-push ]; then
+    local origin_sha head_sha
+    worktree_safety_branch "$WT"
+    branch=$TEARDOWN_WORKTREE_BRANCH_FOR_SAFETY
+    if ! origin_ref=$(GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=true SSH_ASKPASS=true GIT_SSH_COMMAND='ssh -oBatchMode=yes' \
+      git -C "$WT" ls-remote origin "refs/heads/$branch" 2>/dev/null); then
+      if worktree_safety_blocked_by_lock "the direct-push branch $branch on origin"; then
+        return "$TEARDOWN_WORKTREE_SAFETY_LOCK_BLOCKED"
+      fi
+      echo "REFUSED: cannot confirm direct-push worktree $WT pushed branch $branch to origin." >&2
+      echo "origin could not be queried; the validation remote never counts as landed" >&2
+      echo "Restore access to origin and retry, or get the captain's explicit OK to discard, then --force." >&2
+      return 1
+    fi
+    if [ -z "$origin_ref" ]; then
+      echo "REFUSED: direct-push worktree $WT has validated work that was never pushed to origin." >&2
+      echo "branch $branch is absent from origin; the validation remote never counts as landed" >&2
+      echo "Run git push origin HEAD:$branch first, or get the captain's explicit OK to discard, then --force." >&2
+      return 1
+    fi
+    origin_sha=${origin_ref%%[[:space:]]*}
+    if ! head_sha=$(git -C "$WT" rev-parse HEAD 2>/dev/null); then
+      if worktree_safety_blocked_by_lock "the direct-push worktree head"; then
+        return "$TEARDOWN_WORKTREE_SAFETY_LOCK_BLOCKED"
+      fi
+      echo "REFUSED: cannot resolve the head commit of direct-push worktree $WT." >&2
+      echo "origin holds $origin_sha for $branch but the local head is unreadable" >&2
+      echo "Restore the git index state, or get the captain's explicit OK to discard, then --force." >&2
+      return 1
+    fi
+    if [ "$origin_sha" != "$head_sha" ] \
+      && ! git -C "$WT" merge-base --is-ancestor "$head_sha" "$origin_sha" 2>/dev/null; then
+      echo "REFUSED: direct-push worktree $WT has commits after what origin holds for $branch." >&2
+      echo "origin is at $origin_sha but the worktree head is $head_sha; the validation remote never counts as landed" >&2
+      echo "Run git push origin HEAD:$branch first, or get the captain's explicit OK to discard, then --force." >&2
       return 1
     fi
   fi

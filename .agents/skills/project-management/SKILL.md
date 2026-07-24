@@ -32,6 +32,7 @@ Choose the delivery mode when adding or creating the project:
 
 - `no-mistakes` runs the full validation pipeline before a PR and is the default when the captain does not specify a mode.
 - `direct-PR` pushes and opens a PR without the no-mistakes pipeline.
+- `direct-push` runs the full no-mistakes pipeline on a forge firstmate cannot open PRs on (e.g. Bitbucket), then the worker pushes the validated branch to `origin`; the configured merge authority lands it on the forge and there is no PR or CI to wait on. See AGENTS.md section 7 for the full contract.
 - `local-only` has no required remote or PR and lands only through the approved local fast-forward path.
 
 The optional `+yolo` posture changes routine approval authority but does not change the delivery mode.
@@ -44,6 +45,7 @@ Confirm the source URL, local project name, delivery mode, and autonomy posture.
 Clone into `projects/<name>` and add the registry entry only after the destination is known to be unused.
 A `no-mistakes` project must have an `origin` remote and must complete the initialization procedure below.
 A `direct-PR` project needs an `origin` remote but skips no-mistakes initialization.
+A `direct-push` project must have an `origin` remote and must complete the no-mistakes initialization below, since the worker runs the full pipeline before pushing.
 A `local-only` project may have no remote and skips no-mistakes initialization.
 
 ## Create a project
@@ -58,7 +60,7 @@ The captain's request to create that local project authorizes this local initial
 
 ## Initialize
 
-Run no-mistakes initialization only for `no-mistakes` projects:
+Run no-mistakes initialization only for `no-mistakes` and `direct-push` projects, since both run the full pipeline:
 
 ```sh
 cd projects/<name> && no-mistakes init && no-mistakes doctor
