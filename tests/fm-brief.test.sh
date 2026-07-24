@@ -410,6 +410,28 @@ test_scout_and_secondmate_scaffold() {
   pass "fm-brief: scout and secondmate code paths still scaffold well-formed briefs"
 }
 
+# The heavy-run serialization point only helps if crewmates actually route
+# through it, so the generated ship and scout briefs must carry the instruction.
+test_briefs_route_heavy_runs_through_the_runner() {
+  local home brief
+  home="$TMP_ROOT/heavy-run-home"
+  mkdir -p "$home/data"
+  FM_HOME="$home" "$ROOT/bin/fm-brief.sh" brief-heavy-ship some-proj >/dev/null 2>&1 \
+    || fail "fm-brief.sh ship scaffold exited non-zero"
+  brief="$home/data/brief-heavy-ship/brief.md"
+  assert_grep "bin/fm-heavy-run.sh --task brief-heavy-ship --" "$brief" \
+    "ship brief must route heavy runs through fm-heavy-run.sh with its own task id"
+  assert_grep "queued notice while you wait; that is normal, not a hang" "$brief" \
+    "ship brief must tell the crewmate a queued run is not a hang"
+
+  FM_HOME="$home" "$ROOT/bin/fm-brief.sh" brief-heavy-scout some-proj --scout >/dev/null 2>&1 \
+    || fail "fm-brief.sh scout scaffold exited non-zero"
+  brief="$home/data/brief-heavy-scout/brief.md"
+  assert_grep "bin/fm-heavy-run.sh --task brief-heavy-scout --" "$brief" \
+    "scout brief must route heavy runs through fm-heavy-run.sh too"
+  pass "fm-brief.sh: ship and scout briefs route heavy runs through the serialization point"
+}
+
 test_script_parses
 test_help_includes_entire_header
 test_ship_modes_generate_clean_briefs
@@ -426,3 +448,4 @@ test_secondmate_no_projects_charter
 test_pause_verb_override_renders_all_brief_scaffolds
 test_scout_and_secondmate_load_decision_hold_policy
 test_scout_and_secondmate_scaffold
+test_briefs_route_heavy_runs_through_the_runner

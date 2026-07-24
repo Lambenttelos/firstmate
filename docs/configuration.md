@@ -311,6 +311,42 @@ Malformed JSON, an empty or malformed rule/default array, an unverified harness,
 Because the spawn backstop is gated by file presence, any fallback path after a missing match, validation error, or missing `jq` still passes a resolved harness explicitly until the file is fixed or removed.
 Secondmate homes inherit this file from the primary, so a secondmate's own crewmates apply the same dispatch profile behavior.
 
+## Heavy-run serialization (config/heavy-run-slots)
+
+`config/heavy-run-slots` is an optional local, gitignored file holding a single positive integer: the number of HEAVY runs - unit suites, end-to-end suites, lint sweeps, builds - that may execute at one instant in this home.
+The first non-empty line is parsed, and the default is `1`.
+This section is the single owner of the knob; [`bin/fm-heavy-run.sh`](../bin/fm-heavy-run.sh)'s header and `--help` own the lease-queue mechanism, the record format, the refusal cases, and the exit statuses.
+
+A malformed or below-floor value falls back to `1` and warns, rather than falling back to something permissive.
+That direction is deliberate: guessing high recreates the host thrash the ceiling exists to prevent, while guessing low only makes runs wait.
+
+Crewmates reach it by wrapping their heavy command:
+
+```sh
+bin/fm-heavy-run.sh --task <id> -- npm test
+```
+
+The command runs unchanged, its output streams straight through, and the wrapper exits with the command's own status, so a crewmate always acts on its real result.
+While a run waits its turn it prints a queued notice naming its position, so a waiting crewmate is visibly queued rather than apparently hung.
+The generated crewmate briefs ([`bin/fm-brief.sh`](../bin/fm-brief.sh)) carry that instruction, which is how the runner actually gets adopted.
+
+This is deliberately NOT the host-resource monitor.
+That monitor answers "is this machine healthy right now" and only reports; this ceiling answers "how many heavy runs may proceed right now" and actually blocks.
+The two stay uncoupled because a resource reading is momentary and advisory, while the failure mode being prevented - several parked crewmates unblocked at once, all starting a suite before any new reading is taken - needs a hard, stateful count.
+
+Inspect the queue at any time:
+
+```sh
+bin/fm-heavy-run.sh --status
+```
+
+It prints `ceiling=`, `running=`, `waiting=`, then one line per run and per waiter in queue order.
+The runner's state lives under `state/heavy-runs/`; these are runtime records, not files to edit by hand.
+
+The queue is per operational home, because it lives under that home's `state/`.
+A fleet whose secondmate homes share one physical host therefore gets one queue per home, not one for the machine.
+Set the same ceiling in each home, or point every home at one queue by exporting `FM_HEAVY_RUN_DIR` to a shared directory, when the machine rather than the home is the thing being protected.
+
 ## Toolchain
 
 On session start the first mate detects what its required toolchain is missing or too old and lists each problem with either an exact install command or manual instructions.
@@ -465,6 +501,11 @@ FM_CHECK_TIMEOUT=30     # seconds allowed per slow check script
 FM_RESOURCE_INTERVAL=900   # seconds between host CPU/memory/swap sweeps; own cadence, NOT tied to FM_POLL or FM_CHECK_INTERVAL; 0 disables the monitor, malformed falls back to the default (see the host resource monitoring section above)
 FM_RESOURCE_SWEEP_BUDGET=30   # seconds one sweep may spend on crew-liveness checks in total; 0 or malformed falls back to the default
 FM_RESOURCE_PROBE_TIMEOUT=5   # seconds allowed per crew-liveness check inside a sweep; 0 or malformed falls back to the default
+FM_HEAVY_SLOTS=         # heavy-run ceiling override; wins over config/heavy-run-slots, malformed or below-floor values fall back to 1 (see the heavy-run serialization section above)
+FM_HEAVY_RUN_DIR=       # alternate heavy-run queue dir, default state/heavy-runs; point several homes at one dir to cap a whole host
+FM_HEAVY_POLL=2         # seconds between admission attempts while a heavy run is queued
+FM_HEAVY_NOTICE=30      # seconds between "still queued" notices printed by a waiting heavy run
+FM_HEAVY_LOCK_WAIT=30   # seconds a heavy run waits for the admission lock before refusing without running
 FM_CODEX_WATCH_CHECKPOINT=180   # seconds per foreground watcher checkpoint in Codex primary supervision
 FM_CREW_STATE_NM_TIMEOUT=10   # seconds allowed per no-mistakes query inside fm-crew-state.sh
 FM_CREW_STATE_RUNS_LIMIT=200  # recent no-mistakes run rows scanned when axi status cannot be attributed to the current code
