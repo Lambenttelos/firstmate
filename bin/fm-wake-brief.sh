@@ -36,8 +36,9 @@
 # fact about the fleet, not an error: it prints an explicit ABSENT marker rather
 # than failing the brief or silently omitting the task. A FAILED DRAIN is the
 # exception: the queue is still full and this turn's work is unknown, so it
-# prints an explicit DRAIN FAILED marker, keeps the spooled records, and exits
-# non-zero rather than reading like an empty queue.
+# prints an explicit DRAIN FAILED marker, keeps the spooled records under this
+# home's state dir and names that path, and exits non-zero rather than reading
+# like an empty queue.
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -132,21 +133,40 @@ id_for_wake_key() {
 # The drain deletes the durable queue as it prints, so its output must never
 # live only in this process's memory: it is spooled to a file on disk that is
 # removed ONLY after the records have been printed and mined. If this script is
-# interrupted before that, the spool still holds the drained records.
+# interrupted before that, the spool still holds the drained records. The spool
+# lives under this home's state dir rather than an anonymous TMPDIR file, so a
+# retained one is discoverable and sweepable where the rest of this home's
+# durable records already are.
+#
+# The drain's stderr is kept on its own fd: the record stream stays verbatim,
+# and a warning line can never be printed as if it were queue content nor mined
+# for a task id.
 section "WAKE QUEUE (drained)"
-DRAIN_SPOOL=$(mktemp "${TMPDIR:-/tmp}/fm-wake-brief.XXXXXX") || {
-  echo "fm-wake-brief: cannot create the drain spool file" >&2
+mkdir -p "$STATE" 2>/dev/null || true
+DRAIN_SPOOL="$STATE/.wake-brief-spool-$$"
+DRAIN_ERR="$STATE/.wake-brief-spool-$$.err"
+: > "$DRAIN_SPOOL" 2>/dev/null || {
+  echo "fm-wake-brief: cannot create the drain spool file $DRAIN_SPOOL" >&2
+  exit 1
+}
+: > "$DRAIN_ERR" 2>/dev/null || {
+  rm -f "$DRAIN_SPOOL"
+  echo "fm-wake-brief: cannot create the drain spool file $DRAIN_ERR" >&2
   exit 1
 }
 DRAIN_STATUS=0
-"$DRAIN_BIN" >"$DRAIN_SPOOL" 2>&1 || DRAIN_STATUS=$?
+"$DRAIN_BIN" >"$DRAIN_SPOOL" 2>"$DRAIN_ERR" || DRAIN_STATUS=$?
 if [ -s "$DRAIN_SPOOL" ]; then
   cat "$DRAIN_SPOOL"
 elif [ "$DRAIN_STATUS" -eq 0 ]; then
   printf '(no queued wakes)\n'
 fi
+if [ -s "$DRAIN_ERR" ]; then
+  printf 'DRAIN STDERR (not queue content):\n'
+  cat "$DRAIN_ERR"
+fi
 if [ "$DRAIN_STATUS" -ne 0 ]; then
-  printf 'DRAIN FAILED (exit %s): the queue was NOT drained, so this is not an empty queue. Any text above is the drain error, not wakes. Drained records, if any, are retained in %s\n' \
+  printf 'DRAIN FAILED (exit %s): the queue was NOT drained, so this is not an empty queue. Any DRAIN STDERR text above is the drain error, not wakes. Drained records, if any, are retained in %s\n' \
     "$DRAIN_STATUS" "$DRAIN_SPOOL"
 fi
 
@@ -185,7 +205,7 @@ set +f
 
 # The records have been printed and mined; the spool has served its purpose. A
 # failed drain keeps its spool, because then it is the only copy that exists.
-[ "$DRAIN_STATUS" -eq 0 ] && rm -f "$DRAIN_SPOOL"
+[ "$DRAIN_STATUS" -eq 0 ] && rm -f "$DRAIN_SPOOL" "$DRAIN_ERR"
 
 section "TASKS"
 set -f
@@ -310,8 +330,17 @@ for meta in "$STATE"/*.meta; do
     else
       exists=dead
     fi
+    # fm_backend_agent_alive only classifies the backends with an empirically
+    # verified classifier (tmux, herdr) and returns a constant `unknown` for
+    # every other backend. Paying a probe for an answer that is known in
+    # advance would make this sweep slower than the unbatched sequence it
+    # replaces, so an unclassifiable backend is reported without probing.
+    case "$backend" in
+      herdr) agent=$(fm_backend_agent_alive "$backend" "${target:-$window}") ;;
+      *) agent='unknown (backend cannot classify)' ;;
+    esac
     printf '%s backend=%s window=%s endpoint=%s agent=%s\n' \
-      "$id" "$backend" "$window" "$exists" "$(fm_backend_agent_alive "$backend" "${target:-$window}")"
+      "$id" "$backend" "$window" "$exists" "$agent"
   fi
 done
 [ "$META_FOUND" -eq 1 ] || printf '(no recorded endpoints)\n'

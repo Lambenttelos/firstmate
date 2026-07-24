@@ -424,7 +424,94 @@ firstmate:fm-t2	claude" run_brief "$home") || fail "brief must exit 0"
   pass "wake brief takes exactly one tmux listing for the whole endpoint sweep"
 }
 
+test_unclassifiable_backend_costs_no_agent_probe() {
+  local home state calls out brief_calls baseline_calls
+  home=$(make_home unclassifiable)
+  state="$home/state"
+  calls="$home/cmux-calls"
+  cat > "$home/fakebin/cmux" <<'SH'
+#!/usr/bin/env bash
+[ -n "${FM_FAKE_CMUX_CALLS:-}" ] && printf 'x\n' >> "$FM_FAKE_CMUX_CALLS"
+exit 1
+SH
+  chmod +x "$home/fakebin/cmux"
+  fm_write_meta "$state/kappa.meta" 'window=ws:pane' 'backend=cmux'
+
+  : > "$calls"
+  out=$(FM_FAKE_CMUX_CALLS="$calls" run_brief "$home") || fail "brief must exit 0"
+  brief_calls=$(wc -l < "$calls")
+
+  case "$out" in
+    *"kappa backend=cmux window=ws:pane endpoint="*"agent=unknown (backend cannot classify)"*) ;;
+    *) fail "an unclassifiable backend must report unknown without probing: $out" ;;
+  esac
+
+  # Baseline: the presence probe alone. A brief that also ran the agent
+  # classifier would cost strictly more than this.
+  : > "$calls"
+  PATH="$home/fakebin:$PATH" FM_FAKE_CMUX_CALLS="$calls" bash -c \
+    '. "$1/bin/fm-backend.sh"; fm_backend_target_exists cmux ws:pane fm-kappa >/dev/null 2>&1 || true' \
+    _ "$ROOT"
+  baseline_calls=$(wc -l < "$calls")
+  [ "$brief_calls" -eq "$baseline_calls" ] \
+    || fail "the sweep must cost only the presence probe, got $brief_calls vs $baseline_calls"
+  pass "wake brief skips the agent probe for a backend that cannot classify it"
+}
+
+test_drain_stderr_is_labeled_and_not_mined_for_ids() {
+  local home state stub out
+  home=$(make_home drainstderr)
+  state="$home/state"
+  fm_write_meta "$state/omega.meta" 'window=firstmate:fm-omega'
+  stub="$home/fakebin/noisy-drain.sh"
+  cat > "$stub" <<'SH'
+#!/usr/bin/env bash
+printf '1\t1\tsignal\tomega.status\tsignal: omega.status\n'
+printf 'fm-wake-drain: warning\t9\tsignal\tomega\tomega\n' >&2
+exit 0
+SH
+  chmod +x "$stub"
+
+  out=$(FM_WAKE_DRAIN_BIN="$stub" run_brief "$home") || fail "brief must exit 0"
+  case "$out" in
+    *"DRAIN STDERR (not queue content):"*"fm-wake-drain: warning"*) ;;
+    *) fail "drain stderr must be labeled distinctly: $out" ;;
+  esac
+  [ "$(printf '%s\n' "$out" | grep -c '^--- omega ---$')" -eq 1 ] \
+    || fail "stderr must not be mined for ids alongside the records: $out"
+  pass "wake brief keeps drain stderr labeled and out of the mined record stream"
+}
+
+test_failed_drain_spool_is_recoverable_under_state() {
+  local home state stub out status spool
+  home=$(make_home drainfail-spool)
+  state="$home/state"
+  stub="$home/fakebin/failing-drain.sh"
+  cat > "$stub" <<'SH'
+#!/usr/bin/env bash
+printf '1\t1\tsignal\tlost.status\tsignal: lost.status\n'
+echo "fm-wake-drain: could not acquire the queue lock" >&2
+exit 1
+SH
+  chmod +x "$stub"
+
+  status=0
+  out=$(FM_WAKE_DRAIN_BIN="$stub" run_brief "$home") || status=$?
+  [ "$status" -ne 0 ] || fail "a failed drain must fail the brief: $out"
+  spool=$(printf '%s\n' "$out" | sed -n 's/.*retained in \(.*\)$/\1/p')
+  [ -n "$spool" ] || fail "the failure marker must name the retained spool: $out"
+  case "$spool" in
+    "$state"/*) ;;
+    *) fail "the retained spool must live under this home's state dir: $spool" ;;
+  esac
+  grep -q 'lost.status' "$spool" || fail "the retained spool must hold the drained records: $spool"
+  pass "a failed drain leaves a recoverable spool under state/ and reports its path"
+}
+
 test_empty_queue_and_empty_home
+test_unclassifiable_backend_costs_no_agent_probe
+test_drain_stderr_is_labeled_and_not_mined_for_ids
+test_failed_drain_spool_is_recoverable_under_state
 test_drained_wakes_brief_their_tasks
 test_failed_drain_is_distinct_from_an_empty_queue
 test_drain_spool_is_removed_only_after_the_records_are_printed
