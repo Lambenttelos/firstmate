@@ -60,17 +60,16 @@ When it is `1`, a benign-absorbed wake ends the cycle with a distinguishable `ti
 A tick is deliberately cheap and safe:
 
 - It enqueues no durable wake record, so `bin/fm-wake-drain.sh` finds nothing, and neither the continuity guard nor the turn-end guard sees any actionable work.
-  Because a tick ends the cycle, both guards have one knob-gated extension: with `FM_WATCH_ABSORB_TICK=1` the turn-end guard keeps requiring a healthy watcher even at zero in-flight tasks and the pull-based `bin/fm-guard.sh` banner keeps warning there, so an idle tick-enabled home cannot go dark after a tick; with the knob unset or any other value their zero-in-flight exits are unchanged ([`turnend-guard.md`](turnend-guard.md)).
-  Both guards resolve the knob through the one owner in `bin/fm-supervision-lib.sh`, from the same sources the watcher itself sees: an explicit ambient value wins, otherwise the value comes from `config/x-mode.env`, the environment the arm adapters source before launching the watcher.
-  So a knob set only in that file still guards the home, and a missing, unreadable, or empty file leaves both guards exactly as they are with the knob off.
-  Because zero in-flight work only ever reaches a lapse banner on a tick-enabled home, the shared situation clause says so plainly instead of counting zero tasks (`fm_afk_posture_situation`).
+  A tick ends the cycle, but it fires only while work is under way, which is exactly the state in which the turn-end guard already requires a healthy watcher and forces a re-arm, so no guard needs to know about the knob and none was changed.
+  A signal presupposes a task, and the absorbed-heartbeat site gates on the same in-flight count the guards use (`fm_supervision_status`), so the watcher and the guards cannot disagree about what "work under way" means.
+  With nothing in flight the watcher keeps absorbing silently and never exits, self-sustaining exactly as it did before this knob existed.
 - `bin/fm-watch-arm.sh` classifies the `tick:` close as a benign completion, separate from an actionable wake (`signal:`/`stale:`/`check:`/`heartbeat`) and from a failure (nonzero exit), so a live-but-quiet watcher never reads as the empty-cycle failure.
 - It fires at most once per absorbed-wake event, never once per poll.
   Only two absorb points emit it, and both first advance their suppression state so the same event cannot re-fire: a benign signal whose `.seen-*` signature is written, and an absorbed heartbeat whose schedule and exponential backoff are advanced.
   Per-poll re-evaluations of an unchanged or churning stale pane deliberately do not tick, so a static or redrawing fleet cannot storm.
 
 On a tick-enabled home the standing convention is a single literal `tick` reply: the session wakes on the proof-of-life close, sees the tick, answers `tick`, and re-arms the watcher exactly as it would after any cycle close.
-The heartbeat's backoff bounds the quiet-fleet cadence (base `FM_HEARTBEAT`, doubling to `FM_HEARTBEAT_MAX`), so a fully idle-but-supervised fleet ticks on that lengthening interval rather than continuously.
+The heartbeat's backoff bounds the quiet-fleet cadence (base `FM_HEARTBEAT`, doubling to `FM_HEARTBEAT_MAX`), so a quiet-but-supervised fleet ticks on that lengthening interval rather than continuously.
 Verified for the Claude native tracked-background path; the Pi, OpenCode, Codex, and Grok adapters are inert while the knob is off.
 The Pi extension and the OpenCode plugin classify a clean tick-only close as a third benign category of their own, mirroring the arm layer's precedence (an actionable line always wins), so they re-arm and deliver the tick text instead of reporting a cycle failure; a clean close with no reason line at all still takes the typed empty-cycle failure path.
 Both deliver a tick under its own minimal prompt, which states that nothing is queued, orders no wake drain, and asks only for the single literal `tick` reply; OpenCode's streaming observer classifies a tick the same way its close handler does, so a streamed tick counts as a ready successor rather than disagreeing with the close.

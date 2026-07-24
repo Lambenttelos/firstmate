@@ -583,9 +583,11 @@ test_arm_classifies_tick_close_as_benign_completion() {
   fakebin="$dir/fakebin"
   armout="$dir/arm.out"
   mark_pr_check_migration_complete "$state"
-  # A quiet fleet with a fast heartbeat cadence and the proof-of-life knob on: the
-  # child ends its cycle with a "tick:" line only. The arm must treat that clean close
-  # as a benign completion, not as the empty-cycle failure.
+  # A quiet fleet with work under way (the tick fires only then), a fast heartbeat
+  # cadence, and the proof-of-life knob on: the child ends its cycle with a "tick:"
+  # line only. The arm must treat that clean close as a benign completion, not as the
+  # empty-cycle failure.
+  printf 'window=task\n' > "$state/task.meta"
   PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_POLL=1 FM_SIGNAL_GRACE=1 \
     FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=1 FM_WATCH_ABSORB_TICK=1 FM_ARM_CONFIRM_TIMEOUT=1 "$WATCH_ARM" > "$armout" &
   armpid=$!

@@ -1585,7 +1585,9 @@ test_absorb_tick_on_signal_emits_one_tick() {
 test_absorb_tick_on_heartbeat_emits_tick() {
   local dir state fakebin out pid
   dir=$(make_case absorb-tick-heartbeat); state="$dir/state"; fakebin="$dir/fakebin"; out="$dir/watch.out"
-  # A quiet fleet (no windows, no statuses) with a fast heartbeat cadence and the knob on.
+  # A quiet fleet (no statuses) with work under way, a fast heartbeat cadence, and the
+  # knob on. Work under way is required: an idle home never ticks (see the next case).
+  printf 'window=task\n' > "$state/task.meta"
   PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_POLL=1 FM_SIGNAL_GRACE=1 \
     FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=1 FM_WATCH_ABSORB_TICK=1 "$WATCH" > "$out" &
   pid=$!
@@ -1594,6 +1596,27 @@ test_absorb_tick_on_heartbeat_emits_tick() {
   [ ! -s "$state/.wake-queue" ] || fail "a heartbeat tick enqueued a durable wake record"
   [ "$(cat "$state/.heartbeat-streak" 2>/dev/null || echo 0)" -ge 1 ] || fail "heartbeat backoff streak did not advance before ticking"
   pass "with FM_WATCH_ABSORB_TICK=1 a no-change heartbeat ticks once and still backs off its cadence"
+}
+
+test_absorb_tick_idle_home_never_ticks() {
+  local dir state fakebin out pid i
+  dir=$(make_case absorb-tick-idle); state="$dir/state"; fakebin="$dir/fakebin"; out="$dir/watch.out"
+  # Knob on, but NOTHING under way (no state/*.meta). A tick would end the cycle with
+  # nothing queued, and with no in-flight work no guard forces a re-arm, so the home
+  # would go dark. The heartbeat must stay absorbed silently and the watcher must live.
+  PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=1 FM_WATCH_ABSORB_TICK=1 "$WATCH" > "$out" &
+  pid=$!
+  i=0
+  while [ "$i" -lt 40 ]; do
+    kill -0 "$pid" 2>/dev/null || { reap "$pid"; fail "idle tick-enabled watcher exited (should absorb silently): $(cat "$out")"; }
+    [ "$(cat "$state/.heartbeat-streak" 2>/dev/null || echo 0)" -ge 2 ] && break
+    sleep 0.1; i=$((i + 1))
+  done
+  [ "$(cat "$state/.heartbeat-streak" 2>/dev/null || echo 0)" -ge 2 ] || { reap "$pid"; fail "idle watcher did not absorb repeated heartbeats within the bound"; }
+  [ ! -s "$out" ] || { reap "$pid"; fail "idle tick-enabled home printed output (expected silence): $(cat "$out")"; }
+  reap "$pid"
+  pass "with FM_WATCH_ABSORB_TICK=1 an idle home never ticks and its watcher keeps absorbing"
 }
 
 test_absorb_tick_on_actionable_signal_unchanged() {
@@ -1658,4 +1681,5 @@ test_secondmate_unknown_context_fails_closed
 test_absorb_tick_off_is_silent
 test_absorb_tick_on_signal_emits_one_tick
 test_absorb_tick_on_heartbeat_emits_tick
+test_absorb_tick_idle_home_never_ticks
 test_absorb_tick_on_actionable_signal_unchanged

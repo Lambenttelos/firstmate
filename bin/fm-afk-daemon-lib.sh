@@ -264,17 +264,6 @@ fm_afk_daemon_owns_supervision() {
 # re-probes the daemon.
 fm_afk_posture_situation() {
   local state=$1 owned=$2 in_flight=$3 detail=$4
-  # Zero in flight only ever reaches a lapse banner on a tick-enabled home, where a
-  # benign-absorbed wake ends the watcher cycle with nothing queued: say that plainly
-  # instead of the self-contradictory "0 task(s) in flight, but ...".
-  if [ "$in_flight" -eq 0 ]; then
-    if [ "$owned" -eq 0 ] && [ -e "$state/.afk" ]; then
-      printf 'no work is under way, but this home is configured for absorbed-wake proof-of-life ticks so it still needs a live watcher, away mode is on with no supervision daemon, and %s\n' "$detail"
-      return 0
-    fi
-    printf 'no work is under way, but this home is configured for absorbed-wake proof-of-life ticks so it still needs a live watcher, and %s\n' "$detail"
-    return 0
-  fi
   if [ "$owned" -eq 0 ] && [ -e "$state/.afk" ]; then
     printf '%s task(s) in flight, away mode is on with no supervision daemon, and %s\n' "$in_flight" "$detail"
     return 0

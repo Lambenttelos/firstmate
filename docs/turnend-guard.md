@@ -26,8 +26,7 @@ That check keeps crewmate and scout worktrees inert because firstmate provisions
 It also requires `AGENTS.md`, `bin/`, and the effective state directory to exist.
 
 For an in-scope primary checkout, it counts in-flight work from `state/*.meta`.
-If no task is in flight, it exits silently, with one exception: on a home with `FM_WATCH_ABSORB_TICK=1` a benign-absorbed wake ends the watcher cycle without queuing anything, so an idle tick-enabled home would otherwise go dark unnoticed and the guard keeps checking watcher health at zero in-flight tasks (see [`watcher-continuity.md`](watcher-continuity.md) "Absorbed-wake proof-of-life tick").
-The knob is resolved by `fm_watch_absorb_tick_enabled` in `bin/fm-supervision-lib.sh` from the same sources the watcher sees, shared with the pull-based `bin/fm-guard.sh` so the two postures cannot drift.
+If no task is in flight, it exits silently.
 If work is in flight, it requires `fm_watcher_healthy <state-dir> <watch-path> [grace-seconds] [home]` from `bin/fm-wake-lib.sh`.
 That is the same identity-matched live lock and fresh beacon check used by `bin/fm-watch-arm.sh`.
 A stale beacon blocks even if a watcher pid is still live.

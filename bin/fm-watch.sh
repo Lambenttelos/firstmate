@@ -62,6 +62,10 @@ mkdir -p "$STATE"
 
 # shellcheck source=bin/fm-wake-lib.sh
 . "$SCRIPT_DIR/fm-wake-lib.sh"
+# Same in-flight count the guards use, so the watcher and they cannot disagree
+# about what "work under way" means (see absorb_tick).
+# shellcheck source=bin/fm-supervision-lib.sh
+. "$SCRIPT_DIR/fm-supervision-lib.sh"
 # Shared wake classifier (captain-relevant verbs + signal/stale/heartbeat
 # predicates), the SAME library the away-mode daemon uses, so the triage policy
 # has one definition.
@@ -443,7 +447,13 @@ wake() {
 # advanced their suppression state (a benign signal whose .seen-* signature is
 # written, an absorbed heartbeat whose schedule and backoff are advanced), never from
 # a per-poll re-evaluation of an unchanged pane, so it fires at most once per
-# absorbed-wake event and never storms on a static fleet. This function itself never
+# absorbed-wake event and never storms on a static fleet. A tick also fires ONLY while
+# work is under way: a signal presupposes a task, and the absorbed-heartbeat caller
+# gates on the shared in-flight count. That is exactly the state in which the turn-end
+# guard already forces a re-arm, so ending the cycle can never leave a home without
+# supervision and no guard needs to know about this knob. With nothing under way the
+# watcher keeps absorbing silently and self-sustains as it always has.
+# This function itself never
 # writes .heartbeat-streak and never enqueues anything, because a tick is not an
 # actionable wake; the absorbed-heartbeat caller deliberately bumps the streak just
 # before calling here, since that bump is what drives the heartbeat backoff.
@@ -1355,8 +1365,13 @@ EOF
       triage_log "absorbed heartbeat (no captain-relevant change)"
       # Schedule and backoff are advanced above, so the next heartbeat is bounded and
       # further out; a tick (when enabled) makes this quiet-fleet proof of life
-      # visible once per heartbeat cadence instead of only in the debug log.
-      absorb_tick "heartbeat absorbed"
+      # visible once per heartbeat cadence instead of only in the debug log. Only
+      # while work is under way: with nothing in flight nothing forces a re-arm, so
+      # an idle home keeps absorbing silently and its watcher self-sustains.
+      fm_supervision_status "$STATE"
+      if [ "$FM_SUP_IN_FLIGHT" -gt 0 ]; then
+        absorb_tick "heartbeat absorbed"
+      fi
     fi
   fi
 

@@ -150,12 +150,7 @@ fm_supervision_status "$STATE" "$GRACE"
 in_flight=$FM_SUP_IN_FLIGHT
 watcher_fresh=$FM_SUP_WATCHER_FRESH
 beacon_desc=$FM_SUP_BEACON_DESC
-# A tick-enabled home ends its watcher cycle on a benign-absorbed wake without
-# queuing anything, so an idle home there still needs a live watcher; the knob is
-# resolved from the watcher's own environment sources by the one owner in
-# bin/fm-supervision-lib.sh, shared with bin/fm-turnend-guard.sh so the push-based
-# and pull-based postures cannot drift. With the knob off this exit is unchanged.
-if [ "$in_flight" -eq 0 ] && ! fm_watch_absorb_tick_enabled "$CONFIG"; then
+if [ "$in_flight" -eq 0 ]; then
   # Leave the unhealthy state (no work riding on the watcher): clear so a later
   # in-flight + stale combination is a fresh episode even if the beacon is still
   # absent with the same key string.
