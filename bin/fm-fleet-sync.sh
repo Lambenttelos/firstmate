@@ -11,8 +11,10 @@
 # is left untouched and reported as a quantified, loud "STUCK: ... N commits behind
 # ... - needs attention" warning rather than a quiet drift. Nothing is ever forced,
 # stashed, or discarded.
-# Still skips (benignly) local-only/no-origin projects, missing remotes/branches,
-# and fetch failures.
+# Still skips (benignly) local-only/no-origin projects and missing remotes/branches.
+# A failed fetch is deliberately NOT one of those skips: it is reported as a loud,
+# actionable "FETCH FAILED: <git error> - ..." line that bootstrap relays as a
+# session-start FLEET_SYNC diagnostic; see report_fetch_failed for why.
 # Pruning never deletes the checked-out branch or a branch that still has a
 # worktree, so it cannot discard unlanded work; set FM_FLEET_PRUNE=0 to disable it.
 # When the fetch fails on an orphaned .git/packed-refs.lock (left by a ref rewrite
@@ -280,6 +282,20 @@ stuck_state() {
   printf '%s\n' "$s"
 }
 
+# Loud report for a clone whose fetch failed. A failed fetch is NOT a skip: the
+# clone stops receiving new commits while every other signal - a clean tree, the
+# default branch checked out, a plausible recent HEAD - still reads exactly like a
+# healthy clone, so work read or branched from it can be reasoned about against
+# stale code without anything looking wrong. It names the clone, the actual git
+# error, and the retry command so the line is actionable without further digging.
+report_fetch_failed() {
+  local detail="fetch failed"
+  if [ -n "${FETCH_OUTPUT:-}" ]; then
+    detail="$detail: $(first_line "$FETCH_OUTPUT")"
+  fi
+  echo "$label: FETCH FAILED: $detail - clone is not receiving new commits, so anything read or branched from it may be stale; fix the cause, then rerun bin/fm-fleet-sync.sh $label"
+}
+
 # Loud, quantified report for a clone we deliberately leave untouched. Includes
 # how far behind origin/<default> it is, so a chronically-stuck clone is visibly
 # distinct from a benign one-off skip.
@@ -313,11 +329,7 @@ sync_project() {
   fi
 
   if ! fetch_with_packed_refs_lock_guard; then
-    reason="fetch failed"
-    if [ -n "$FETCH_OUTPUT" ]; then
-      reason="$reason: $(first_line "$FETCH_OUTPUT")"
-    fi
-    echo "$label: skipped: $reason"
+    report_fetch_failed
     return 0
   fi
 
