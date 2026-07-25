@@ -41,6 +41,17 @@
 #                          the host-resource sweep found CPU/memory/swap pressure
 #                          WORSE than the level firstmate was last told about.
 #                          Report-only: nothing is paused, shed or killed here.
+#   check: session-review <headline>
+#                          the hourly session review found something that has
+#                          NOT moved (a silent worker, an unanswered decision,
+#                          queued work with nothing running, a batch of unmerged
+#                          branches). Silent when there is nothing new to say.
+#   check: session-cleanup <headline>
+#                          the hourly cleanup sweep found accumulated material it
+#                          deliberately did NOT remove because it could hold
+#                          unlanded work. Report-only; nothing is discarded here.
+#                          Both are armed by bin/fm-session-start.sh and run on
+#                          this watcher's slow poll (bin/fm-hourly-lib.sh).
 #   tick: <note>           env-gated proof-of-life close (FM_WATCH_ABSORB_TICK=1,
 #                          default off) for a benign-ABSORBED wake while work is
 #                          under way. Not an actionable wake: nothing is queued,
@@ -115,6 +126,11 @@ mkdir -p "$STATE"
 # yields no tokens and never wakes. See docs/secondmate-context-handoff.md.
 # shellcheck source=bin/fm-secondmate-context-lib.sh
 . "$SCRIPT_DIR/fm-secondmate-context-lib.sh"
+
+# Arming, cadence, and script mapping for the two session-lifetime hourly
+# passes (hourly_pass_sweep below). Unarmed homes never run them.
+# shellcheck source=bin/fm-hourly-lib.sh
+. "$SCRIPT_DIR/fm-hourly-lib.sh"
 
 WATCH_LOCK="$STATE/.watch.lock"
 WATCH_PATH="$SCRIPT_DIR/fm-watch.sh"
@@ -426,6 +442,41 @@ resource_sweep() {
     | awk '{sub(/^resources: /, ""); printf "%s%s", sep, $0; sep="; "}')"
   fm_wake_append check host-resources "$reason" || exit 1
   wake "$reason"
+}
+
+# hourly_pass_sweep: run the session-lifetime hourly passes that
+# bin/fm-session-start.sh armed - the session review and the cleanup sweep.
+# They live here, on the one watcher, precisely so no second supervision cycle
+# is needed: this loop is already the home's single scheduler, so an hourly duty
+# becomes one more cadence-gated sweep rather than a competing timer.
+#
+# Each pass runs at most once per its own interval, time-based via its stamp
+# mtime so the cadence survives watcher restarts, and the stamp is touched
+# BEFORE the run so a slow or failing pass cannot re-fire every poll. Only
+# repository-owned, non-symlinked bin/ scripts are executed, the same trust rule
+# the X-mode poll shim uses. A pass that prints nothing is the normal case and
+# wakes nobody; output means it has something the fleet has not been told about,
+# so it is flattened onto one wake record. wake() ends the cycle, so a second
+# due pass runs on a later poll.
+hourly_pass_sweep() {
+  local pass interval stamp script out reason
+  fm_hourly_is_armed "$STATE" || return 0
+  for pass in $FM_HOURLY_PASSES; do
+    interval=$(fm_hourly_interval "$pass") || continue
+    [ "$interval" -gt 0 ] || continue
+    stamp=$(fm_hourly_stamp "$STATE" "$pass")
+    [ "$(age_of "$stamp")" -ge "$interval" ] || continue
+    touch "$stamp"
+    script="$SCRIPT_DIR/$(fm_hourly_pass_script "$pass")" || continue
+    [ -f "$script" ] && [ ! -L "$script" ] || continue
+    FM_HOME="$FM_HOME" run_check_capture "$script" || exit 1
+    out=$FM_CHECK_RESULT
+    [ -n "$out" ] || continue
+    reason="check: session-$pass $(printf '%s\n' "$out" \
+      | awk 'NF {printf "%s%s", sep, $0; sep="; "}')"
+    fm_wake_append check "session-$pass" "$reason" || exit 1
+    wake "$reason"
+  done
 }
 
 # Exit reporting a wake. Consecutive heartbeats with no other wake in between
@@ -1085,6 +1136,10 @@ while :; do
     touch "$STATE/.last-resource"
     resource_sweep
   fi
+
+  # Hourly session passes, each on its own stamp cadence. Placed with the other
+  # slow sweeps, before the signal scan, so a chatty crewmate cannot starve them.
+  hourly_pass_sweep
 
   # On the first changed signal, linger one grace period and re-scan before
   # classifying: a crewmate's final status write and the same turn's turn-end

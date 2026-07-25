@@ -108,7 +108,7 @@ exclusion_reason() {
     fm-teardown.test.sh)
       printf '%s\n' 'landed-work + lock-race teardown matrix; keep serial with forge/git stress peers'
       ;;
-    fm-daemon.test.sh|fm-guard-stale-banner.test.sh|fm-pi-watch-extension.test.sh|\
+    fm-daemon.test.sh|fm-guard-stale-banner.test.sh|fm-hourly-passes.test.sh|fm-pi-watch-extension.test.sh|\
     fm-supervision-events.test.sh|fm-turnend-guard.test.sh|fm-wake-daemon-lifecycle-e2e.test.sh|\
     fm-wake-queue.test.sh|fm-watch-checkpoint.test.sh|fm-watch-triage.test.sh|\
     fm-watcher-lock.test.sh)
