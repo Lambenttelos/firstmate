@@ -18,9 +18,17 @@
 #      -> test_attributes_*, test_unowned_vs_unclassified_are_distinct,
 #         test_ancestry_never_overrides_records.
 #
-# Everything runs against INJECTED listings (FM_MEMREPORT_TOP / _PS / _LSOF), so
-# the suite is hermetic and does not depend on what happens to be running on the
-# machine executing it.
+# Process listings are always INJECTED (FM_MEMREPORT_TOP / _PS / _LSOF), so no
+# assertion depends on what happens to be running on the machine executing it.
+#
+# Records are a different matter. Most tests write their own records into a temp
+# home, and that is exactly why the first version of this suite stayed green
+# while ownership was broken against every real lane: a fixture the test authored
+# cannot be missing the way a real home can, so the suite proved the matching
+# logic and never exercised record DISCOVERY. The tests under "attribution
+# against REAL state/*.meta content" therefore read the operating home's actual
+# records - once, into a snapshot (see real_home) so they stay deterministic -
+# and skip with a pass on a host that has no fleet records, such as CI.
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -365,19 +373,75 @@ test_reclaim_classes_do_not_overlap() {
 # fine; the RECORD SET was empty, and "unowned" was asserted about live work on
 # the strength of records that had never been read.
 
-test_refuses_when_no_records_were_read() {
-  local out rc empty
-  empty="$TMPROOT/emptyhome"
-  mkdir -p "$empty/state" "$empty/data"
-  out=$(FM_HOME="$empty" FM_MEMREPORT_TOP="$TOP" FM_MEMREPORT_PS="$PS" \
+test_refuses_when_records_cannot_be_read() {
+  local out rc nostate
+  # The question is whether the record store was READABLE, not whether it
+  # happened to be empty. A missing store is the shape that caused the shipped
+  # defect: run from a worktree, which has no state/ at all, the report called
+  # every live lane unowned having read nothing.
+  nostate="$TMPROOT/nostatehome"
+  mkdir -p "$nostate/data"
+  out=$(FM_HOME="$nostate" FM_MEMREPORT_TOP="$TOP" FM_MEMREPORT_PS="$PS" \
         FM_MEMREPORT_LSOF="$LSOF" FM_MEMREPORT_SELF_PID=1006 "$REPORT" 2>&1); rc=$?
-  expect_code 3 "$rc" "an empty record set must refuse, not label live work unowned"
-  assert_contains "$out" "no fleet records were found" "the refusal must name the empty record set"
+  expect_code 3 "$rc" "an unreadable record store must refuse, not label live work unowned"
+  assert_contains "$out" "could not be read" "the refusal must name the unreadable store"
   assert_not_contains "$out" "TOP PROCESSES" "a refusal must print NO ranking"
   # The decisive property: it must never have called anything unowned.
   assert_not_contains "$out" "no record claims it" \
     "with no records read, nothing may be described as unowned"
-  pass "refuses rather than calling live work unowned from an empty record set"
+  pass "refuses rather than calling live work unowned when records cannot be read"
+}
+
+test_idle_fleet_is_not_a_broken_instrument() {
+  local out rc empty
+  # An empty but READABLE store means the fleet is genuinely idle. Refusing there
+  # would make the report useless exactly when the machine is quiet, which is a
+  # perfectly ordinary time to ask what is using memory.
+  empty="$TMPROOT/idlehome"
+  mkdir -p "$empty/state" "$empty/data"
+  out=$(FM_HOME="$empty" FM_MEMREPORT_TOP="$TOP" FM_MEMREPORT_PS="$PS" \
+        FM_MEMREPORT_LSOF="$LSOF" FM_MEMREPORT_SELF_PID=1006 "$REPORT" 2>&1); rc=$?
+  expect_code 0 "$rc" "an idle fleet must still report; it is not a broken instrument"
+  assert_contains "$out" "TOP PROCESSES" "an idle fleet must still get its ranking"
+  pass "an idle but readable record store reports normally"
+}
+
+test_live_agents_are_never_reclaimable() {
+  local out reclaim
+  # THE safety property of the reclaim list. A running agent that no record of
+  # THIS home claims belongs to another tool, another home, or the captain - it
+  # is live work. Billing it as free memory is the original incident one layer
+  # out. pid 1008 is exactly that: an agent in no recorded directory.
+  out=$(run_report --all)
+  printf '%s\n' "$out" | awk '$1 == 1008' | grep -Fq "live agent" \
+    || fail "an unclaimed running agent must be bucketed as a live foreign agent"
+  reclaim=$(printf '%s\n' "$out" | awk '/RECLAIMABLE/, /never kills/')
+  assert_contains "$reclaim" "NOT listed" "the reclaim list must say what it excluded"
+  case "$reclaim" in
+    *"live agent"*) : ;;
+    *) fail "the reclaim list must name the live agents it excluded" ;;
+  esac
+  pass "a running agent no record claims is never offered as reclaimable"
+}
+
+test_editor_is_surfaced_but_not_billed_as_free() {
+  local out reclaim
+  # The editor is the single largest available win, so it must be visible - but
+  # on this fleet the terminal emulator hosts the tmux session every agent runs
+  # in, so "no live work depends on it" would be flatly false.
+  out=$(run_report)
+  reclaim=$(printf '%s\n' "$out" | awk '/RECLAIMABLE/, /never kills/')
+  assert_contains "$reclaim" "YOUR CALL" "closing the editor must be offered as a human decision"
+  # The editor's 900M must NOT be inside the freed-if-reclaimed total. The only
+  # qualifying leftover in the fixture is the language server in the stale
+  # checkout, so the total is that alone.
+  case "$reclaim" in
+    *"leftovers in a checkout no record claims"*) : ;;
+    *) fail "the genuine leftover class must still be reported" ;;
+  esac
+  printf '%s\n' "$reclaim" | awk '/total, if all of the above were freed/' | grep -Fq "900" \
+    && fail "the editor must not be inside the reclaimable total"
+  pass "the editor is surfaced as a decision, not billed as reclaimable"
 }
 
 test_warns_when_agents_match_no_record() {
@@ -440,13 +504,26 @@ test_healthy_attribution_is_quiet() {
 # defect. This drives the SAME logic against the real records on this machine:
 # real key names, real path shapes, real secondmate `home=` entries.
 
+# Echoes a SNAPSHOT of the operating home's real records, or fails if this host
+# has none (CI). The snapshot is taken once and everything downstream reads it,
+# so the assertions use real record content while staying deterministic: the live
+# fleet gains and loses records constantly - a lane started during this very task
+# - and a test that re-read the originals could see two different record sets
+# between building its fixture and checking the result.
+FM_REAL_SNAPSHOT=""
 real_home() {
-  local common primary
+  local common primary snap
+  [ -n "$FM_REAL_SNAPSHOT" ] && { printf '%s\n' "$FM_REAL_SNAPSHOT"; return 0; }
   common=$(git -C "$ROOT" rev-parse --git-common-dir 2>/dev/null) || return 1
   case "$common" in /*) : ;; *) common="$ROOT/$common" ;; esac
   primary=$(cd "$(dirname "$common")" 2>/dev/null && pwd -P) || return 1
   compgen -G "$primary/state/*.meta" >/dev/null 2>&1 || return 1
-  printf '%s\n' "$primary"
+  snap="$TMPROOT/realsnap"
+  mkdir -p "$snap/state" "$snap/data"
+  cp "$primary"/state/*.meta "$snap/state/" 2>/dev/null || return 1
+  [ -r "$primary/data/secondmates.md" ] && cp "$primary/data/secondmates.md" "$snap/data/"
+  FM_REAL_SNAPSHOT=$snap
+  printf '%s\n' "$snap"
 }
 
 test_attributes_against_real_meta_records() {
@@ -687,7 +764,10 @@ test_ancestry_never_overrides_records
 test_unowned_vs_unclassified_are_distinct
 test_unreadable_facts_never_become_findings
 test_reclaim_classes_do_not_overlap
-test_refuses_when_no_records_were_read
+test_refuses_when_records_cannot_be_read
+test_idle_fleet_is_not_a_broken_instrument
+test_live_agents_are_never_reclaimable
+test_editor_is_surfaced_but_not_billed_as_free
 test_warns_when_agents_match_no_record
 test_attribution_warning_survives_a_pipe
 test_healthy_attribution_is_quiet

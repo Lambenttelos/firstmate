@@ -213,6 +213,29 @@ Bundled applications are now read from the executable path into their own `app` 
 The reclaim classes are disjoint, so their totals can be added without overstating the win.
 Overlapping buckets would be their own kind of confident wrong answer.
 
+## What is allowed into the reclaim list
+
+The review gate before merge found that the reclaim list was offering live work as free memory, which is the original incident one layer further out.
+At that point it billed 1.47 GB across 112 processes as reclaimable, and that set included a running `opencode` agent, a live `claude -p` gate worker, a Paseo agent, the MCP servers those agents were using, the captain's shells, `nginx`, and `iTerm2` - the terminal emulator hosting the tmux session every agent in the fleet runs inside.
+
+The rule now is that a process is listed only when there is positive evidence nothing needs it, and four exclusions enforce that.
+
+A running agent is never reclaimable.
+An agent that no record of this home claims belongs to another tool, another home, or the captain directly, so it goes to a `foreign-agent` bucket and is reported as context.
+
+A live agent adopts the tooling in its directory.
+An MCP or language server started by an agent, in a checkout no firstmate record claims, would otherwise read as an abandoned leftover; killing it would break the agent using it.
+
+Only language and build tooling can be a leftover.
+A shell is a terminal someone is sitting in and a service is a service, and neither is abandoned merely because no fleet record names its directory.
+The checkout test alone is far too weak to carry this conclusion, because `/opt/homebrew` is itself a git checkout, which is how `nginx` reached the list.
+
+The editor is surfaced but never billed as free.
+Closing it is the single largest available win and the report says so explicitly, but as a decision for a human rather than a figure in the reclaimable total.
+
+Everything excluded is still named and totalled, so the reader can see what was left out and why rather than wondering where the rest of the machine went.
+On the live fleet this took the reclaim total from 1.47 GB of mostly-live work to 91 MB that is genuinely abandoned.
+
 ## Scope boundary
 
 This script does not replace or modify `bin/fm-resource-check.sh`.

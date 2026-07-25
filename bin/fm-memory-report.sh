@@ -18,8 +18,23 @@
 # Exit status:
 #   0  a reading was taken and reported
 #   1  a required input could not be collected at all
-#   3  REFUSED - the instrument is broken (see SELF-CHECK); no table was printed
+#   3  REFUSED - the reading or the record set cannot be stood behind; no table
+#      was printed. A refusal is the correct output when the instrument is broken
 #   64 usage error
+#
+# WHAT IT MEASURES. phys_footprint, the same quantity Activity Monitor's Memory
+# column shows, read from top(1) and cross-checkable with --verify. rss is shown
+# only beside it, always labelled, and never sorts the ranking: under swap the
+# two diverge badly and unevenly in BOTH directions.
+#
+# HOW IT ATTRIBUTES. Every process is enumerated with no name filter deciding
+# what counts; names only label a process already counted. Ownership is read from
+# durable records - state/*.meta `worktree=`/`home=`/`tasktmp=`,
+# data/secondmates.md, $FM_HOME, and the project clones - matched against each
+# process's working directory. Ancestry is never the first word, because a
+# reparented process reports ppid 1 and cannot be told from a daemon that way.
+# "unowned" means the records were read and none matched; a process whose facts
+# could not be read is "unclassified" and never becomes a finding.
 #
 # NEVER WAKES. This script must never call bin/fm-wake-lib.sh, fm_wake_append,
 # bin/fm-send.sh, or append to a status file - the same contract
@@ -31,118 +46,11 @@
 # pressure and the concurrent-agent ceiling - and other code depends on its
 # contract. This script never calls it and never changes it.
 #
-# ---------------------------------------------------------------------------
-# WHY THIS EXISTS - four traps this tool makes impossible by construction
-#
-# On 2026-07-24 the same question was answered wrong three times on a machine at
-# 86% swap while two lanes sat parked waiting for memory. Each wrong answer was a
-# distinct reproducible trap, and each maps to a defense below.
-#
-# 1. A FILTERED PROCESS TABLE WAS REPORTED AS TRUTH. `ps -Ao rss,command | sort`
-#    returned only system daemons topping out at 24 MB on a 16 GB machine that
-#    was swapping hard. That is impossible, and it was reported anyway.
-#    This is NOT hypothetical: while building this script, the very first
-#    `ps -Ao pid= | wc -l` on this machine returned 31 - against 649-652 across
-#    the next 40 samples. ps really does occasionally return a truncated table.
-#    DEFENSE: SELF-CHECK below refuses (exit 3) rather than print a figure it
-#    cannot stand behind.
-#
-# 2. THE FLEET WAS EXCLUDED BY ACCIDENT. Filtering on processes named `node`
-#    missed every agent, because agents run as `claude` - and in top's COMMAND
-#    column a claude agent shows as its version string ("2.1.219"), not as
-#    "claude" at all. The conclusion "it's the editor, not the fleet" followed
-#    directly from that hole.
-#    DEFENSE: enumeration is UNFILTERED. Every process on the machine is ranked.
-#    Name matching is used ONLY to LABEL a process that is already counted, never
-#    to decide whether it counts.
-#
-# 3. TWO DIFFERENT QUANTITIES WERE COMPARED AS ONE. `rss` was read and compared
-#    against Activity Monitor, which shows phys_footprint. Under heavy swap most
-#    of a process's memory is compressed out of residency, so rss understates
-#    badly AND unevenly - which produced the opposite wrong answer, "the agents
-#    are the hogs".
-#    DEFENSE: phys_footprint is the primary and sorting number everywhere. rss is
-#    shown only beside it, always labelled, never as a substitute. --verify
-#    re-checks the footprint reading against footprint(1) on demand.
-#
-# 4. OWNERSHIP WAS GUESSED INSTEAD OF READ. A worktree was called an orphan when
-#    state/*.meta plainly recorded which live task owned it.
-#    DEFENSE: ownership is resolved from durable records (state/*.meta,
-#    data/secondmates.md) against each process's own working directory. "unowned"
-#    means the records WERE read and none claimed it. A process whose facts could
-#    not be read is "unclassified" - a separate bucket that never masquerades as
-#    a finding.
-#
-# ---------------------------------------------------------------------------
-# MEASUREMENT - why top(1) is the primary source
-#
-# Verified on this machine, 2026-07-24, macOS 24.6.0:
-#   `top -l 1 -o mem -stats pid,mem` MEM column == `footprint -p <pid>` exactly
-#   for 9 of 11 sampled processes; the 2 that differed by one unit were live
-#   processes drifting between the two samples. That MEM column IS
-#   phys_footprint, the same quantity Activity Monitor's Memory column shows.
-# top is preferred over per-pid footprint(1) for two reasons:
-#   - Cost: one 0.4s call covers the whole machine; footprint(1) costs ~0.03s per
-#     pid, ~20s for 600 processes.
-#   - Coverage: footprint(1) is DENIED on root-owned processes (WindowServer
-#     returns nothing), so a footprint-only reading would silently drop the very
-#     system processes a total has to include.
-# footprint(1) remains the cross-check, wired to --verify.
-#
-# ---------------------------------------------------------------------------
-# OWNERSHIP - records and working directory, never ancestry alone
-#
-# ANCESTRY LIES EXACTLY WHERE ATTRIBUTION MATTERS. When a process's spawner dies
-# the kernel reparents it to launchd, so it reports ppid 1 - indistinguishable
-# from a system daemon by ancestry alone. That is precisely how a live-task
-# language server got misjudged as an orphan. Live proof on this machine while
-# writing this: pid 67870 (ppid 1) sits in a no-mistakes worktree and pid 76895
-# (ppid 1) sits in the firstmate home - both plainly owned, both reparented.
-#
-# So ownership is resolved in this order, and ancestry is never the first word:
-#   1. The process's working directory (lsof -d cwd), longest-prefix matched
-#      against paths read from durable records: state/*.meta `worktree=`,
-#      `home=`, `tasktmp=`; data/secondmates.md `home:`; $FM_HOME; and the
-#      project clones under $FM_HOME/projects. Recorded as via=cwd.
-#   2. Only if the working directory is UNREADABLE, the parent's
-#      already-cwd-derived owner may be inherited - and NEVER from ppid 1, which
-#      is the reparented case above. Recorded as via=ancestry so a weaker
-#      attribution is always visible as one.
-#   3. Otherwise the process is system (by its own executable path), tooling,
-#      unowned, or unclassified - see the bucket rules in classify_rows().
-#
-# pstree(1) was evaluated as an input and deliberately NOT used: on macOS it
-# prints no memory column, and it reads the same `ps -axwwo user,pid,ppid,...`
-# ancestry this script already collects, so it adds no fact - only a rendering of
-# the one axis that lies. --tree groups by OWNER instead, which is the axis
-# capacity decisions actually run on. Nothing here depends on pstree being
-# installed.
-#
-# ---------------------------------------------------------------------------
-# ROLLUP - the true cost of a worker
-#
-# An agent spawns its own language server, and on this fleet each costs about
-# 1 GB, three to four times the agent process itself. A flat per-process ranking
-# therefore UNDERSTATES what a worker really costs, which is the number capacity
-# decisions depend on. Every owner group reports both its agent's own footprint
-# and its total-with-children, rolled up by OWNERSHIP (working directory against
-# the records), not by ancestry - so a language server whose parent editor was
-# killed still rolls up to the task whose worktree it is indexing.
-#
-# RECLAIM classes make the cheap wins obvious: a process in a checkout no live
-# record claims, a detached process whose spawner is gone, and editor/language
-# tooling carrying no fleet work.
-#
-# ---------------------------------------------------------------------------
-# SELF-CHECK - refuse loudly rather than print a confident wrong table
-#
-# A refusal IS the correct output when the instrument is broken. All of these
-# must hold or the script exits 3 having printed no ranking:
-#   - this script's own pid appears in BOTH the top and ps listings;
-#   - at least MIN_PROCS processes were enumerated;
-#   - the ps and top process counts agree within tolerance;
-#   - top's PhysMem line parses;
-#   - the summed footprint is a plausible fraction of PhysMem used.
+# WHY IT IS BUILT THIS WAY. docs/memory-report.md is the single owner of the
+# rationale and the measurements: the incident that produced it, the top(1) vs
+# footprint(1) evidence, the rss divergence figures, why pstree is not an input,
+# the language-server rollup, the self-check thresholds, and the attribution
+# defect of 2026-07-24. Read it before changing any threshold or bucket rule.
 #
 # Test seams: FM_MEMREPORT_TOP and FM_MEMREPORT_PS read a captured listing from a
 # file instead of running the tool, FM_MEMREPORT_LSOF likewise for working
@@ -205,6 +113,10 @@ COUNT_TOLERANCE_PCT=30
 # below the lowest reading actually observed, while still catching a listing that
 # has lost most of the machine's memory.
 FOOTPRINT_FLOOR_PCT=60
+# The upper bound on the same ratio, guarding double-counted rows rather than a
+# truncated listing. Set far above the observed 111-126% so ordinary shared
+# memory never trips it.
+FOOTPRINT_CEILING_PCT=400
 
 # The header comment IS the help text: every line from the description down to
 # the first line of code. Derived rather than a hardcoded line range so the help
@@ -430,13 +342,23 @@ run_self_check() {
   # under 1% of used memory. Real readings run ABOVE used memory (footprint
   # counts compressed pages and shared regions per process; this machine
   # measured 17.6 GB summed against 14 GB used), so the floor is one-sided.
-  local sum_kb floor_kb
+  local sum_kb floor_kb ceil_kb
   sum_kb=$(awk -F'\t' '{ s += $2 } END { printf "%d", s }' "$TMP/top.tsv")
   floor_kb=$(( physmem_used * FOOTPRINT_FLOOR_PCT / 100 ))
   [ "$sum_kb" -ge "$floor_kb" ] \
     || refuse "the measured total is impossibly small for this machine" \
               "summed footprint $(fmt_kb "$sum_kb") against $(fmt_kb "$physmem_used") of used memory" \
               "the listing is missing most of the machine's memory; it is filtered or truncated"
+
+  # The other side of the same plausibility question. Exceeding used memory is
+  # normal (measured 111-126%), but a total several times the machine's memory
+  # means rows are being counted more than once, which would inflate every group
+  # total and every reclaim figure. Generous, so normal sharing never trips it.
+  ceil_kb=$(( physmem_used * FOOTPRINT_CEILING_PCT / 100 ))
+  [ "$sum_kb" -le "$ceil_kb" ] \
+    || refuse "the measured total is impossibly large for this machine" \
+              "summed footprint $(fmt_kb "$sum_kb") against $(fmt_kb "$physmem_used") of used memory" \
+              "processes are being counted more than once; every total would be inflated"
 
   SELF_PS_COUNT=$ps_count
   SELF_PHYSMEM_USED=$physmem_used
@@ -525,20 +447,26 @@ build_git_cwds() {
 # actually shipped: a perfectly good reading was published with ownership
 # resolved against an empty record set.
 
-# "unowned" is a claim that the records were read and none of them matched. If no
-# records were read, the script cannot make that claim about anything, so it must
-# refuse rather than relabel every live lane as reclaimable.
+# "unowned" is a claim that the records were read and none of them matched. The
+# question is therefore whether the record store was READABLE, not whether it
+# happened to be empty.
+#
+# An unreadable store means the script cannot make that claim about anything, so
+# it refuses. An empty but readable store means the fleet is genuinely idle,
+# which is a normal state and NOT a broken instrument - refusing there would make
+# the report useless exactly when the machine is quiet. The wrong-home case that
+# motivated this check is caught by the missing-directory arm (a worktree has no
+# state/ at all) and by check_agent_attribution below.
 check_records_were_read() {
-  local task_records
-  task_records=$(awk -F'\t' '$2 == "task" || $2 == "secondmate" { n++ } END { print n + 0 }' "$TMP/owners.tsv")
-  [ "$task_records" -gt 0 ] && return 0
-  refuse "no fleet records were found, so nothing can be called unowned" \
-    "looked for state/*.meta in: $STATE" \
-    "and the secondmate registry in: $DATA/secondmates.md" \
-    "Reporting ownership from an empty record set would mark every live lane" \
-    "as claimed by nothing, and invite killing work that is running." \
-    "Point the report at the operating home, for example:" \
-    "  FM_HOME=/path/to/firstmate $(basename "${BASH_SOURCE[0]}")"
+  if [ ! -d "$STATE" ]; then
+    refuse "the fleet record store could not be read, so nothing can be called unowned" \
+      "no such directory: $STATE" \
+      "Reporting ownership without reading the records would mark every live lane" \
+      "as claimed by nothing, and invite killing work that is running." \
+      "Point the report at the operating home, for example:" \
+      "  FM_HOME=/path/to/firstmate $(basename "${BASH_SOURCE[0]}")"
+  fi
+  [ -r "$STATE" ] || refuse "the fleet record store is not readable" "cannot read: $STATE"
 }
 
 # Records exist, but almost every agent still came back unowned. Fleet agents run
@@ -550,7 +478,10 @@ check_agent_attribution() {
   local agents unowned pct
   agents=$(awk -F'\t' '$9 == "agent" { n++ } END { print n + 0 }' "$TMP/rows.tsv")
   [ "$agents" -ge 3 ] || return 0
-  unowned=$(awk -F'\t' '$9 == "agent" && ($6 == "unowned" || $6 == "unclassified") { n++ } END { print n + 0 }' "$TMP/rows.tsv")
+  # foreign-agent counts here too: it is precisely "an agent no record claimed",
+  # which is the signal this guard exists to measure. Leaving it out would have
+  # silently disarmed the guard the moment that bucket was introduced.
+  unowned=$(awk -F'\t' '$9 == "agent" && ($6 == "unowned" || $6 == "unclassified" || $6 == "foreign-agent") { n++ } END { print n + 0 }' "$TMP/rows.tsv")
   pct=$(( unowned * 100 / agents ))
   [ "$pct" -gt "$UNOWNED_AGENT_WARN_PCT" ] || return 0
   ATTRIBUTION_WARNING="$unowned of $agents agent processes ($pct%) matched no record"
@@ -613,6 +544,16 @@ classify_rows() {
       next
     }
 
+    # True when a live agent is running in this directory or an ancestor of it.
+    function shares_agent_dir(c,   i, a) {
+      if (c == "") return 0
+      for (i = 1; i <= na; i++) {
+        a = agentcwd[i]
+        if (c == a || index(c, a "/") == 1 || index(a, c "/") == 1) return 1
+      }
+      return 0
+    }
+
     function match_owner(c,   i, best, bestlen, p) {
       best = 0; bestlen = -1
       if (c == "") return 0
@@ -653,6 +594,19 @@ classify_rows() {
         }
       }
 
+      # A live agent adopts the tooling running in its directory. Without this,
+      # an MCP server or language server started BY a live agent - in a checkout
+      # no firstmate record claims, because the agent belongs to another tool or
+      # another home - reads as an abandoned leftover and gets billed as free
+      # memory. Killing it would break the agent that is using it.
+      na = 0
+      for (i = 1; i <= np; i++) {
+        p = pids[i]
+        if (k[p] == "agent" && (p in cwd) && cwd[p] != "" && cwd[p] != "/") {
+          agentcwd[++na] = cwd[p]
+        }
+      }
+
       # Pass 3: buckets for everything the records did not claim, plus flags.
       for (i = 1; i <= np; i++) {
         p = pids[i]
@@ -667,7 +621,19 @@ classify_rows() {
         if (unclaimed) fl = fl (fl == "" ? "" : ",") "unclaimed-checkout"
 
         if (okindof[p] == "") {
-          if (unclaimed) {
+          if (k[p] == "agent") {
+            # A RUNNING AGENT that no record of THIS home claims: belonging to
+            # another tool, another home, or the captain directly. It is live
+            # work, not a leftover, so it gets its own bucket and is excluded
+            # from the reclaim list entirely. Billing a live agent as reclaimable
+            # is the same incident one layer further out.
+            # NOTE: no apostrophes in this awk block - it is single-quoted.
+            okindof[p] = "foreign-agent"; olabelof[p] = "live agent, not this fleet"
+          } else if (unclaimed && shares_agent_dir(c)) {
+            # Tooling sitting in the same directory as a live agent: its work,
+            # not an abandoned leftover.
+            okindof[p] = "foreign-agent"; olabelof[p] = "live agent, not this fleet"
+          } else if (unclaimed) {
             # A leftover in a checkout nothing claims: the incident case.
             okindof[p] = "unowned"; olabelof[p] = "checkout no record claims"
           } else if (k[p] == "app") {
@@ -753,18 +719,47 @@ render_groups() {
 # numbers can be added up without overstating the win. Overlapping buckets would
 # be their own kind of confident wrong answer.
 render_reclaim() {
-  printf '\nRECLAIMABLE - memory carrying no live fleet work (classes do not overlap)\n'
+  printf '\nRECLAIMABLE - no live work depends on it (classes do not overlap)\n'
+  # DELIBERATELY NARROW. Only two classes qualify, and a running agent is in
+  # neither: a process is listed here only when there is positive evidence
+  # nothing needs it. Everything else the records did not claim is reported
+  # below as context, NOT as something to free - a captain's editor, terminal,
+  # or monitor is not a leftover, and neither is another tool's live agent.
   awk -F'\t' '
-    $6 == "unowned" && $10 ~ /unclaimed-checkout/ { u += $3; un++; next }
+    $9 == "agent" { next }
+    # Only language/build tooling qualifies as a leftover. A shell is a terminal
+    # someone is sitting in, and a service is a service: neither is abandoned
+    # just because no fleet record names its directory. The checkout test alone
+    # is too weak to carry this - /opt/homebrew is itself a git checkout.
+    $6 == "unowned" && $10 ~ /unclaimed-checkout/ && ($9 == "lsp" || $9 == "tooling") { u += $3; un++; next }
+    # An EDITOR is not in this list. It is a running application someone is
+    # working in - and on this fleet the terminal emulator hosts the tmux session
+    # every agent lives in, so "nothing depends on it" would be flatly false.
+    # Its cost is still surfaced separately below, because closing it IS the
+    # single largest available win; that is just a decision for a human, not a
+    # figure to bill as free.
+    $6 == "tooling" && $9 == "editor" { e += $3; en++; next }
     $6 == "tooling" { t += $3; tn++; next }
-    $6 == "unowned" { o += $3; on++; next }
     END {
-      any = (un + tn + on)
-      if (any == 0) { printf "  nothing found in this class\n"; exit }
+      if (un + tn == 0) printf "  nothing qualifies; no leftovers found\n"
       if (un) printf "  %-42s %8s  %d processes\n", "leftovers in a checkout no record claims", sz(u), un
-      if (tn) printf "  %-42s %8s  %d processes\n", "editor / language tooling, no fleet work", sz(t), tn
-      if (on) printf "  %-42s %8s  %d processes\n", "other processes no record claims", sz(o), on
-      printf "  %-42s %8s\n", "total, if all of the above were freed", sz(u + t + o)
+      if (tn) printf "  %-42s %8s  %d processes\n", "language / build tooling, no fleet work", sz(t), tn
+      if (un + tn) printf "  %-42s %8s\n", "total, if all of the above were freed", sz(u + t)
+      if (en) printf "  YOUR CALL: closing the editor/terminal would free %s (%d proc),\n             but the fleet may be running inside it\n", sz(e), en
+    }
+    function sz(kb) {
+      if (kb >= 1024 * 1024) return sprintf("%.2f GB", kb / 1024 / 1024)
+      return sprintf("%.0f MB", kb / 1024)
+    }
+  ' "$TMP/rows.tsv"
+  # Context, not candidates. Named explicitly so the reader can see what was
+  # excluded and why, rather than wondering where the rest of the machine went.
+  awk -F'\t' '
+    $9 == "agent" && ($6 == "foreign-agent" || $6 == "unowned") { a += $3; an++; next }
+    $6 == "unowned" || $6 == "app" { o += $3; on++; next }
+    END {
+      if (an) printf "  NOT listed: %d live agent process(es), %s - another tool or home owns them\n", an, sz(a)
+      if (on) printf "  NOT listed: %d application/other process(es), %s - in use, not leftovers\n", on, sz(o)
     }
     function sz(kb) {
       if (kb >= 1024 * 1024) return sprintf("%.2f GB", kb / 1024 / 1024)
@@ -833,7 +828,7 @@ render_json() {
   printf '  "measured": "phys_footprint",\n'
   printf '  "records_home": "%s",\n' "$STATE"
   printf '  "fleet_records": %s,\n' \
-    "$(awk -F'\t' '$2 == "task" || $2 == "secondmate" { n++ } END { print n + 0 }' "$TMP/owners.tsv")"
+    "$FLEET_RECORD_COUNT"
   # A consumer must be able to see the same doubt a human sees, so the warning is
   # a field rather than a stderr line an automated caller would never read.
   printf '  "attribution_warning": %s,\n' \
@@ -910,6 +905,9 @@ parse_ps
 collect_cwd
 run_self_check
 build_owners
+# One owner for the count every later caller reports; recomputing it per call
+# site let the text report and the JSON drift apart in principle.
+FLEET_RECORD_COUNT=$(awk -F'\t' '$2 == "task" || $2 == "secondmate" { n++ } END { print n + 0 }' "$TMP/owners.tsv")
 check_records_were_read
 build_git_cwds
 classify_rows
@@ -923,7 +921,7 @@ fi
 host_line
 printf 'Reading: %s processes, phys_footprint - the same quantity Activity Monitor shows.\n' "$SELF_PS_COUNT"
 printf 'Ownership read from %s fleet records in %s against each working directory.\n' \
-  "$(awk -F'\t' '$2 == "task" || $2 == "secondmate" { n++ } END { print n + 0 }' "$TMP/owners.tsv")" "$STATE"
+  "$FLEET_RECORD_COUNT" "$STATE"
 [ -n "${FM_HOME_REDIRECTED:-}" ] \
   && printf 'Invoked from a worktree with no records of its own; read the operating home above.\n'
 render_attribution_warning
