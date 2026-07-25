@@ -476,8 +476,115 @@ test_briefs_bind_the_shared_machine_rules() {
   pass "fm-brief.sh: ship and scout briefs bind the shared-machine and coverage rules"
 }
 
+# The standing captain rules used to reach workers only when firstmate remembered to
+# paste them onto a brief, so a lane whose brief predated a rule never saw it (one such
+# lane force-pushed within an hour of the never-force rule being set). They must be
+# structural in every generated scaffold. Rules 5 and 6 ride on every ship and scout
+# brief rather than behind a flag: {TASK} is filled after scaffolding, so a flag firstmate
+# forgets to pass is worthless, while an always-present rule costs a few lines.
+test_ship_and_scout_briefs_bind_the_standing_captain_rules() {
+  local home brief kind
+  home="$TMP_ROOT/captain-rules-home"
+  mkdir -p "$home/data"
+  FM_HOME="$home" "$ROOT/bin/fm-brief.sh" brief-captain-ship some-proj >/dev/null 2>&1 \
+    || fail "fm-brief.sh ship scaffold exited non-zero"
+  FM_HOME="$home" "$ROOT/bin/fm-brief.sh" brief-captain-scout some-proj --scout >/dev/null 2>&1 \
+    || fail "fm-brief.sh scout scaffold exited non-zero"
+
+  for kind in ship scout; do
+    brief="$home/data/brief-captain-$kind/brief.md"
+    assert_grep "# Standing captain rules" "$brief" \
+      "$kind brief must carry the standing captain rules section"
+    # 1. never force anything
+    assert_grep "Never force-push, never force a release, and never delete a" "$brief" \
+      "$kind brief must forbid force-push, force-release, and branch deletion"
+    assert_grep "push to a NEW branch" "$brief" \
+      "$kind brief must give the new-branch escape hatch when a push is blocked"
+    # 2. understand the why
+    assert_grep "Understand the WHY before acting" "$brief" \
+      "$kind brief must forbid working the wording mechanically"
+    assert_grep "ask firstmate" "$brief" \
+      "$kind brief must send an unclear reason back to firstmate"
+    assert_grep "grilling session" "$brief" \
+      "$kind brief must name the grilling session as the way to ask"
+    # 3. plan with wayfinder
+    # shellcheck disable=SC2016 # Literal backticks must remain unexpanded.
+    assert_grep '`wayfinder` skill' "$brief" \
+      "$kind brief must require planning with the wayfinder skill"
+    # 4. caveman ultra prose, with its normal-English exceptions
+    assert_grep "caveman ultra style" "$brief" \
+      "$kind brief must require caveman ultra prose"
+    assert_grep "anything a tool or CI parses" "$brief" \
+      "$kind brief must exempt code, commits, PR text, and tool-parsed output from caveman prose"
+    assert_grep "abbreviate identifiers, API names, CLI commands, or error strings" "$brief" \
+      "$kind brief must forbid abbreviating identifiers and commands"
+    # 5. server ports
+    assert_grep "Never bind port 443 or 3000" "$brief" \
+      "$kind brief must forbid the captain own default server ports"
+    assert_grep "non-default port" "$brief" \
+      "$kind brief must send a started server to a non-default port"
+    # 6. Mattermost-sourced tasks
+    assert_grep "If this task came from a Mattermost thread" "$brief" \
+      "$kind brief must carry the Mattermost re-read rule as a self-guarding conditional"
+    assert_grep "never trust the queue-time summary" "$brief" \
+      "$kind brief must distrust the queue-time summary of a Mattermost thread"
+    assert_grep "ADD the missing end-to-end coverage" "$brief" \
+      "$kind brief must require added coverage when the reported bug is already fixed"
+  done
+  pass "fm-brief.sh: ship and scout briefs bind the standing captain rules structurally"
+}
+
+# A secondmate supervises rather than implements, so it carries the subset that
+# genuinely applies to its own conduct; its crewmates get the full set from their
+# own generated briefs.
+test_secondmate_charter_binds_the_applicable_captain_rules() {
+  local home brief
+  home="$TMP_ROOT/captain-rules-secondmate-home"
+  mkdir -p "$home/data"
+  FM_HOME="$home" FM_SECONDMATE_CHARTER='Supervise the alpha domain.' \
+    "$ROOT/bin/fm-brief.sh" brief-captain-sm --secondmate --no-projects >/dev/null 2>&1 \
+    || fail "fm-brief.sh secondmate scaffold exited non-zero"
+  brief="$home/data/brief-captain-sm/brief.md"
+  assert_grep "# Standing captain rules" "$brief" \
+    "secondmate charter must carry the standing captain rules section"
+  assert_grep "Never force-push, never force a release, and never delete a" "$brief" \
+    "secondmate charter must forbid forcing and branch deletion - a supervisor can force-push too"
+  assert_grep "Understand the WHY before acting" "$brief" \
+    "secondmate charter must forbid acting on routed work mechanically"
+  assert_grep "grilling session" "$brief" \
+    "secondmate charter must route an unclear reason back as a grilling session"
+  assert_grep "caveman ultra style" "$brief" \
+    "secondmate charter must require caveman ultra prose in its reports"
+  assert_grep "anything a tool or CI parses" "$brief" \
+    "secondmate charter must exempt tool-parsed text from caveman prose"
+  pass "fm-brief.sh: secondmate charter binds the captain rules that apply to a supervising home"
+}
+
+# The rules must not displace the contracts they sit beside.
+test_captain_rules_preserve_existing_brief_contracts() {
+  local home brief
+  home="$TMP_ROOT/captain-rules-coexist-home"
+  mkdir -p "$home/data"
+  FM_HOME="$home" "$ROOT/bin/fm-brief.sh" brief-captain-coexist some-proj >/dev/null 2>&1 \
+    || fail "fm-brief.sh ship scaffold exited non-zero"
+  brief="$home/data/brief-captain-coexist/brief.md"
+  assert_grep "{TASK}" "$brief" "captain rules must not displace the {TASK} placeholder"
+  assert_grep "Verify isolation before anything else" "$brief" \
+    "captain rules must not displace the worktree-isolation assertion"
+  assert_grep "States: working, needs-decision, blocked, paused, done, failed." "$brief" \
+    "captain rules must not displace the status protocol"
+  assert_grep "# Definition of done" "$brief" \
+    "captain rules must not displace the Definition of done"
+  assert_no_grep "EOF" "$brief" \
+    "captain rules section leaked a heredoc EOF marker"
+  pass "fm-brief.sh: captain rules coexist with the placeholder, isolation, and status contracts"
+}
+
 test_script_parses
 test_help_includes_entire_header
+test_ship_and_scout_briefs_bind_the_standing_captain_rules
+test_secondmate_charter_binds_the_applicable_captain_rules
+test_captain_rules_preserve_existing_brief_contracts
 test_ship_modes_generate_clean_briefs
 test_direct_push_dod_semantics
 test_faster_paths_use_configured_authority_without_stacked_review

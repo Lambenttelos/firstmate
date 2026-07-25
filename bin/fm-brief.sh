@@ -56,6 +56,16 @@
 # waits for firstmate's go-ahead because at most TWO may run fleet-wide at once.
 # Ship scaffolds additionally require the final report to declare whether the change was
 # built test-first and whether it has end-to-end coverage.
+# Every ship and scout scaffold also carries the standing captain rules that bind every
+# worker, so they are structural instead of hand-pasted per dispatch: never force anything
+# (push to a NEW branch when blocked, never force-push, never force-release, never delete a
+# branch), understand the reason behind an instruction before acting and ask firstmate for a
+# grilling session when it is unclear, plan with the wayfinder skill before changing code,
+# write prose in caveman ultra style while keeping code and tool-parsed text normal, and bind
+# no server to port 443 or 3000. The Mattermost-sourced rule is written as a self-guarding
+# conditional on the same section rather than behind a flag, because a rule firstmate can
+# forget to pass is worth nothing. The secondmate charter carries the subset that applies to a
+# supervising home: never force, understand the reason, and caveman ultra prose.
 # Refuses to overwrite an existing brief.
 set -eu
 
@@ -119,6 +129,63 @@ shell_quote() {
 
 STATUS_FILE=$(shell_quote "$STATE/$ID.status")
 
+# Standing captain rules. These bind every worker, so they are generated here
+# rather than pasted onto each brief by hand: a rule that lives only in
+# firstmate memory never reaches a worker whose brief predates it.
+# Written with no apostrophes so the enclosing command substitution keeps
+# parsing (see tests/fm-brief.test.sh, issue #166).
+CAPTAIN_RULES=$(cat <<'EOF'
+# Standing captain rules
+
+These bind you for the whole task. They are not optional and they outrank convenience.
+
+1. **Never force anything.** Never force-push, never force a release, and never delete a
+   branch - branch deletion is the captain decision alone. If a push is rejected or a branch
+   is otherwise blocked, push to a NEW branch instead and report the new branch name, so
+   nothing that exists can be lost.
+2. **Understand the WHY before acting.** Never work the wording of this brief mechanically.
+   If the reason behind an instruction is not clear enough to act on, STOP and ask firstmate
+   for a grilling session. Asking is far cheaper than a wrong implementation and is never
+   treated as a failure.
+3. **Plan before you change code.** Invoke the `wayfinder` skill to plan the work first.
+4. **Write prose in caveman ultra style.** Every prose output - status lines and reports to
+   firstmate - drops articles, filler, hedging, and pleasantries; fragments are fine; state
+   each fact once. HARD EXCEPTIONS, written in normal English: code, code comments, commit
+   messages, PR titles and bodies, and anything a tool or CI parses. Also drop the style for
+   security warnings, irreversible-action confirmations, and any multi-step sequence where
+   removing conjunctions would make the order ambiguous. Never invent abbreviations and never
+   abbreviate identifiers, API names, CLI commands, or error strings.
+5. **Never bind port 443 or 3000.** Those ports are reserved for the servers the captain
+   runs personally. Any server you start runs on a non-default port.
+6. **If this task came from a Mattermost thread**, your FIRST action is to re-read the full
+   thread; never trust the queue-time summary in this brief. If the reported bug turns out to
+   be already fixed, verify that and ADD the missing end-to-end coverage rather than closing
+   the task as done.
+EOF
+)
+
+# The supervising subset for a persistent secondmate home. A secondmate delegates
+# implementation to its own crewmates, whose briefs carry the full set, so the
+# planning, port, and Mattermost rules do not apply to the charter itself.
+CAPTAIN_RULES_SECONDMATE=$(cat <<'EOF'
+# Standing captain rules
+
+These bind you and every crewmate you dispatch.
+
+1. **Never force anything.** Never force-push, never force a release, and never delete a
+   branch - branch deletion is the captain decision alone. When a push is blocked, push to a
+   NEW branch and report it, so nothing that exists can be lost.
+2. **Understand the WHY before acting.** Never work routed instructions mechanically. When
+   the reason behind a request is not clear enough to act on, STOP and ask the main firstmate
+   for a grilling session. Asking is never treated as a failure.
+3. **Write prose in caveman ultra style.** Status lines and reports drop articles, filler,
+   hedging, and pleasantries; state each fact once. HARD EXCEPTIONS, written in normal
+   English: code, code comments, commit messages, PR titles and bodies, and
+   anything a tool or CI parses, plus security warnings, irreversible-action confirmations, and any
+   multi-step sequence where dropping conjunctions would make the order ambiguous.
+EOF
+)
+
 if [ "$KIND" = secondmate ]; then
 SECONDMATE_PROJECTS=""
 idx=1
@@ -172,6 +239,8 @@ For a terse result, a status line is the whole answer.
 For a detailed answer (an investigation, a plan, an audit), write it to a doc under your home's \`data/\` and append a status line that points to that doc - the scout-report pattern - so the main firstmate is woken and can read it.
 Before treating an investigation or visual review as complete, load \`decision-hold-lifecycle\` from this home's \`.agents/skills/\` and pass its shared completion gate.
 A message with NO marker is the captain typing directly into your pane: treat it as authoritative captain intervention and stay conversational exactly as you would for any captain message; do not force it onto the status path.
+
+$CAPTAIN_RULES_SECONDMATE
 
 # Escalation to main firstmate
 Handle routine work yourself.
@@ -284,6 +353,8 @@ The report is the only thing that survives, so anything worth keeping must be in
    Before you start one, append \`working: BROWSER WAIT - {what you will drive}\` and STOP until
    firstmate replies with a go-ahead - the one line in this brief you do wait on.
    Append \`working: BROWSER END - {outcome}\` the moment it finishes so the slot is released.
+
+$CAPTAIN_RULES
 
 # Definition of done
 Write your findings to \`$DATA/$ID/report.md\`.
@@ -449,6 +520,8 @@ $RULE1
    Before you start one, append \`working: BROWSER WAIT - {what you will drive}\` and STOP until
    firstmate replies with a go-ahead - the one line in this brief you do wait on.
    Append \`working: BROWSER END - {outcome}\` the moment it finishes so the slot is released.
+
+$CAPTAIN_RULES
 
 # Project memory
 If \`AGENTS.md\` or \`CLAUDE.md\` already exists, or if this task produced durable project-intrinsic knowledge, run \`$FM_ROOT/bin/fm-ensure-agents-md.sh .\` in the worktree.
