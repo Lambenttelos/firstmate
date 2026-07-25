@@ -128,9 +128,9 @@ if [ "$INFLIGHT" -eq 0 ]; then
     skip=0
     rest=$LIVE_KEYS
     while [ -n "$rest" ]; do
-      rest=${rest#|}
       key=${rest%%|*}
       rest=${rest#"$key"}
+      rest=${rest#|}
       [ -n "$key" ] || continue
       case "$name" in *"$key"*) skip=1; break ;; esac
     done

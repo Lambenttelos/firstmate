@@ -292,6 +292,35 @@ t_review_decision_age_survives_later_append() {
   pass "an open decision ages from when it opened, not from the status file"
 }
 
+# --- resolving a decision removes its first-seen record -------------------------
+t_review_decision_marker_cleared_on_resolve() {
+  local home out marker
+  home=$(new_home review-decision-marker)
+  fm_write_meta "$home/state/svc..api.meta" "window=firstmate:fm-svc" "kind=ship"
+  printf 'needs-decision[key=a..b]: pick the delivery mode\n' > "$home/state/svc..api.status"
+  backdate "$home/state/svc..api.status" 7200
+
+  out=$(run_review "$home")
+  assert_contains "$out" "waiting on a decision" "the aging decision must surface first"
+  marker=$(find "$home/state" -maxdepth 1 -name '.hourly-decision-*' | head -1)
+  [ -n "$marker" ] || fail "an open decision must leave a first-seen record"
+  rm -f "$home/state/.hourly-review-surfaced"
+
+  # A still-open decision keeps the SAME record, even when the id and key both
+  # mangle to names carrying extra underscores.
+  out=$(run_review "$home")
+  assert_present "$marker" "a still-open decision must keep its first-seen record"
+
+  printf 'resolved[key=a..b]: delivery mode chosen\n' >> "$home/state/svc..api.status"
+  out=$(run_review "$home")
+  assert_absent "$marker" "resolving a decision must clear its first-seen record"
+
+  printf 'needs-decision[key=a..b]: a brand new question\n' >> "$home/state/svc..api.status"
+  out=$(run_review "$home")
+  [ -z "$out" ] || fail "a re-opened decision must age from the new opening, got: $out"
+  pass "resolving a decision clears its first-seen record"
+}
+
 # --- blocked or held queue items are not idle capacity --------------------------
 t_review_idle_capacity_ignores_blocked() {
   local home out
@@ -488,6 +517,7 @@ t_cleanup_never_sweeps_merge_queue
 t_secondmate_is_not_work_under_way
 t_review_stall_without_status_file
 t_review_decision_age_survives_later_append
+t_review_decision_marker_cleared_on_resolve
 t_review_idle_capacity_ignores_blocked
 t_cleanup_protects_glob_keys
 t_arm_keeps_existing_stamp

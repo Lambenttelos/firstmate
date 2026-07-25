@@ -99,9 +99,11 @@ EOF
   fi
   # A resolved decision leaves no marker behind, so the next time it opens it is
   # aged from that new opening.
-  for dmarker in "$STATE"/.hourly-decision-"$(fm_hourly_marker_key "$id")"__*; do
+  idkey=$(fm_hourly_marker_key "$id")
+  for dmarker in "$STATE"/.hourly-decision-"$idkey"__*; do
     [ -f "$dmarker" ] || continue
-    mkey=${dmarker##*__}
+    mkey=$(basename "$dmarker")
+    mkey=${mkey#".hourly-decision-${idkey}__"}
     case "$open_keys" in *"|$mkey|"*) continue ;; esac
     rm -f "$dmarker" 2>/dev/null || true
   done

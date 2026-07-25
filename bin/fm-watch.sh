@@ -459,7 +459,7 @@ resource_sweep() {
 # so it is flattened onto one wake record. wake() ends the cycle, so a second
 # due pass runs on a later poll.
 hourly_pass_sweep() {
-  local pass interval stamp script out reason
+  local pass interval stamp script script_name out reason
   fm_hourly_is_armed "$STATE" || return 0
   for pass in $FM_HOURLY_PASSES; do
     interval=$(fm_hourly_interval "$pass") || continue
@@ -467,7 +467,9 @@ hourly_pass_sweep() {
     stamp=$(fm_hourly_stamp "$STATE" "$pass")
     [ "$(age_of "$stamp")" -ge "$interval" ] || continue
     touch "$stamp"
-    script="$SCRIPT_DIR/$(fm_hourly_pass_script "$pass")" || continue
+    script_name=$(fm_hourly_pass_script "$pass") || continue
+    [ -n "$script_name" ] || continue
+    script="$SCRIPT_DIR/$script_name"
     [ -f "$script" ] && [ ! -L "$script" ] || continue
     FM_HOME="$FM_HOME" run_check_capture "$script" || exit 1
     out=$FM_CHECK_RESULT
