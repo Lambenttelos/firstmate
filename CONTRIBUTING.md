@@ -96,6 +96,8 @@ Family selection is the ordinary local path; `--all` is deliberate full regressi
 CI owns broad regression across required portable parallel shards, the portable serial lane, the Herdr lane, lint, invariants, the coverage guard, and macOS snapshot compatibility in [`.github/workflows/ci.yml`](.github/workflows/ci.yml).
 Use `bin/fm-test-run.sh --help` for lane names, `--jobs` rules, and required gate-skip flags when reproducing a lane locally.
 Discover tests by listing `tests/*.test.sh`: each is a self-contained bash script named `<subject>.test.sh`, and its header comment describes what it covers, so pass one to `bin/fm-test-run.sh` to focus on a subject with canonical timing output.
+A test that races a real background process (a watcher, a daemon, a spawned agent) must wait on the condition it actually depends on rather than sleeping a guessed number of seconds, because process start-up cost is unbounded on a loaded host.
+Wait on the process's own observable signal, such as the watcher's liveness beacon `state/.last-watcher-beat`, and use a generous `--seconds` style bound only as a hang guard that a green run never spends; see `tests/fm-watch-checkpoint.test.sh` for the pattern.
 Tests that need a real optional backend or an explicit opt-in (real herdr/zellij/cmux smoke tests, the live Pi regression) skip themselves and print the tool or environment gate needed to enable them, so the portable suite remains safe on machines without those tools.
 The [Herdr backend guide](docs/herdr-backend.md) owns the lane's safety and isolation rationale, including why live harness credential tests remain opt-in.
 
