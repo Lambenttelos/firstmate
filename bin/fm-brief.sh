@@ -132,8 +132,11 @@ STATUS_FILE=$(shell_quote "$STATE/$ID.status")
 # Standing captain rules. These bind every worker, so they are generated here
 # rather than pasted onto each brief by hand: a rule that lives only in
 # firstmate memory never reaches a worker whose brief predates it.
-# Written with no apostrophes so the enclosing command substitution keeps
-# parsing (see tests/fm-brief.test.sh, issue #166).
+# Both blocks use quoted heredocs and reach the brief only through variable
+# expansion, which is not re-parsed, so their contents are literal.
+# Rule 3's `wayfinder` skill is installed at the user level
+# (~/.claude/skills/wayfinder), not tracked in this repo, so it resolves for
+# every worker spawned on this machine and a repo-presence check is the wrong test.
 CAPTAIN_RULES=$(cat <<'EOF'
 # Standing captain rules
 
@@ -148,12 +151,16 @@ These bind you for the whole task. They are not optional and they outrank conven
    for a grilling session. Asking is far cheaper than a wrong implementation and is never
    treated as a failure.
 3. **Plan before you change code.** Invoke the `wayfinder` skill to plan the work first.
-4. **Write prose in caveman ultra style.** Every prose output - status lines and reports to
-   firstmate - drops articles, filler, hedging, and pleasantries; fragments are fine; state
-   each fact once. HARD EXCEPTIONS, written in normal English: code, code comments, commit
-   messages, PR titles and bodies, and anything a tool or CI parses. Also drop the style for
-   security warnings, irreversible-action confirmations, and any multi-step sequence where
-   removing conjunctions would make the order ambiguous. Never invent abbreviations and never
+4. **Write EPHEMERAL prose in caveman ultra style.** Ephemeral prose means status lines and
+   the reports or replies you send back to firstmate: drop articles, filler, hedging, and
+   pleasantries; fragments are fine; state each fact once. DURABLE documents stay in normal
+   English: the scout report at `data/<id>/report.md`, any project `AGENTS.md` or
+   `CLAUDE.md`, ADRs, files under `docs/`, code, code comments, commit messages, PR titles
+   and bodies, and anything a tool or CI parses. The style exists to cut chat noise, not to
+   make the permanent record harder to read - durable documents are read cold months later
+   by people and agents with no context. Also drop the style for security warnings,
+   irreversible-action confirmations, and any multi-step sequence where dropping
+   conjunctions would make the order ambiguous. Never invent abbreviations and never
    abbreviate identifiers, API names, CLI commands, or error strings.
 5. **Never bind port 443 or 3000.** Those ports are reserved for the servers the captain
    runs personally. Any server you start runs on a non-default port.
@@ -178,11 +185,17 @@ These bind you and every crewmate you dispatch.
 2. **Understand the WHY before acting.** Never work routed instructions mechanically. When
    the reason behind a request is not clear enough to act on, STOP and ask the main firstmate
    for a grilling session. Asking is never treated as a failure.
-3. **Write prose in caveman ultra style.** Status lines and reports drop articles, filler,
-   hedging, and pleasantries; state each fact once. HARD EXCEPTIONS, written in normal
-   English: code, code comments, commit messages, PR titles and bodies, and
-   anything a tool or CI parses, plus security warnings, irreversible-action confirmations, and any
-   multi-step sequence where dropping conjunctions would make the order ambiguous.
+3. **Write EPHEMERAL prose in caveman ultra style.** Ephemeral prose means status lines and
+   the reports or replies you send back to the main firstmate: drop articles, filler,
+   hedging, and pleasantries; state each fact once. DURABLE documents stay in normal
+   English: the scout report at `data/<id>/report.md`, any project `AGENTS.md` or
+   `CLAUDE.md`, ADRs, files under `docs/`, code, code comments, commit messages, PR titles
+   and bodies, and anything a tool or CI parses. The style exists to cut chat noise, not to
+   make the permanent record harder to read - durable documents are read cold months later
+   by people and agents with no context. Also drop the style for security warnings,
+   irreversible-action confirmations, and any multi-step sequence where dropping
+   conjunctions would make the order ambiguous. Never invent abbreviations and never
+   abbreviate identifiers, API names, CLI commands, or error strings.
 EOF
 )
 

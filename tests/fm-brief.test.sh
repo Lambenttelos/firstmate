@@ -511,11 +511,23 @@ test_ship_and_scout_briefs_bind_the_standing_captain_rules() {
     # shellcheck disable=SC2016 # Literal backticks must remain unexpanded.
     assert_grep '`wayfinder` skill' "$brief" \
       "$kind brief must require planning with the wayfinder skill"
-    # 4. caveman ultra prose, with its normal-English exceptions
-    assert_grep "caveman ultra style" "$brief" \
-      "$kind brief must require caveman ultra prose"
+    # 4. caveman ultra prose for ephemeral output only, durable documents in normal English
+    assert_grep "EPHEMERAL prose in caveman ultra style" "$brief" \
+      "$kind brief must scope caveman ultra prose to ephemeral output"
+    assert_grep "DURABLE documents stay in normal" "$brief" \
+      "$kind brief must keep durable documents in normal English"
+    # shellcheck disable=SC2016 # Literal backticks must remain unexpanded.
+    assert_grep 'data/<id>/report.md' "$brief" \
+      "$kind brief must name the scout report as a durable normal-English document"
+    # shellcheck disable=SC2016 # Literal backticks must remain unexpanded.
+    assert_grep '`AGENTS.md`' "$brief" \
+      "$kind brief must name project AGENTS.md as a durable normal-English document"
     assert_grep "anything a tool or CI parses" "$brief" \
-      "$kind brief must exempt code, commits, PR text, and tool-parsed output from caveman prose"
+      "$kind brief must keep code, commits, PR text, and tool-parsed output in normal English"
+    assert_grep "read cold months later" "$brief" \
+      "$kind brief must state why durable documents keep normal English"
+    assert_grep "irreversible-action confirmations" "$brief" \
+      "$kind brief must keep the security and irreversible-action carve-outs"
     assert_grep "abbreviate identifiers, API names, CLI commands, or error strings" "$brief" \
       "$kind brief must forbid abbreviating identifiers and commands"
     # 5. server ports
@@ -553,10 +565,18 @@ test_secondmate_charter_binds_the_applicable_captain_rules() {
     "secondmate charter must forbid acting on routed work mechanically"
   assert_grep "grilling session" "$brief" \
     "secondmate charter must route an unclear reason back as a grilling session"
-  assert_grep "caveman ultra style" "$brief" \
-    "secondmate charter must require caveman ultra prose in its reports"
+  assert_grep "EPHEMERAL prose in caveman ultra style" "$brief" \
+    "secondmate charter must scope caveman ultra prose to ephemeral reports"
+  assert_grep "DURABLE documents stay in normal" "$brief" \
+    "secondmate charter must keep durable documents in normal English"
+  # shellcheck disable=SC2016 # Literal backticks must remain unexpanded.
+  assert_grep 'data/<id>/report.md' "$brief" \
+    "secondmate charter must name the scout report as a durable normal-English document"
+  # shellcheck disable=SC2016 # Literal backticks must remain unexpanded.
+  assert_grep '`AGENTS.md`' "$brief" \
+    "secondmate charter must name project AGENTS.md as a durable normal-English document"
   assert_grep "anything a tool or CI parses" "$brief" \
-    "secondmate charter must exempt tool-parsed text from caveman prose"
+    "secondmate charter must keep tool-parsed text in normal English"
   pass "fm-brief.sh: secondmate charter binds the captain rules that apply to a supervising home"
 }
 
