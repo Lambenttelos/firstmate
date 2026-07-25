@@ -986,6 +986,71 @@ unit_clear_failure_still_enters_away_mode() {
   rm -rf "$st"
 }
 
+# The daemon lock may be reclaimed only from a live process the probe CONFIDENTLY
+# reads as some other program. An UNDETERMINED probe - an unreadable pid identity,
+# or an empty ps command line under fork pressure - must leave the lock alone: it
+# can belong to a daemon that really is running, and tearing it out starts a second
+# supervisor beside the first, with both believing they own escalation delivery.
+# The daemon started afterwards refuses loudly against a held lock instead, which
+# is loud and self-correcting.
+unit_lock_steal_requires_a_confident_foreign_holder() {
+  local st lock holder stub
+
+  # (1) UNDETERMINED holder: the lock records an identity and the probe cannot
+  # complete. The lock must survive.
+  st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-steal-undetermined.XXXXXX")
+  mkdir -p "$st/state"
+  stub="$st/stub-daemon.sh"
+  printf '#!/usr/bin/env bash\nexit 0\n' > "$stub"
+  chmod +x "$stub"
+  sleep 600 &
+  holder=$!
+  lock="$st/state/.supervise-daemon.lock"
+  mkdir -p "$lock"
+  printf '%s' "$holder" > "$lock/pid"
+  printf 'recorded-identity\n' > "$lock/pid-identity"
+  FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" bash -c '
+    . "$1"
+    FM_AFK_DAEMON=$2
+    fm_pid_identity() { return 1; }
+    fm_afk_start_main
+  ' _ "$START" "$stub" >/dev/null 2>&1 || true
+  if [ -e "$lock/pid" ]; then
+    pass "lock steal: an undetermined holder keeps its daemon lock"
+  else
+    fail "lock steal: an undetermined probe tore out a lock that may belong to a live daemon"
+  fi
+  kill "$holder" 2>/dev/null || true
+  wait "$holder" 2>/dev/null || true
+  rm -rf "$st"
+
+  # (2) CONFIDENTLY FOREIGN holder: a live process with a readable command line
+  # that is not this daemon. Its lock is reclaimed, exactly as before.
+  st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-steal-foreign.XXXXXX")
+  mkdir -p "$st/state"
+  stub="$st/stub-daemon.sh"
+  printf '#!/usr/bin/env bash\nexit 0\n' > "$stub"
+  chmod +x "$stub"
+  sleep 600 &
+  holder=$!
+  lock="$st/state/.supervise-daemon.lock"
+  mkdir -p "$lock"
+  printf '%s' "$holder" > "$lock/pid"
+  FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" bash -c '
+    . "$1"
+    FM_AFK_DAEMON=$2
+    fm_afk_start_main
+  ' _ "$START" "$stub" >/dev/null 2>&1 || true
+  if [ ! -e "$lock/pid" ]; then
+    pass "lock steal: a confidently foreign live holder still has its lock reclaimed"
+  else
+    fail "lock steal: a foreign live holder kept a lock that blocks the daemon"
+  fi
+  kill "$holder" 2>/dev/null || true
+  wait "$holder" 2>/dev/null || true
+  rm -rf "$st"
+}
+
 unit_confirmed_absence_succeeds() {
   local st
   st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-confirmed-absent.XXXXXX")
@@ -1171,6 +1236,7 @@ unit_stop_surfaces_afk_removal_failure
 unit_stop_confirms_daemon_exit
 unit_refresh_validates_record
 unit_clear_failure_still_enters_away_mode
+unit_lock_steal_requires_a_confident_foreign_holder
 unit_confirmed_absence_succeeds
 unit_incomplete_restore_retains_backup
 unit_flag_write_failure_aborts

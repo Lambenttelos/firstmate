@@ -211,6 +211,36 @@ fm_afk_daemon_alive() {
   [ "$(fm_afk_daemon_liveness "$@")" = live ]
 }
 
+# fm_afk_daemon_lock_held_by_foreign_live_process <lock-path> <daemon-path> [strict]
+# True ONLY when this home's daemon lock is held by a live process that the probe
+# CONFIDENTLY reads as something other than this repo's supervise daemon.
+#
+# This is the "may I tear this lock out?" question, and it is not the negation of
+# fm_afk_daemon_alive. That boolean folds an unprobeable holder into not-alive,
+# which is the right conservative answer for "should I start a daemon" but the
+# wrong one here: an entry path that stole a lock on an undetermined probe would
+# take it away from a daemon that is in fact running - fm_pid_identity returns
+# non-zero when /proc or ps cannot be read, and ps can hand back an empty command
+# line under fork pressure - and leave two supervisors both believing they own
+# escalation delivery.
+#
+# So only a confident `dead` match state (a recorded identity that differs, or a
+# readable command line that is not the daemon) authorizes removal. An
+# undetermined probe leaves the lock alone; the caller's daemon then refuses to
+# start against the held lock, which is loud and self-correcting. A holder whose
+# process is genuinely gone needs nothing here either: bin/fm-wake-lib.sh's own
+# dead-pid steal already recovers that lock lazily.
+fm_afk_daemon_lock_held_by_foreign_live_process() {
+  local lock=$1 daemon=$2 strict=${3:-0} owner pid
+  owner=$(fm_afk_daemon_lock_owner "$lock") || return 1
+  pid=$(cat "$owner/pid" 2>/dev/null || true)
+  case "$pid" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  fm_pid_alive "$pid" || return 1
+  [ "$(fm_afk_daemon_pid_match_state "$pid" "$owner" "$daemon" "$strict")" = dead ]
+}
+
 # fm_afk_daemon_supervision_state <state-dir> <bin-dir>
 # Print which of the three supervision-ownership states this home is in:
 #   free         - away mode is off, or no daemon holds this home's lock and no
