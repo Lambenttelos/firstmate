@@ -346,6 +346,7 @@ Handle actionable wakes as follows:
 A `host-resources` wake, a heartbeat's host-pressure annotation, and a spawn's resource advisory all report that the machine itself is overloaded, never that a crew misbehaved.
 Relay the pressure and the crew count the host supports, and ask the captain before shedding work; never stop or kill anything automatically on a resource reading.
 `bin/fm-resource-check.sh` owns the reading and its thresholds, and `docs/configuration.md` owns its separate sweep cadence.
+When the pressure is memory and the question becomes which processes are consuming it and who owns them, `bin/fm-memory-report.sh` answers that separately; never judge memory by resident size, which understates a swapping process badly.
 
 When any wake reports a merged PR for a project cloned in this home, refresh that clone through the guarded fleet-sync path.
 When X-linked work reaches a milestone or terminal state, load `fmx-respond`; before terminal teardown, always post the final completion follow-up so the link clears even if earlier follow-ups were spent.
