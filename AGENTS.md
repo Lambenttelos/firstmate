@@ -111,6 +111,7 @@ state/               volatile runtime signals; gitignored
   .watch.lock .wake-queue.lock watcher singleton and queue serialization locks
   .wake-brief-spool-*  bin/fm-wake-brief.sh's drained-record spool; removed after a successful brief, kept and named in the output when the drain failed because it is then the only copy of those records
   .hash-* .count-* .stale-* .stale-since-* .paused-* .wedge-escalations-* .seen-* .hb-surfaced-* .last-* .resource-* .heartbeat-streak   watcher internals; never touch
+  .hourly-armed .hourly-*-surfaced .hourly-*.latest .hourly-decision-* .hourly-cleanup.log  hourly session-review and cleanup pass state: armed for the session by bin/fm-session-start.sh, run by the one watcher on its slow poll (docs/configuration.md); watcher internals, never touch
   .watch-triage.log  watcher's absorbed-wake debug log (size-capped); never relied on, safe to delete
   .last-watcher-beat watcher liveness beacon, touched every poll (including while absorbing benign wakes); guard scripts read it
   .subsuper-* .supervise-daemon.*   sub-supervisor internals; never touch
@@ -142,6 +143,8 @@ A lock-refused session must not spawn, steer, merge, drain the wake queue, repai
    The secondmate liveness sweep deterministically guarantees every registered secondmate is actually running: it probes each live secondmate's endpoint for a real agent process (not just pane presence), respawns only on a confident dead reading, and reports only skipped or failed guarantees as `SECONDMATE_LIVENESS:` lines (`bin/fm-bootstrap.sh`; `bin/fm-backend.sh`'s `fm_backend_agent_alive`).
 3. **Wake queue** - when locked, drains the durable wake queue and prints the raw records prominently as this turn's first work queue; a bounded, clearly labeled historical status-event annotation may follow a valid `signal` record but never replaces it or current-state reconciliation, and a lapsed watcher chain still surfaces here via the same guard alarm.
    When the lock could not be acquired, the queue is left untouched because another session owns it, and the guard's tangle/watcher-liveness alarms still print in read-only advisory mode without drain, supervision repair, or checkout repair commands.
+   **3b. Hourly passes** - when locked, arms the hourly session review and the hourly cleanup sweep for the life of the session.
+   Arming writes durable schedule state only, so the one live watcher runs a due pass on its existing slow poll and no second supervision cycle exists; it is mutating, so a read-only session leaves it to the session holding the lock.
 4. **Context digest** - the full contents of `data/projects.md`, `data/secondmates.md`, `data/captain.md`, `data/captain-shared.md`, and `data/learnings.md`, each clearly delimited.
    A file that does not exist prints an explicit `ABSENT` marker, never confused with an empty-but-present file: absence is meaningful (`captain.md` absent means use the firstmate repo's built-in defaults, `projects.md` absent means rebuild it from the clones under `projects/`, etc.).
 5. **Fleet-state digest** - the compact backlog listing owned by `bin/fm-session-start.sh`; every `state/<id>.meta`; a bounded tail of each task's `state/<id>.status` (labeled as wake-EVENT history, not current state, with the full log path printed for a deeper read); one host CPU/memory/swap reading with the concurrent-agent ceiling it supports; a one-line count of released-but-unmerged ship branches when the merge queue is non-empty, and nothing when it is empty; the `state/.afk` flag, distinguishing daemon-owned away mode from the away posture with no daemon running here; and one cheap alive/dead read of each task's recorded backend endpoint.
@@ -341,13 +344,17 @@ Handle actionable wakes as follows:
 
 1. For `signal:`, read the listed event lines first, then reconcile current state only where action depends on it.
 2. For `stale:`, inspect the recorded endpoint and load `stuck-crewmate-recovery` for a stopped, looping, confused, or unresponsive worker; a deep-inspection reason also requires current-state and validation-log inspection.
-3. For `check:`, act on the named poll result, including merges, X-mode events, and a `host-resources` reading.
+3. For `check:`, act on the named poll result, including merges, X-mode events, a `host-resources` reading, and the hourly `session-review` and `session-cleanup` passes.
 4. For `heartbeat:`, review the whole fleet from the structured fleet view, reconcile suspicious tasks and PR state, update the backlog, and never report an unchanged fleet as progress.
 
 A `host-resources` wake, a heartbeat's host-pressure annotation, and a spawn's resource advisory all report that the machine itself is overloaded, never that a crew misbehaved.
 Relay the pressure and the crew count the host supports, and ask the captain before shedding work; never stop or kill anything automatically on a resource reading.
 `bin/fm-resource-check.sh` owns the reading and its thresholds, and `docs/configuration.md` owns its separate sweep cadence.
 When the pressure is memory and the question becomes which processes are consuming it and who owns them, `bin/fm-memory-report.sh` answers that separately; never judge memory by resident size, which understates a swapping process badly.
+
+A `session-review` wake reports only work that has not moved - an unanswered decision, a silent worker, queued work with nothing running, a batch of finished-but-unmerged branches - so act on the named item rather than re-reviewing the fleet, and read the full report behind the headline when the one line is not enough.
+A `session-cleanup` wake reports only accumulated material the sweep deliberately did not remove because it could hold unlanded work; investigate it under the ordinary teardown rules and never discard it on the strength of that report.
+`docs/configuration.md` owns both cadences, and the two pass scripts own their thresholds.
 
 When any wake reports a merged PR for a project cloned in this home, refresh that clone through the guarded fleet-sync path.
 When X-linked work reaches a milestone or terminal state, load `fmx-respond`; before terminal teardown, always post the final completion follow-up so the link clears even if earlier follow-ups were spent.
