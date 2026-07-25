@@ -81,19 +81,27 @@ test_quiet_checkpoint_exits_124_cleanly() {
 }
 
 test_signal_passes_through_and_exits_zero() {
-  local home out err status drained
+  local home out err status drained nobeat
   home=$(make_home signal)
   out="$home/out.txt"
   err="$home/err.txt"
+  nobeat="$home/no-watcher-beat"
   # Write the status only once the watcher is provably in its poll loop, so the
   # wake is a real mid-checkpoint signal rather than a bet on watcher boot time.
+  # If the beacon never appears the watcher never reached its poll loop, and that
+  # is the real cause - record it so the assertion below reports it instead of a
+  # generic exit-code mismatch.
   (
-    wait_for "$home/state/.last-watcher-beat" "$WAKE_CEILING_SECONDS" || exit 0
+    if ! wait_for "$home/state/.last-watcher-beat" "$WAKE_CEILING_SECONDS"; then
+      printf 'no watcher liveness beacon within %ss\n' "$WAKE_CEILING_SECONDS" > "$nobeat"
+      exit 0
+    fi
     printf 'done: synthetic wake\n' > "$home/state/demo.status"
   ) &
   status=0
   FM_HOME="$home" FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 "$CHECKPOINT" --seconds "$WAKE_CEILING_SECONDS" >"$out" 2>"$err" || status=$?
   wait
+  [ ! -e "$nobeat" ] || fail "watcher never reached its poll loop: $(cat "$nobeat")"
   expect_code 0 "$status" "signal checkpoint exit"
   assert_contains "$(cat "$out")" "signal:" "signal wake was not passed through"
   drained=$(FM_HOME="$home" "$ROOT/bin/fm-wake-drain.sh")
