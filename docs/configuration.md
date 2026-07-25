@@ -167,6 +167,9 @@ Portable shard evidence and coverage rules are in [fm-test-portable-shards.md](f
 
 Domain-local preferences for one captain's fleet live locally in each home's `data/captain.md`; it is gitignored and printed in the session-start context digest after `data/projects.md` and optional `data/secondmates.md`.
 Before changing it, inspect the current file and rewrite or prune the matching bullet in place; add a new bullet only for a genuinely new durable preference.
+A preference that a config file already owns is recorded as a pointer at that file, never as a restated value.
+Prose binds only when an agent reads and obeys it, while a config file binds mechanically, so a second copy of a harness, model, effort level, ceiling, threshold, cadence, path, or retention count is pure drift risk: the two disagree the moment only one is edited, and the prose copy is what gets believed.
+Keep the durable ruling in prose - what to prefer, what to escalate, what never to force - and keep the number in its config.
 Shared captain preferences that apply across secondmate domains live only in the primary home's optional `data/captain-shared.md`.
 `secondmate-provisioning` owns its propagation contract, including the required header, read-only secondmate copies, quarantine diagnostics, and the rollout rule that existing homes trim `data/captain.md` by hand after first propagation rather than deleting private content automatically.
 
@@ -175,6 +178,7 @@ Shared captain preferences that apply across secondmate domains live only in the
 Fleet-local operational facts and gotchas live locally in `data/learnings.md`; it is gitignored and printed after the captain-preference files in the session-start context digest.
 The file is created lazily on first learning and follows the same dated, evidence-backed, curated style as `data/captain.md`: inspect the current file first, then rewrite or prune stale entries instead of appending forever.
 There is no shared learnings file by captain decision.
+The pointer-not-value rule from the captain-preference section above applies here too: a learning may record what a value WAS on a dated occasion as evidence, but the live value is always read from its config file.
 
 ## Secondmate routes (data/secondmates.md)
 
