@@ -30,6 +30,7 @@ Before writing a new fact anywhere in this repo, ask where it belongs, in this o
 
 Stop at the first tier that answers yes.
 Do not place a fact at a more convenient tier than the one this tree gives you.
+A fact that is an operating value some config file already owns belongs in that config file, recorded elsewhere only as a pointer, per the pointer-not-value rule in [docs/configuration.md](../../../docs/configuration.md#captain-preferences-datacaptainmd--datacaptain-sharedmd).
 
 ## One-owner rule
 
