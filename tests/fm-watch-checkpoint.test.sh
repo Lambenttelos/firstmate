@@ -4,6 +4,8 @@ set -u
 
 # shellcheck source=tests/lib.sh
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+# shellcheck source=bin/fm-mutex-lib.sh
+. "$ROOT/bin/fm-mutex-lib.sh"
 
 CHECKPOINT="$ROOT/bin/fm-watch-checkpoint.sh"
 TMP_ROOT=$(fm_test_tmproot fm-watch-checkpoint)
@@ -38,26 +40,27 @@ wait_for() {
 }
 
 # assert_no_live_watch_lock <home> <message> - the durable property after a
-# timed-out checkpoint is that NO LIVE watcher still holds the singleton lock,
-# not that the lock directory was already reaped by the instant the checkpoint
-# returned. Those are different claims: the checkpoint's timeout signals the
-# watcher and the watcher's own EXIT trap releases the lock, so on a loaded host
-# the release can land microseconds after the signal returns - and if the watcher
-# is SIGKILLed before its trap runs, the lock is left naming a DEAD pid, which
-# bin/fm-mutex-lib.sh steals on the next arm (fm_lock_try_acquire's dead-holder
-# path). So wait on the condition - lock gone, or holder pid dead - instead of
-# asserting an instantaneous absence that races the signal.
+# timed-out checkpoint is that the singleton lock is RE-ACQUIRABLE, i.e. a fresh
+# arm can actually take it, not that the lock directory was already reaped by the
+# instant the checkpoint returned. Those are different claims: the checkpoint's
+# timeout signals the watcher and the watcher's own EXIT trap releases the lock,
+# so on a loaded host the release can land microseconds after the signal returns.
+# So assert the property that matters by really acquiring the lock through
+# bin/fm-mutex-lib.sh's fm_lock_try_acquire (the same path the next arm uses,
+# including its dead-holder steal) and releasing it again, waiting on that
+# condition instead of asserting an instantaneous absence that races the signal.
+# A regression where the watcher stops releasing its lock still fails here,
+# because a live holder blocks acquisition until the deadline.
 assert_no_live_watch_lock() {
-  local home=$1 msg=$2 waited=0 pid
-  local pidfile="$home/state/.watch.lock/pid"
-  while :; do
-    pid=$(cat "$pidfile" 2>/dev/null || true)
-    [ -n "$pid" ] || return 0
-    kill -0 "$pid" 2>/dev/null || return 0
-    [ "$waited" -lt $((WAKE_CEILING_SECONDS * 20)) ] || fail "$msg (live pid $pid)"
+  local home=$1 msg=$2 waited=0
+  local lockdir="$home/state/.watch.lock"
+  while ! fm_lock_try_acquire "$lockdir"; do
+    [ "$waited" -lt $((WAKE_CEILING_SECONDS * 20)) ] \
+      || fail "$msg (lock still held by pid ${FM_LOCK_HELD_PID:-unknown})"
     sleep 0.05
     waited=$((waited + 1))
   done
+  fm_lock_release "$lockdir"
 }
 
 make_home() {
