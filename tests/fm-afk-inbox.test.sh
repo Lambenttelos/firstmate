@@ -661,6 +661,71 @@ test_every_exit_line_carries_a_re_arm_verdict() {
   pass "every reader exit ends with exactly one re-arm verdict firstmate can act on"
 }
 
+# A FAILED run must not end MUTE. Firstmate decides whether to arm this reader
+# again from its final line, so an exit that carries only a stderr diagnostic
+# leaves that decision undefined - and an undefined decision has historically
+# meant nobody re-arms, which is the unwatched channel this whole path exists to
+# remove. Records are still pending and nothing else is listening for them, so
+# every operational failure ends in a re-arm verdict while keeping its loud
+# diagnostic and its non-zero exit. It must still never look HEALTHY: no
+# nothing-pending, idle, or delivered line.
+test_failed_runs_still_end_in_a_re_arm_verdict() {
+  local state rc out final
+  assert_failed_verdict() {  # <output> <label>
+    local text=$1 label=$2 line
+    line=$(printf '%s\n' "$text" | grep '^afk-inbox: ' | tail -n 1)
+    [ -n "$line" ] || fail "$label exited mute, with no verdict firstmate can act on: $text"
+    case "$line" in
+      *"re-arm to keep listening"*) ;;
+      *) fail "$label did not tell firstmate to re-arm: $line" ;;
+    esac
+    case "$text" in
+      *"afk-inbox: nothing pending"*|*"afk-inbox: idle after"*|*"afk-inbox: delivered "*)
+        fail "$label printed a healthy status line for a failed run: $text" ;;
+    esac
+  }
+
+  # (1) A single-shot run that cannot take the lock.
+  state=$(make_inbox_case failed-verdict-lock)
+  enter_away "$state"
+  append_digest "$state" "Supervisor escalate (1 event(s)): xi.status: blocked: needs a token"
+  hold_outbox_lock "$state" 10
+  rc=0
+  out=$(FM_AFK_OUTBOX_LOCK_TRIES=2 run_inbox "$state" --once) || rc=$?
+  release_outbox_lock
+  [ "$rc" -ne 0 ] || fail "a single-shot run that could not take the lock exited 0: $out"
+  assert_failed_verdict "$out" "the single-shot lock-timeout exit"
+  [ "$(fm_afk_outbox_pending_count "$state")" -eq 1 ] \
+    || fail "the record did not stay pending after the failed single-shot run"
+
+  # (2) A present-but-unreadable outbox file, which is a failed READ rather than
+  # a lock the reader merely lost a race for.
+  if [ "$(id -u)" != 0 ]; then
+    state=$(make_inbox_case failed-verdict-unreadable)
+    enter_away "$state"
+    append_digest "$state" "Supervisor escalate (1 event(s)): omicron.status: failed: CI red"
+    chmod 000 "$state/$FM_AFK_OUTBOX_NAME"
+    rc=0
+    out=$(run_inbox "$state" --once) || rc=$?
+    chmod 644 "$state/$FM_AFK_OUTBOX_NAME"
+    [ "$rc" -ne 0 ] || fail "an unreadable outbox exited 0: $out"
+    assert_failed_verdict "$out" "the unreadable-outbox exit"
+    [ "$(fm_afk_outbox_pending_count "$state")" -eq 1 ] \
+      || fail "the record did not stay pending after the unreadable read"
+  fi
+
+  # (3) Bad arguments are the deliberate exception: re-arming with the same bad
+  # arguments would loop without ever listening, so that exit stays mute.
+  state=$(make_inbox_case failed-verdict-usage)
+  enter_away "$state"
+  rc=0
+  out=$(run_inbox "$state" --poll 0) || rc=$?
+  [ "$rc" -ne 0 ] || fail "an invalid --poll exited 0: $out"
+  final=$(printf '%s\n' "$out" | grep '^afk-inbox: ' | tail -n 1 || true)
+  [ -z "$final" ] || fail "an argument error must not invite a re-arm: $final"
+  pass "an operational failure still ends in a re-arm verdict while an argument error does not"
+}
+
 # The whole point, end to end: a REAL daemon with no terminal backend reachable
 # at all. It must select paneless delivery instead of typing into the legacy
 # firstmate:0 guess, and a captain-relevant status must reach the reader's stdout
@@ -875,6 +940,7 @@ test_acknowledged_records_are_compacted_without_losing_pending_ones
 test_reader_exits_non_zero_when_the_outbox_cannot_be_read
 test_concurrent_readers_never_announce_what_they_did_not_deliver
 test_every_exit_line_carries_a_re_arm_verdict
+test_failed_runs_still_end_in_a_re_arm_verdict
 test_a_transient_lock_timeout_keeps_the_reader_alive
 test_a_lock_that_never_clears_ends_the_reader_within_its_bound
 test_transient_temp_templates_track_their_artifact_constants
