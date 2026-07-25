@@ -110,6 +110,48 @@ fm_hourly_surfaced_marker() {  # <state> <pass>
   printf '%s/.hourly-%s-surfaced' "$1" "$2"
 }
 
+# Report accumulator, shared by both passes so the report shape has one owner.
+# FM_HOURLY_SIGNATURE carries IDENTITY only - never an age or a count - so a
+# finding that is still true an hour later produces the same signature and stays
+# silent, while a genuinely new one surfaces.
+FM_HOURLY_SIGNATURE=
+FM_HOURLY_REPORT=
+FM_HOURLY_FINDINGS=0
+FM_HOURLY_HEADLINES=
+
+fm_hourly_reset_findings() {
+  FM_HOURLY_SIGNATURE=
+  FM_HOURLY_REPORT=
+  FM_HOURLY_FINDINGS=0
+  FM_HOURLY_HEADLINES=
+}
+
+fm_hourly_add_finding() {  # <signature-key> <headline> <report-line>
+  FM_HOURLY_SIGNATURE="$FM_HOURLY_SIGNATURE$1
+"
+  FM_HOURLY_FINDINGS=$(( FM_HOURLY_FINDINGS + 1 ))
+  [ -n "$FM_HOURLY_HEADLINES" ] && FM_HOURLY_HEADLINES="$FM_HOURLY_HEADLINES; "
+  FM_HOURLY_HEADLINES="$FM_HOURLY_HEADLINES$2"
+  FM_HOURLY_REPORT="$FM_HOURLY_REPORT- $3
+"
+}
+
+# Key-safe rendering of a task id or window value for use inside a marker file
+# name, matching the mangling the watcher already applies to its own markers.
+fm_hourly_marker_key() {  # <value>
+  printf '%s' "$1" | tr './:' '___'
+}
+
+# First-seen marker for one open decision. The status FILE's mtime cannot age a
+# decision: any later unrelated append (progress, paused) would reset it, so a
+# decision nobody answered for a day would never cross the threshold. The marker
+# records when the decision was first observed open, and is cleared when it
+# resolves.
+fm_hourly_decision_marker() {  # <state> <id> <key>
+  printf '%s/.hourly-decision-%s__%s' \
+    "$1" "$(fm_hourly_marker_key "$2")" "$(fm_hourly_marker_key "$3")"
+}
+
 fm_hourly_report_path() {  # <state> <pass>
   printf '%s/.hourly-%s.latest' "$1" "$2"
 }

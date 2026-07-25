@@ -312,6 +312,7 @@ Arming is idempotent and creates a cadence stamp only when it is absent, so elap
 
 Both passes are silent unless they have something the fleet has not already been told about.
 The session review reports only what has not moved - an open decision nobody has answered, a worker that has posted nothing for hours, queued work with nothing running, a batch of finished-but-unmerged branches - because a point-in-time fleet review is what the watcher heartbeat already provides.
+A queued item that is blocked by another item or captain-held is not dispatchable, so it never counts toward the idle-capacity finding.
 Both passes ignore a persistent secondmate's record, which is idle by contract, so it neither counts as work under way nor reads as a stalled worker.
 The cleanup sweep silently reclaims bookkeeping that can hold no work (watcher temp residue, suppression markers for a fleet that no longer exists) and reports without removing anything that could hold unlanded work, leaving [`bin/fm-teardown.sh`](../bin/fm-teardown.sh) the single owner of the landed-work test.
 It never writes into a project clone and never touches the network, so the merge queue is swept only by firstmate's own [`bin/fm-merge-queue.sh`](../bin/fm-merge-queue.sh) run, and per-task temp roots under a shared `/tmp` are not scanned at all because they carry no reliable home ownership.
@@ -321,7 +322,7 @@ A finding surfaces once and stays silent while it is unchanged; an emptied findi
 `0` disables that pass for this home, and a malformed value falls back to the default rather than silently disabling it.
 The thresholds each pass applies (`FM_REVIEW_DECISION_SECS`, `FM_REVIEW_STALL_SECS`, `FM_REVIEW_MERGE_BATCH`, `FM_CLEANUP_TEMP_SECS`, `FM_CLEANUP_MARKER_SECS`, `FM_CLEANUP_ORPHAN_SECS`) are owned by the two script headers.
 
-State lives in `state/.hourly-armed` (armed for this session), `state/.last-hourly-review` and `state/.last-hourly-cleanup` (cadence stamps), `state/.hourly-review-surfaced` and `state/.hourly-cleanup-surfaced` (what has already been reported), `state/.hourly-review.latest` and `state/.hourly-cleanup.latest` (the full report behind each one-line headline), and `state/.hourly-cleanup.log` (what the cleanup sweep reclaimed).
+State lives in `state/.hourly-armed` (armed for this session), `state/.last-hourly-review` and `state/.last-hourly-cleanup` (cadence stamps), `state/.hourly-review-surfaced` and `state/.hourly-cleanup-surfaced` (what has already been reported), `state/.hourly-review.latest` and `state/.hourly-cleanup.latest` (the full report behind each one-line headline), and `state/.hourly-decision-<id>__<key>` (when an open decision was first seen, so a later unrelated status append cannot reset its age), and `state/.hourly-cleanup.log` (what the cleanup sweep reclaimed, size-capped like the watcher's triage log).
 These are watcher internals; never edit them by hand.
 
 ## Crew dispatch profiles (config/crew-dispatch.json)

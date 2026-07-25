@@ -38,7 +38,11 @@
 # Thresholds (seconds; see docs/configuration.md):
 #   FM_CLEANUP_TEMP_SECS      default 3600    age before temp residue is reclaimed
 #   FM_CLEANUP_MARKER_SECS    default 86400   age before dead markers are reclaimed
-#   FM_CLEANUP_ORPHAN_SECS    default 86400   age before an orphan copy is reported
+#   FM_CLEANUP_ORPHAN_SECS    default 86400   how old the orphan copy's own
+#                                             directory mtime must be before it
+#                                             is reported (a coarse "left alone
+#                                             for a while" test, not a measure of
+#                                             when work in it last happened)
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -63,10 +67,7 @@ LOG_PATH="$STATE/.hourly-cleanup.log"
 LOG_MAX_BYTES=${FM_CLEANUP_LOG_MAX_BYTES:-262144}
 case "$LOG_MAX_BYTES" in ''|*[!0-9]*|0) LOG_MAX_BYTES=262144 ;; esac
 RECLAIMED=0
-SIGNATURE=
-REPORT=
-FINDINGS=0
-HEADLINES=
+fm_hourly_reset_findings
 
 # Size-capped the same way bin/fm-watch.sh caps its triage log, so a long-lived
 # home cannot grow this file without bound. Best-effort: a logging hiccup never
@@ -81,19 +82,6 @@ log_reclaim() {
     tail -n 2000 "$LOG_PATH" > "$LOG_PATH.tmp" 2>/dev/null && mv -f "$LOG_PATH.tmp" "$LOG_PATH" 2>/dev/null
     rm -f "$LOG_PATH.tmp" 2>/dev/null || true
   fi
-}
-
-# add_finding <signature-key> <headline> <report-line>: identity-only signature,
-# so an unattended candidate stays silent after its first report
-# (bin/fm-hourly-lib.sh owns the contract).
-add_finding() {
-  SIGNATURE="$SIGNATURE$1
-"
-  FINDINGS=$(( FINDINGS + 1 ))
-  [ -n "$HEADLINES" ] && HEADLINES="$HEADLINES; "
-  HEADLINES="$HEADLINES$2"
-  REPORT="$REPORT- $3
-"
 }
 
 INFLIGHT=0
@@ -122,11 +110,11 @@ if [ "$INFLIGHT" -eq 0 ]; then
   LIVE_KEYS=
   for meta in "$STATE"/*.meta; do
     [ -f "$meta" ] || continue
-    key=$(basename "$meta" .meta | tr './:' '___')
-    LIVE_KEYS="$LIVE_KEYS|$key|"
+    key=$(fm_hourly_marker_key "$(basename "$meta" .meta)")
+    LIVE_KEYS="$LIVE_KEYS|$key"
     win=$(grep '^window=' "$meta" 2>/dev/null | head -1 | cut -d= -f2- || true)
     [ -n "$win" ] || continue
-    LIVE_KEYS="$LIVE_KEYS|$(printf '%s' "$win" | tr './:' '___')|"
+    LIVE_KEYS="$LIVE_KEYS|$(fm_hourly_marker_key "$win")"
   done
   for marker in "$STATE"/.seen-* "$STATE"/.hash-* "$STATE"/.count-* \
     "$STATE"/.stale-* "$STATE"/.paused-* "$STATE"/.hb-surfaced-* \
@@ -134,8 +122,16 @@ if [ "$INFLIGHT" -eq 0 ]; then
     [ -f "$marker" ] || continue
     [ "$(fm_hourly_age_of "$marker")" -ge "$MARKER_SECS" ] || continue
     name=$(basename "$marker")
+    # Scan LIVE_KEYS by its "|" delimiter rather than word-splitting it: an id or
+    # window value carrying a glob character would otherwise expand against the
+    # current directory and stop protecting that task's markers.
     skip=0
-    for key in $(printf '%s' "$LIVE_KEYS" | tr '|' ' '); do
+    rest=$LIVE_KEYS
+    while [ -n "$rest" ]; do
+      rest=${rest#|}
+      key=${rest%%|*}
+      rest=${rest#"$key"}
+      [ -n "$key" ] || continue
       case "$name" in *"$key"*) skip=1; break ;; esac
     done
     [ "$skip" -eq 1 ] && continue
@@ -162,7 +158,7 @@ if [ -d "$PROJECTS" ]; then
       case "$LIVE_WORKTREES" in *"|$wt|"*) continue ;; esac
       [ -d "$wt" ] || continue
       [ "$(fm_hourly_age_of "$wt")" -ge "$ORPHAN_SECS" ] || continue
-      add_finding "worktree:$wt" \
+      fm_hourly_add_finding "worktree:$wt" \
         "an isolated copy in $(basename "$clone") outlived its task" \
         "$wt is still registered in $clone with no task recorded for it; NOT removed - it may hold unlanded work, so clean it up with bin/fm-teardown.sh <id> (which owns the landed-work test) or inspect it first"
     done <<EOF
@@ -182,14 +178,14 @@ REPORT_PATH=$(fm_hourly_report_path "$STATE" cleanup)
   printf 'hourly cleanup sweep - %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')"
   printf 'home: %s\n' "$FM_HOME"
   printf 'reclaimed silently: %s bookkeeping item(s) (see %s)\n' "$RECLAIMED" "$LOG_PATH"
-  if [ "$FINDINGS" -eq 0 ]; then
+  if [ "$FM_HOURLY_FINDINGS" -eq 0 ]; then
     printf 'no candidates needing a decision.\n'
   else
-    printf '%s candidate(s) left in place for a decision:\n' "$FINDINGS"
-    printf '%s' "$REPORT"
+    printf '%s candidate(s) left in place for a decision:\n' "$FM_HOURLY_FINDINGS"
+    printf '%s' "$FM_HOURLY_REPORT"
   fi
 } > "$REPORT_PATH" 2>/dev/null || true
 
-fm_hourly_should_surface "$STATE" cleanup "$SIGNATURE" || exit 0
-printf 'cleanup: %s (nothing was removed; full report: %s)\n' "$HEADLINES" "$REPORT_PATH"
+fm_hourly_should_surface "$STATE" cleanup "$FM_HOURLY_SIGNATURE" || exit 0
+printf 'cleanup: %s (nothing was removed; full report: %s)\n' "$FM_HOURLY_HEADLINES" "$REPORT_PATH"
 exit 0

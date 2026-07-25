@@ -14,7 +14,11 @@
 #   - the cleanup sweep RECLAIMS only bookkeeping (watcher temp residue, dead
 #     suppression markers with nothing in flight) and REPORTS without removing
 #     anything that could hold unlanded work
-#   - suppression markers survive while work IS in flight
+#   - an open decision ages from when it opened, so a later unrelated status
+#     append cannot reset its clock, and a blocked or held queue item is never
+#     counted as idle dispatch capacity
+#   - suppression markers survive while work IS in flight, including for a task
+#     whose id or window carries a glob character
 #   - fm-session-start.sh arms both passes when it holds the lock and skips
 #     arming on the read-only path
 #   - the real watcher runs a due pass, wakes once with a "check: session-*"
@@ -260,6 +264,84 @@ t_review_stall_without_status_file() {
   pass "review sees a worker that wedged before its first status line"
 }
 
+# --- a decision is aged from when it opened, not from the last status write -----
+t_review_decision_age_survives_later_append() {
+  local home out
+  home=$(new_home review-decision-age)
+  fm_write_meta "$home/state/iota.meta" "window=firstmate:fm-iota" "kind=ship"
+  printf 'needs-decision: pick the delivery mode\n' > "$home/state/iota.status"
+  backdate "$home/state/iota.status" 7200
+
+  out=$(run_review "$home")
+  assert_contains "$out" "iota waiting on a decision" "the aging decision must surface first"
+  rm -f "$home/state/.hourly-review-surfaced"
+
+  # An unrelated later event must NOT reset the decision's clock.
+  printf 'working: still on it\n' >> "$home/state/iota.status"
+  out=$(run_review "$home")
+  assert_contains "$out" "iota waiting on a decision" \
+    "a later unrelated status append must not reset an open decision's age"
+
+  # Resolving it clears the first-seen record, so a new decision ages afresh.
+  printf 'resolved: delivery mode chosen\n' >> "$home/state/iota.status"
+  out=$(run_review "$home")
+  [ -z "$out" ] || fail "a resolved decision must not surface, got: $out"
+  printf 'needs-decision: a brand new question\n' >> "$home/state/iota.status"
+  out=$(run_review "$home")
+  [ -z "$out" ] || fail "a decision opened just now is not yet aging, got: $out"
+  pass "an open decision ages from when it opened, not from the status file"
+}
+
+# --- blocked or held queue items are not idle capacity --------------------------
+t_review_idle_capacity_ignores_blocked() {
+  local home out
+  home=$(new_home review-idle-blocked)
+  cat > "$home/data/backlog.md" <<'MD'
+## In flight
+
+## Queued
+
+- [ ] one - first queued item (blocked-by: two - waiting on the fix)
+- [ ] two - second queued item (hold: captain decision)
+
+## Done
+MD
+  out=$(run_review "$home")
+  [ -z "$out" ] \
+    || fail "an entirely blocked or held queue is not idle dispatch capacity, got: $out"
+
+  cat > "$home/data/backlog.md" <<'MD'
+## In flight
+
+## Queued
+
+- [ ] one - first queued item (blocked-by: two - waiting on the fix)
+- [ ] two - second queued item (hold: captain decision)
+- [ ] three - actually dispatchable
+
+## Done
+MD
+  out=$(run_review "$home")
+  assert_contains "$out" "nothing under way with 1 queued" \
+    "only the dispatchable item may count as idle capacity"
+  pass "blocked and captain-held queue items never count as idle capacity"
+}
+
+# --- a live task id carrying a glob character keeps its markers -----------------
+t_cleanup_protects_glob_keys() {
+  local home out
+  home=$(new_home cleanup-globkey)
+  fm_write_meta "$home/state/epsilon.meta" "window=firstmate:fm-*-epsilon" "kind=secondmate"
+  : > "$home/state/.hash-firstmate_fm-*-epsilon"
+  backdate "$home/state/.hash-firstmate_fm-*-epsilon" 200000
+
+  out=$(run_cleanup "$home")
+  [ -z "$out" ] || fail "expected silence, got: $out"
+  assert_present "$home/state/.hash-firstmate_fm-*-epsilon" \
+    "a live key containing a glob character must still protect its marker"
+  pass "marker protection survives a task id or window carrying a glob character"
+}
+
 # --- arming is idempotent across restarts ---------------------------------------
 t_arm_keeps_existing_stamp() {
   local home before after
@@ -405,6 +487,9 @@ t_cleanup_reports_orphan_worktree
 t_cleanup_never_sweeps_merge_queue
 t_secondmate_is_not_work_under_way
 t_review_stall_without_status_file
+t_review_decision_age_survives_later_append
+t_review_idle_capacity_ignores_blocked
+t_cleanup_protects_glob_keys
 t_arm_keeps_existing_stamp
 t_session_start_arms
 t_session_start_read_only_does_not_arm

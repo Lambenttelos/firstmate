@@ -18,7 +18,7 @@
 #
 # It is READ-ONLY over fleet state: it reads state/*.meta, state/*.status,
 # data/backlog.md, and the merge-queue count, and writes only its own report
-# and suppression markers under state/. It never steers, tears down, merges,
+# and its own suppression and decision-first-seen markers under state/. It never steers, tears down, merges,
 # or touches anything under projects/.
 #
 # Usage: fm-session-review.sh
@@ -53,29 +53,16 @@ case "$MERGE_BATCH" in ''|*[!0-9]*|0) MERGE_BATCH=3 ;; esac
 
 [ -d "$STATE" ] || exit 0
 
-SIGNATURE=
-REPORT=
-FINDINGS=0
-HEADLINES=
-
-# add_finding <signature-key> <headline> <report-line>
-# The signature key carries IDENTITY only - never an age or a count - so a
-# finding that is still true an hour later produces the same signature and
-# stays silent, while a genuinely new one surfaces.
-add_finding() {
-  SIGNATURE="$SIGNATURE$1
-"
-  FINDINGS=$(( FINDINGS + 1 ))
-  [ -n "$HEADLINES" ] && HEADLINES="$HEADLINES; "
-  HEADLINES="$HEADLINES$2"
-  REPORT="$REPORT- $3
-"
-}
+fm_hourly_reset_findings
 
 # --- work under way: open decisions and silent workers -----------------------
+# The in-flight count is taken from this same walk, so state/*.meta is read once
+# under one secondmate filter.
+INFLIGHT=0
 for meta in "$STATE"/*.meta; do
   [ -f "$meta" ] || continue
   fm_hourly_meta_is_secondmate "$meta" && continue
+  INFLIGHT=$(( INFLIGHT + 1 ))
   id=$(basename "$meta" .meta)
   status="$STATE/$id.status"
   if [ -f "$status" ]; then
@@ -87,17 +74,39 @@ for meta in "$STATE"/*.meta; do
     age=$(fm_hourly_age_of "$meta")
     open=
   fi
-  if [ -n "$open" ] && [ "$age" -ge "$DECISION_SECS" ]; then
+  # Each open decision is aged from when it was FIRST seen open, not from the
+  # status file, so a later unrelated append cannot reset the clock on a
+  # decision nobody has answered.
+  open_keys=
+  if [ -n "$open" ]; then
     while IFS=$(printf '\t') read -r key verb note; do
       [ -n "$key" ] || continue
-      add_finding "decision:$id:$key" \
+      open_keys="$open_keys|$(fm_hourly_marker_key "$key")|"
+      dmarker=$(fm_hourly_decision_marker "$STATE" "$id" "$key")
+      # Seeded from the status file the first time the decision is seen, which
+      # is the best available estimate for a decision that predates this marker,
+      # and never touched again - so later appends cannot reset the clock.
+      [ -e "$dmarker" ] || touch -r "$status" "$dmarker" 2>/dev/null || \
+        touch "$dmarker" 2>/dev/null || true
+      dage=$(fm_hourly_age_of "$dmarker")
+      [ "$dage" -ge "$DECISION_SECS" ] || continue
+      fm_hourly_add_finding "decision:$id:$key" \
         "$id waiting on a decision" \
-        "$id has an unanswered $verb open for $(fm_hourly_human_age "$age"): $note"
+        "$id has an unanswered $verb open for $(fm_hourly_human_age "$dage"): $note"
     done <<EOF
 $open
 EOF
-  elif [ "$age" -ge "$STALL_SECS" ]; then
-    add_finding "stall:$id" \
+  fi
+  # A resolved decision leaves no marker behind, so the next time it opens it is
+  # aged from that new opening.
+  for dmarker in "$STATE"/.hourly-decision-"$(fm_hourly_marker_key "$id")"__*; do
+    [ -f "$dmarker" ] || continue
+    mkey=${dmarker##*__}
+    case "$open_keys" in *"|$mkey|"*) continue ;; esac
+    rm -f "$dmarker" 2>/dev/null || true
+  done
+  if [ -z "$open" ] && [ "$age" -ge "$STALL_SECS" ]; then
+    fm_hourly_add_finding "stall:$id" \
       "$id silent for $(fm_hourly_human_age "$age")" \
       "$id has reported nothing for $(fm_hourly_human_age "$age"); check its current state before assuming it is working"
   fi
@@ -106,24 +115,25 @@ done
 # --- idle capacity: queued work with nothing running -------------------------
 # The captain's standing rule is that an idle slot while work is queued is a
 # failure, and that is invisible to any single-moment fleet view: nothing is
-# wrong with any one task, the fleet has simply stopped dispatching.
-INFLIGHT=0
-for meta in "$STATE"/*.meta; do
-  [ -f "$meta" ] || continue
-  fm_hourly_meta_is_secondmate "$meta" && continue
-  INFLIGHT=$(( INFLIGHT + 1 ))
-done
+# wrong with any one task, the fleet has simply stopped dispatching. A blocked
+# or captain-held item is not dispatchable, so it must not count here: an
+# entirely blocked queue reported as idle capacity every hour is exactly the
+# recurring false finding that would get the whole report ignored.
 QUEUED=0
 if [ -f "$DATA/backlog.md" ]; then
   QUEUED=$(awk '
     /^##[[:space:]]+/ { queued = ($0 ~ /^##[[:space:]]+Queued[[:space:]]*$/); next }
-    queued && /^[-*][[:space:]]+/ { n++ }
+    queued && /^[-*][[:space:]]+/ {
+      if ($0 ~ /blocked-by:[[:space:]]*[^[:space:])]/) next
+      if ($0 ~ /hold:[[:space:]]*[^[:space:])]/) next
+      n++
+    }
     END { print n + 0 }
   ' "$DATA/backlog.md")
 fi
 case "$QUEUED" in ''|*[!0-9]*) QUEUED=0 ;; esac
 if [ "$INFLIGHT" -eq 0 ] && [ "$QUEUED" -gt 0 ]; then
-  add_finding "idle-capacity" \
+  fm_hourly_add_finding "idle-capacity" \
     "nothing under way with $QUEUED queued" \
     "$QUEUED queued item(s) and no work under way; re-evaluate the queue and dispatch what is unblocked"
 fi
@@ -132,7 +142,7 @@ fi
 MERGE_COUNT=$("$SCRIPT_DIR/fm-merge-queue.sh" count 2>/dev/null || printf 0)
 case "$MERGE_COUNT" in ''|*[!0-9]*) MERGE_COUNT=0 ;; esac
 if [ "$MERGE_COUNT" -ge "$MERGE_BATCH" ]; then
-  add_finding "merge-batch" \
+  fm_hourly_add_finding "merge-batch" \
     "$MERGE_COUNT finished branches waiting to merge" \
     "$MERGE_COUNT finished branch(es) are pushed but unmerged - a batch worth landing; bin/fm-merge-queue.sh list has the compare links"
 fi
@@ -142,14 +152,14 @@ REPORT_PATH=$(fm_hourly_report_path "$STATE" review)
 {
   printf 'hourly session review - %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')"
   printf 'home: %s\n' "$FM_HOME"
-  if [ "$FINDINGS" -eq 0 ]; then
+  if [ "$FM_HOURLY_FINDINGS" -eq 0 ]; then
     printf 'no findings: nothing has stalled, no decision is waiting, and the queue is moving.\n'
   else
-    printf '%s finding(s):\n' "$FINDINGS"
-    printf '%s' "$REPORT"
+    printf '%s finding(s):\n' "$FM_HOURLY_FINDINGS"
+    printf '%s' "$FM_HOURLY_REPORT"
   fi
 } > "$REPORT_PATH" 2>/dev/null || true
 
-fm_hourly_should_surface "$STATE" review "$SIGNATURE" || exit 0
-printf 'session review: %s (full report: %s)\n' "$HEADLINES" "$REPORT_PATH"
+fm_hourly_should_surface "$STATE" review "$FM_HOURLY_SIGNATURE" || exit 0
+printf 'session review: %s (full report: %s)\n' "$FM_HOURLY_HEADLINES" "$REPORT_PATH"
 exit 0
