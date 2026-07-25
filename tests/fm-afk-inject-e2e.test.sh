@@ -98,11 +98,15 @@ redraw() {
 }
 submit_line() {
   local _line=$_buf _c _hex
-  if [ "${_line:0:1}" = "$MARK" ]; then
-    _c="injection"
-  else
-    _c="user"
-  fi
+  # Prefix match, not "${_line:0:1}". Bash slices by CHARACTER under a UTF-8
+  # locale and by BYTE otherwise, and the marker is the three-byte U+2063, so the
+  # single-character comparison classified every injected digest as a user message
+  # whenever the pane's shell ran in a non-UTF-8 locale. The tmux server here
+  # inherits whatever locale the runner has, so the fixture must not depend on it.
+  case "$_line" in
+    "$MARK"*) _c="injection" ;;
+    *) _c="user" ;;
+  esac
   _hex=$(printf '%s' "$_line" | od -An -tx1 | tr -d ' \n')
   printf '%s\t%s\t%s\n' "$_hex" "$_line" "$_c" >> "$LOG"
   _buf=

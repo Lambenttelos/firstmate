@@ -719,7 +719,9 @@ escalate_flush() {  # <state>
   local state=$1 buf item n msg
   buf="$state/.subsuper-escalations"
   [ -s "$buf" ] || return 0
-  n=$(wc -l < "$buf" 2>/dev/null || echo 0)
+  # `tr -d ' '`: BSD wc pads its count, and this number is rendered straight into
+  # the digest the captain reads, so an unpadded count is the only correct one.
+  n=$(wc -l < "$buf" 2>/dev/null | tr -d ' ' || echo 0)
   # Join buffered items with the literal " | " separator into one digest line.
   msg=$(awk 'NR>1{printf " | "} {printf "%s",$0} END{print ""}' "$buf" 2>/dev/null)
   # Single-line wrapper: no embedded newlines (inject_msg also collapses as a
