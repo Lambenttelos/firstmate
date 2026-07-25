@@ -50,6 +50,11 @@ run_cleanup() {  # <home> [extra env...]
   env FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" "$@" "$CLEANUP"
 }
 
+# mtime_of <path>: epoch seconds.
+mtime_of() {
+  stat -f %m "$1" 2>/dev/null || stat -c %Y "$1"
+}
+
 # backdate <path> <seconds>: age a file or directory by <seconds>.
 backdate() {
   local path=$1 secs=$2 stamp
@@ -157,7 +162,7 @@ t_cleanup_reclaims_quietly() {
   : > "$home/state/.seen-gone_status"
   backdate "$home/state/.seen-gone_status" 200000
 
-  out=$(run_cleanup "$home" FM_CLEANUP_TMP_ROOT="$TMP_ROOT/no-such-tmp")
+  out=$(run_cleanup "$home")
   [ -z "$out" ] || fail "reclaiming bookkeeping is not captain-facing, expected silence, got: $out"
   assert_absent "$home/state/.fm-check-output.abc123" "stale watcher temp residue must be reclaimed"
   assert_absent "$home/state/.seen-gone_status" "a dead suppression marker must be reclaimed with nothing in flight"
@@ -173,7 +178,7 @@ t_cleanup_keeps_markers_in_flight() {
   : > "$home/state/.hash-firstmate_fm-delta"
   backdate "$home/state/.hash-firstmate_fm-delta" 200000
 
-  out=$(run_cleanup "$home" FM_CLEANUP_TMP_ROOT="$TMP_ROOT/no-such-tmp")
+  out=$(run_cleanup "$home")
   [ -z "$out" ] || fail "expected silence, got: $out"
   assert_present "$home/state/.hash-firstmate_fm-delta" "suppression markers must survive while work is in flight"
   pass "cleanup leaves suppression markers alone while work is under way"
@@ -190,29 +195,84 @@ t_cleanup_reports_orphan_worktree() {
   git -C "$clone" worktree add -q -b fm/orphan "$wt" >/dev/null 2>&1
   backdate "$wt" 200000
 
-  out=$(run_cleanup "$home" FM_CLEANUP_TMP_ROOT="$TMP_ROOT/no-such-tmp")
+  out=$(run_cleanup "$home")
   assert_contains "$out" "outlived its task" "an orphan isolated copy must be reported"
   assert_contains "$out" "nothing was removed" "the headline must say nothing was removed"
   assert_present "$wt" "cleanup must never remove an isolated copy itself"
   assert_grep "bin/fm-teardown.sh" "$home/state/.hourly-cleanup.latest" "the report must point at the owner of the landed-work test"
 
-  out=$(run_cleanup "$home" FM_CLEANUP_TMP_ROOT="$TMP_ROOT/no-such-tmp")
+  out=$(run_cleanup "$home")
   [ -z "$out" ] || fail "an unchanged cleanup candidate must not surface again, got: $out"
   pass "cleanup reports an orphan copy once and never removes it"
 }
 
-# --- cleanup: reports a leftover per-task temp root ----------------------------
-t_cleanup_reports_tasktmp() {
-  local home tmproot out
-  home=$(new_home cleanup-tasktmp)
-  tmproot="$TMP_ROOT/cleanup-tasktmp-root"
-  mkdir -p "$tmproot/fm-epsilon/gotmp"
-  backdate "$tmproot/fm-epsilon" 200000
+# --- cleanup: a project clone is never written to -------------------------------
+# The merged test in the merge queue fetches into a clone, so an unattended poll
+# must not sweep it: the sweep stays firstmate's own action.
+t_cleanup_never_sweeps_merge_queue() {
+  local home out i
+  home=$(new_home cleanup-mergequeue)
+  for i in 1 2 3; do
+    printf 'task%s\tproj\tfm/branch%s\tdeadbeef\tmain\thttps://example.test/compare/%s\n' \
+      "$i" "$i" "$i" >> "$home/data/merge-queue.tsv"
+  done
+  out=$(run_cleanup "$home")
+  [ -z "$out" ] || fail "expected silence, got: $out"
+  assert_grep "task1" "$home/data/merge-queue.tsv" "the cleanup pass must leave the merge queue alone"
+  assert_no_grep 'fm-merge-queue.sh" sweep' "$ROOT/bin/fm-cleanup-sweep.sh" "the cleanup pass must never run a merge-queue sweep"
+  pass "cleanup never sweeps the merge queue, so it never fetches into a clone"
+}
 
-  out=$(run_cleanup "$home" FM_CLEANUP_TMP_ROOT="$tmproot")
-  assert_contains "$out" "leftover build temp for epsilon" "a leftover per-task temp root must be reported"
-  assert_present "$tmproot/fm-epsilon" "cleanup must not remove a per-task temp root itself"
-  pass "cleanup reports a leftover per-task temp root without removing it"
+# --- a persistent secondmate is idle by contract --------------------------------
+t_secondmate_is_not_work_under_way() {
+  local home out
+  home=$(new_home secondmate-idle)
+  fm_write_meta "$home/state/sm.meta" "window=firstmate:fm-sm" "kind=secondmate"
+  printf 'working: standing by\n' > "$home/state/sm.status"
+  backdate "$home/state/sm.status" 200000
+  cat > "$home/data/backlog.md" <<'MD'
+## Queued
+
+- one - first queued item
+MD
+
+  out=$(run_review "$home")
+  assert_not_contains "$out" "silent for" "an idle secondmate must never read as a stalled worker"
+  assert_contains "$out" "nothing under way with 1 queued" "an idle secondmate must not count as work under way"
+
+  : > "$home/state/.seen-gone_status"
+  backdate "$home/state/.seen-gone_status" 200000
+  out=$(run_cleanup "$home")
+  assert_absent "$home/state/.seen-gone_status" "a registered secondmate must not disable dead-marker reclaim"
+  assert_present "$home/state/sm.meta" "the secondmate's own record is untouched"
+  pass "a persistent secondmate is neither work under way nor a stall"
+}
+
+# --- a worker that wedged before its first status line --------------------------
+t_review_stall_without_status_file() {
+  local home out
+  home=$(new_home review-nostatus)
+  fm_write_meta "$home/state/theta.meta" "window=firstmate:fm-theta" "kind=ship"
+  backdate "$home/state/theta.meta" 10800
+
+  out=$(run_review "$home")
+  assert_contains "$out" "theta silent for" "a worker that never wrote a status line must still surface"
+  pass "review sees a worker that wedged before its first status line"
+}
+
+# --- arming is idempotent across restarts ---------------------------------------
+t_arm_keeps_existing_stamp() {
+  local home before after
+  home=$(new_home arm-idempotent)
+  ( . "$ROOT/bin/fm-hourly-lib.sh"; fm_hourly_arm "$home/state" )
+  backdate "$home/state/.last-hourly-review" 3000
+  before=$(mtime_of "$home/state/.last-hourly-review")
+  ( . "$ROOT/bin/fm-hourly-lib.sh"; fm_hourly_arm "$home/state" )
+  after=$(mtime_of "$home/state/.last-hourly-review")
+  [ "$before" = "$after" ] \
+    || fail "a second arm must leave an existing cadence stamp alone (was $before, now $after)"
+  assert_present "$home/state/.hourly-armed" "arming still writes the armed marker"
+  pass "arming is idempotent, so elapsed time survives a session restart"
 }
 
 # --- arming ---------------------------------------------------------------------
@@ -342,7 +402,10 @@ t_review_merge_batch
 t_cleanup_reclaims_quietly
 t_cleanup_keeps_markers_in_flight
 t_cleanup_reports_orphan_worktree
-t_cleanup_reports_tasktmp
+t_cleanup_never_sweeps_merge_queue
+t_secondmate_is_not_work_under_way
+t_review_stall_without_status_file
+t_arm_keeps_existing_stamp
 t_session_start_arms
 t_session_start_read_only_does_not_arm
 t_unarmed_home_never_runs_a_pass

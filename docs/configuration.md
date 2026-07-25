@@ -308,11 +308,13 @@ Every session start arms two recurring passes that then run for the life of the 
 Arming writes durable schedule state only.
 The one live watcher runs a due pass on its existing slow poll and wakes firstmate with `check: session-review <headline>` or `check: session-cleanup <headline>`, so no second supervision cycle and no extra timer exists.
 Arming is a mutating step, so a read-only session (one that did not acquire the home's session lock) leaves it to the session holding the lock, and an unarmed home never runs a pass at all.
-Each arm resets both cadence stamps to now, so a home that sat idle does not fire a burst of overdue passes into its first turn.
+Arming is idempotent and creates a cadence stamp only when it is absent, so elapsed time survives a session restart and a home whose sessions restart faster than the interval still runs its passes.
 
 Both passes are silent unless they have something the fleet has not already been told about.
 The session review reports only what has not moved - an open decision nobody has answered, a worker that has posted nothing for hours, queued work with nothing running, a batch of finished-but-unmerged branches - because a point-in-time fleet review is what the watcher heartbeat already provides.
-The cleanup sweep silently reclaims bookkeeping that can hold no work (watcher temp residue, suppression markers for a fleet that no longer exists, merge-queue entries whose branch has landed) and reports without removing anything that could hold unlanded work, leaving [`bin/fm-teardown.sh`](../bin/fm-teardown.sh) the single owner of the landed-work test.
+Both passes ignore a persistent secondmate's record, which is idle by contract, so it neither counts as work under way nor reads as a stalled worker.
+The cleanup sweep silently reclaims bookkeeping that can hold no work (watcher temp residue, suppression markers for a fleet that no longer exists) and reports without removing anything that could hold unlanded work, leaving [`bin/fm-teardown.sh`](../bin/fm-teardown.sh) the single owner of the landed-work test.
+It never writes into a project clone and never touches the network, so the merge queue is swept only by firstmate's own [`bin/fm-merge-queue.sh`](../bin/fm-merge-queue.sh) run, and per-task temp roots under a shared `/tmp` are not scanned at all because they carry no reliable home ownership.
 A finding surfaces once and stays silent while it is unchanged; an emptied finding set re-arms the report silently, the same shape the host-resource monitor uses.
 
 `FM_HOURLY_REVIEW_INTERVAL` and `FM_HOURLY_CLEANUP_INTERVAL` are the seconds between runs of each pass, both defaulting to `3600`.

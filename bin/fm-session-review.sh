@@ -75,11 +75,18 @@ add_finding() {
 # --- work under way: open decisions and silent workers -----------------------
 for meta in "$STATE"/*.meta; do
   [ -f "$meta" ] || continue
+  fm_hourly_meta_is_secondmate "$meta" && continue
   id=$(basename "$meta" .meta)
   status="$STATE/$id.status"
-  [ -f "$status" ] || continue
-  age=$(fm_hourly_age_of "$status")
-  open=$(status_open_decisions "$status")
+  if [ -f "$status" ]; then
+    age=$(fm_hourly_age_of "$status")
+    open=$(status_open_decisions "$status")
+  else
+    # A worker that wedged before writing its first status line is the worst
+    # stall there is, so age it from its own record instead of skipping it.
+    age=$(fm_hourly_age_of "$meta")
+    open=
+  fi
   if [ -n "$open" ] && [ "$age" -ge "$DECISION_SECS" ]; then
     while IFS=$(printf '\t') read -r key verb note; do
       [ -n "$key" ] || continue
@@ -103,6 +110,7 @@ done
 INFLIGHT=0
 for meta in "$STATE"/*.meta; do
   [ -f "$meta" ] || continue
+  fm_hourly_meta_is_secondmate "$meta" && continue
   INFLIGHT=$(( INFLIGHT + 1 ))
 done
 QUEUED=0

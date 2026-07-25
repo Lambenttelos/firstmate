@@ -9,24 +9,25 @@
 #   - watcher suppression markers for tasks that no longer exist: .seen-*,
 #     .hash-*, .count-*, .stale-*, .paused-*, .hb-surfaced-*,
 #     .wedge-escalations-*, .sm-context-surfaced-*
-#   - merge-queue entries whose branch has since been merged
-#     (bin/fm-merge-queue-lib.sh owns the merged test)
 #   - isolated copies still registered in a project clone after their task is
-#     gone, and per-task temp roots under /tmp for tasks that are gone
+#     gone
 #
-# THE SAFETY LINE, AND WHY IT IS DRAWN HERE: the first three are pure
-# bookkeeping - no work of any kind lives in them - so this pass reclaims them
-# SILENTLY and logs what it did. The last two can hold unlanded work, so this
-# pass never removes them and never runs a teardown to find out: it REPORTS
-# them as candidates with the exact command, and bin/fm-teardown.sh stays the
-# single owner of the landed-work test. That keeps a background sweep
-# structurally incapable of discarding work: refusing costs a line of prose,
-# and being wrong costs a crewmate's unlanded branch.
+# THE SAFETY LINE, AND WHY IT IS DRAWN HERE: the first two are pure bookkeeping
+# - no work of any kind lives in them - so this pass reclaims them SILENTLY and
+# logs what it did. An orphan isolated copy can hold unlanded work, so this pass
+# never removes it and never runs a teardown to find out: it REPORTS it as a
+# candidate with the exact command, and bin/fm-teardown.sh stays the single
+# owner of the landed-work test. That keeps a background sweep structurally
+# incapable of discarding work: refusing costs a line of prose, and being wrong
+# costs a crewmate's unlanded branch.
 #
-# Nothing here writes to a project. The project-clone inspection is a read-only
-# `git worktree list`; even a `git worktree prune` (which would be safe in
-# isolation) is deliberately not run, because it is a write into a clone
-# firstmate must only read.
+# Nothing here writes to a project, and nothing here touches the network. The
+# project-clone inspection is a read-only `git worktree list`; even a
+# `git worktree prune` (which would be safe in isolation) is deliberately not
+# run, because it is a write into a clone firstmate must only read. The merge
+# queue is deliberately NOT swept here either: its merged test fetches into a
+# clone, which an unattended poll must never do, so sweeping it stays
+# firstmate's own action through bin/fm-merge-queue.sh.
 #
 # Usage: fm-cleanup-sweep.sh
 #   Prints one short headline line when something needs a decision, and nothing
@@ -38,15 +39,12 @@
 #   FM_CLEANUP_TEMP_SECS      default 3600    age before temp residue is reclaimed
 #   FM_CLEANUP_MARKER_SECS    default 86400   age before dead markers are reclaimed
 #   FM_CLEANUP_ORPHAN_SECS    default 86400   age before an orphan copy is reported
-# FM_CLEANUP_TMP_ROOT (default /tmp) redirects the per-task temp-root scan; it
-# exists so tests can point the scan at a fixture instead of the real /tmp.
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
-DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 PROJECTS="${FM_PROJECTS_OVERRIDE:-$FM_HOME/projects}"
 
 # shellcheck source=bin/fm-hourly-lib.sh
@@ -62,15 +60,27 @@ case "$ORPHAN_SECS" in ''|*[!0-9]*) ORPHAN_SECS=86400 ;; esac
 [ -d "$STATE" ] || exit 0
 
 LOG_PATH="$STATE/.hourly-cleanup.log"
+LOG_MAX_BYTES=${FM_CLEANUP_LOG_MAX_BYTES:-262144}
+case "$LOG_MAX_BYTES" in ''|*[!0-9]*|0) LOG_MAX_BYTES=262144 ;; esac
 RECLAIMED=0
 SIGNATURE=
 REPORT=
 FINDINGS=0
 HEADLINES=
 
+# Size-capped the same way bin/fm-watch.sh caps its triage log, so a long-lived
+# home cannot grow this file without bound. Best-effort: a logging hiccup never
+# affects the sweep.
 log_reclaim() {
+  local sz
   RECLAIMED=$(( RECLAIMED + 1 ))
-  printf '[%s] %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$1" >> "$LOG_PATH" 2>/dev/null || true
+  printf '[%s] %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$1" >> "$LOG_PATH" 2>/dev/null || return 0
+  sz=$(wc -c < "$LOG_PATH" 2>/dev/null | tr -d '[:space:]')
+  case "$sz" in ''|*[!0-9]*) return 0 ;; esac
+  if [ "$sz" -ge "$LOG_MAX_BYTES" ]; then
+    tail -n 2000 "$LOG_PATH" > "$LOG_PATH.tmp" 2>/dev/null && mv -f "$LOG_PATH.tmp" "$LOG_PATH" 2>/dev/null
+    rm -f "$LOG_PATH.tmp" 2>/dev/null || true
+  fi
 }
 
 # add_finding <signature-key> <headline> <report-line>: identity-only signature,
@@ -89,6 +99,7 @@ add_finding() {
 INFLIGHT=0
 for meta in "$STATE"/*.meta; do
   [ -f "$meta" ] || continue
+  fm_hourly_meta_is_secondmate "$meta" && continue
   INFLIGHT=$(( INFLIGHT + 1 ))
 done
 
@@ -100,28 +111,36 @@ for tmpfile in "$STATE"/.fm-check-output.* "$STATE"/.fm-custom-check.*; do
 done
 
 # --- reclaim 2: suppression markers for a fleet that no longer exists ---------
-# Only with NOTHING under way: with no task, no marker can be suppressing a live
-# wake, which makes removal provably safe. With work in flight the mapping from
-# a mangled marker key back to a task is not worth trusting, so nothing is
-# touched - a few stale markers are harmless, a wrongly cleared one is not.
+# Only with NO ordinary work under way: with no task, no marker can be
+# suppressing a live wake, which makes removal provably safe. With work in
+# flight the mapping from a mangled marker key back to a task is not worth
+# trusting, so nothing is touched - a few stale markers are harmless, a wrongly
+# cleared one is not. A persistent secondmate is idle by contract and would
+# otherwise disable this reclaim forever in any home that has one, so it does
+# not count as work under way; its own markers are protected by name instead.
 if [ "$INFLIGHT" -eq 0 ]; then
+  LIVE_KEYS=
+  for meta in "$STATE"/*.meta; do
+    [ -f "$meta" ] || continue
+    key=$(basename "$meta" .meta | tr './:' '___')
+    LIVE_KEYS="$LIVE_KEYS|$key|"
+    win=$(grep '^window=' "$meta" 2>/dev/null | head -1 | cut -d= -f2- || true)
+    [ -n "$win" ] || continue
+    LIVE_KEYS="$LIVE_KEYS|$(printf '%s' "$win" | tr './:' '___')|"
+  done
   for marker in "$STATE"/.seen-* "$STATE"/.hash-* "$STATE"/.count-* \
     "$STATE"/.stale-* "$STATE"/.paused-* "$STATE"/.hb-surfaced-* \
     "$STATE"/.wedge-escalations-* "$STATE"/.sm-context-surfaced-*; do
     [ -f "$marker" ] || continue
     [ "$(fm_hourly_age_of "$marker")" -ge "$MARKER_SECS" ] || continue
-    rm -f "$marker" 2>/dev/null && log_reclaim "removed dead suppression marker $(basename "$marker")"
+    name=$(basename "$marker")
+    skip=0
+    for key in $(printf '%s' "$LIVE_KEYS" | tr '|' ' '); do
+      case "$name" in *"$key"*) skip=1; break ;; esac
+    done
+    [ "$skip" -eq 1 ] && continue
+    rm -f "$marker" 2>/dev/null && log_reclaim "removed dead suppression marker $name"
   done
-fi
-
-# --- reclaim 3: merge-queue entries whose branch has landed -------------------
-# fm-merge-queue.sh sweep owns the merged test and only ever drops entries whose
-# content is already in the base branch.
-if [ -f "$DATA/merge-queue.tsv" ] && [ -s "$DATA/merge-queue.tsv" ]; then
-  SWEEP_OUT=$("$SCRIPT_DIR/fm-merge-queue.sh" sweep 2>&1 || true)
-  case "$SWEEP_OUT" in
-    *'removed'*|*'Removed'*) log_reclaim "merge queue sweep: $(printf '%s' "$SWEEP_OUT" | tr '\n' ' ')" ;;
-  esac
 fi
 
 # --- report 1: isolated copies still registered after their task is gone ------
@@ -152,19 +171,10 @@ EOF
   done
 fi
 
-# --- report 2: per-task temp roots whose task is gone -------------------------
-TASKTMP_ROOT=${FM_CLEANUP_TMP_ROOT:-/tmp}
-for tasktmp in "$TASKTMP_ROOT"/fm-*; do
-  [ -d "$tasktmp" ] || continue
-  id=$(basename "$tasktmp")
-  id=${id#fm-}
-  [ -n "$id" ] || continue
-  [ -f "$STATE/$id.meta" ] && continue
-  [ "$(fm_hourly_age_of "$tasktmp")" -ge "$ORPHAN_SECS" ] || continue
-  add_finding "tasktmp:$id" \
-    "leftover build temp for $id" \
-    "$tasktmp survives a task that is gone; NOT removed - bin/fm-teardown.sh owns per-task temp roots, so remove it only through a cleanup of $id"
-done
+# Per-task temp roots under /tmp are deliberately NOT scanned: /tmp is shared by
+# every firstmate home on the host, so a live task of another home would be
+# reported here as this home's leftover, and there is no reliable ownership
+# signal in those paths.
 
 # --- report --------------------------------------------------------------------
 REPORT_PATH=$(fm_hourly_report_path "$STATE" cleanup)

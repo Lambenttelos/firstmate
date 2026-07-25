@@ -73,16 +73,29 @@ fm_hourly_is_armed() {  # <state>
   [ -f "$(fm_hourly_armed_marker "$1")" ]
 }
 
-# Arm both passes for this session. Idempotent, and deliberately resets each
-# stamp to now: a session start means "from here, hourly", so a home that sat
-# idle overnight does not fire a burst of overdue passes into its first turn.
+# Arm both passes for this session. Idempotent, and deliberately does NOT touch
+# a cadence stamp that already exists: a home whose session restarts more often
+# than the interval (a context reset, a watcher restart, a self-update) would
+# otherwise never accumulate an elapsed hour and neither pass would ever run.
+# Elapsed time therefore survives a restart, and a stamp is created only when it
+# is absent, which makes a first arm mean "from here, hourly".
 fm_hourly_arm() {  # <state>
-  local state=$1 pass
+  local state=$1 pass stamp
   [ -d "$state" ] || return 1
   touch "$(fm_hourly_armed_marker "$state")" || return 1
   for pass in $FM_HOURLY_PASSES; do
-    touch "$(fm_hourly_stamp "$state" "$pass")" || return 1
+    stamp=$(fm_hourly_stamp "$state" "$pass")
+    [ -e "$stamp" ] && continue
+    touch "$stamp" || return 1
   done
+}
+
+# A persistent secondmate is idle by contract (AGENTS.md section 8), so both
+# passes must exclude its metadata from any "work under way" or "has gone quiet"
+# judgment: counting it would make in-flight never reach zero, and timing it
+# would report a healthy idle endpoint as a stall.
+fm_hourly_meta_is_secondmate() {  # <meta>
+  grep -q '^kind=secondmate$' "$1" 2>/dev/null
 }
 
 # --- shared pass helpers ------------------------------------------------------
@@ -119,7 +132,10 @@ fm_hourly_should_surface() {  # <state> <pass> <signature>
   fi
   last=$(cat "$marker" 2>/dev/null || printf '')
   [ "$signature" = "$last" ] && return 1
-  printf '%s\n' "$signature" > "$marker" 2>/dev/null || return 1
+  # A marker that cannot be written costs a repeated report; a marker whose
+  # failure suppressed the report would cost the report itself, so err toward
+  # surfacing.
+  printf '%s\n' "$signature" > "$marker" 2>/dev/null || true
   return 0
 }
 
