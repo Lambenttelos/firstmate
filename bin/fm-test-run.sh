@@ -123,6 +123,7 @@ family_for_basename() {
     fm-continuity-pretool-check.test.sh|fm-crew-state.test.sh|fm-decision-hold-lifecycle.test.sh|\
     fm-dispatch-select.test.sh|fm-ensure-agents-md.test.sh|fm-grok-harness.test.sh|\
     fm-herdr-lab.test.sh|fm-instruction-owners.test.sh|fm-lint.test.sh|\
+    fm-memory-report.test.sh|\
     fm-install-herdr.test.sh|fm-nm-test-contract.test.sh|fm-no-mistakes-ownership.test.sh|\
     fm-nm-preflight.test.sh|\
     fm-operational-input.test.sh|fm-pi-primary-types.test.sh|fm-project-mode.test.sh|\

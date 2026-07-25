@@ -347,6 +347,7 @@ Handle actionable wakes as follows:
 A `host-resources` wake, a heartbeat's host-pressure annotation, and a spawn's resource advisory all report that the machine itself is overloaded, never that a crew misbehaved.
 Relay the pressure and the crew count the host supports, and ask the captain before shedding work; never stop or kill anything automatically on a resource reading.
 `bin/fm-resource-check.sh` owns the reading and its thresholds, and `docs/configuration.md` owns its separate sweep cadence.
+When the pressure is memory and the question becomes which processes are consuming it and who owns them, `bin/fm-memory-report.sh` answers that separately; never judge memory by resident size, which understates a swapping process badly.
 
 When any wake reports a merged PR for a project cloned in this home, refresh that clone through the guarded fleet-sync path.
 When X-linked work reaches a milestone or terminal state, load `fmx-respond`; before terminal teardown, always post the final completion follow-up so the link clears even if earlier follow-ups were spent.
@@ -477,6 +478,7 @@ These skills are not captain-invocable; load them only at their precise triggers
 - `project-management` - load before adding, creating, removing, or initializing a project.
 - `stuck-crewmate-recovery` - load when the session-start digest reports an ordinary direct report's endpoint dead or its metadata has no window, or after a stale wake, looping pane, repeated confusion, an answered-by-brief question, an unresponsive crewmate, or a failed steer.
 - `secondmate-provisioning` - load before creating, seeding, validating, launching, handing backlog to, recovering, pushing inherited local material into, or retiring a secondmate home, before editing `data/secondmates.md`, and when a live secondmate nears its context threshold (a `check: secondmate-context <id>` wake) to hand its work to a fresh agent instead of compacting.
+- `afk-review` - load only when a scheduled self-wake asks for the next standing two-hourly away-mode review round, and on nothing else.
 - `decision-hold-lifecycle` - load before treating an investigation or visual review as complete, before ending a visual review that exposed a decision, and when recording or routing the captain's answer.
 - `fmx-respond` - load on an `x-mention <request_id>` `check:` wake to handle the mention, on an `x-mode-error ...` `check:` wake to report the X-mode configuration blocker, and on any milestone or terminal wake for an X-mode-linked task before posting its completion follow-up; relevant only when X mode is on.
 - `firstmate-codexapp` - load before coordinating a visible Codex Desktop thread, evaluating a Codex App backend request, or reconciling Codex Desktop host-tool smoke evidence for Firstmate work.

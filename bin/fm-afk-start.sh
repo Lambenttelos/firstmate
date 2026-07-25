@@ -178,7 +178,15 @@ fm_afk_start_main() {
     return 0
   fi
 
-  if fm_pid_alive "$pid" && [ -n "$pid" ]; then
+  # Reclaim the lock only from a live process this probe CONFIDENTLY reads as some
+  # other program. Removing it whenever the owner pid is merely alive also fired on
+  # an undetermined probe - an unreadable pid identity, or an empty ps command line
+  # under fork pressure - which tore the lock away from a daemon that was in fact
+  # running and started a second one beside it, two supervisors both believing they
+  # own escalation delivery. An undetermined holder now keeps its lock, and the
+  # daemon exec'd below refuses loudly against it instead
+  # (bin/fm-afk-daemon-lib.sh, fm_afk_daemon_lock_held_by_foreign_live_process).
+  if fm_afk_daemon_lock_held_by_foreign_live_process "$FM_AFK_LOCK" "$FM_AFK_DAEMON"; then
     fm_lock_remove_path "$FM_AFK_LOCK" 2>/dev/null || true
   fi
 

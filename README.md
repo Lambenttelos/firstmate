@@ -204,6 +204,7 @@ Firstmate's skills live in two separate places with different audiences:
 - [docs/codex-app-backend.md](docs/codex-app-backend.md) - Codex App backend boundary, evidence, and rollout contract.
 - [docs/gitlab-merge-watch.md](docs/gitlab-merge-watch.md) - how the merge watch follows a GitLab merge request on any instance, and the evidence behind it.
 - [docs/merge-queue.md](docs/merge-queue.md) - the durable record of pushed-but-unmerged ship branches behind release-on-pushed teardown, and the merge-workers-on-demand contract.
+- [docs/memory-report.md](docs/memory-report.md) - what is eating the machine's memory and who owns it: the phys_footprint evidence, why ownership comes from records rather than ancestry, and what may be called reclaimable.
 - [docs/turnend-guard.md](docs/turnend-guard.md) - the primary session's structural "no turn ends blind" backstop: verified per-harness hook mechanisms, scoping, loop safety, and fail-open tradeoffs.
 - [docs/supervision-protocols/](docs/supervision-protocols/) - rendered primary-harness watcher protocols for Claude, Codex, OpenCode, Pi, Grok, and unknown harness fallback.
 - [docs/scripts.md](docs/scripts.md) - the `bin/` toolbelt reference.

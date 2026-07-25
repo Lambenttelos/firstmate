@@ -76,6 +76,8 @@ approval authority; they differ only in what supervises.
    Read the digests it printed and act on them.
    Then obey its final line for whether to arm it again: every exit ends in either `re-arm to keep listening` or `- do not re-arm`.
    Re-arming after a `do not re-arm` line is an immediate-exit loop, because that line means the pane is delivering or the away session is over, so nothing will ever arrive here.
+   A run that failed exits non-zero with a loud diagnostic and still ends in a `re-arm to keep listening` line, because its records are still pending and nothing else is listening for them: re-arm it once and report the diagnostic, and treat a second identical failure as a blocker for the captain rather than a loop to keep running.
+   An argument error is the one exit with no verdict at all; fix the invocation instead of re-arming it.
 
 4. **Do not separately arm the watcher.**
    The daemon manages `bin/fm-watch.sh` as its child, and the singleton lock

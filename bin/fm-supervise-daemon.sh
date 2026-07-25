@@ -719,7 +719,13 @@ escalate_flush() {  # <state>
   local state=$1 buf item n msg
   buf="$state/.subsuper-escalations"
   [ -s "$buf" ] || return 0
-  n=$(wc -l < "$buf" 2>/dev/null || echo 0)
+  # `tr -d ' '`: BSD wc pads its count, and this number is rendered straight into
+  # the digest the captain reads, so an unpadded count is the only correct one.
+  n=$(wc -l < "$buf" 2>/dev/null | tr -d ' ')
+  # `tr` succeeds even when `wc` did not, so the fallback has to be checked on the
+  # value rather than on the pipeline's status: an empty count would render as
+  # "( event(s))" in the line the captain reads.
+  [ -n "$n" ] || n=0
   # Join buffered items with the literal " | " separator into one digest line.
   msg=$(awk 'NR>1{printf " | "} {printf "%s",$0} END{print ""}' "$buf" 2>/dev/null)
   # Single-line wrapper: no embedded newlines (inject_msg also collapses as a
