@@ -121,7 +121,6 @@ print_blockers() {  # <file>
 }
 
 clear_delivery_artifacts() {
-  local name
   rm -f \
     "$STATE/.subsuper-escalations" \
     "$STATE/.subsuper-escalations.since" \
@@ -130,11 +129,24 @@ clear_delivery_artifacts() {
   # escalation buffer; both are session-scoped delivery artifacts, and both are
   # cleared only after return_reconcile has already retained their content as
   # catch-up evidence.
-  while IFS= read -r name; do
-    [ -n "$name" ] || continue
-    rm -f "$STATE/$name"
-  done < <(fm_afk_outbox_artifact_names)
-  fm_afk_outbox_clear_transient "$STATE" || true
+  #
+  # The outbox files go through their library's own clearing owner rather than a
+  # raw rm loop here, because they must be retired UNDER the outbox lock. Away
+  # mode is over by this point, but the inbox reader this session armed can still
+  # be running: it exits only on its next poll, and that poll may be inside an
+  # acknowledgement's compaction, which lands by renaming a sibling over the
+  # outbox file. An unlocked delete racing that rename resurrects the finished
+  # session's records with the acknowledgement mark gone, so the next away
+  # session's reader replays them as fresh escalations
+  # (bin/fm-afk-outbox-lib.sh, fm_afk_outbox_clear_session).
+  #
+  # A clear that cannot take the lock leaves the outbox exactly as it is and names
+  # it on stderr. That never reopens the gate: the records were already read and
+  # reported as catch-up evidence above, and a fresh away entry clears them under
+  # the same lock. Leaving a stale acknowledgement mark behind is harmless because
+  # sequence allocation takes the maximum of the counter, the mark, and the
+  # highest record present, so a new session's records still land above it.
+  fm_afk_outbox_clear_session "$STATE" || true
 }
 
 return_guard() {
