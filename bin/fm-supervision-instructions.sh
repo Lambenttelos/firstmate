@@ -24,12 +24,13 @@ AWAY_POSTURE=0
 X_MODE=0
 REPAIR_LINE=0
 QUEUE_PENDING=0
+PRESENT_DAEMON=
 
 usage() {
   cat <<'EOF'
 Usage: fm-supervision-instructions.sh [--harness <name>] [--read-only 0|1] [--afk 0|1]
                                      [--away-posture 0|1] [--x-mode 0|1] [--repair-line]
-                                     [--queue-pending 0|1]
+                                     [--queue-pending 0|1] [--present-daemon 0|1]
 
 Print the current primary harness's supervision operating instructions.
 With --repair-line, print one concise repair instruction for guard and hook messages.
@@ -38,6 +39,9 @@ With --repair-line, print one concise repair instruction for guard and hook mess
 home's watcher. --away-posture reports the away POSTURE (state/.afk) on its own.
 Away posture with no daemon means this session still owns supervision, so the
 emitted protocol below applies in full.
+
+--present-daemon defaults to probing this home's present-mode daemon
+(bin/fm-present-daemon.sh status).
 EOF
 }
 
@@ -73,6 +77,11 @@ while [ "$#" -gt 0 ]; do
     --x-mode)
       [ "$#" -gt 1 ] || { echo "error: --x-mode requires 0 or 1" >&2; exit 2; }
       X_MODE=$(bool_value "$2")
+      shift 2
+      ;;
+    --present-daemon)
+      [ "$#" -gt 1 ] || { echo "error: --present-daemon requires 0 or 1" >&2; exit 2; }
+      PRESENT_DAEMON=$(bool_value "$2")
       shift 2
       ;;
     --queue-pending)
@@ -121,6 +130,18 @@ x_mode_env_sh=$(shell_quote "$x_mode_env")
 
 if [ "$X_MODE" -eq 0 ] && [ -f "$x_mode_env" ]; then
   X_MODE=1
+fi
+
+# The present-mode daemon is opt-in and inert by default, so an unset flag probes
+# for a genuinely live one rather than assuming either way. A live daemon changes
+# only the ordinary-wake continuation: it already owns re-arming. It never changes
+# the repair path, because a guard alarm firing at all means the daemon is not
+# keeping a watcher alive and this session must arm one itself.
+if [ -z "$PRESENT_DAEMON" ]; then
+  PRESENT_DAEMON=0
+  if FM_HOME="$FM_HOME" "$SCRIPT_DIR/fm-present-daemon.sh" status >/dev/null 2>&1; then
+    PRESENT_DAEMON=1
+  fi
 fi
 
 render_snippet() {
@@ -175,6 +196,10 @@ repair_line() {
 }
 
 ordinary_wake_line() {
+  if [ "$PRESENT_DAEMON" -eq 1 ]; then
+    printf '%s\n' '- Ordinary wake: the present-mode supervision daemon already owns re-arming; drain queued wakes and do not arm another cycle.'
+    return 0
+  fi
   case "$HARNESS" in
     claude)
       printf '%s\n' '- Ordinary wake: re-arm exactly one bin/fm-watch-arm.sh Claude Code background task as directed below.'
@@ -219,6 +244,9 @@ elif [ "$AWAY_POSTURE" -eq 1 ]; then
   printf '%s\n' '- Supervision ownership: this session owns it, so the "away mode is not active" precondition in the protocol below is met and it applies in full.'
 else
   printf '%s\n' '- Away mode: inactive.'
+fi
+if [ "$PRESENT_DAEMON" -eq 1 ]; then
+  printf '%s\n' '- Present-mode supervision daemon: live; it keeps one watcher armed for this session, so do not arm per turn. Still drain the wake queue at the top of every turn, and arm normally if a guard alarm ever fires.'
 fi
 if [ "$X_MODE" -eq 1 ]; then
   printf '%s%s%s\n' '- X mode: active; source ' "$x_mode_env" ' before launching any watcher process so the 30s cadence is inherited.'

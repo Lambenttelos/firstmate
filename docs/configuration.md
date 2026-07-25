@@ -129,6 +129,30 @@ An absent file means `auto`, i.e. default-on on macOS: the alarm exists precisel
 A missing or failing channel logs and falls through to the next, never crashing the daemon.
 See [`wedge-alarm.md`](wedge-alarm.md) for the channel reference and macOS verification evidence, and [`examples/wedge-alarm`](examples/wedge-alarm) for a copyable config.
 
+## Present-mode supervision daemon (config/present-daemon)
+
+The watcher is single-shot on an actionable wake, so an active session normally pays a per-turn tax to re-arm it and wait for that arm to confirm.
+The optional local `config/present-daemon` presence flag moves that re-arm loop off the session and into `bin/fm-present-daemon.sh`, a small detached background process that runs `bin/fm-watch-arm.sh` again whenever a watcher cycle ends.
+The feature is inert without the flag: nothing launches, and supervision behaves exactly as it did before.
+The file's contents are ignored; only its presence matters.
+It is not inherited into secondmate homes, because a secondmate is idle by default and pays no per-turn supervision tax.
+
+The daemon only keeps a watcher alive.
+It never classifies a wake, decides anything, or acts on a finding, and it changes no approval authority: every wake stays in `state/.wake-queue` for firstmate to drain at the top of its next turn.
+That is the line separating it from the away-mode sub-supervisor, which does own triage and escalation.
+
+Session start launches it when this session actually holds the fleet lock, through `bin/fm-bootstrap.sh`'s `present_daemon_sweep`, and only a real launch failure prints an actionable `PRESENT_DAEMON:` line.
+While the daemon is live, `bin/fm-supervision-instructions.sh` reports it in the emitted supervision block and tells firstmate not to arm per turn; the wake queue must still be drained at the top of every turn.
+
+Never-blind is unchanged.
+The daemon touches neither guard and never touches the session lock `state/.lock`; it holds only its own `state/.present-daemon.lock` while its watcher child holds `state/.watch.lock`.
+If the daemon dies, its orphaned watcher ends on the next actionable wake, the beacon ages past the guard grace, and `bin/fm-turnend-guard.sh` fires its normal alarm, so the session degrades to per-turn arming rather than to blind supervision.
+
+Away mode and present mode never supervise concurrently.
+The daemon refuses to start while `state/.afk` exists, `bin/fm-afk-start.sh` stops it before the away daemon takes over, and a running loop re-checks the flag between arm cycles.
+
+`bin/fm-present-daemon.sh --help` owns the subcommands, the exact status lines, and the `FM_PRESENT_*` tuning knobs.
+
 ## Gate defaults (.no-mistakes.yaml)
 
 The tracked `.no-mistakes.yaml` keeps test evidence outside the repo and pins `commands.lint` to `bin/fm-lint.sh` so local lint matches CI.
