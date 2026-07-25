@@ -9,7 +9,7 @@
 #                 "MISSING_MANUAL: <tool> (instructions: <url>)", "NEEDS_GH_AUTH",
 #                 "BACKEND_INVALID: <name> (known: <names>)",
 #                 "CREW_DISPATCH: invalid config/crew-dispatch.json - <reason>",
-#                 "FLEET_SYNC: <repo>: skipped|recovered|STUCK: <detail>",
+#                 "FLEET_SYNC: <repo>: skipped|recovered|STUCK|FETCH FAILED: <detail>",
 #                 "PRESENT_DAEMON: <reason>",
 #                 "PR_CHECK_MIGRATION: <private remediation>",
 #                 "TANGLE: <remediation>",
@@ -144,6 +144,9 @@ fleet_sync_relay_filtered_output() {
     case "$line" in
       *': skipped: local-only project') ;;
       *': skipped: no origin remote') ;;
+      # A failed fetch is a distinct, louder outcome than a skip: the clone stops
+      # receiving new commits while still reading as healthy everywhere else.
+      *': FETCH FAILED:'*) echo "FLEET_SYNC: $line" ;;
       *': skipped:'*) echo "FLEET_SYNC: $line" ;;
       *': STUCK:'*) echo "FLEET_SYNC: $line" ;;
       *': recovered:'*) echo "FLEET_SYNC: $line" ;;

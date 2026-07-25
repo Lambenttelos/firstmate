@@ -9,6 +9,12 @@
 #   - every other off-default state is left untouched and reported as a loud,
 #     quantified "STUCK: ... N commits behind ... - needs attention" warning
 #     instead of a quiet skip.
+#   - a FAILED fetch is reported as a loud, actionable "FETCH FAILED: ..." line
+#     rather than a benign-looking skip, and bootstrap relays it - a clone that
+#     stops fetching is otherwise indistinguishable from a healthy one. The
+#     matching negative case matters just as much: every benign outcome (synced,
+#     already current, local-only, no origin) stays silent, because a diagnostic
+#     that fires on healthy fleets gets ignored and recreates the same blindness.
 # The pre-existing fast-forward / already-current / local-only / no-origin paths
 # must be unchanged, and bootstrap must relay the new outcomes as FLEET_SYNC lines.
 #
@@ -29,15 +35,18 @@ set -u
 fm_git_identity fmtest fmtest@example.invalid
 
 TMP_ROOT=$(fm_test_tmproot fm-fleet-sync-tests)
-HOME_N=0
 
 # --- fixtures ---------------------------------------------------------------
 
 # new_home: fresh isolated FM_HOME with an empty projects/ dir. Each test gets its
 # own so the whole-fleet form never sees another test's clones.
+# The unique name comes from mktemp, not a counter: every caller uses
+# `home=$(new_home)`, whose subshell would discard a counter increment and hand
+# every test the same home - which is exactly the isolation this fixture promises.
 new_home() {
-  HOME_N=$((HOME_N + 1))
-  local h="$TMP_ROOT/home-$HOME_N"
+  local h
+  mkdir -p "$TMP_ROOT"
+  h=$(mktemp -d "$TMP_ROOT/home-XXXXXX")
   mkdir -p "$h/projects"
   printf '%s\n' "$h"
 }
@@ -470,6 +479,69 @@ test_bootstrap_relays_recovered_and_stuck() {
   pass "bootstrap relays recovered: and STUCK: fleet-sync outcomes"
 }
 
+# --- failed-fetch reporting tests --------------------------------------------
+
+# A failed fetch must never read as a benign skip. A clone whose fetch fails keeps
+# a clean tree on its default branch at a plausible recent commit, so it looks
+# exactly like a healthy clone; only a distinct, loud, actionable line makes the
+# silently-stale state visible.
+test_fetch_failure_is_reported_as_failure_not_skip() {
+  local home clone out
+  home=$(new_home)
+  clone=$(build_pair "$home" fetchfail)
+  git -C "$clone" remote set-url origin "file://$home/remotes/does-not-exist.git"
+
+  out=$(run_sync "$home" fetchfail)
+
+  assert_contains "$out" "fetchfail: FETCH FAILED:" "a failed fetch reports FETCH FAILED, not a skip"
+  assert_not_contains "$out" "skipped:" "a failed fetch must not be reported as a benign skip"
+  assert_contains "$out" "does-not-exist" "the report carries the actual git error"
+  assert_contains "$out" "not receiving new commits" "the report states the consequence"
+  assert_contains "$out" "bin/fm-fleet-sync.sh fetchfail" "the report names the retry command for this clone"
+  pass "a failed fetch is reported as a loud, actionable failure rather than a skip"
+}
+
+test_bootstrap_relays_fetch_failure() {
+  local home clone out
+  home=$(new_home)
+  clone=$(build_pair "$home" bootfetchfail)
+  git -C "$clone" remote set-url origin "file://$home/remotes/does-not-exist.git"
+
+  out=$(FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" "$ROOT/bin/fm-bootstrap.sh" 2>/dev/null)
+
+  assert_contains "$out" "FLEET_SYNC: bootfetchfail: FETCH FAILED:" \
+    "bootstrap relays a failed fetch as a session-start diagnostic line"
+  pass "bootstrap surfaces a failed fetch in its diagnostic lines"
+}
+
+# The other half of the fix: a diagnostic that fires on healthy fleets gets
+# ignored, which recreates the very bug this reporting exists to prevent. Every
+# benign outcome - synced, already current, local-only, no origin - must stay
+# completely silent in bootstrap's diagnostics.
+test_bootstrap_stays_quiet_on_benign_outcomes() {
+  local home behind noorigin localonly out
+  home=$(new_home)
+  behind=$(build_pair "$home" quiet-behind)
+  advance_origin "$home" quiet-behind C1
+  build_pair "$home" quiet-current >/dev/null
+  localonly=$(build_pair "$home" quiet-localonly)
+  mkdir -p "$home/data"
+  printf -- '- quiet-localonly [local-only] - test project (added 2026-07-24)\n' > "$home/data/projects.md"
+  noorigin="$home/projects/quiet-noorigin"
+  git init -q "$noorigin"
+  git -C "$noorigin" symbolic-ref HEAD refs/heads/main
+  commit_file "$noorigin" file.txt v0 C0
+
+  out=$(FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" "$ROOT/bin/fm-bootstrap.sh" 2>/dev/null)
+
+  assert_not_contains "$out" "FLEET_SYNC:" "benign fleet outcomes must produce no diagnostic noise"
+  : "$behind $localonly"
+  # The silence must be silence about healthy clones, not a broken sweep.
+  [ "$(head_sha "$behind")" = "$(git -C "$behind" rev-parse origin/main)" ] \
+    || fail "benign-quiet case: the behind clone was not actually fast-forwarded"
+  pass "benign fleet-sync outcomes stay quiet in bootstrap diagnostics"
+}
+
 # --- packed-refs.lock guard tests -------------------------------------------
 
 test_orphaned_stale_packed_refs_lock_recovers() {
@@ -521,7 +593,7 @@ test_live_packed_refs_lock_is_never_removed() {
   assert_grep "is not provably stale" "$err" "live lock: guard did not explain the refusal"
   assert_no_grep "removed provably-stale packed-refs lock" "$err" \
     "live lock: guard force-removed a live lock"
-  assert_contains "$(cat "$out")" "locklive: skipped: fetch failed" "live lock: fleet-sync did not skip"
+  assert_contains "$(cat "$out")" "locklive: FETCH FAILED: fetch failed" "live lock: fleet-sync did not report the fetch failure"
   assert_present "$clone/.git/packed-refs.lock" "live lock: lock must never be removed"
   [ "$(head_sha "$clone")" = "$before" ] || fail "live lock: clone was advanced despite the refusal"
   pass "a live packed-refs.lock is never removed and the sync fails loudly"
@@ -597,7 +669,7 @@ test_non_signature_fetch_failure_is_not_retried() {
     run_sync_guarded "$home" "$fakebin" "$out" "$err" locknonsig
   set -e
 
-  assert_contains "$(cat "$out")" "locknonsig: skipped: fetch failed" "non-signature: fleet-sync did not report the fetch failure"
+  assert_contains "$(cat "$out")" "locknonsig: FETCH FAILED: fetch failed" "non-signature: fleet-sync did not report the fetch failure"
   assert_no_grep "waiting" "$err" "non-signature: a non-lock failure was wrongly retried"
   assert_no_grep "packed-refs lock" "$err" "non-signature: a non-lock failure entered the lock guard"
   pass "a non-packed-refs.lock fetch failure keeps today's behavior (no retry)"
@@ -620,6 +692,9 @@ test_single_project_by_projects_relative_name_ignores_cwd_shadow
 test_single_project_unresolvable_name_still_skips
 test_whole_fleet_form
 test_bootstrap_relays_recovered_and_stuck
+test_fetch_failure_is_reported_as_failure_not_skip
+test_bootstrap_relays_fetch_failure
+test_bootstrap_stays_quiet_on_benign_outcomes
 test_orphaned_stale_packed_refs_lock_recovers
 test_live_packed_refs_lock_is_never_removed
 test_live_git_cwd_in_clone_dir_blocks_removal
