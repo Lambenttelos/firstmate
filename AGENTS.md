@@ -302,6 +302,7 @@ A captain instruction to merge is explicit authority; `yolo` is the only standin
 For any custom `state/<id>.check.sh` you write yourself, keep it an ordinary single-link mode-`0700` file, print one line only when firstmate should wake, print nothing otherwise, finish before `FM_CHECK_TIMEOUT`, then bind its current bytes with `bin/fm-check-register.sh <id>` before the watcher may execute it.
 
 Tear down a ship task once its work is durable: teardown releases a worktree whose branch is fully pushed to origin, independent of whether it has merged, so a finished worker does not hold a memory slot waiting to merge.
+Work whose exact commit is already contained in a default branch that outlives the worktree is durable too, so a lane that finished on a detached HEAD, on a scratch branch name, or by merging into the approved local landing target releases without `--force`.
 A released-but-unmerged ship branch is recorded in the durable merge queue; surface the batched set as one list of compare links with `bin/fm-merge-queue.sh list`, clear merged branches with its `sweep`, and spawn a merge worker per repo per batch on demand when a batch has accumulated and merge authority exists (never a standing merge worker; see `docs/merge-queue.md`).
 A teardown refusal for uncommitted or genuinely unpushed-and-unlanded work is a stop-and-investigate result, never an obstacle to bypass.
 Never force teardown without explicit discard authority.

@@ -7,7 +7,10 @@
 # and GitHub reports a PR head that contains the current local work, or its content
 # is already in the up-to-date default branch.
 #
-# Covers three fixes:
+# "Landed" also covers CONTAINMENT: HEAD's exact commit already reachable from a
+# default branch that outlives the worktree.
+#
+# Covers four fixes:
 #   - local-only fork-remote: a fork IS a remote, so fork-pushed upstream-
 #     contribution PRs are teardown-eligible (the pre-fix code false-refused them).
 #   - squash-merge-then-delete-branch: the branch's own commits live nowhere on a
@@ -15,6 +18,11 @@
 #     main. Reachability alone false-refused this common GitHub flow; the check now
 #     recognizes a merged PR head containing the local work (or the content already
 #     in main) as landed.
+#   - branch-name false refusal: the landed test matched on the local branch NAME,
+#     so a lane that finished on a detached HEAD or a scratch branch, or that landed
+#     by merging rather than by pushing that name, was refused even though its exact
+#     commit was already in the default branch. Containment in a SURVIVING default
+#     branch now counts; a standalone clone's own default branch still does not.
 #   - teardown-lock-race: a killed crew process can leave a transient worktree
 #     git index.lock that blocks teardown. The return path retries on the lock
 #     error signature (even if the lock self-clears mid-check), then only removes a
@@ -42,6 +50,13 @@
 #   (aa) no-mistakes + pushed base + extra unpushed local commit -> REFUSE (unpushed wins)
 #   (bb) no-mistakes + pushed branch but dirty worktree          -> REFUSE (dirty wins)
 #   (cc) no-mistakes + pushed branch but origin unreachable      -> REFUSE (unverifiable)
+#   (dd) direct-push + detached HEAD at the origin default tip    -> ALLOW  (containment)
+#   (ee) direct-push + scratch branch name at origin default tip  -> ALLOW  (containment)
+#   (ff) direct-push + merged into the shared local default       -> ALLOW  (local landing)
+#   (gg) no-mistakes + merged into the shared local default only  -> ALLOW  (local landing)
+#   (hh) local default of a STANDALONE clone contains HEAD        -> REFUSE (ref dies with it)
+#   (ii) contained in the default branch but dirty                -> REFUSE (dirty wins)
+#   (jj) detached HEAD absent from every default branch           -> REFUSE (safety)
 #
 # Also covers backlog teardown-lock-race: a git index.lock left in the worktree by a
 # killed crew process (bin/fm-teardown.sh's teardown_treehouse_return).
@@ -1415,6 +1430,188 @@ SH
   chmod +x "$case_dir/fakebin/git"
 }
 
+# Merge the worktree's task branch into the PROJECT clone's local default branch
+# with --no-ff, without pushing. The task worktree is a linked worktree of that
+# clone, so the merge commit and everything it reaches live in a shared object
+# store that outlives the worktree. Args: case_dir
+merge_task_branch_into_shared_local_default() {
+  local case_dir=$1
+  git -C "$case_dir/project" -c user.email=t@t -c user.name=t \
+    merge -q --no-ff --no-edit fm/task-x1
+}
+
+# Land <file>=<content> on origin's default branch, refresh the clone's
+# remote-tracking refs, and leave the task worktree detached at exactly that
+# commit - the shape of a lane that finished on a detached HEAD. Args: case_dir
+detach_worktree_at_origin_default() {
+  local case_dir=$1 file=$2 content=$3
+  land_on_origin_main "$case_dir" "$file" "$content"
+  git -C "$case_dir/project" fetch -q origin
+  git -C "$case_dir/wt" checkout -q --detach refs/remotes/origin/main
+}
+
+# (dd) direct-push + detached HEAD at the origin default tip -> ALLOW.
+# The lane finished on a detached HEAD, so there is no branch name to look up on
+# origin, but the exact commit is origin's default branch head. Nothing is lost.
+test_direct_push_detached_head_contained_in_origin_default_allows() {
+  local case_dir rc
+  case_dir=$(make_case dp-detached-contained)
+  write_meta "$case_dir" direct-push ship
+  detach_worktree_at_origin_default "$case_dir" feature.txt hello
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 0 "$rc" "dp-detached-contained: teardown should release a detached HEAD already on origin's default branch"
+  ! grep -q REFUSED "$case_dir/stderr" \
+    || fail "dp-detached-contained: teardown printed a REFUSED line for landed work"
+  pass "direct-push worktree detached at the origin default tip is torn down (containment beats the branch name)"
+}
+
+# (ee) direct-push + scratch local branch name never pushed, HEAD at the origin
+#      default tip -> ALLOW. Matches the batch-merge lane that landed on origin and
+#      left fm/land-batch-tmp pointing at exactly that commit.
+test_direct_push_scratch_branch_at_origin_default_allows() {
+  local case_dir rc
+  case_dir=$(make_case dp-scratch-branch-contained)
+  write_meta "$case_dir" direct-push ship
+  land_on_origin_main "$case_dir" feature.txt hello
+  git -C "$case_dir/project" fetch -q origin
+  git -C "$case_dir/wt" checkout -q -B fm/land-batch-tmp refs/remotes/origin/main
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 0 "$rc" "dp-scratch-branch-contained: teardown should release a scratch branch sitting on origin's default branch"
+  ! grep -q REFUSED "$case_dir/stderr" \
+    || fail "dp-scratch-branch-contained: teardown printed a REFUSED line for landed work"
+  pass "direct-push worktree on a scratch branch at the origin default tip is torn down"
+}
+
+# (ff) direct-push + HEAD merged into the SHARED local default branch, which is
+#      ahead of origin -> ALLOW. The merge commit lives in the project clone's
+#      object store, which teardown does not remove.
+test_direct_push_contained_in_shared_local_default_allows() {
+  local case_dir rc
+  case_dir=$(make_case dp-shared-local-default)
+  write_meta "$case_dir" direct-push ship
+  wt_commit_file "$case_dir" feature.txt hello "validated work"
+  # The pipeline's internal validation remote holds the branch, so the generic
+  # "commits not on a remote" probe comes back empty exactly as it does in production.
+  add_no_mistakes_internal_remote_with_pushed_branch "$case_dir"
+  merge_task_branch_into_shared_local_default "$case_dir"
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 0 "$rc" "dp-shared-local-default: teardown should release work merged into the shared local default branch"
+  ! grep -q REFUSED "$case_dir/stderr" \
+    || fail "dp-shared-local-default: teardown printed a REFUSED line for landed work"
+  pass "direct-push worktree merged into the shared local default branch is torn down"
+}
+
+# (gg) no-mistakes + merged --no-ff into the shared local default branch and nowhere
+#      on any remote -> ALLOW. This is the firstmate repo's merge-locally landing
+#      target: origin exists but is not where the work lands.
+test_merged_into_shared_local_default_allows() {
+  local case_dir rc
+  case_dir=$(make_case nm-shared-local-default)
+  write_meta "$case_dir" no-mistakes ship
+  wt_commit_file "$case_dir" feature.txt hello "fast-lane work"
+  merge_task_branch_into_shared_local_default "$case_dir"
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 0 "$rc" "nm-shared-local-default: teardown should release work merged into local main even though origin never saw it"
+  ! grep -q REFUSED "$case_dir/stderr" \
+    || fail "nm-shared-local-default: teardown printed a REFUSED line for locally landed work"
+  pass "worktree merged into the shared local default branch is torn down (local landing target)"
+}
+
+# (hh) local default branch of a STANDALONE clone contains HEAD -> REFUSE. The ref
+#      lives in the worktree's own repository, which teardown removes, so it proves
+#      nothing about survival. This pins the boundary that keeps the containment
+#      fallback from becoming "origin is optional".
+test_standalone_clone_local_default_does_not_count_as_landed() {
+  local case_dir rc standalone
+  case_dir=$(make_case standalone-local-default)
+  standalone="$case_dir/standalone"
+  git clone -q "$case_dir/origin.git" "$standalone"
+  git -C "$standalone" remote set-head origin main 2>/dev/null || true
+  git -C "$standalone" checkout -q -b fm/task-x1
+  printf '%s\n' hello > "$standalone/feature.txt"
+  git -C "$standalone" add -- feature.txt
+  git -C "$standalone" -c user.email=t@t -c user.name=t commit -q -m "standalone work"
+  git -C "$standalone" checkout -q main
+  git -C "$standalone" -c user.email=t@t -c user.name=t merge -q --no-ff --no-edit fm/task-x1
+  git -C "$standalone" checkout -q fm/task-x1
+  fm_write_meta "$case_dir/state/task-x1.meta" \
+    "window=fm-task-x1" \
+    "worktree=$standalone" \
+    "project=$case_dir/project" \
+    "kind=ship" \
+    "mode=no-mistakes"
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 1 "$rc" "standalone-local-default: teardown should refuse when the only containing ref dies with the worktree"
+  grep -q REFUSED "$case_dir/stderr" \
+    || fail "standalone-local-default: no REFUSED line in stderr"
+  pass "a local default branch that does not outlive the worktree never counts as landed"
+}
+
+# (ii) contained in the default branch but the worktree is dirty -> REFUSE.
+#      Uncommitted changes are never landed, whatever the containment proof says.
+test_contained_in_default_but_dirty_refuses() {
+  local case_dir rc
+  case_dir=$(make_case contained-dirty)
+  write_meta "$case_dir" direct-push ship
+  detach_worktree_at_origin_default "$case_dir" feature.txt hello
+  printf '%s\n' dirty > "$case_dir/wt/uncommitted.txt"
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 1 "$rc" "contained-dirty: teardown should refuse a dirty worktree even when HEAD is on the default branch"
+  assert_grep "uncommitted changes" "$case_dir/stderr" \
+    "contained-dirty: refusal did not name the uncommitted changes"
+  pass "uncommitted changes are refused even when HEAD is contained in the default branch (dirty wins)"
+}
+
+# (jj) detached HEAD whose commit is on no default branch anywhere -> REFUSE, with
+#      the same clarity as before. Containment must not turn a detached HEAD into a
+#      free pass.
+test_detached_head_absent_from_every_default_refuses() {
+  local case_dir rc
+  case_dir=$(make_case detached-absent)
+  write_meta "$case_dir" direct-push ship
+  wt_commit_file "$case_dir" feature.txt hello "unlanded work"
+  git -C "$case_dir/wt" checkout -q --detach HEAD
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 1 "$rc" "detached-absent: teardown should refuse a detached HEAD that landed nowhere"
+  grep -q REFUSED "$case_dir/stderr" || fail "detached-absent: no REFUSED line in stderr"
+  pass "detached HEAD absent from every default branch is refused (safety preserved)"
+}
+
 test_direct_push_branch_absent_from_origin_refuses() {
   local case_dir rc
   case_dir=$(make_case dp-no-origin)
@@ -1687,3 +1884,10 @@ test_direct_push_branch_on_origin_allows
 test_direct_push_stale_origin_ref_refuses
 test_direct_push_origin_ahead_of_head_allows
 test_direct_push_force_overrides_missing_origin_branch
+test_direct_push_detached_head_contained_in_origin_default_allows
+test_direct_push_scratch_branch_at_origin_default_allows
+test_direct_push_contained_in_shared_local_default_allows
+test_merged_into_shared_local_default_allows
+test_standalone_clone_local_default_does_not_count_as_landed
+test_contained_in_default_but_dirty_refuses
+test_detached_head_absent_from_every_default_refuses
