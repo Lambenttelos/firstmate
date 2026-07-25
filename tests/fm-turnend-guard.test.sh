@@ -94,6 +94,9 @@ install_guard_scripts() {
   cp "$ROOT/bin/fm-primary-scope-lib.sh" "$dir/bin/fm-primary-scope-lib.sh"
   cp "$ROOT/bin/fm-supervision-lib.sh" "$dir/bin/fm-supervision-lib.sh"
   cp "$ROOT/bin/fm-wake-lib.sh" "$dir/bin/fm-wake-lib.sh"
+  # fm-wake-lib.sh sources this at load time; without it the guard's own libraries
+  # fail to load and the hook emits a sourcing error where it should stay silent.
+  cp "$ROOT/bin/fm-mutex-lib.sh" "$dir/bin/fm-mutex-lib.sh"
   cp "$ROOT/bin/fm-pid-lib.sh" "$dir/bin/fm-pid-lib.sh"
   cp "$ROOT/bin/fm-afk-daemon-lib.sh" "$dir/bin/fm-afk-daemon-lib.sh"
   mkdir -p "$dir/docs"
