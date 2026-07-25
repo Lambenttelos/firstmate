@@ -152,9 +152,46 @@ set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
+
+# Was FM_HOME chosen by the caller, or are we falling back to this code root?
+# The distinction matters: an explicit home is honored exactly, while a fallback
+# may be redirected below. Recorded before the fallback assignment overwrites it.
+FM_HOME_EXPLICIT=${FM_HOME+yes}
 FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
+
+# HOME RESOLUTION. This script is frequently invoked from a disposable worktree
+# of firstmate - a crewmate checking the machine it is working on. A worktree has
+# no state/ of its own, so falling back to the code root found ZERO records while
+# every fleet process kept its working directory. The report then said "no record
+# claims it" about live lanes, having read no records at all, and listed 4.23 GB
+# of live work as reclaimable. That is the exact failure class this script
+# exists to prevent, so the fallback now resolves to the real home instead.
+#
+# A git worktree's common dir is the primary checkout's .git, which is a durable
+# fact rather than a guess about paths. Only ever consulted when the caller did
+# NOT set FM_HOME, and only accepted when it actually holds records.
+if [ -z "$FM_HOME_EXPLICIT" ] && [ -z "${FM_ROOT_OVERRIDE:-}" ] && [ -z "${FM_STATE_OVERRIDE:-}" ]; then
+  if ! compgen -G "$FM_HOME/state/*.meta" >/dev/null 2>&1; then
+    _common=$(git -C "$FM_ROOT" rev-parse --git-common-dir 2>/dev/null || true)
+    if [ -n "$_common" ]; then
+      case "$_common" in /*) : ;; *) _common="$FM_ROOT/$_common" ;; esac
+      _primary=$(cd "$(dirname "$_common")" 2>/dev/null && pwd -P) || _primary=
+      if [ -n "$_primary" ] && compgen -G "$_primary/state/*.meta" >/dev/null 2>&1; then
+        FM_HOME=$_primary
+        FM_HOME_REDIRECTED=$_primary
+      fi
+    fi
+    unset _common _primary
+  fi
+fi
+
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
+
+# Share of agent-kind processes that may come back unowned before the reading is
+# treated as suspect. Fleet agents run inside recorded worktrees, so a high share
+# is the signature of records not being read - not of an idle machine.
+UNOWNED_AGENT_WARN_PCT=${FM_MEMREPORT_AGENT_WARN_PCT:-60}
 
 # Self-check thresholds. Deliberately generous: they exist to catch an
 # obviously broken instrument (the 31-process reading), not to police normal
@@ -481,6 +518,58 @@ build_git_cwds() {
   done < <(cut -f2 "$TMP/cwd.tsv" | sort -u)
 }
 
+# --- attribution self-checks ------------------------------------------------
+#
+# The measurement self-check above proves the READING is sound. These two prove
+# the ATTRIBUTION is sound, which is a separate failure mode and the one that
+# actually shipped: a perfectly good reading was published with ownership
+# resolved against an empty record set.
+
+# "unowned" is a claim that the records were read and none of them matched. If no
+# records were read, the script cannot make that claim about anything, so it must
+# refuse rather than relabel every live lane as reclaimable.
+check_records_were_read() {
+  local task_records
+  task_records=$(awk -F'\t' '$2 == "task" || $2 == "secondmate" { n++ } END { print n + 0 }' "$TMP/owners.tsv")
+  [ "$task_records" -gt 0 ] && return 0
+  refuse "no fleet records were found, so nothing can be called unowned" \
+    "looked for state/*.meta in: $STATE" \
+    "and the secondmate registry in: $DATA/secondmates.md" \
+    "Reporting ownership from an empty record set would mark every live lane" \
+    "as claimed by nothing, and invite killing work that is running." \
+    "Point the report at the operating home, for example:" \
+    "  FM_HOME=/path/to/firstmate $(basename "${BASH_SOURCE[0]}")"
+}
+
+# Records exist, but almost every agent still came back unowned. Fleet agents run
+# inside recorded worktrees, so that shape means the records being read are not
+# the ones describing these processes - most often the report is pointed at a
+# secondmate's home while the main fleet runs elsewhere. The reading is correct
+# FOR THAT HOME, so this warns loudly rather than refusing.
+check_agent_attribution() {
+  local agents unowned pct
+  agents=$(awk -F'\t' '$9 == "agent" { n++ } END { print n + 0 }' "$TMP/rows.tsv")
+  [ "$agents" -ge 3 ] || return 0
+  unowned=$(awk -F'\t' '$9 == "agent" && ($6 == "unowned" || $6 == "unclassified") { n++ } END { print n + 0 }' "$TMP/rows.tsv")
+  pct=$(( unowned * 100 / agents ))
+  [ "$pct" -gt "$UNOWNED_AGENT_WARN_PCT" ] || return 0
+  ATTRIBUTION_WARNING="$unowned of $agents agent processes ($pct%) matched no record"
+}
+
+# Printed on STDOUT, deliberately. The warning qualifies the table's meaning, so
+# it must travel with the table: on stderr it would be stripped by any caller
+# that pipes the report, leaving exactly the confident wrong output this warning
+# exists to prevent.
+render_attribution_warning() {
+  [ -n "${ATTRIBUTION_WARNING:-}" ] || return 0
+  printf '\n!! ATTRIBUTION LOOKS WRONG - do not act on the reclaim list below.\n'
+  printf '   %s.\n' "$ATTRIBUTION_WARNING"
+  printf '   Fleet agents run inside recorded worktrees, so this usually means the\n'
+  printf '   report is reading a different home than the one running this work.\n'
+  printf '   Records were read from: %s\n' "$STATE"
+  printf '   Re-run against the operating home before trusting any ownership here.\n'
+}
+
 # --- classification ---------------------------------------------------------
 
 classify_rows() {
@@ -742,6 +831,13 @@ render_json() {
   printf '  "footprint_sum_kb": %s,\n' "$SELF_FOOTPRINT_SUM"
   printf '  "process_count": %s,\n' "$SELF_PS_COUNT"
   printf '  "measured": "phys_footprint",\n'
+  printf '  "records_home": "%s",\n' "$STATE"
+  printf '  "fleet_records": %s,\n' \
+    "$(awk -F'\t' '$2 == "task" || $2 == "secondmate" { n++ } END { print n + 0 }' "$TMP/owners.tsv")"
+  # A consumer must be able to see the same doubt a human sees, so the warning is
+  # a field rather than a stderr line an automated caller would never read.
+  printf '  "attribution_warning": %s,\n' \
+    "$([ -n "${ATTRIBUTION_WARNING:-}" ] && printf '"%s"' "$ATTRIBUTION_WARNING" || printf 'null')"
   printf '  "processes": [\n'
   awk -F'\t' '
     function esc(s) { gsub(/\\/, "\\\\", s); gsub(/"/, "\\\"", s); gsub(/\t/, " ", s); return s }
@@ -814,8 +910,10 @@ parse_ps
 collect_cwd
 run_self_check
 build_owners
+check_records_were_read
 build_git_cwds
 classify_rows
+check_agent_attribution
 
 if [ "$mode" = json ]; then
   render_json
@@ -824,7 +922,11 @@ fi
 
 host_line
 printf 'Reading: %s processes, phys_footprint - the same quantity Activity Monitor shows.\n' "$SELF_PS_COUNT"
-printf 'Ownership read from durable records against each process working directory.\n'
+printf 'Ownership read from %s fleet records in %s against each working directory.\n' \
+  "$(awk -F'\t' '$2 == "task" || $2 == "secondmate" { n++ } END { print n + 0 }' "$TMP/owners.tsv")" "$STATE"
+[ -n "${FM_HOME_REDIRECTED:-}" ] \
+  && printf 'Invoked from a worktree with no records of its own; read the operating home above.\n'
+render_attribution_warning
 render_groups
 render_reclaim
 if [ "$show_tree" -eq 1 ]; then

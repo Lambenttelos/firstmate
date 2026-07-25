@@ -156,6 +156,52 @@ Nothing can enumerate every process while missing the one doing the asking.
 A refusal exits 3 and prints no ranking.
 That is the correct output when the instrument is broken.
 
+## The attribution defect, 2026-07-24
+
+The first version of this script shipped with 25 green tests and ownership broken against every real lane on the machine.
+It is recorded here because the shape of the failure matters more than the fix.
+
+Run from a disposable firstmate worktree without `FM_HOME`, the report classified every live crewmate and secondmate as `checkout no record claims` and rolled 4.23 GB across 76 processes into RECLAIMABLE.
+Reproduced exactly:
+
+```
+  unowned      checkout no record claims             4.23 GB   73 proc (agent itself 2.14 GB)
+```
+
+The measurement was perfect.
+The reading passed every self-check.
+The failure was that `FM_HOME` fell back to the script's own code root, a worktree has no `state/` of its own, and so **zero records were read** - after which the report asserted "no record claims it" about work that several records plainly claimed.
+
+The matching logic was not at fault, and this is worth stating precisely because it was the intuitive suspect.
+`worktree=` and `home=` were both already registered, and matching already resolved a process running in a subdirectory of a recorded path, not only an exact path equality.
+Once the records were actually read, all six named processes attributed correctly on the first try, including the three secondmates matched through `home=`.
+
+The real fault was narrower and worse than a matching bug: **the script made a claim it had no evidence for**.
+`unowned` means "the records were read and none matched".
+With an empty record set the script was entitled to say nothing at all, and instead said the most dangerous available thing.
+
+Three changes followed.
+
+Home resolution: when `FM_HOME` is not set and the code root holds no records, the operating home is resolved through the git common dir, which for a worktree is the primary checkout's `.git`.
+That is a durable fact rather than a guess about path shapes, and it is a no-op when the script already runs from the primary checkout.
+
+A refusal on an empty record set: if no task or secondmate record was read, the script exits 3 and prints no table.
+Nothing can be called unowned by a reader that has read nothing.
+
+A loud warning when records were read but almost no agent matched one.
+Fleet agents run inside recorded worktrees, so a high unowned share among agent-kind processes is the signature of reading the wrong home.
+This warns rather than refuses, because the reading is genuinely correct for the home it was pointed at.
+
+### Why the tests did not catch it
+
+Every test wrote its own records into a temp home and then asserted against them, so the suite proved the matching logic and never once exercised record *discovery*.
+A fixture the test authored cannot be missing in the way a real home can.
+
+The suite now also drives the real `state/*.meta` records on the host: one synthetic agent per real record placed in the directory that record actually names, plus one a subdirectory deeper, each of which must attribute back to a record claiming that path.
+That test also surfaced a real property worth knowing - two live records may name the same worktree - so it asserts the owner is one of the records claiming the path rather than a single expected id.
+
+A separate test runs the script the way it was actually run when it failed: from a worktree, with no `FM_HOME`, asserting it does not read zero records.
+
 ## Buckets, and what "unowned" is allowed to mean
 
 `unowned` means the durable records were read and none of them claimed the process.

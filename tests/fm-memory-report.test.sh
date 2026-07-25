@@ -90,6 +90,7 @@ build_listings() {
     printf '1005   700M  stale\n'
     printf '1006   50M   self\n'
     printf '1007   40M   mystery\n'
+    printf '1008   60M   foreign\n'
     for n in $(seq 1 210); do printf '2%03d   30M   filler\n' "$n"; done
   } > "$TOP"
 
@@ -103,6 +104,10 @@ build_listings() {
     # No lsof entry below and nothing recognisable in its path: its facts cannot
     # be read, so it must land in `unclassified` and never in a finding bucket.
     printf '1007 900 30000 cyuan /opt/vendor/mystery-daemon --serve\n'
+    # A third agent, deliberately NOT in any recorded directory: a foreign agent
+    # (another tool's, or the captain's own). One unowned agent out of three is
+    # normal and must stay quiet; three out of three is the wrong-home signature.
+    printf '1008 900 40000 cyuan /usr/local/bin/opencode serve --port 1234\n'
     for n in $(seq 1 210); do printf '2%03d 1 8000 root /usr/libexec/filler%s\n' "$n" "$n"; done
   } > "$PS"
 
@@ -111,6 +116,7 @@ build_listings() {
     printf '1002\t%s\n' "$WT_TASK"
     printf '1003\t%s\n' "$WT_SECOND"
     printf '1005\t%s\n' "$WT_STALE"
+    printf '1008\t/tmp\n'
     printf '1006\t%s\n' "$HOME_DIR"
   } > "$LSOF"
 }
@@ -352,6 +358,234 @@ test_reclaim_classes_do_not_overlap() {
   pass "the reclaim grouping is disjoint and states its read-only contract"
 }
 
+# --- attribution self-checks -------------------------------------------------
+#
+# These pin the defect that shipped: 25 synthetic-fixture tests were green while
+# ownership was broken against every real lane on the machine. The reading was
+# fine; the RECORD SET was empty, and "unowned" was asserted about live work on
+# the strength of records that had never been read.
+
+test_refuses_when_no_records_were_read() {
+  local out rc empty
+  empty="$TMPROOT/emptyhome"
+  mkdir -p "$empty/state" "$empty/data"
+  out=$(FM_HOME="$empty" FM_MEMREPORT_TOP="$TOP" FM_MEMREPORT_PS="$PS" \
+        FM_MEMREPORT_LSOF="$LSOF" FM_MEMREPORT_SELF_PID=1006 "$REPORT" 2>&1); rc=$?
+  expect_code 3 "$rc" "an empty record set must refuse, not label live work unowned"
+  assert_contains "$out" "no fleet records were found" "the refusal must name the empty record set"
+  assert_not_contains "$out" "TOP PROCESSES" "a refusal must print NO ranking"
+  # The decisive property: it must never have called anything unowned.
+  assert_not_contains "$out" "no record claims it" \
+    "with no records read, nothing may be described as unowned"
+  pass "refuses rather than calling live work unowned from an empty record set"
+}
+
+test_warns_when_agents_match_no_record() {
+  local out rc wrong f
+  # Records exist, but they describe worktrees nothing is running in - the shape
+  # produced by reading the wrong home. The reading is valid for that home, so
+  # this warns loudly instead of refusing.
+  wrong="$TMPROOT/wronghome"
+  mkdir -p "$wrong/state" "$wrong/data"
+  for f in "$HOME_DIR"/state/*.meta; do
+    sed -e 's#^worktree=.*#worktree=/nonexistent/elsewhere#' \
+        -e 's#^home=.*#home=/nonexistent/elsewhere-home#' "$f" \
+        > "$wrong/state/$(basename "$f")"
+  done
+  out=$(FM_HOME="$wrong" FM_MEMREPORT_TOP="$TOP" FM_MEMREPORT_PS="$PS" \
+        FM_MEMREPORT_LSOF="$LSOF" FM_MEMREPORT_SELF_PID=1006 "$REPORT" 2>&1); rc=$?
+  expect_code 0 "$rc" "a valid reading of the wrong home must still report"
+  assert_contains "$out" "ATTRIBUTION LOOKS WRONG" "the mismatch must be called out loudly"
+  assert_contains "$out" "do not act on the reclaim list" \
+    "the warning must tell the reader not to act on it"
+  pass "warns loudly when agents match no record, the signature of the wrong home"
+}
+
+test_attribution_warning_survives_a_pipe() {
+  local out wrong f
+  # The warning qualifies the table, so it must be on the SAME stream. On stderr
+  # a caller that pipes the report would get the table with the doubt stripped
+  # off - the confident wrong output all over again.
+  wrong="$TMPROOT/wronghome2"
+  mkdir -p "$wrong/state" "$wrong/data"
+  for f in "$HOME_DIR"/state/*.meta; do
+    sed -e 's#^worktree=.*#worktree=/nonexistent/elsewhere#' \
+        -e 's#^home=.*#home=/nonexistent/elsewhere-home#' "$f" \
+        > "$wrong/state/$(basename "$f")"
+  done
+  out=$(FM_HOME="$wrong" FM_MEMREPORT_TOP="$TOP" FM_MEMREPORT_PS="$PS" \
+        FM_MEMREPORT_LSOF="$LSOF" FM_MEMREPORT_SELF_PID=1006 "$REPORT" 2>/dev/null)
+  assert_contains "$out" "ATTRIBUTION LOOKS WRONG" \
+    "the warning must be on stdout so it survives a pipe"
+  # And a machine consumer must see the same doubt.
+  out=$(FM_HOME="$wrong" FM_MEMREPORT_TOP="$TOP" FM_MEMREPORT_PS="$PS" \
+        FM_MEMREPORT_LSOF="$LSOF" FM_MEMREPORT_SELF_PID=1006 "$REPORT" --json 2>/dev/null)
+  assert_contains "$out" '"attribution_warning": "' \
+    "--json must carry the attribution warning as a field"
+  pass "the attribution warning survives a pipe and reaches machine consumers"
+}
+
+test_healthy_attribution_is_quiet() {
+  local out
+  out=$(run_report)
+  assert_not_contains "$out" "ATTRIBUTION LOOKS WRONG" \
+    "a correctly attributed fleet must not warn"
+  pass "correct attribution produces no warning"
+}
+
+# --- attribution against REAL state/*.meta content ---------------------------
+#
+# The synthetic fixtures above proved the matching logic against records this
+# test file wrote itself, which is exactly why they stayed green through the
+# defect. This drives the SAME logic against the real records on this machine:
+# real key names, real path shapes, real secondmate `home=` entries.
+
+real_home() {
+  local common primary
+  common=$(git -C "$ROOT" rev-parse --git-common-dir 2>/dev/null) || return 1
+  case "$common" in /*) : ;; *) common="$ROOT/$common" ;; esac
+  primary=$(cd "$(dirname "$common")" 2>/dev/null && pwd -P) || return 1
+  compgen -G "$primary/state/*.meta" >/dev/null 2>&1 || return 1
+  printf '%s\n' "$primary"
+}
+
+test_attributes_against_real_meta_records() {
+  local home f id path pid n=0 top ps lsof out
+  if ! home=$(real_home); then
+    pass "no real fleet records on this host; real-record attribution skipped"
+    return 0
+  fi
+  top="$TMPROOT/real.top"; ps="$TMPROOT/real.ps"; lsof="$TMPROOT/real.lsof"
+  head -12 "$TOP" > "$top"
+  : > "$ps"; : > "$lsof"
+  pid=3000
+  # One synthetic agent per real record, placed in the directory that record
+  # actually names. Every one must come back owned by that record's id.
+  for f in "$home"/state/*.meta; do
+    id=$(basename "$f" .meta)
+    path=$(awk -F= '/^worktree=/ { print $2; exit }' "$f")
+    [ -n "$path" ] || path=$(awk -F= '/^home=/ { print $2; exit }' "$f")
+    [ -n "$path" ] || continue
+    pid=$((pid + 1)); n=$((n + 1))
+    printf '%s   40M   real\n' "$pid" >> "$top"
+    printf '%s 900 30000 cyuan claude --dangerously-skip-permissions --model opus\n' "$pid" >> "$ps"
+    printf '%s\t%s\n' "$pid" "$path" >> "$lsof"
+    # A process one level DEEPER than the recorded path must attribute too: a
+    # crewmate rarely sits at the worktree root.
+    pid=$((pid + 1))
+    printf '%s   40M   deep\n' "$pid" >> "$top"
+    printf '%s 900 30000 cyuan node /opt/ts/bin/tsserver --stdio\n' "$pid" >> "$ps"
+    printf '%s\t%s/src/nested\n' "$pid" "$path" >> "$lsof"
+  done
+  [ "$n" -gt 0 ] || { pass "real records carried no worktree/home path; skipped"; return 0; }
+  # Pad to clear the plausibility floors, then reuse the fixture's tail.
+  awk 'f && $1 ~ /^2[0-9]+$/ { print } /^PID/ { f = 1 }' "$TOP" >> "$top"
+  awk '$1 ~ /^2[0-9][0-9][0-9]$/ { print }' "$PS" >> "$ps"
+  printf '1006   50M   self\n' >> "$top"
+  printf '1006 900 20000 cyuan /bin/bash %s\n' "$REPORT" >> "$ps"
+
+  out=$(FM_HOME="$home" FM_MEMREPORT_TOP="$top" FM_MEMREPORT_PS="$ps" \
+        FM_MEMREPORT_LSOF="$lsof" FM_MEMREPORT_SELF_PID=1006 "$REPORT" --all 2>&1)
+  [ "${out#*REFUSING}" = "$out" ] || fail "real-record run refused: $out"
+  assert_not_contains "$out" "ATTRIBUTION LOOKS WRONG" \
+    "agents sitting in real recorded worktrees must attribute cleanly"
+
+  # Compare exactly, from --json: the text OWNER column is width-truncated, and
+  # comparing against a truncated label would pass on a wrong owner. Note two
+  # real records may name the SAME worktree, so the assertion is that the
+  # resolved owner is one of the records claiming that exact path - the check is
+  # "attributed to a claiming record", never "attributed to nothing".
+  command -v python3 >/dev/null 2>&1 || {
+    pass "python3 unavailable for exact owner comparison; real-record depth check skipped"
+    return 0
+  }
+  local json bad
+  json=$(FM_HOME="$home" FM_MEMREPORT_TOP="$top" FM_MEMREPORT_PS="$ps" \
+         FM_MEMREPORT_LSOF="$lsof" FM_MEMREPORT_SELF_PID=1006 "$REPORT" --json 2>/dev/null)
+  bad=$(printf '%s' "$json" | REAL_HOME="$home" REAL_LSOF="$lsof" python3 -c '
+import json, sys, os
+d = json.load(sys.stdin)
+home = os.environ["REAL_HOME"]
+# path -> every record id that claims it
+claims = {}
+for name in os.listdir(os.path.join(home, "state")):
+    if not name.endswith(".meta"):
+        continue
+    rid = name[:-5]
+    for line in open(os.path.join(home, "state", name)):
+        k, _, v = line.strip().partition("=")
+        if k in ("worktree", "home") and v:
+            claims.setdefault(v, set()).add(rid)
+cwds = {}
+for line in open(os.environ["REAL_LSOF"]):
+    pid, _, path = line.strip().partition("\t")
+    cwds[int(pid)] = path
+bad = 0
+for p in d["processes"]:
+    path = cwds.get(p["pid"])
+    if path is None:
+        continue
+    base = path[:-len("/src/nested")] if path.endswith("/src/nested") else path
+    want = claims.get(base)
+    if not want:
+        continue
+    if p["owner"] not in want or p["owner_kind"] not in ("task", "secondmate"):
+        bad += 1
+        print("pid %s in %s -> %s/%s, expected one of %s"
+              % (p["pid"], path, p["owner_kind"], p["owner"], sorted(want)), file=sys.stderr)
+print(bad)
+' 2>&1 | tail -1)
+  [ "$bad" = 0 ] || fail "$bad process(es) in real recorded directories were not attributed to a claiming record"
+  pass "every real state/*.meta record attributes its worktree and one subdirectory deeper ($n records)"
+}
+
+test_real_secondmate_home_attributes() {
+  local home f id path found=0 top ps lsof out
+  if ! home=$(real_home); then
+    pass "no real fleet records on this host; real secondmate check skipped"
+    return 0
+  fi
+  # A secondmate's home is a firstmate worktree recorded as `home=`, so it will
+  # never match a project-worktree shape. It must still attribute.
+  for f in "$home"/state/*.meta; do
+    awk -F= '/^kind=/ { print $2; exit }' "$f" | grep -Fqx secondmate || continue
+    path=$(awk -F= '/^home=/ { print $2; exit }' "$f")
+    [ -n "$path" ] || continue
+    id=$(basename "$f" .meta); found=1; break
+  done
+  [ "$found" -eq 1 ] || { pass "no real secondmate records on this host; skipped"; return 0; }
+  top="$TMPROOT/sm.top"; ps="$TMPROOT/sm.ps"; lsof="$TMPROOT/sm.lsof"
+  sed 's/^1003   280M  second$/1003   280M  second/' "$TOP" > "$top"
+  cp "$PS" "$ps"
+  printf '1003\t%s\n' "$path" > "$lsof"
+  printf '1006\t%s\n' "$home" >> "$lsof"
+  out=$(FM_HOME="$home" FM_MEMREPORT_TOP="$top" FM_MEMREPORT_PS="$ps" \
+        FM_MEMREPORT_LSOF="$lsof" FM_MEMREPORT_SELF_PID=1006 "$REPORT" --all 2>&1)
+  printf '%s\n' "$out" | awk '$1 == 1003' | grep -Fq "$id" \
+    || fail "a real secondmate home= record must attribute (expected $id)"
+  pass "a real secondmate home= record attributes its agent"
+}
+
+test_worktree_invocation_finds_the_operating_home() {
+  local out
+  # THE regression: invoked from a firstmate worktree with no state/ of its own,
+  # the report must resolve the operating home instead of reporting an empty
+  # record set as though the fleet were unowned.
+  if ! real_home >/dev/null; then
+    pass "no real fleet records on this host; worktree-invocation check skipped"
+    return 0
+  fi
+  out=$(cd "$ROOT" && ./bin/fm-memory-report.sh --limit 1 2>&1)
+  [ "${out#*REFUSING}" = "$out" ] \
+    || fail "invocation from a worktree must resolve the operating home, not refuse"
+  assert_contains "$out" "fleet records" "the report must state how many records it read"
+  case "$out" in
+    *"Ownership read from 0 fleet records"*)
+      fail "invocation from a worktree read zero records - the original defect" ;;
+  esac
+  pass "invoked from a worktree, the report resolves the operating home"
+}
+
 # --- interface ---------------------------------------------------------------
 
 test_json_is_machine_readable() {
@@ -453,6 +687,13 @@ test_ancestry_never_overrides_records
 test_unowned_vs_unclassified_are_distinct
 test_unreadable_facts_never_become_findings
 test_reclaim_classes_do_not_overlap
+test_refuses_when_no_records_were_read
+test_warns_when_agents_match_no_record
+test_attribution_warning_survives_a_pipe
+test_healthy_attribution_is_quiet
+test_attributes_against_real_meta_records
+test_real_secondmate_home_attributes
+test_worktree_invocation_finds_the_operating_home
 test_json_is_machine_readable
 test_json_refusal_is_not_a_document
 test_limit_and_all
