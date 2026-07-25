@@ -118,7 +118,12 @@ test_swap_thresholds() {
 test_memory_headroom_threshold_and_ceiling() {
   run_check FM_RESOURCE_AVAIL_MB=1024
   expect_code 0 "$RC" "1024 MB available is still healthy"
-  assert_contains "$OUT" "recommended ceiling 1" "1024 MB supports exactly one crew"
+  assert_contains "$OUT" "recommended ceiling 1" "1024 MB supports exactly one agent at 640 MB each"
+
+  run_check FM_RESOURCE_AVAIL_MB=1280
+  expect_code 0 "$RC" "two-agent headroom is healthy"
+  assert_contains "$OUT" "recommended ceiling 2" \
+    "the memory bound is one active agent per measured 640 MB, not per 1024 MB"
 
   run_check FM_RESOURCE_AVAIL_MB=1023
   expect_code 2 "$RC" "sub-gigabyte headroom exit"
@@ -134,9 +139,9 @@ test_worst_of_three_decides_the_status() {
 }
 
 test_shed_advice_names_the_overage_only_when_over_ceiling() {
-  run_check FM_RESOURCE_LOAD1=40 FM_RESOURCE_AVAIL_MB=3000 FM_RESOURCE_LIVE=8
+  run_check FM_RESOURCE_LOAD1=40 FM_RESOURCE_AVAIL_MB=1500 FM_RESOURCE_LIVE=8
   expect_code 2 "$RC" "over-ceiling critical exit"
-  assert_contains "$OUT" "recommended ceiling 2" "ceiling should be the memory bound (3000 MB)"
+  assert_contains "$OUT" "recommended ceiling 2" "ceiling should be the memory bound (1500 MB)"
   assert_contains "$OUT" "SHED 6 crew(s)" "shed advice must name the overage"
   assert_contains "$OUT" "test and browser runs" "shed advice must name the expensive work first"
 
@@ -206,7 +211,7 @@ test_live_crew_count_comes_from_recorded_work() {
   fm_write_meta "$home/state/beta.meta" "window=firstmate:fm-beta" "harness=echo"
   run_in_home "$home" "$fakebin" --sweep
   expect_code 0 "$RC" "live-count exit"
-  assert_contains "$OUT" "live agents 2 (2 crew(s))" \
+  assert_contains "$OUT" "live agents 2 = 2 active (2 crew(s))" \
     "a crew whose liveness cannot be read must still count"
   pass "recorded work counts as live unless the backend confidently says otherwise"
 }
@@ -220,11 +225,11 @@ test_live_crew_count_excludes_agents_that_are_not_running() {
   fm_write_meta "$home/state/gamma.meta" "window=firstmate:fm-gamma" "harness=claude"
   run_in_home "$home" "$fakebin" --sweep
   expect_code 0 "$RC" "divergent live-count exit"
-  assert_contains "$OUT" "live agents 1 (1 crew(s))" \
+  assert_contains "$OUT" "live agents 1 = 1 active (1 crew(s))" \
     "recorded work whose agent has exited must not count as a live crew"
   assert_not_contains "$OUT" "liveness unverified" \
     "a probed sweep reports a verified count"
-  [ "$(cat "$home/state/.resource-live")" = "1 0 0" ] \
+  [ "$(cat "$home/state/.resource-live")" = "1 0 0 0" ] \
     || fail "the sweep must cache its verified count for the synchronous callers"
   pass "the live-crew count follows running agents, not recorded task files"
 }
@@ -236,10 +241,10 @@ test_synchronous_reading_uses_the_cached_verdict() {
   fm_write_meta "$home/state/alpha.meta" "window=firstmate:fm-alpha" "harness=claude"
   fm_write_meta "$home/state/beta.meta" "window=firstmate:fm-beta" "harness=claude"
   fm_write_meta "$home/state/gamma.meta" "window=firstmate:fm-gamma" "harness=claude"
-  printf '1 0 0\n' > "$home/state/.resource-live"
+  printf '1 0 0 0\n' > "$home/state/.resource-live"
   run_in_home "$home" "$fakebin"
   expect_code 0 "$RC" "cached live-count exit"
-  assert_contains "$OUT" "live agents 1 (1 crew(s))" \
+  assert_contains "$OUT" "live agents 1 = 1 active (1 crew(s))" \
     "the synchronous path must use the sweep's cached verdict, not the meta count"
   assert_not_contains "$OUT" "liveness unverified" "a fresh cached verdict is verified"
   pass "a synchronous reading reports the sweep's cached running-crew count"
@@ -258,7 +263,7 @@ test_synchronous_reading_never_probes_a_wedged_backend() {
   elapsed=$((SECONDS - started))
   expect_code 0 "$RC" "wedged-backend synchronous exit"
   [ "$elapsed" -lt 10 ] || fail "a synchronous reading waited ${elapsed}s on a wedged backend"
-  assert_contains "$OUT" "live agents 2 (2 crew(s)) (recorded work, liveness unverified)" \
+  assert_contains "$OUT" "live agents 2 = 2 active (2 crew(s)) (recorded work, liveness unverified)" \
     "with no cached verdict the count must fall back to recorded work and say so"
   pass "a dispatch-path reading never probes, so a wedged backend cannot delay it"
 }
@@ -269,11 +274,11 @@ test_stale_cached_verdict_degrades_honestly() {
   fakebin=$(fake_tmux "$TMP_ROOT/live-count-stale-bin" fm-alpha)
   fm_write_meta "$home/state/alpha.meta" "window=firstmate:fm-alpha" "harness=claude"
   fm_write_meta "$home/state/beta.meta" "window=firstmate:fm-beta" "harness=claude"
-  printf '1 0 0\n' > "$home/state/.resource-live"
+  printf '1 0 0 0\n' > "$home/state/.resource-live"
   touch -t 202001010000 "$home/state/.resource-live"
   run_in_home "$home" "$fakebin"
   expect_code 0 "$RC" "stale cached live-count exit"
-  assert_contains "$OUT" "live agents 2 (2 crew(s)) (recorded work, liveness unverified)" \
+  assert_contains "$OUT" "live agents 2 = 2 active (2 crew(s)) (recorded work, liveness unverified)" \
     "a verdict older than two sweeps must not pass as a verified count"
   pass "a cached verdict older than two sweep intervals degrades and says so"
 }
@@ -289,14 +294,14 @@ test_cached_partial_verdict_stays_labelled_partial() {
   done
   run_in_home "$home" "$fakebin" --sweep FM_RESOURCE_PROBE_TIMEOUT=1 FM_RESOURCE_SWEEP_BUDGET=1
   expect_code 0 "$RC" "partial sweep exit"
-  assert_contains "$OUT" "live agents 3 (3 crew(s)) (liveness partly unverified, probe budget spent)" \
+  assert_contains "$OUT" "live agents 3 = 3 active (3 crew(s)) (liveness partly unverified, probe budget spent)" \
     "the sweep itself must label a budget-truncated count"
   started=$SECONDS
   run_in_home "$home" "$fakebin"
   elapsed=$((SECONDS - started))
   expect_code 0 "$RC" "cached partial exit"
   [ "$elapsed" -lt 10 ] || fail "the cached path waited ${elapsed}s on a wedged backend"
-  assert_contains "$OUT" "live agents 3 (3 crew(s)) (liveness partly unverified, probe budget spent)" \
+  assert_contains "$OUT" "live agents 3 = 3 active (3 crew(s)) (liveness partly unverified, probe budget spent)" \
     "a cached partly probed count must not be replayed as a verified one"
   pkill -f 'sleep 4715' >/dev/null 2>&1 || true
   pass "a partly probed count keeps its label on every later cached reading"
@@ -312,7 +317,7 @@ test_persistent_secondmates_are_counted_but_never_shed() {
     "kind=secondmate"
   run_in_home "$home" "$fakebin" --sweep FM_RESOURCE_LOAD1=40 FM_RESOURCE_AVAIL_MB=3000
   expect_code 2 "$RC" "critical exit with a secondmate present"
-  assert_contains "$OUT" "live agents 3 (2 crew(s) + 1 persistent secondmate(s))" \
+  assert_contains "$OUT" "live agents 3 = 3 active (2 crew(s) + 1 persistent secondmate(s))" \
     "the reading must report crews and persistent secondmates separately"
   assert_contains "$OUT" "SHED 2 crew(s)" \
     "the overage must be measured on all running agents against the same ceiling"
@@ -332,9 +337,9 @@ test_the_ceiling_and_the_overage_share_one_basis() {
   # a CPU-derived ceiling of 4, an overage of 4, capped at the 4 ordinary crews.
   run_in_home "$home" "$fakebin" --sweep FM_RESOURCE_LOAD1=40
   expect_code 2 "$RC" "critical exit with crews and secondmates together"
-  assert_contains "$OUT" "live agents 8 (4 crew(s) + 4 persistent secondmate(s))" \
+  assert_contains "$OUT" "live agents 8 = 8 active (4 crew(s) + 4 persistent secondmate(s))" \
     "both kinds of running agent must stay visible"
-  assert_contains "$OUT" "recommended ceiling 4 agents" \
+  assert_contains "$OUT" "recommended ceiling 4 active agents" \
     "the ceiling must be derived from all running agents"
   assert_contains "$OUT" "SHED 4 crew(s)" \
     "secondmates must not suppress shed advice for ordinary crews"
@@ -342,7 +347,7 @@ test_the_ceiling_and_the_overage_share_one_basis() {
   # The same host with no secondmates: 4 running agents, ceiling 2, overage 2.
   run_check FM_RESOURCE_LOAD1=40 FM_RESOURCE_LIVE=4
   expect_code 2 "$RC" "critical exit with four crews and no secondmates"
-  assert_contains "$OUT" "recommended ceiling 2 agents" "4.0x per core halves four crews to two"
+  assert_contains "$OUT" "recommended ceiling 2 active agents" "4.0x per core halves four crews to two"
   assert_contains "$OUT" "SHED 2 crew(s)" "the crew-only host must advise shedding two"
   pass "the ceiling and the overage are computed on the same all-agents basis"
 }
@@ -357,7 +362,7 @@ test_a_home_of_only_secondmates_never_advises_shedding() {
     "kind=secondmate"
   run_in_home "$home" "$fakebin" --sweep FM_RESOURCE_LOAD1=40 FM_RESOURCE_AVAIL_MB=3000
   expect_code 2 "$RC" "critical exit with only secondmates recorded"
-  assert_contains "$OUT" "live agents 2 (0 crew(s) + 2 persistent secondmate(s))" \
+  assert_contains "$OUT" "live agents 2 = 2 active (0 crew(s) + 2 persistent secondmate(s))" \
     "persistent secondmates must still be visible in the reading"
   assert_not_contains "$OUT" "SHED" \
     "a home whose only running agents are secondmates has nothing to shed"
@@ -369,6 +374,101 @@ test_a_home_of_only_secondmates_never_advises_shedding() {
   pass "persistent secondmates alone never produce shed advice, however loaded the host"
 }
 
+# The captain's 2026-07-24 ruling: an idle persistent secondmate is reported but
+# charged nothing. Idle means its OWN home holds no routed work, so these tests
+# give each secondmate meta a real home directory and vary only what is recorded
+# inside it.
+test_an_idle_secondmate_is_reported_but_never_charged() {
+  local home fakebin sm1 sm2
+  home=$(make_home live-count-idle-secondmate)
+  sm1=$(make_home live-count-idle-secondmate-sm1)
+  sm2=$(make_home live-count-idle-secondmate-sm2)
+  fakebin=$(fake_tmux "$TMP_ROOT/live-count-idle-secondmate-bin")
+  fm_write_meta "$home/state/alpha.meta" "window=firstmate:fm-alpha" "harness=claude"
+  fm_write_meta "$home/state/beta.meta" "window=firstmate:fm-beta" "harness=claude"
+  fm_write_secondmate_meta "$home/state/sm1.meta" "$sm1" "firstmate:fm-sm1"
+  fm_write_secondmate_meta "$home/state/sm2.meta" "$sm2" "firstmate:fm-sm2"
+  # 2 crews charged, 2 idle secondmates not. At 4.0 per core the CPU bound halves
+  # the ACTIVE 2 to a ceiling of 1, so the overage is 1. Charging all four would
+  # have given a ceiling of 2 and an overage of 2.
+  run_in_home "$home" "$fakebin" --sweep FM_RESOURCE_LOAD1=40
+  expect_code 2 "$RC" "critical exit with idle secondmates present"
+  assert_contains "$OUT" "live agents 4 = 2 active (2 crew(s)) + 2 idle secondmate(s)" \
+    "an idle secondmate must stay visible in the total even though it is not charged"
+  assert_contains "$OUT" "recommended ceiling 1 active agents" \
+    "an idle secondmate must not enter the processor component of the ceiling"
+  assert_contains "$OUT" "SHED 1 crew(s)" \
+    "an idle secondmate must not inflate the overage"
+  [ "$(cat "$home/state/.resource-live")" = "2 0 2 0" ] \
+    || fail "the sweep must cache the idle secondmates separately from the charged ones"
+  pass "an idle persistent secondmate is reported in the total but charged nothing"
+}
+
+test_a_working_secondmate_is_charged_like_a_crew() {
+  local home fakebin sm
+  home=$(make_home live-count-busy-secondmate)
+  sm=$(make_home live-count-busy-secondmate-sm)
+  fakebin=$(fake_tmux "$TMP_ROOT/live-count-busy-secondmate-bin")
+  fm_write_meta "$home/state/alpha.meta" "window=firstmate:fm-alpha" "harness=claude"
+  fm_write_secondmate_meta "$home/state/sm.meta" "$sm" "firstmate:fm-sm"
+  # One routed task recorded in the secondmate's OWN home is what makes it busy.
+  fm_write_meta "$sm/state/routed.meta" "window=domain:fm-routed" "harness=claude"
+  run_in_home "$home" "$fakebin" --sweep FM_RESOURCE_LOAD1=40
+  expect_code 2 "$RC" "critical exit with a working secondmate"
+  assert_contains "$OUT" "live agents 2 = 2 active (1 crew(s) + 1 persistent secondmate(s))" \
+    "a secondmate with routed work in flight must count as active"
+  assert_not_contains "$OUT" "idle secondmate" \
+    "a working secondmate must not be reported as idle"
+  assert_contains "$OUT" "SHED 1 crew(s)" \
+    "a working secondmate counts toward the overage the shed advice is measured from"
+  pass "a persistent secondmate with routed work in flight is charged like a crew"
+}
+
+test_a_secondmate_whose_agent_has_exited_is_not_counted_at_all() {
+  local home fakebin sm
+  home=$(make_home live-count-dead-secondmate)
+  sm=$(make_home live-count-dead-secondmate-sm)
+  fakebin=$(fake_tmux "$TMP_ROOT/live-count-dead-secondmate-bin" fm-alpha)
+  fm_write_meta "$home/state/alpha.meta" "window=firstmate:fm-alpha" "harness=claude"
+  fm_write_secondmate_meta "$home/state/sm.meta" "$sm" "firstmate:fm-sm"
+  fm_write_meta "$sm/state/routed.meta" "window=domain:fm-routed" "harness=claude"
+  # The secondmate would be charged as active on its recorded work alone, but its
+  # agent has exited, so it must not appear anywhere in the reading.
+  run_in_home "$home" "$fakebin" --sweep
+  expect_code 0 "$RC" "exited-secondmate sweep exit"
+  assert_contains "$OUT" "live agents 1 = 1 active (1 crew(s))" \
+    "a recorded secondmate whose agent has exited must not be counted"
+  assert_not_contains "$OUT" "secondmate(s)" \
+    "an exited secondmate must not be reported as either active or idle"
+  [ "$(cat "$home/state/.resource-live")" = "1 0 0 0" ] \
+    || fail "the cached verdict must also exclude the exited secondmate"
+
+  # And the synchronous path replays that cached verdict rather than re-probing.
+  run_in_home "$home" "$fakebin"
+  expect_code 0 "$RC" "exited-secondmate cached exit"
+  assert_contains "$OUT" "live agents 1 = 1 active (1 crew(s))" \
+    "the synchronous path must reuse the sweep's cached liveness, not the meta count"
+  assert_not_contains "$OUT" "liveness unverified" "a fresh cached verdict is verified"
+  pass "a recorded agent whose process is gone is charged nothing on either path"
+}
+
+test_a_pre_split_cached_record_degrades_rather_than_being_misread() {
+  local home fakebin sm
+  home=$(make_home live-count-old-cache)
+  sm=$(make_home live-count-old-cache-sm)
+  fakebin=$(fake_tmux "$TMP_ROOT/live-count-old-cache-bin")
+  fm_write_meta "$home/state/alpha.meta" "window=firstmate:fm-alpha" "harness=claude"
+  fm_write_secondmate_meta "$home/state/sm.meta" "$sm" "firstmate:fm-sm"
+  # The three-field record written before the idle split. Its third field is the
+  # partial marker, which must never be read as an idle-secondmate count.
+  printf '5 5 0\n' > "$home/state/.resource-live"
+  run_in_home "$home" "$fakebin"
+  expect_code 0 "$RC" "pre-split cache exit"
+  assert_contains "$OUT" "live agents 2 = 1 active (1 crew(s)) + 1 idle secondmate(s) (recorded work, liveness unverified)" \
+    "a cache written before the idle split must degrade to an honest recorded-work count"
+  pass "a pre-split cached record is discarded instead of being misread"
+}
+
 test_sweep_without_the_backend_library_labels_its_count() {
   local home fakebin
   home=$(make_home live-count-nolib)
@@ -377,7 +477,7 @@ test_sweep_without_the_backend_library_labels_its_count() {
   fm_write_meta "$home/state/alpha.meta" "window=firstmate:fm-alpha" "harness=claude"
   run_in_home "$home" "$fakebin" --sweep FM_ROOT_OVERRIDE="$TMP_ROOT/norootbin"
   expect_code 0 "$RC" "backend-less sweep exit"
-  assert_contains "$OUT" "live agents 1 (1 crew(s)) (recorded work, liveness unverified)" \
+  assert_contains "$OUT" "live agents 1 = 1 active (1 crew(s)) (recorded work, liveness unverified)" \
     "a sweep that cannot read liveness must not present recorded work as verified"
   pass "a sweep with no backend library labels its recorded-work count honestly"
 }
@@ -395,7 +495,7 @@ test_probe_timeout_leaves_no_stuck_backend_process() {
   elapsed=$((SECONDS - started))
   expect_code 0 "$RC" "wedged-probe sweep exit"
   [ "$elapsed" -lt 15 ] || fail "a wedged probe hung the sweep for ${elapsed}s"
-  assert_contains "$OUT" "live agents 1 (1 crew(s))" "an unanswered probe must still count its crew"
+  assert_contains "$OUT" "live agents 1 = 1 active (1 crew(s))" "an unanswered probe must still count its crew"
   sleep 1
   if pgrep -f 'sleep 4711' >/dev/null 2>&1; then
     pkill -f 'sleep 4711' >/dev/null 2>&1 || true
@@ -417,7 +517,7 @@ test_sweep_probing_is_bounded_as_a_whole() {
   run_in_home "$home" "$fakebin" --sweep FM_RESOURCE_PROBE_TIMEOUT=1 FM_RESOURCE_SWEEP_BUDGET=1
   elapsed_small=$((SECONDS - started))
   expect_code 0 "$RC" "budgeted sweep exit with two crews"
-  assert_contains "$OUT" "live agents 2 (2 crew(s)) (liveness partly unverified, probe budget spent)" \
+  assert_contains "$OUT" "live agents 2 = 2 active (2 crew(s)) (liveness partly unverified, probe budget spent)" \
     "a partly probed sweep must count unprobed crews and say the count is partly unverified"
 
   # Eight recorded crews, same budget: the sweep must not cost four times as much.
@@ -428,7 +528,7 @@ test_sweep_probing_is_bounded_as_a_whole() {
   run_in_home "$home" "$fakebin" --sweep FM_RESOURCE_PROBE_TIMEOUT=1 FM_RESOURCE_SWEEP_BUDGET=1
   elapsed_big=$((SECONDS - started))
   expect_code 0 "$RC" "budgeted sweep exit with eight crews"
-  assert_contains "$OUT" "live agents 8 (8 crew(s)) (liveness partly unverified, probe budget spent)" \
+  assert_contains "$OUT" "live agents 8 = 8 active (8 crew(s)) (liveness partly unverified, probe budget spent)" \
     "every crew left unprobed must still count toward the live total"
   [ "$elapsed_big" -lt $(( elapsed_small + 4 )) ] \
     || fail "sweep probing scaled with the crew count: ${elapsed_small}s then ${elapsed_big}s"
@@ -446,7 +546,7 @@ test_malformed_sweep_budget_never_disables_the_budget() {
   expect_code 0 "$RC" "malformed sweep-budget exit"
   assert_contains "$OUT" "resources: healthy" \
     "a malformed sweep budget must fall back, not degrade the whole reading"
-  assert_contains "$OUT" "live agents 1 (1 crew(s))" "the sweep must still probe with the fallback budget"
+  assert_contains "$OUT" "live agents 1 = 1 active (1 crew(s))" "the sweep must still probe with the fallback budget"
   assert_not_contains "$OUT" "partly unverified" \
     "a fallback budget must leave a fully probed sweep verified"
   pass "a malformed sweep budget falls back to the default instead of disabling it"
@@ -462,7 +562,7 @@ test_malformed_probe_timeout_never_takes_monitoring_dark() {
   expect_code 0 "$RC" "malformed probe-timeout exit"
   assert_contains "$OUT" "resources: healthy" \
     "a malformed probe timeout must fall back, not degrade the whole reading"
-  assert_contains "$OUT" "live agents 1 (1 crew(s))" "the sweep must still probe with the fallback timeout"
+  assert_contains "$OUT" "live agents 1 = 1 active (1 crew(s))" "the sweep must still probe with the fallback timeout"
   pass "a malformed probe timeout falls back instead of taking the monitor dark"
 }
 
@@ -473,10 +573,10 @@ test_injected_live_count_still_wins() {
   fm_write_meta "$home/state/alpha.meta" "window=firstmate:fm-alpha" "harness=claude"
   run_in_home "$home" "$fakebin" --sweep FM_RESOURCE_LIVE=6
   expect_code 0 "$RC" "injected live-count exit"
-  assert_contains "$OUT" "live agents 6 (6 crew(s))" "an injected crew count must be used verbatim"
+  assert_contains "$OUT" "live agents 6 = 6 active (6 crew(s))" "an injected crew count must be used verbatim"
   run_in_home "$home" "$fakebin" FM_RESOURCE_LIVE=6
   expect_code 0 "$RC" "injected live-count exit on the synchronous path"
-  assert_contains "$OUT" "live agents 6 (6 crew(s))" "injection must win on the cached path too"
+  assert_contains "$OUT" "live agents 6 = 6 active (6 crew(s))" "injection must win on the cached path too"
   pass "the FM_RESOURCE_LIVE injection seam still overrides both crew-count paths"
 }
 
@@ -753,6 +853,10 @@ test_stale_cached_verdict_degrades_honestly
 test_cached_partial_verdict_stays_labelled_partial
 test_persistent_secondmates_are_counted_but_never_shed
 test_a_home_of_only_secondmates_never_advises_shedding
+test_an_idle_secondmate_is_reported_but_never_charged
+test_a_working_secondmate_is_charged_like_a_crew
+test_a_secondmate_whose_agent_has_exited_is_not_counted_at_all
+test_a_pre_split_cached_record_degrades_rather_than_being_misread
 test_the_ceiling_and_the_overage_share_one_basis
 test_sweep_without_the_backend_library_labels_its_count
 test_probe_timeout_leaves_no_stuck_backend_process

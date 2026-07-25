@@ -239,9 +239,17 @@ The crew count in the reading is the number of crews whose agent is actually run
 Only the watcher's sweep pays for that liveness answer, and it caches the verdict, so the count every other caller shows is at most two sweep intervals old (`FM_RESOURCE_INTERVAL`, default 900 seconds, so 1800 seconds at the default).
 Two intervals rather than one is deliberate: the watcher exits on every wake and is re-armed, so a home between arms routinely has no sweep running while the other callers keep reading the cache.
 When no cached verdict is available, or it is older than that, the reading falls back to the count of recorded tasks and says so with "liveness unverified" instead of presenting it as a verified count.
-Persistent secondmates are running agents and real load, so they are counted and reported separately in the reading and they count toward the ceiling and the overage, but the number of crews the shed advice names is capped at the ordinary crews, because AGENTS.md makes an idle secondmate endpoint healthy and its retirement an explicit decision.
-The reading names the all-agents total and labels the ceiling in agents, so the number the ceiling is compared against is visible on the line and the shed advice reads as a consequence of it.
-A home whose only running agents are persistent secondmates therefore never gets shed advice.
+The ceiling's memory component allows one active agent per 640 MB of available memory.
+That figure is measured rather than assumed: the 2026-07-24 measurement recorded in `data/measure-ccstatusline-cost/report.md` puts a working agent at 394-491 MB resident and an idle one at roughly 290 MB decaying toward 180 MB over hours of genuine inactivity.
+It replaced an earlier 1024 MB per agent, which over-charged even a working agent and over-charged an idle one by around 3.5 times.
+640 MB sits about 30 percent above the top of the measured working range, the conservative choice the report's own caveat asks for, since it measured never-prompted sessions and so treats 290 MB as a floor that context size moves upward.
+
+A persistent secondmate whose own home has no routed work in flight is idle, and by the captain's ruling of 2026-07-24 an idle secondmate is charged nothing: it counts toward neither the ceiling's memory component, nor its processor component, nor the overage that produces shed advice.
+The measurement is what justifies that: idle agents changed the host's load average by -0.11 and its swap by -239 MB while five were added.
+A working secondmate is charged exactly like an ordinary crew.
+Idleness is decided from files alone, by looking for recorded tasks under the secondmate's own home, so the synchronous callers still never touch a backend, and a secondmate whose home cannot be read is charged as active rather than silently discounted.
+Nothing disappears from the reading by ceasing to be charged: the line names the all-agents total, then the active figure the ceiling and overage are measured on, then the crew and secondmate breakdown, and labels the ceiling in active agents.
+The number of crews the shed advice names is still capped at the ordinary crews, because AGENTS.md makes an idle secondmate endpoint healthy and its retirement an explicit decision, so a home whose only running agents are persistent secondmates never gets shed advice.
 
 `FM_RESOURCE_SWEEP_BUDGET` is the number of seconds one sweep may spend checking crew liveness in total, defaulting to `30`, and `0` or a malformed value falls back to that default rather than disabling the budget.
 It bounds the watcher's poll loop however many crews are recorded and however unresponsive a backend is, since bounding each check on its own would still allow one timeout per recorded crew.
@@ -263,7 +271,7 @@ Nothing in this path pauses, sheds, or kills anything.
 Shedding load is the captain's decision, so the monitor's job ends at reporting the pressure and the crew count the host can support.
 An unknown reading, on a host where no kernel-wide probe answers, and a disabled monitor both stay silent instead of alarming, the same never-wake-on-an-unreadable-probe rule the secondmate context monitor follows.
 
-The watcher keeps its sweep state in `state/.last-resource` (sweep cadence), `state/.resource-status` (latest reading, read by the heartbeat annotation), `state/.resource-live` (last running-agent counts and whether the sweep could check them all, read by the synchronous callers), and `state/.resource-surfaced` (worst level already reported, so recovery to healthy re-arms the monitor silently).
+The watcher keeps its sweep state in `state/.last-resource` (sweep cadence), `state/.resource-status` (latest reading, read by the heartbeat annotation), `state/.resource-live` (last running-agent counts, split into crews, working secondmates and idle secondmates, plus whether the sweep could check them all, read by the synchronous callers), and `state/.resource-surfaced` (worst level already reported, so recovery to healthy re-arms the monitor silently).
 These are watcher internals; never edit them by hand.
 
 ## Crew dispatch profiles (config/crew-dispatch.json)
