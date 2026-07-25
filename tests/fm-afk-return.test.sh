@@ -17,7 +17,12 @@ install_runner() {  # <case-dir>
   local dir=$1
   mkdir -p "$dir/bin" "$dir/home/state" "$dir/home/data" "$dir/home/config"
   cp "$ROOT/bin/fm-afk-return.sh" "$dir/bin/"
+  # fm-wake-lib.sh sources fm-mutex-lib.sh at load time. Without it the portable
+  # lock helpers never get defined, every outbox read fails its bounded acquire,
+  # and this fixture silently exercises a degraded no-lock path instead of the
+  # real one.
   cp "$ROOT/bin/fm-wake-lib.sh" "$dir/bin/"
+  cp "$ROOT/bin/fm-mutex-lib.sh" "$dir/bin/"
   cp "$ROOT/bin/fm-pid-lib.sh" "$dir/bin/"
   cp "$ROOT/bin/fm-classify-lib.sh" "$dir/bin/"
   cp "$ROOT/bin/fm-afk-outbox-lib.sh" "$dir/bin/"
@@ -39,6 +44,14 @@ file="$FM_HOME/state/.fake-drain"
 : > "$file"
 SH
   chmod +x "$dir/bin/"*.sh
+  # Fail loudly on an incomplete library set. A missing sourced dependency leaves
+  # the portable lock helpers undefined, which degrades every outbox assertion
+  # below into a no-lock path that reports a lock timeout instead of exercising
+  # the real one - a fixture gap that reads as a product regression.
+  FM_HOME="$dir/home" FM_STATE_OVERRIDE="$dir/home/state" \
+    bash -c '. "$1" >/dev/null 2>&1; declare -F fm_lock_acquire_wait >/dev/null' \
+    _ "$dir/bin/fm-wake-lib.sh" \
+    || fail "install_runner copied an incomplete library set: fm_lock_acquire_wait is undefined"
 }
 
 run_return() {  # <case-dir> <mode>

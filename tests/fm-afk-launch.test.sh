@@ -920,13 +920,25 @@ unit_refresh_validates_record() {
 # holds a mode-000 non-empty subdirectory, so neither the portable lock helper's
 # removal path nor `rm -rf` can retire it.
 unit_clear_failure_still_enters_away_mode() {
-  local st out
+  local st out continue_message
   if [ "$(id -u)" = 0 ]; then
     pass "clear failure: skipped, running as root where mode 000 does not deny a removal"
     return 0
   fi
   st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-clear-fail.XXXXXX")
   mkdir -p "$st/state"
+
+  # Resolve the shared continue wording through the launcher itself. Calling
+  # fm_afk_stale_artifact_continue_message directly in THIS shell would expand to
+  # the empty string (it is defined only inside the sourced launcher), and a
+  # `grep -F ''` matches every output, so the assertion below would pass no matter
+  # what the entry points printed.
+  continue_message=$(FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" bash -c '
+    . "$1"
+    fm_afk_stale_artifact_continue_message
+  ' _ "$LAUNCH" 2>/dev/null)
+  [ -n "$continue_message" ] \
+    || fail "clear failure: could not resolve the shared stale-artifact continue message"
 
   seed_unclearable_lock() {
     rm -rf "$st/state/.afk-outbox.lock"
@@ -947,7 +959,7 @@ unit_clear_failure_still_enters_away_mode() {
   ' _ "$LAUNCH" 2>&1)
   if [ -e "$st/state/.afk" ] \
     && printf '%s' "$out" | grep -F "could not clear stale away-mode artifact $st/state/.afk-outbox.lock" >/dev/null \
-    && printf '%s' "$out" | grep -F "$(fm_afk_stale_artifact_continue_message)" >/dev/null; then
+    && printf '%s' "$out" | grep -F "$continue_message" >/dev/null; then
     pass "clear failure: native entry names the artifact and still enters away mode"
   else
     fail "clear failure: native entry refused or did not name the artifact: $out"
@@ -965,7 +977,7 @@ unit_clear_failure_still_enters_away_mode() {
   ' _ "$LAUNCH" 2>&1)
   if [ -e "$st/state/.afk" ] \
     && printf '%s' "$out" | grep -F "could not clear stale away-mode artifact $st/state/.afk-outbox.lock" >/dev/null \
-    && printf '%s' "$out" | grep -F "$(fm_afk_stale_artifact_continue_message)" >/dev/null; then
+    && printf '%s' "$out" | grep -F "$continue_message" >/dev/null; then
     pass "clear failure: terminal entry names the artifact and still enters away mode"
   else
     fail "clear failure: terminal entry refused or did not name the artifact: $out"
