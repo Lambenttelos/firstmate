@@ -60,7 +60,7 @@ The pull-based banner in `bin/fm-guard.sh` carries the same daemon-free context,
 Away posture with no daemon renders as posture only and states that this session owns supervision, so the emitted protocol's "away mode is not active" precondition reads as met rather than as excluding the very home it was emitted for.
 
 `FM_STATE_OVERRIDE` wins over `FM_HOME/state`, and `FM_HOME` wins over repo-root `state/`.
-`FM_GUARD_GRACE` controls the beacon freshness window and defaults to 300 seconds.
+`FM_GUARD_GRACE` controls the beacon freshness window and defaults to 900 seconds.
 If `jq` is missing or hook stdin is empty, the guard fails open and exits 0 because it cannot safely read loop-guard fields.
 
 ## Harness Integrations

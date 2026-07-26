@@ -112,13 +112,15 @@ test_signal_reason_is_actionable_classifier() {
 # the tracked default here, and assert the POLL < grace invariant holds for the
 # grace the captain pairs with it.
 test_tracked_poll_default() {
-  local poll
+  local resolved poll grace
   # shellcheck disable=SC2016  # the bash -c body must expand in the child, not here
-  poll=$(env -u FM_POLL -u FM_WATCHER_STALE_GRACE -u FM_GUARD_GRACE bash -c \
-    '. "$1" >/dev/null 2>&1; printf %s "$POLL"' _ "$WATCH")
+  resolved=$(env -u FM_POLL -u FM_WATCHER_STALE_GRACE -u FM_GUARD_GRACE bash -c \
+    '. "$1" >/dev/null 2>&1; printf "%s %s" "$POLL" "$WATCHER_STALE_GRACE"' _ "$WATCH")
+  poll=${resolved% *}; grace=${resolved#* }
   [ "$poll" = 300 ] || fail "tracked FM_POLL default is '$poll', expected 300"
-  [ "$poll" -lt 900 ] || fail "tracked FM_POLL default $poll violates POLL < grace for the paired grace of 900"
-  pass "tracked FM_POLL default is 300 and stays below the paired 900s beacon grace"
+  [ "$grace" = 900 ] || fail "tracked beacon grace default is '$grace', expected 900"
+  [ "$poll" -lt "$grace" ] || fail "tracked defaults violate POLL < grace: POLL $poll, grace $grace"
+  pass "tracked FM_POLL default is 300 and stays below the tracked 900s beacon grace"
 }
 
 test_stale_is_terminal_classifier() {

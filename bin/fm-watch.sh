@@ -118,7 +118,7 @@ mkdir -p "$STATE"
 
 WATCH_LOCK="$STATE/.watch.lock"
 WATCH_PATH="$SCRIPT_DIR/fm-watch.sh"
-WATCHER_STALE_GRACE=${FM_WATCHER_STALE_GRACE:-${FM_GUARD_GRACE:-300}}
+WATCHER_STALE_GRACE=${FM_WATCHER_STALE_GRACE:-${FM_GUARD_GRACE:-900}}
 # The singleton-lock acquisition, EXIT trap, and the blocking supervision loop
 # all live below the source guard at the very bottom of this file (see "Main
 # entry"). Sourcing this file for unit tests therefore loads the functions -
@@ -148,10 +148,10 @@ POLL=${FM_POLL:-300}                  # seconds between cycles (captain default:
                                       # outlives the liveness beacon - see beacon_sleep
                                       # and the start-up invariant check in the runtime
                                       # section, which warns when it is violated.
-                                      # This default assumes a grace above 300; the
-                                      # captain's operating pair is FM_POLL=300 with
-                                      # FM_GUARD_GRACE=900. Raise the grace with the
-                                      # poll if you raise POLL to 300 or more.
+                                      # This default of 300 sits below the tracked
+                                      # grace default of 900, which is the captain's
+                                      # operating pair. If either value is changed,
+                                      # keep POLL below the grace.
 HEARTBEAT=${FM_HEARTBEAT:-600}        # base seconds between heartbeat scans
 HEARTBEAT_MAX=${FM_HEARTBEAT_MAX:-7200}  # heartbeat backoff cap
 CHECK_INTERVAL=${FM_CHECK_INTERVAL:-600}  # seconds between *.check.sh sweeps (captain default: 10 min)
