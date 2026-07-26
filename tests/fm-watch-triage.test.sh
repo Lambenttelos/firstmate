@@ -114,7 +114,8 @@ test_signal_reason_is_actionable_classifier() {
 test_tracked_poll_default() {
   local resolved poll grace
   # shellcheck disable=SC2016  # the bash -c body must expand in the child, not here
-  resolved=$(env -u FM_POLL -u FM_WATCHER_STALE_GRACE -u FM_GUARD_GRACE bash -c \
+  resolved=$(env -u FM_POLL -u FM_WATCHER_STALE_GRACE -u FM_GUARD_GRACE \
+    FM_STATE_OVERRIDE="$TMP_ROOT/poll-default-state" bash -c \
     '. "$1" >/dev/null 2>&1; printf "%s %s" "$POLL" "$WATCHER_STALE_GRACE"' _ "$WATCH")
   poll=${resolved% *}; grace=${resolved#* }
   [ "$poll" = 300 ] || fail "tracked FM_POLL default is '$poll', expected 300"
