@@ -141,6 +141,60 @@ test_section_9_owner_is_not_duplicated_into_skills() {
   pass "skills cross-reference section 9 instead of duplicating the mapping list"
 }
 
+# The caveman ultra prose rule used to live only in one home's private captain
+# preferences, so it bound by memory and every live worker had to be hand-steered.
+# Section 9 is now its structural owner, next to the translation contract it must
+# never override.
+test_section_9_owns_the_caveman_ultra_prose_rule() {
+  local contract
+  contract=$(section_9)
+  assert_contains "$contract" "**Write in caveman ultra prose.**" \
+    "section 9 does not own the caveman ultra prose rule"
+  assert_contains "$contract" "It binds captain-facing chat, escalations, captain-facing summaries, and reports, including scout reports, per-task reports, and session or status reports." \
+    "section 9 does not bind reports to the compression rule"
+  assert_contains "$contract" "never relaxes section 8's quiet-when-idle contract" \
+    "section 9 lets compression relax the quiet-when-idle contract"
+  assert_contains "$contract" "a compressed message that leaks internal vocabulary is still a violation" \
+    "section 9 lets compression override the translation contract"
+  assert_contains "$contract" "exact identifiers, paths, commands, status lines, and error strings stay verbatim" \
+    "section 9 lost the verbatim-evidence carve-out for private reports"
+  pass "section 9 owns the caveman ultra prose rule for chat and reports"
+}
+
+# The exceptions must be stated where the rule is stated, so an agent that reads
+# only this paragraph never compresses text a tool, a forge, or a human safety
+# decision depends on.
+test_caveman_rule_states_its_exceptions_in_place() {
+  local contract phrase
+  contract=$(section_9)
+  for phrase in \
+    "commit messages" \
+    "PR titles and bodies" \
+    "anything a tool, forge, or CI parses" \
+    "security warnings" \
+    "irreversible-action confirmations" \
+    "dropping conjunctions makes the order ambiguous" \
+    "Never invent abbreviations"; do
+    assert_contains "$contract" "$phrase" \
+      "section 9's caveman rule lost its \"$phrase\" exception"
+  done
+  pass "the caveman rule states its exceptions next to the rule"
+}
+
+# One owner: skills must point at section 9 rather than carry a second copy of
+# the rule that will drift the moment only one is edited.
+test_caveman_rule_is_not_duplicated_into_skills() {
+  local duplicate_count file
+  duplicate_count=0
+  for file in "$BOOTSTRAP" "$AFK" "$DECISION" "$RECOVERY" "$HARNESS" "$CODEXAPP" "$FMX" "$UPDATE" "$AHOY"; do
+    if grep -Fq "**Write in caveman ultra prose.**" "$file"; then
+      duplicate_count=$((duplicate_count + 1))
+    fi
+  done
+  [ "$duplicate_count" -eq 0 ] || fail "skills duplicated section 9's caveman ultra prose owner"
+  pass "skills do not duplicate the caveman ultra prose owner"
+}
+
 test_ahoy_is_an_internal_user_invocable_skill() {
   assert_present "$AHOY" "ahoy skill is missing"
   assert_grep 'name: ahoy' "$AHOY" "ahoy skill metadata has the wrong name"
@@ -245,6 +299,9 @@ test_mapping_list_covers_high_risk_internal_families
 test_verbatim_internal_evidence_is_rejected_from_chat
 test_outward_facing_skill_points_reference_section_9_owner
 test_section_9_owner_is_not_duplicated_into_skills
+test_section_9_owns_the_caveman_ultra_prose_rule
+test_caveman_rule_states_its_exceptions_in_place
+test_caveman_rule_is_not_duplicated_into_skills
 test_ahoy_is_an_internal_user_invocable_skill
 test_ahoy_readme_uses_cross_harness_convention
 test_ahoy_owns_only_the_visible_session_recap
