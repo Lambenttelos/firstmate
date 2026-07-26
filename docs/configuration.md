@@ -180,6 +180,17 @@ The file is created lazily on first learning and follows the same dated, evidenc
 There is no shared learnings file by captain decision.
 The pointer-not-value rule from the captain-preference section above applies here too: a learning may record what a value WAS on a dated occasion as evidence, but the live value is always read from its config file.
 
+## Session stats (data/session-stats.log)
+
+`data/session-stats.log` is this home's append-only session history: one tab-separated `key=value` line per session closed through `bin/fm-end-session.sh`, whose header owns the exact field list.
+It is gitignored like the rest of `data/`, and it is history rather than state, so records are never rewritten, reordered, or pruned.
+Only durable identifiers and counts are recorded - no worktree paths, pane ids, or tool versions, which rot the moment the session ends.
+
+Away-mode time in that record is deliberately incomplete.
+`state/.afk` holds the epoch second away mode was entered, so a stretch still open when the session closes is measurable to the second and records as `away_source=open-flag`.
+A stretch that already ended leaves no durable duration behind, because return clears the flag without recording how long it was held, so those sessions record `away_source=unrecorded` rather than an estimate.
+Making cumulative away time recoverable would require away-mode entry and return to append a durable stretch ledger (entered and exited epochs per stretch); until they do, no consumer may infer total away time from this file.
+
 ## Secondmate routes (data/secondmates.md)
 
 Persistent secondmate routes live locally in `data/secondmates.md`.

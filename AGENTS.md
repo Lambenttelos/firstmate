@@ -82,6 +82,7 @@ data/                personal fleet records; LOCAL, gitignored as a whole
   projects.md        thin fleet navigation registry; firstmate-private, parsed by fm-project-mode.sh (section 6)
   secondmates.md      secondmate routing table; firstmate-private, maintained by fm-home-seed.sh (section 6)
   merge-queue.tsv    durable list of released-but-unmerged ship branches; firstmate-private, owned by fm-merge-queue-lib.sh, surfaced/swept by fm-merge-queue.sh (docs/merge-queue.md, section 7)
+  session-stats.log  append-only one-line-per-session close record; firstmate-private, owned by fm-end-session.sh (docs/configuration.md)
   <id>/brief.md      per-task crewmate brief, or per-secondmate charter brief when kind=secondmate
   <id>/report.md     scout task deliverable, written by the crewmate; survives teardown
 projects/            cloned repos; gitignored; READ-ONLY for you
@@ -156,6 +157,8 @@ Use `gh-axi` for GitHub, `chrome-devtools-axi` for browser work, and `lavish-axi
 A silent bootstrap section needs no action; for any printed actionable diagnostic line, load `bootstrap-diagnostics` and follow its owner procedure.
 `BOOTSTRAP_INFO:` lines are completed no-action facts and do not require loading a skill.
 `secondmate-provisioning` owns startup secondmate sync, liveness, and inherited local-material convergence.
+
+When the captain invokes `/endsession` or says they are done for the session, load the `end-session` skill, which owns closing a session down: the stow-first ordering, the safe stand-down, the session-stats record, and the offered session report.
 
 ## 4. Harness and runtime dispatch
 
