@@ -419,8 +419,10 @@ An absent `quota-axi` reports `MISSING: quota-axi (install: npm install -g quota
 Bootstrap also reports a `TANGLE:` line when `FM_ROOT` is on a named non-default branch; follow the printed checkout remediation rather than treating it as an installable tool problem.
 In a read-only session that did not get the fleet lock, the same line is advisory and omits the checkout command.
 The locked session-start bootstrap step also runs a best-effort project clone refresh through `fm-fleet-sync.sh`.
-It emits `FLEET_SYNC:` for skipped refreshes that may matter, recovered self-heals, `STUCK:` alarms, and `FETCH FAILED:` reports.
+It emits `FLEET_SYNC:` for skipped refreshes that may matter, recovered self-heals, `STUCK:` alarms, `FETCH FAILED:` reports, and `PIN FAILED:` reports.
 Normal completed runs keep local-only and no-origin skips silent.
+Every sync also converges each clone's Treehouse worktree pool pin through `bin/fm-treehouse-pin.sh`, before the local-only and no-origin skips, so existing clones self-heal and a home that moves re-pins itself.
+A converged pin stays silent; a pin that cannot be applied is reported as `PIN FAILED:` and never aborts the refresh, because an unpinned clone shares one pool with every other copy of the same repo on the machine and its spawns will be refused (see [treehouse-pools.md](treehouse-pools.md)).
 A failed fetch is deliberately reported as `FETCH FAILED:` rather than as a skip, because a clone that stops fetching still presents a clean tree on its default branch and is otherwise indistinguishable from a healthy one, so a quiet skip lets work be reasoned against silently stale code.
 If bootstrap kills a timed-out refresh, it replays any completed `fm-fleet-sync.sh` output before the aggregate timeout skip so no finished result is lost.
 A killed refresh (or a teardown process kill) can leave an orphaned `.git/packed-refs.lock` in a clone, which makes the next refresh's fetch fail with Git's `Unable to create '...packed-refs.lock': File exists`.
