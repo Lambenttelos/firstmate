@@ -53,13 +53,18 @@ SH
 
 # make_case <name> <id> builds a home, the home's own project clone with a real
 # worktree, and a SEPARATE clone of the same shape with its own real worktree.
-# The second clone stands in for another firstmate home's copy of the same repo
-# sharing the same treehouse pool.
+# The second clone stands in for another copy of the same repo sharing the same
+# treehouse pool - another firstmate home's clone, or the captain's own checkout.
+#
+# The home's own clone lives at $home/projects/<name>, the shape the registry
+# defines and the shape fm-spawn now requires; the foreign clone deliberately
+# sits outside that directory, because "a clone this home does not own" is
+# exactly what the containment assertion has to reject.
 make_case() {
   local name=$1 id=$2 case_dir home proj own_wt foreign foreign_wt fakebin
   case_dir="$TMP_ROOT/$name"
   home="$case_dir/home"
-  proj="$case_dir/project"
+  proj="$case_dir/home/projects/project"
   own_wt="$case_dir/own-wt"
   foreign="$case_dir/foreign-clone"
   foreign_wt="$case_dir/foreign-wt"
@@ -75,20 +80,23 @@ make_case() {
 }
 
 read_case() {
-  IFS='|' read -r _ HOME_DIR PROJ_DIR OWN_WT _ FOREIGN_WT FAKEBIN_DIR <<EOF
+  IFS='|' read -r _ HOME_DIR PROJ_DIR OWN_WT FOREIGN_DIR FOREIGN_WT FAKEBIN_DIR <<EOF
 $1
 EOF
 }
 
+# run_spawn <id> <pane> [<project-arg>] - the project argument defaults to the
+# home's own clone; the bypass tests pass their own to stand in for a caller that
+# names a clone this home does not own.
 run_spawn() {
-  local id=$1 pane=$2
+  local id=$1 pane=$2 project=${3:-$PROJ_DIR}
   FM_ROOT_OVERRIDE='' FM_HOME="$HOME_DIR" \
     FM_STATE_OVERRIDE="$HOME_DIR/state" FM_DATA_OVERRIDE="$HOME_DIR/data" \
     FM_PROJECTS_OVERRIDE="$HOME_DIR/projects" FM_CONFIG_OVERRIDE="$HOME_DIR/config" \
     FM_SPAWN_NO_GUARD=1 TMUX="fake,1,0" \
     FM_FAKE_PANE_PATH="$pane" \
     PATH="$FAKEBIN_DIR:$PATH" \
-    "$SPAWN" "$id" "$PROJ_DIR" 2>&1
+    "$SPAWN" "$id" "$project" 2>&1
 }
 
 # The incident shape: a real, isolated worktree that belongs to a DIFFERENT
@@ -133,7 +141,75 @@ test_own_clone_worktree_is_accepted() {
   pass "a worktree of the project's own clone is still accepted"
 }
 
+# The bypass: the clone comparison above is RELATIVE - it only proves the
+# worktree and the project agree. Name a clone this home does not own AS the
+# project and treehouse allocates a slot of that same clone, so both sides match
+# and the comparison is satisfied while the crew works in a foreign object store.
+# This is the shape that let real fleet branches land in another clone's store
+# even after the clone comparison shipped, so it gets a test that tries the
+# bypass directly rather than trusting the comparison to imply it.
+test_foreign_clone_as_the_project_is_refused() {
+  local rec id out status
+  id="foreign-project-z3"
+  rec=$(make_case bypass "$id")
+  read_case "$rec"
+
+  # Pane path and project are the SAME foreign clone: self-consistent, so the
+  # clone-identity comparison alone would pass this launch.
+  out=$(run_spawn "$id" "$FOREIGN_WT" "$FOREIGN_DIR")
+  status=$?
+  [ "$status" -ne 0 ] || fail "spawn accepted a foreign clone as its project: $out"
+  assert_contains "$out" "not one of this home's project clones" \
+    "refusal did not explain that the project is not one of this home's clones"
+  # The refusal names the PHYSICALLY resolved projects dir (/private/... on
+  # macOS), so match the fixture's directory suffix rather than the raw path.
+  assert_contains "$out" "/home/projects" "refusal did not name this home's projects directory"
+  assert_contains "$out" "/foreign-clone" "refusal did not name the clone it refused"
+  assert_absent "$HOME_DIR/state/$id.meta" "a refused foreign-clone project still recorded task metadata"
+  pass "a clone this home does not own is refused as a project"
+}
+
+# Same bypass reached by path traversal instead of an absolute path: the
+# "projects/" prefix is rewritten against this home's projects dir, so a caller
+# can try to climb back out of it. The check resolves physically before comparing,
+# so the climb does not survive.
+test_traversal_out_of_projects_is_refused() {
+  local rec id out status
+  id="traversal-z4"
+  rec=$(make_case traversal "$id")
+  read_case "$rec"
+
+  out=$(run_spawn "$id" "$FOREIGN_WT" "projects/../../foreign-clone")
+  status=$?
+  [ "$status" -ne 0 ] || fail "spawn accepted a path that climbed out of the projects dir: $out"
+  assert_contains "$out" "not one of this home's project clones" \
+    "refusal did not explain that the traversed path leaves this home's clones"
+  assert_absent "$HOME_DIR/state/$id.meta" "a refused traversal path still recorded task metadata"
+  pass "a path that climbs out of the projects dir is refused"
+}
+
+# A nested path INSIDE the projects dir is still not a project clone: only a
+# direct child is, so a subdirectory of a clone cannot stand in for it.
+test_subdirectory_of_a_clone_is_refused() {
+  local rec id out status sub
+  id="subdir-z5"
+  rec=$(make_case subdir "$id")
+  read_case "$rec"
+  sub="$PROJ_DIR/nested"
+  mkdir -p "$sub"
+
+  out=$(run_spawn "$id" "$OWN_WT" "$sub")
+  status=$?
+  [ "$status" -ne 0 ] || fail "spawn accepted a subdirectory of a clone as its project: $out"
+  assert_contains "$out" "not one of this home's project clones" \
+    "refusal did not explain that a nested path is not a project clone"
+  pass "a subdirectory inside a clone is refused as a project"
+}
+
 test_foreign_clone_worktree_is_refused
 test_own_clone_worktree_is_accepted
+test_foreign_clone_as_the_project_is_refused
+test_traversal_out_of_projects_is_refused
+test_subdirectory_of_a_clone_is_refused
 
 echo "# all fm-spawn-foreign-clone tests passed"

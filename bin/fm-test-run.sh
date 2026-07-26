@@ -164,7 +164,8 @@ family_for_basename() {
       ;;
     fm-backend-herdr.test.sh|fm-backend-tmux-smoke.test.sh|fm-backend.test.sh|\
     fm-send-strict.test.sh|fm-spawn-batch.test.sh|fm-spawn-dispatch-profile.test.sh|\
-    fm-spawn-foreign-clone.test.sh|fm-spawn-worktree-settle.test.sh)
+    fm-spawn-foreign-clone.test.sh|fm-spawn-worktree-settle.test.sh|\
+    fm-treehouse-pin.test.sh|fm-treehouse-pin-e2e.test.sh)
       printf '%s\n' backend-dispatch
       ;;
     fm-pr-check-security.test.sh|fm-pr-merge.test.sh|fm-review-diff.test.sh|\
@@ -668,7 +669,7 @@ families_for_changed_path() {
       printf '%s\n' pr-forge
       ;;
     bin/fm-spawn.sh|bin/fm-send.sh|bin/fm-dispatch-select.sh|bin/fm-harness.sh|\
-    bin/fm-peek.sh|bin/fm-composer*)
+    bin/fm-peek.sh|bin/fm-composer*|bin/fm-treehouse-pin.sh)
       printf '%s\n' backend-dispatch
       printf '%s\n' pure-contract-unit
       ;;

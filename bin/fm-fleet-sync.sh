@@ -317,6 +317,19 @@ sync_project() {
     echo "$label: skipped: not a git repo"
     return 0
   fi
+
+  # Converge this clone's treehouse pool pin on every sync, before any of the
+  # skips below: a pool shared with another clone of the same remote is what lets
+  # a spawn be handed a worktree of the wrong object store, and that is just as
+  # true for a local-only project or one whose fetch is failing. The pin is
+  # idempotent and silent once converged, so this costs nothing on a settled
+  # fleet. A pin failure is reported and never aborts the sync.
+  if pin_out=$("$FM_ROOT/bin/fm-treehouse-pin.sh" "$PROJ" 2>&1); then
+    [ -z "$pin_out" ] || echo "$label: pinned worktree pool to this home"
+  else
+    echo "$label: PIN FAILED: $(first_line "$pin_out") - spawns may draw a worktree of another clone"
+  fi
+
   mode_line=$("$FM_ROOT/bin/fm-project-mode.sh" "$label" 2>/dev/null || echo "no-mistakes off")
   mode=${mode_line%% *}
   if [ "$mode" = "local-only" ]; then

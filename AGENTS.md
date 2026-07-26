@@ -85,6 +85,7 @@ data/                personal fleet records; LOCAL, gitignored as a whole
   <id>/brief.md      per-task crewmate brief, or per-secondmate charter brief when kind=secondmate
   <id>/report.md     scout task deliverable, written by the crewmate; survives teardown
 projects/            cloned repos; gitignored; READ-ONLY for you
+.treehouse/          this home's own worktree pools for those clones; gitignored; created by treehouse, pinned per clone by bin/fm-treehouse-pin.sh so a spawn cannot draw a worktree of another copy of the repo (docs/treehouse-pools.md)
 state/               volatile runtime signals; gitignored
   <id>.status        appended by crewmates: "<state>: <note>" wake-event lines, not current-state truth
   <id>.turn-ended    touched by turn-end hooks

@@ -85,8 +85,9 @@
 #   provisioned firstmate home; the default is kind=ship.
 #   Before a secondmate launch, the home is locally fast-forwarded to the primary
 #   default-branch commit when safe; skipped syncs warn and launch unchanged.
-#   Ship/scout spawns refuse to launch unless the resolved task path is a real
-#   git worktree root distinct from the primary project checkout.
+#   Ship/scout spawns refuse to launch unless the project is one of THIS home's
+#   own clones (a direct child of $PROJECTS) and the resolved task path is a real
+#   git worktree root of that same clone, distinct from the primary checkout.
 # Batch dispatch: pass one or more `id=repo` pairs instead of a single <id> <project>, e.g.
 #     fm-spawn.sh fix-a-k3=projects/foo add-b-q7=projects/bar [--scout]
 #   Each pair re-execs this script in single-task mode, so the single path stays the only
@@ -652,6 +653,31 @@ resolve_project_dir_arg() {
   esac
 }
 
+# The clone-identity assertion in validate_spawn_worktree is RELATIVE: it compares
+# the allocated worktree against this spawn's project and refuses when they
+# disagree. That catches a pool handing back another clone's slot, but it cannot
+# see that the project ITSELF is the wrong clone. resolve_project_dir_arg above
+# rewrites only a "projects/<name>" argument; every other string passes through
+# verbatim, so a spawn given another checkout of the same repo - the captain's own
+# working copy, say - opens its pane there, `treehouse get` allocates a slot of
+# THAT clone's object store, and both sides of the clone comparison then name the
+# same foreign clone. The assertion passes and the crew commits where the home
+# that dispatched it cannot see the branch: a refusal that does not refuse.
+#
+# Closing it needs an ABSOLUTE test, and the registry model already supplies one -
+# every registered project is this home's own clone at $PROJECTS/<name>. Fail
+# closed on anything else rather than offering a bypass flag; tests that need a
+# different location move the whole projects dir with FM_PROJECTS_OVERRIDE.
+validate_project_is_own_clone() {  # <raw-arg> <resolved-abs>
+  local raw=$1 abs=$2 abs_real projects_real
+  abs_real=$(cd "$abs" 2>/dev/null && pwd -P) || abs_real=$abs
+  projects_real=$(cd "$PROJECTS" 2>/dev/null && pwd -P) || projects_real=$PROJECTS
+  if [ "$(dirname "$abs_real")" != "$projects_real" ]; then
+    echo "error: project '$raw' resolves to '$abs_real', which is not one of this home's project clones (expected a direct child of '$projects_real'); refusing to launch so the task cannot work in a copy of this repo that this home does not own" >&2
+    exit 1
+  fi
+}
+
 path_is_ancestor_of() {
   local ancestor=$1 path=$2
   [ -n "$ancestor" ] || return 1
@@ -805,6 +831,7 @@ if [ "$KIND" = secondmate ]; then
   fi
 else
   PROJ_ABS="$(cd "$(resolve_project_dir_arg "$PROJ")" && pwd)"
+  validate_project_is_own_clone "$PROJ" "$PROJ_ABS"
   WT=""
   BRIEF="$DATA/$ID/brief.md"
 fi

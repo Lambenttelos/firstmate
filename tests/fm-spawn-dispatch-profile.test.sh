@@ -51,7 +51,9 @@ make_spawn_case() {
   shift 2
   case_dir="$TMP_ROOT/$name"
   home="$case_dir/home"
-  proj="$case_dir/project"
+  # The project must be one of the home's OWN clones: fm-spawn refuses a ship or
+  # scout project that is not a direct child of this home's projects directory.
+  proj="$case_dir/home/projects/project"
   wt="$case_dir/wt"
   launchlog="$case_dir/launch.log"
   fakebin=$(make_spawn_fakebin "$case_dir/fake")
