@@ -141,9 +141,12 @@ STATUS_FILE=$(shell_quote "$STATE/$ID.status")
 # Rule labels are stable across both blocks so a steer that names a rule always
 # means the same rule: the secondmate subset carries C1, C2, and C4, keeping the
 # gap rather than renumbering.
-# Rule C3's `wayfinder` skill is installed at the user level
-# (~/.claude/skills/wayfinder), not tracked in this repo, so it resolves for
-# every worker spawned on this machine and a repo-presence check is the wrong test.
+# Rule C3's planning mandate is unconditional on every harness. Its `wayfinder`
+# skill is installed at the user level (~/.claude/skills/wayfinder), not tracked
+# in this repo, so a repo-presence check is the wrong test; only claude resolves
+# that path, while firstmate also dispatches to codex, opencode, pi, and grok.
+# C3 therefore names wayfinder as the way to plan where the runtime provides it
+# and still requires a worker on any other runtime to plan first by its own means.
 CAPTAIN_RULES=$(cat <<'EOF'
 # Standing captain rules
 
@@ -160,7 +163,9 @@ These bind you for the whole task. They are not optional and they outrank conven
    If the reason behind an instruction is not clear enough to act on, STOP and ask firstmate
    for a grilling session. Asking is far cheaper than a wrong implementation and is never
    treated as a failure.
-- **C3. Plan before you change code.** Invoke the `wayfinder` skill to plan the work first.
+- **C3. Plan before you change code.** Planning first is MANDATORY, whatever runtime you are
+   running on. If your runtime provides the `wayfinder` skill, invoke it to plan the work.
+   If it does not, plan by your own means before touching code; the mandate stands either way.
 - **C4. Write EPHEMERAL prose in caveman ultra style.** Ephemeral prose means status lines and
    the reports or replies you send back to firstmate: drop articles, filler, hedging, and
    pleasantries; fragments are fine; state each fact once. DURABLE documents stay in normal
@@ -200,7 +205,10 @@ These bind you and every crewmate you dispatch.
    rule prohibits.
 - **C2. Understand the WHY before acting.** Never work routed instructions mechanically. When
    the reason behind a request is not clear enough to act on, STOP and ask the main firstmate
-   for a grilling session. Asking is never treated as a failure.
+   for a grilling session through the escalation path below - append a `needs-decision` status
+   line to the main status file, carrying the same `corr=<id>` token when the request you are
+   questioning arrived marked. Never ask only in this chat: the main firstmate does not read
+   it, so a chat-only question is lost. Asking is never treated as a failure.
 - **C4. Write EPHEMERAL prose in caveman ultra style.** Ephemeral prose means status lines and
    the reports or replies you send back to the main firstmate: drop articles, filler,
    hedging, and pleasantries; state each fact once. DURABLE documents stay in normal

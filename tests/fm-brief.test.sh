@@ -511,10 +511,14 @@ test_ship_and_scout_briefs_bind_the_standing_captain_rules() {
       "$kind brief must send an unclear reason back to firstmate"
     assert_grep "grilling session" "$brief" \
       "$kind brief must name the grilling session as the way to ask"
-    # C3. plan with wayfinder
+    # C3. plan first on every harness, with wayfinder where the runtime has it
     # shellcheck disable=SC2016 # Literal backticks must remain unexpanded.
     assert_grep '`wayfinder` skill' "$brief" \
-      "$kind brief must require planning with the wayfinder skill"
+      "$kind brief must name the wayfinder skill as the way to plan"
+    assert_grep "MANDATORY, whatever runtime you are" "$brief" \
+      "$kind brief must keep planning mandatory on every harness, not only where wayfinder resolves"
+    assert_grep "plan by your own means" "$brief" \
+      "$kind brief must stay satisfiable on a runtime without the wayfinder skill"
     # C4. caveman ultra prose for ephemeral output only, durable documents in normal English
     assert_grep "EPHEMERAL prose in caveman ultra style" "$brief" \
       "$kind brief must scope caveman ultra prose to ephemeral output"
@@ -573,6 +577,16 @@ test_secondmate_charter_binds_the_applicable_captain_rules() {
     "secondmate charter must forbid acting on routed work mechanically, labelled C2"
   assert_grep "grilling session" "$brief" \
     "secondmate charter must route an unclear reason back as a grilling session"
+  # The main firstmate never reads a secondmate chat, so C2 must name the status
+  # return path or the ask is lost and the domain stalls silently.
+  # shellcheck disable=SC2016 # Literal backticks must remain unexpanded.
+  assert_grep 'append a `needs-decision` status' "$brief" \
+    "secondmate charter C2 must raise the grilling request on the status path, not in chat"
+  # shellcheck disable=SC2016 # Literal backticks must remain unexpanded.
+  assert_grep 'carrying the same `corr=<id>` token' "$brief" \
+    "secondmate charter C2 must carry the correlation token of a marked request"
+  assert_grep "Never ask only in this chat" "$brief" \
+    "secondmate charter C2 must forbid a chat-only question"
   # Labels are stable fleet-wide: the caveman rule is C4 in every block, and the
   # secondmate subset keeps the C3 gap rather than renumbering, so a steer that
   # names a rule always means the same rule to a crewmate and to a secondmate.
