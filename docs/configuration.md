@@ -374,6 +374,8 @@ The same scaffold carries three further shared-machine rules, for the same reaso
 - Every test run is announced in the status file, `working: TEST START - ...` before and `working: TEST END - ...` after, which is the signal firstmate coordinates the machine from.
 - At most TWO live browser reproductions may run across the whole fleet at once, so a crewmate announces `working: BROWSER WAIT - ...` and waits for firstmate's go-ahead before starting one, then releases the slot with `working: BROWSER END - ...`.
 
+For the same reason, every ship and scout scaffold also generates the standing captain rules as a labelled `C1`-`C6` block, and the secondmate charter generates the supervising subset under the same stable labels; [`bin/fm-brief.sh`](../bin/fm-brief.sh)'s header and `--help` own their exact wording and scope.
+
 Ship scaffolds also require the final report to declare whether the change was built test-first and whether it has end-to-end coverage.
 A gap does not block the merge; leaving it unstated does, because the captain reviews every untested product change.
 

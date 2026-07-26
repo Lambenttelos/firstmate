@@ -56,6 +56,19 @@
 # waits for firstmate's go-ahead because at most TWO may run fleet-wide at once.
 # Ship scaffolds additionally require the final report to declare whether the change was
 # built test-first and whether it has end-to-end coverage.
+# Every ship and scout scaffold also carries the standing captain rules that bind every
+# worker, so they are structural instead of hand-pasted per dispatch: never force anything
+# (push to a NEW branch when blocked, never force-push, never force-release, never decide on
+# your own to delete a branch, though the guarded teardown and fleet-sync paths removing
+# their own refs are exempt), understand the reason behind an instruction before acting and ask firstmate for a
+# grilling session when it is unclear, plan with the wayfinder skill before changing code,
+# write prose in caveman ultra style while keeping code and tool-parsed text normal, and bind
+# no server to port 443 or 3000. The Mattermost-sourced rule is written as a self-guarding
+# conditional on the same section rather than behind a flag, because a rule firstmate can
+# forget to pass is worth nothing. The secondmate charter carries the subset that applies to a
+# supervising home: never force, understand the reason, and caveman ultra prose. The rules are
+# labelled C1-C6 so a steer referencing a rule number cannot collide with the brief's own
+# numbered Rules list.
 # Refuses to overwrite an existing brief.
 set -eu
 
@@ -119,6 +132,97 @@ shell_quote() {
 
 STATUS_FILE=$(shell_quote "$STATE/$ID.status")
 
+# Standing captain rules. These bind every worker, so they are generated here
+# rather than pasted onto each brief by hand: a rule that lives only in
+# firstmate memory never reaches a worker whose brief predates it.
+# Both blocks use quoted heredocs, so their text is literal and apostrophes in it
+# are safe: the issue #166 regression class came from UNQUOTED heredoc bodies
+# inside a command substitution, which this is not.
+# Rule labels are stable across both blocks so a steer that names a rule always
+# means the same rule: the secondmate subset carries C1, C2, and C4, keeping the
+# gap rather than renumbering.
+# Rule C3's planning mandate is unconditional on every harness. Its `wayfinder`
+# skill is installed at the user level (~/.claude/skills/wayfinder), not tracked
+# in this repo, so a repo-presence check is the wrong test; only claude resolves
+# that path, while firstmate also dispatches to codex, opencode, pi, and grok.
+# C3 therefore names wayfinder as the way to plan where the runtime provides it
+# and still requires a worker on any other runtime to plan first by its own means.
+CAPTAIN_RULES=$(cat <<'EOF'
+# Standing captain rules
+
+These bind you for the whole task. They are not optional and they outrank convenience.
+
+- **C1. Never force anything.** Never force-push, never force a release, and never decide on
+   your own to delete a branch - deleting a branch is the captain decision alone. If a push
+   is rejected or a branch is otherwise blocked, push to a NEW branch instead and report the
+   new branch name, so nothing that exists can be lost. Running the guarded
+   machinery as designed, such as `bin/fm-teardown.sh` or `bin/fm-fleet-sync.sh` removing
+   their own worktrees and already-landed or pruned refs through their existing safety
+   checks, is ordinary tooling behavior and is not what this rule prohibits.
+- **C2. Understand the WHY before acting.** Never work the wording of this brief mechanically.
+   If the reason behind an instruction is not clear enough to act on, STOP and ask firstmate
+   for a grilling session. Asking is far cheaper than a wrong implementation and is never
+   treated as a failure.
+- **C3. Plan before you change code.** Planning first is MANDATORY, whatever runtime you are
+   running on. If your runtime provides the `wayfinder` skill, invoke it to plan the work.
+   If it does not, plan by your own means before touching code; the mandate stands either way.
+- **C4. Write EPHEMERAL prose in caveman ultra style.** Ephemeral prose means status lines and
+   the reports or replies you send back to firstmate: drop articles, filler, hedging, and
+   pleasantries; fragments are fine; state each fact once. DURABLE documents stay in normal
+   English: the scout report at `data/<id>/report.md`, any project `AGENTS.md` or
+   `CLAUDE.md`, ADRs, files under `docs/`, code, code comments, commit messages, PR titles
+   and bodies, and anything a tool or CI parses. The style exists to cut chat noise, not to
+   make the permanent record harder to read - durable documents are read cold months later
+   by people and agents with no context. Also drop the style for security warnings,
+   irreversible-action confirmations, and any multi-step sequence where dropping
+   conjunctions would make the order ambiguous. Never invent abbreviations and never
+   abbreviate identifiers, API names, CLI commands, or error strings.
+- **C5. Never bind port 443 or 3000.** Those ports are reserved for the servers the captain
+   runs personally. Any server you start runs on a non-default port.
+- **C6. If this task came from a Mattermost thread**, your FIRST action is to re-read the full
+   thread; never trust the queue-time summary in this brief. If the reported bug turns out to
+   be already fixed, verify that and ADD the missing end-to-end coverage rather than closing
+   the task as done.
+EOF
+)
+
+# The supervising subset for a persistent secondmate home. A secondmate delegates
+# implementation to its own crewmates, whose briefs carry the full set, so the
+# planning, port, and Mattermost rules do not apply to the charter itself.
+# The labels match the ship and scout block exactly - C1, C2, C4 - because
+# firstmate steers by label; the missing C3 is deliberate, not a renumbering.
+CAPTAIN_RULES_SECONDMATE=$(cat <<'EOF'
+# Standing captain rules
+
+These bind you and every crewmate you dispatch.
+
+- **C1. Never force anything.** Never force-push, never force a release, and never decide on
+   your own to delete a branch - deleting a branch is the captain decision alone. When a push
+   is blocked, push to a NEW branch and report it, so nothing that exists can be lost.
+   Running the guarded machinery as designed, such as `bin/fm-teardown.sh` or
+   `bin/fm-fleet-sync.sh` removing their own worktrees and already-landed or pruned refs
+   through their existing safety checks, is ordinary tooling behavior and is not what this
+   rule prohibits.
+- **C2. Understand the WHY before acting.** Never work routed instructions mechanically. When
+   the reason behind a request is not clear enough to act on, STOP and ask the main firstmate
+   for a grilling session through the escalation path below - append a `needs-decision` status
+   line to the main status file, carrying the same `corr=<id>` token when the request you are
+   questioning arrived marked. Never ask only in this chat: the main firstmate does not read
+   it, so a chat-only question is lost. Asking is never treated as a failure.
+- **C4. Write EPHEMERAL prose in caveman ultra style.** Ephemeral prose means status lines and
+   the reports or replies you send back to the main firstmate: drop articles, filler,
+   hedging, and pleasantries; state each fact once. DURABLE documents stay in normal
+   English: the scout report at `data/<id>/report.md`, any project `AGENTS.md` or
+   `CLAUDE.md`, ADRs, files under `docs/`, code, code comments, commit messages, PR titles
+   and bodies, and anything a tool or CI parses. The style exists to cut chat noise, not to
+   make the permanent record harder to read - durable documents are read cold months later
+   by people and agents with no context. Also drop the style for security warnings,
+   irreversible-action confirmations, and any multi-step sequence where dropping
+   conjunctions would make the order ambiguous. Never invent abbreviations and never
+   abbreviate identifiers, API names, CLI commands, or error strings.
+EOF
+)
+
 if [ "$KIND" = secondmate ]; then
 SECONDMATE_PROJECTS=""
 idx=1
@@ -172,6 +276,8 @@ For a terse result, a status line is the whole answer.
 For a detailed answer (an investigation, a plan, an audit), write it to a doc under your home's \`data/\` and append a status line that points to that doc - the scout-report pattern - so the main firstmate is woken and can read it.
 Before treating an investigation or visual review as complete, load \`decision-hold-lifecycle\` from this home's \`.agents/skills/\` and pass its shared completion gate.
 A message with NO marker is the captain typing directly into your pane: treat it as authoritative captain intervention and stay conversational exactly as you would for any captain message; do not force it onto the status path.
+
+$CAPTAIN_RULES_SECONDMATE
 
 # Escalation to main firstmate
 Handle routine work yourself.
@@ -284,6 +390,8 @@ The report is the only thing that survives, so anything worth keeping must be in
    Before you start one, append \`working: BROWSER WAIT - {what you will drive}\` and STOP until
    firstmate replies with a go-ahead - the one line in this brief you do wait on.
    Append \`working: BROWSER END - {outcome}\` the moment it finishes so the slot is released.
+
+$CAPTAIN_RULES
 
 # Definition of done
 Write your findings to \`$DATA/$ID/report.md\`.
@@ -449,6 +557,8 @@ $RULE1
    Before you start one, append \`working: BROWSER WAIT - {what you will drive}\` and STOP until
    firstmate replies with a go-ahead - the one line in this brief you do wait on.
    Append \`working: BROWSER END - {outcome}\` the moment it finishes so the slot is released.
+
+$CAPTAIN_RULES
 
 # Project memory
 If \`AGENTS.md\` or \`CLAUDE.md\` already exists, or if this task produced durable project-intrinsic knowledge, run \`$FM_ROOT/bin/fm-ensure-agents-md.sh .\` in the worktree.
