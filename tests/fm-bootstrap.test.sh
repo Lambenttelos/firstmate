@@ -794,6 +794,42 @@ ROWS
   pass "bootstrap validates crew-dispatch.json and reports malformed or unverified configs"
 }
 
+test_afk_daemon_revive_sweep_is_gated_on_persist_intent() {
+  local case_dir fakebin out
+  # Baseline: deps present, tmux absent, NO durable persist intent -> the away-mode
+  # revive sweep is a silent no-op (herdr backend keeps bootstrap otherwise silent,
+  # per test_session_provider_backends_do_not_require_tmux).
+  case_dir="$TMP_ROOT/afk-revive-no-intent"
+  mkdir -p "$case_dir/home/config" "$case_dir/home/state"
+  printf '%s\n' manual > "$case_dir/home/config/backlog-backend"
+  printf '%s\n' herdr > "$case_dir/home/config/backend"
+  fakebin=$(make_fake_toolchain_no_tmux "$case_dir" herdr)
+  out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$case_dir/home" \
+    FM_FAKE_TREEHOUSE_LEASE_HELP=1 "$ROOT/bin/fm-bootstrap.sh")
+  case "$out" in
+    *AFK_DAEMON:*) fail "revive sweep must be silent without a persist intent, got: $out" ;;
+    *) pass "bootstrap: afk revive sweep is a silent no-op without a persist intent" ;;
+  esac
+
+  # With the durable persist intent set but tmux absent, the sweep fires and
+  # surfaces the hosting failure as one AFK_DAEMON line. It spawns no daemon,
+  # because durable paneless hosting needs the tmux CLI (absent here), so this
+  # deterministically exercises the wiring without a real background daemon.
+  case_dir="$TMP_ROOT/afk-revive-intent"
+  mkdir -p "$case_dir/home/config" "$case_dir/home/state"
+  printf '%s\n' manual > "$case_dir/home/config/backlog-backend"
+  printf '%s\n' herdr > "$case_dir/home/config/backend"
+  : > "$case_dir/home/state/.afk-persist"
+  fakebin=$(make_fake_toolchain_no_tmux "$case_dir" herdr)
+  out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$case_dir/home" \
+    FM_FAKE_TREEHOUSE_LEASE_HELP=1 "$ROOT/bin/fm-bootstrap.sh")
+  case "$out" in
+    *"AFK_DAEMON: away-mode revive failed:"*) pass "bootstrap: afk revive sweep fires under a persist intent and reports a hosting failure" ;;
+    *) fail "revive sweep must report a failure under a persist intent with tmux absent, got: $out" ;;
+  esac
+}
+
+test_afk_daemon_revive_sweep_is_gated_on_persist_intent
 test_bootstrap_reporting
 test_no_mistakes_min_version
 test_git_is_required_with_supported_install_instruction
