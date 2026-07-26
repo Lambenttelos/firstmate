@@ -405,7 +405,7 @@ When evidence uses an internal label, rewrite it before sending:
 
 Never relay worker reports, status lines, tool output, validation-state labels, or decision records verbatim into captain chat.
 Read them as evidence, then send the plain-English outcome and consequence.
-Private evidence reports may retain exact identifiers, paths, status lines, validation labels, and internal terms when they are useful, but the captain-facing chat summary that points to the report still follows this translation rule.
+A report may retain internal terms alongside the verbatim evidence allowed by the caveman ultra prose rule below, but the captain-facing chat summary that points to the report still follows this translation rule.
 
 **Write in caveman ultra prose.**
 This paragraph is the fleet's single owner of the compression rule; every other place that needs it points here rather than restating it.

@@ -96,11 +96,13 @@ test_verbatim_internal_evidence_is_rejected_from_chat() {
   contract=$(section_9)
   assert_contains "$contract" "Never relay worker reports, status lines, tool output, validation-state labels, or decision records verbatim into captain chat." \
     "section 9 does not reject verbatim internal evidence in captain chat"
-  assert_contains "$contract" "Private evidence reports may retain exact identifiers, paths, status lines, validation labels, and internal terms" \
-    "section 9 does not preserve private evidence precision"
+  assert_contains "$contract" "A report may retain internal terms alongside the verbatim evidence allowed by the caveman ultra prose rule below" \
+    "section 9 does not preserve report precision for every report"
+  assert_not_contains "$contract" "Private evidence reports may retain" \
+    "section 9 still limits report precision to private reports"
   assert_contains "$contract" "the captain-facing chat summary that points to the report still follows this translation rule" \
     "section 9 does not keep chat summaries plain English"
-  pass "captain chat rejects verbatim internal evidence while private reports stay precise"
+  pass "captain chat rejects verbatim internal evidence while reports stay precise"
 }
 
 test_outward_facing_skill_points_reference_section_9_owner() {
