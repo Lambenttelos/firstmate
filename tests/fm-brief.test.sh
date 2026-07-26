@@ -569,10 +569,17 @@ test_secondmate_charter_binds_the_applicable_captain_rules() {
     "secondmate charter must forbid forcing and self-directed branch deletion - a supervisor can force-push too"
   assert_grep "is ordinary tooling behavior and is not what this" "$brief" \
     "secondmate charter must exempt the guarded teardown and fleet-sync paths from the deletion rule"
-  assert_grep "Understand the WHY before acting" "$brief" \
-    "secondmate charter must forbid acting on routed work mechanically"
+  assert_grep "C2. Understand the WHY before acting" "$brief" \
+    "secondmate charter must forbid acting on routed work mechanically, labelled C2"
   assert_grep "grilling session" "$brief" \
     "secondmate charter must route an unclear reason back as a grilling session"
+  # Labels are stable fleet-wide: the caveman rule is C4 in every block, and the
+  # secondmate subset keeps the C3 gap rather than renumbering, so a steer that
+  # names a rule always means the same rule to a crewmate and to a secondmate.
+  assert_grep "C4. Write EPHEMERAL prose in caveman ultra style" "$brief" \
+    "secondmate charter must label the caveman rule C4, matching the ship and scout block"
+  assert_no_grep "C3." "$brief" \
+    "secondmate charter must keep the C3 gap instead of renumbering its rules contiguously"
   assert_grep "EPHEMERAL prose in caveman ultra style" "$brief" \
     "secondmate charter must scope caveman ultra prose to ephemeral reports"
   assert_grep "DURABLE documents stay in normal" "$brief" \

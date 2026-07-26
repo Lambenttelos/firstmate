@@ -135,9 +135,12 @@ STATUS_FILE=$(shell_quote "$STATE/$ID.status")
 # Standing captain rules. These bind every worker, so they are generated here
 # rather than pasted onto each brief by hand: a rule that lives only in
 # firstmate memory never reaches a worker whose brief predates it.
-# Both blocks are written without apostrophes: their text is expanded inside a
-# command-substitution heredoc, where a stray apostrophe breaks bash parsing of
-# the whole script (the issue #166 regression class).
+# Both blocks use quoted heredocs, so their text is literal and apostrophes in it
+# are safe: the issue #166 regression class came from UNQUOTED heredoc bodies
+# inside a command substitution, which this is not.
+# Rule labels are stable across both blocks so a steer that names a rule always
+# means the same rule: the secondmate subset carries C1, C2, and C4, keeping the
+# gap rather than renumbering.
 # Rule C3's `wayfinder` skill is installed at the user level
 # (~/.claude/skills/wayfinder), not tracked in this repo, so it resolves for
 # every worker spawned on this machine and a repo-presence check is the wrong test.
@@ -181,6 +184,8 @@ EOF
 # The supervising subset for a persistent secondmate home. A secondmate delegates
 # implementation to its own crewmates, whose briefs carry the full set, so the
 # planning, port, and Mattermost rules do not apply to the charter itself.
+# The labels match the ship and scout block exactly - C1, C2, C4 - because
+# firstmate steers by label; the missing C3 is deliberate, not a renumbering.
 CAPTAIN_RULES_SECONDMATE=$(cat <<'EOF'
 # Standing captain rules
 
@@ -196,7 +201,7 @@ These bind you and every crewmate you dispatch.
 - **C2. Understand the WHY before acting.** Never work routed instructions mechanically. When
    the reason behind a request is not clear enough to act on, STOP and ask the main firstmate
    for a grilling session. Asking is never treated as a failure.
-- **C3. Write EPHEMERAL prose in caveman ultra style.** Ephemeral prose means status lines and
+- **C4. Write EPHEMERAL prose in caveman ultra style.** Ephemeral prose means status lines and
    the reports or replies you send back to the main firstmate: drop articles, filler,
    hedging, and pleasantries; state each fact once. DURABLE documents stay in normal
    English: the scout report at `data/<id>/report.md`, any project `AGENTS.md` or
