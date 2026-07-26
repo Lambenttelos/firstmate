@@ -315,6 +315,31 @@ An unknown reading, on a host where no kernel-wide probe answers, and a disabled
 The watcher keeps its sweep state in `state/.last-resource` (sweep cadence), `state/.resource-status` (latest reading, read by the heartbeat annotation), `state/.resource-live` (last running-agent counts, split into crews, working secondmates and idle secondmates, plus whether the sweep could check them all, read by the synchronous callers), and `state/.resource-surfaced` (worst level already reported, so recovery to healthy re-arms the monitor silently).
 These are watcher internals; never edit them by hand.
 
+## Hourly session passes (FM_HOURLY_REVIEW_INTERVAL / FM_HOURLY_CLEANUP_INTERVAL)
+
+Every session start arms two recurring passes that then run for the life of the session: an hourly session review and an hourly cleanup sweep.
+[`bin/fm-session-start.sh`](../bin/fm-session-start.sh) arms them, [`bin/fm-hourly-lib.sh`](../bin/fm-hourly-lib.sh) owns the arming, cadence, and suppression contract, and the two pass scripts own what they look at.
+
+Arming writes durable schedule state only.
+The one live watcher runs a due pass on its existing slow poll and wakes firstmate with `check: session-review <headline>` or `check: session-cleanup <headline>`, so no second supervision cycle and no extra timer exists.
+Arming is a mutating step, so a read-only session (one that did not acquire the home's session lock) leaves it to the session holding the lock, and an unarmed home never runs a pass at all.
+Arming is idempotent and creates a cadence stamp only when it is absent, so elapsed time survives a session restart and a home whose sessions restart faster than the interval still runs its passes.
+
+Both passes are silent unless they have something the fleet has not already been told about.
+The session review reports only what has not moved - an open decision nobody has answered, a worker that has posted nothing for hours, queued work with nothing running, a batch of finished-but-unmerged branches - because a point-in-time fleet review is what the watcher heartbeat already provides.
+A queued item that is blocked by another item or captain-held is not dispatchable, so it never counts toward the idle-capacity finding.
+Both passes ignore a persistent secondmate's record, which is idle by contract, so it neither counts as work under way nor reads as a stalled worker.
+The cleanup sweep silently reclaims bookkeeping that can hold no work (watcher temp residue, suppression markers for a fleet that no longer exists) and reports without removing anything that could hold unlanded work, leaving [`bin/fm-teardown.sh`](../bin/fm-teardown.sh) the single owner of the landed-work test.
+It never writes into a project clone and never touches the network, so the merge queue is swept only by firstmate's own [`bin/fm-merge-queue.sh`](../bin/fm-merge-queue.sh) run, and per-task temp roots under a shared `/tmp` are not scanned at all because they carry no reliable home ownership.
+A finding surfaces once and stays silent while it is unchanged; an emptied finding set re-arms the report silently, the same shape the host-resource monitor uses.
+
+`FM_HOURLY_REVIEW_INTERVAL` and `FM_HOURLY_CLEANUP_INTERVAL` are the seconds between runs of each pass, both defaulting to `3600`.
+`0` disables that pass for this home, and a malformed value falls back to the default rather than silently disabling it.
+The thresholds each pass applies (`FM_REVIEW_DECISION_SECS`, `FM_REVIEW_STALL_SECS`, `FM_REVIEW_MERGE_BATCH`, `FM_CLEANUP_TEMP_SECS`, `FM_CLEANUP_MARKER_SECS`, `FM_CLEANUP_ORPHAN_SECS`) are owned by the two script headers.
+
+State lives in `state/.hourly-armed` (armed for this session), `state/.last-hourly-review` and `state/.last-hourly-cleanup` (cadence stamps), `state/.hourly-review-surfaced` and `state/.hourly-cleanup-surfaced` (what has already been reported), `state/.hourly-review.latest` and `state/.hourly-cleanup.latest` (the full report behind each one-line headline), and `state/.hourly-decision-<id>__<key>` (when an open decision was first seen, so a later unrelated status append cannot reset its age), and `state/.hourly-cleanup.log` (what the cleanup sweep reclaimed, size-capped like the watcher's triage log).
+These are watcher internals; never edit them by hand.
+
 ## Crew dispatch profiles (config/crew-dispatch.json)
 
 `config/crew-dispatch.json` is an optional local, gitignored file containing natural-language rules that firstmate reads before dispatching a crewmate or scout.
@@ -560,6 +585,8 @@ FM_WATCH_ABSORB_TICK=0  # 1 makes a benign-absorbed wake end the cycle with a di
 FM_CHECK_INTERVAL=300   # seconds between slow checks (authenticated merge polls, custom checks, or X-mode dispatch)
 FM_CHECK_TIMEOUT=30     # seconds allowed per slow check script
 FM_RESOURCE_INTERVAL=900   # seconds between host CPU/memory/swap sweeps; own cadence, NOT tied to FM_POLL or FM_CHECK_INTERVAL; 0 disables the monitor, malformed falls back to the default (see the host resource monitoring section above)
+FM_HOURLY_REVIEW_INTERVAL=3600   # seconds between hourly session-review passes; 0 disables it, malformed falls back to the default (see the hourly session passes section above)
+FM_HOURLY_CLEANUP_INTERVAL=3600  # seconds between hourly cleanup sweeps; same 0/malformed rules
 FM_RESOURCE_SWEEP_BUDGET=30   # seconds one sweep may spend on crew-liveness checks in total; 0 or malformed falls back to the default
 FM_RESOURCE_PROBE_TIMEOUT=5   # seconds allowed per crew-liveness check inside a sweep; 0 or malformed falls back to the default
 FM_HEAVY_SLOTS=         # heavy-run ceiling override; wins over config/heavy-run-slots, malformed or below-floor values fall back to 1 (see the heavy-run serialization section above)

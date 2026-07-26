@@ -29,6 +29,9 @@ On its own slow cadence the watcher also reads the host itself through `bin/fm-r
 It wakes firstmate with `check: host-resources <reading>` only when pressure first gets worse than the level firstmate was last told about, annotates a heartbeat with the last cached reading, and re-arms silently when the host recovers; `bin/fm-spawn.sh` prints the same reading as a pre-dispatch advisory and `bin/fm-session-start.sh` prints one in its digest.
 Nothing on that path pauses, sheds, or kills anything, because shedding load is the captain's decision; [configuration.md](configuration.md#host-resource-monitoring-fm_resource_interval) owns the cadence knob and the script header owns the thresholds and the ceiling formula.
 
+The same slow poll carries the two hourly passes that `bin/fm-session-start.sh` arms for the life of a session: a session review that reports only what has not moved, and a cleanup sweep that reclaims bookkeeping and reports - never removes - anything that could hold unlanded work.
+They ride the one watcher precisely so a recurring duty needs no second supervision cycle, and both stay silent unless they have something the fleet has not already been told about; [configuration.md](configuration.md#hourly-session-passes-fm_hourly_review_interval--fm_hourly_cleanup_interval) owns the cadence knobs.
+
 Crew status files are append-only wake-event logs, not current-state fields.
 `bin/fm-crew-state.sh <id>` is the cheap current-state read for an actionable heartbeat review: it attributes a no-mistakes run, active or terminal, only when it matches the crew's branch and current code identity, then keeps that run-step authoritative even if the pane has closed.
 The script header owns the exact run-head ancestry rules.

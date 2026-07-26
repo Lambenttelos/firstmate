@@ -62,6 +62,9 @@ The shared no-mistakes gate refusal for fleet lifecycle entrypoints is summarize
 | `fm-watch-arm.sh`        | Verified home-scoped watcher arm wrapper with loud cycle endings and bounded lifecycle ledger |
 | `fm-watch-checkpoint.sh` | Run one bounded foreground watcher checkpoint for Codex-style supervision            |
 | `fm-watch.sh`            | Singleton-safe always-on watcher: absorb benign wakes, queue and exit on actionable ones |
+| `fm-hourly-lib.sh`       | Own arming, cadence, suppression, and script mapping for the two session-lifetime hourly passes |
+| `fm-session-review.sh`   | Hourly session review: report only what has NOT moved, and stay silent otherwise    |
+| `fm-cleanup-sweep.sh`    | Hourly cleanup sweep: silently reclaim bookkeeping, and report - never remove - anything that could hold unlanded work |
 | `fm-afk-daemon-lib.sh`   | Shared owner of "is an away-mode daemon actually live for THIS home?" and who owns supervision |
 | `fm-afk-daemon-state.sh` | Print this home's supervision-ownership state so non-shell auto-arm adapters ask that one owner |
 | `fm-afk-start.sh`        | Run the common sourceable away-mode daemon entry in the foreground                      |
