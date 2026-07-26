@@ -47,6 +47,7 @@ Retire or clean that home first, and re-scaffold a stale project-bearing charter
 Keep custom charter text focused on the persistent responsibility, available project clones, and genuinely domain-specific hard rules.
 The scaffolded charter, later copied to `data/charter.md`, owns the standard lifecycle and escalation wording.
 Preserve the generated charter sections unless the domain genuinely needs a hard rule.
+That includes the generated standing captain rules, which the charter carries as the supervising subset `C1`, `C2`, and `C4`; the labels match the ship and scout briefs so a steer naming a rule always means the same rule, so keep the `C3` gap rather than renumbering.
 
 Provision the persistent home and registry entry after the charter is filled:
 
