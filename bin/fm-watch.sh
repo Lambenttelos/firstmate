@@ -141,11 +141,17 @@ else
   stat_sig()   { stat -c '%s:%Y' "$1" 2>/dev/null; }
 fi
 
-POLL=${FM_POLL:-600}                  # seconds between cycles (captain default: 10 min).
-                                      # Keep POLL < grace (WATCHER_STALE_GRACE, set
-                                      # above) so a full cycle's wait never outlives
-                                      # the liveness beacon - see beacon_sleep and the
-                                      # start-up invariant check in the runtime section.
+POLL=${FM_POLL:-300}                  # seconds between cycles (captain default: 5 min).
+                                      # INVARIANT: POLL < grace (WATCHER_STALE_GRACE,
+                                      # set above from FM_WATCHER_STALE_GRACE, then
+                                      # FM_GUARD_GRACE) so a full cycle's wait never
+                                      # outlives the liveness beacon - see beacon_sleep
+                                      # and the start-up invariant check in the runtime
+                                      # section, which warns when it is violated.
+                                      # This default assumes a grace above 300; the
+                                      # captain's operating pair is FM_POLL=300 with
+                                      # FM_GUARD_GRACE=900. Raise the grace with the
+                                      # poll if you raise POLL to 300 or more.
 HEARTBEAT=${FM_HEARTBEAT:-600}        # base seconds between heartbeat scans
 HEARTBEAT_MAX=${FM_HEARTBEAT_MAX:-7200}  # heartbeat backoff cap
 CHECK_INTERVAL=${FM_CHECK_INTERVAL:-600}  # seconds between *.check.sh sweeps (captain default: 10 min)

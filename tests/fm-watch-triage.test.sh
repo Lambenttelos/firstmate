@@ -107,6 +107,20 @@ test_signal_reason_is_actionable_classifier() {
   pass "signal_reason_is_actionable: benign absorbed, captain verbs and coalesced batches surfaced"
 }
 
+# Drift guard: the poll cadence is an operating value the tracked default owns.
+# A cadence that lives only in a local settings file drifts silently, so assert
+# the tracked default here, and assert the POLL < grace invariant holds for the
+# grace the captain pairs with it.
+test_tracked_poll_default() {
+  local poll
+  # shellcheck disable=SC2016  # the bash -c body must expand in the child, not here
+  poll=$(env -u FM_POLL -u FM_WATCHER_STALE_GRACE -u FM_GUARD_GRACE bash -c \
+    '. "$1" >/dev/null 2>&1; printf %s "$POLL"' _ "$WATCH")
+  [ "$poll" = 300 ] || fail "tracked FM_POLL default is '$poll', expected 300"
+  [ "$poll" -lt 900 ] || fail "tracked FM_POLL default $poll violates POLL < grace for the paired grace of 900"
+  pass "tracked FM_POLL default is 300 and stays below the paired 900s beacon grace"
+}
+
 test_stale_is_terminal_classifier() {
   local dir state
   dir=$(make_case classify-stale); state="$dir/state"
@@ -1683,3 +1697,4 @@ test_absorb_tick_on_signal_emits_one_tick
 test_absorb_tick_on_heartbeat_emits_tick
 test_absorb_tick_idle_home_never_ticks
 test_absorb_tick_on_actionable_signal_unchanged
+test_tracked_poll_default
