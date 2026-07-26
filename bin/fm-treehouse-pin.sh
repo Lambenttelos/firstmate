@@ -106,11 +106,15 @@ changed=no
 
 # Preserve every key the file already carries except `root`, which this script
 # owns. A hand-added max_trees, for example, survives re-pinning.
+# `root` is written FIRST: treehouse's config is flat, so a top-level key placed
+# after a table header such as [pool] would belong to that table and be ignored,
+# making the pin silently ineffective. Writing it ahead of every preserved line
+# also fixes a pre-existing root that sat under a table header.
 new_toml=$(
+  printf '%s\n' "$want_root"
   if [ -f "$TOML" ]; then
     grep -v '^[[:space:]]*root[[:space:]]*=' "$TOML" || true
   fi
-  printf '%s\n' "$want_root"
 )
 
 if [ ! -f "$TOML" ] || [ "$(cat "$TOML")" != "$new_toml" ]; then

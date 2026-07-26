@@ -106,6 +106,26 @@ test_pin_preserves_other_keys_and_replaces_a_stale_root() {
   pass "the pin replaces a stale root and preserves unrelated keys"
 }
 
+# Treehouse's config is flat, so a top-level key written after a table header
+# would belong to that table and be ignored, leaving the pin silently ineffective.
+# `root` must therefore lead the file, ahead of every preserved line.
+test_pin_writes_root_ahead_of_a_table_header() {
+  local rec root_line header_line
+  rec=$(make_home tableheader); read_home "$rec"
+  printf 'max_trees = 4\n[pool]\nroot = "/somewhere/stale"\n' > "$CLONE/treehouse.toml"
+
+  run_pin "$CLONE" >/dev/null
+  assert_grep "root = \"$(home_real)\"" "$CLONE/treehouse.toml" "the pin did not write this home's root"
+  assert_no_grep "/somewhere/stale" "$CLONE/treehouse.toml" "the stale root under a table survived the pin"
+  assert_grep "max_trees = 4" "$CLONE/treehouse.toml" "the pin dropped an unrelated key"
+  assert_grep "[pool]" "$CLONE/treehouse.toml" "the pin dropped a preserved table header"
+  root_line=$(grep -n '^root = ' "$CLONE/treehouse.toml" | head -1 | cut -d: -f1)
+  header_line=$(grep -n '^\[pool\]' "$CLONE/treehouse.toml" | head -1 | cut -d: -f1)
+  [ "$root_line" = 1 ] || fail "root is not the first line of the pinned treehouse.toml (line $root_line)"
+  [ "$root_line" -lt "$header_line" ] || fail "root was written inside the [pool] table instead of at top level"
+  pass "the pin writes root at top level ahead of an existing table header"
+}
+
 # The safety boundary. A clone outside this home's projects directory is not
 # firstmate's to modify - the captain's own checkout of the same repo is exactly
 # that shape, and writing into it would be a project write with no mandate.
@@ -167,6 +187,7 @@ test_pin_points_the_pool_at_this_home
 test_pin_is_invisible_to_git
 test_pin_is_idempotent_and_silent_once_converged
 test_pin_preserves_other_keys_and_replaces_a_stale_root
+test_pin_writes_root_ahead_of_a_table_header
 test_pin_refuses_a_clone_outside_this_home
 test_pin_refuses_a_tracked_treehouse_toml
 test_pin_skips_a_clone_with_no_origin
