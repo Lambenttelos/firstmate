@@ -129,15 +129,22 @@ test_outward_facing_skill_points_reference_section_9_owner() {
   pass "outward-facing skill handoffs point to the section 9 owner"
 }
 
-test_section_9_owner_is_not_duplicated_into_skills() {
-  local duplicate_count file
-  duplicate_count=0
-  for file in "$BOOTSTRAP" "$AFK" "$DECISION" "$RECOVERY" "$HARNESS" "$CODEXAPP" "$UPDATE"; do
-    if grep -Fq "When evidence uses an internal label, rewrite it before sending:" "$file"; then
-      duplicate_count=$((duplicate_count + 1))
+assert_no_skill_duplicates() {
+  local marker="$1" message="$2"
+  local duplicates file
+  duplicates=""
+  for file in "$ROOT"/.agents/skills/*/SKILL.md; do
+    [ -e "$file" ] || continue
+    if grep -Fq "$marker" "$file"; then
+      duplicates="$duplicates $file"
     fi
   done
-  [ "$duplicate_count" -eq 0 ] || fail "skills duplicated section 9's mapping owner"
+  [ -z "$duplicates" ] || fail "$message:$duplicates"
+}
+
+test_section_9_owner_is_not_duplicated_into_skills() {
+  assert_no_skill_duplicates "When evidence uses an internal label, rewrite it before sending:" \
+    "skills duplicated section 9's mapping owner"
   pass "skills cross-reference section 9 instead of duplicating the mapping list"
 }
 
@@ -156,8 +163,8 @@ test_section_9_owns_the_caveman_ultra_prose_rule() {
     "section 9 lets compression relax the quiet-when-idle contract"
   assert_contains "$contract" "a compressed message that leaks internal vocabulary is still a violation" \
     "section 9 lets compression override the translation contract"
-  assert_contains "$contract" "exact identifiers, paths, commands, status lines, and error strings stay verbatim" \
-    "section 9 lost the verbatim-evidence carve-out for private reports"
+  assert_contains "$contract" "Inside any report, private or captain-facing, exact identifiers, paths, commands, status lines, and error strings stay verbatim" \
+    "section 9 does not grant the verbatim-evidence carve-out to any report"
   pass "section 9 owns the caveman ultra prose rule for chat and reports"
 }
 
@@ -184,14 +191,8 @@ test_caveman_rule_states_its_exceptions_in_place() {
 # One owner: skills must point at section 9 rather than carry a second copy of
 # the rule that will drift the moment only one is edited.
 test_caveman_rule_is_not_duplicated_into_skills() {
-  local duplicate_count file
-  duplicate_count=0
-  for file in "$BOOTSTRAP" "$AFK" "$DECISION" "$RECOVERY" "$HARNESS" "$CODEXAPP" "$FMX" "$UPDATE" "$AHOY"; do
-    if grep -Fq "**Write in caveman ultra prose.**" "$file"; then
-      duplicate_count=$((duplicate_count + 1))
-    fi
-  done
-  [ "$duplicate_count" -eq 0 ] || fail "skills duplicated section 9's caveman ultra prose owner"
+  assert_no_skill_duplicates "**Write in caveman ultra prose.**" \
+    "skills duplicated section 9's caveman ultra prose owner"
   pass "skills do not duplicate the caveman ultra prose owner"
 }
 

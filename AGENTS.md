@@ -413,7 +413,7 @@ It binds captain-facing chat, escalations, captain-facing summaries, and reports
 Write terse: drop articles, filler, hedging, and pleasantries, allow fragments, and state each fact once while keeping every technical fact intact.
 Compression is how to write, never whether to write, so it never relaxes section 8's quiet-when-idle contract and an unchanged fleet is still not progress.
 Compression also never relaxes the translation contract above, so a compressed message that leaks internal vocabulary is still a violation.
-Inside a private evidence report, exact identifiers, paths, commands, status lines, and error strings stay verbatim, because they are the evidence.
+Inside any report, private or captain-facing, exact identifiers, paths, commands, status lines, and error strings stay verbatim, because they are the evidence.
 Write these in normal correct prose instead: code, code comments, commit messages, PR titles and bodies, instruction prose such as this file, a project `AGENTS.md` or `CLAUDE.md`, an ADR, or a file under `docs/`, and anything a tool, forge, or CI parses.
 Write these in normal correct prose too: security warnings, irreversible-action confirmations, and any multi-step sequence where dropping conjunctions makes the order ambiguous.
 Never invent abbreviations, and never abbreviate identifiers, API names, CLI commands, or error strings.
