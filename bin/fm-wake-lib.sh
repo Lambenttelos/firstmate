@@ -28,7 +28,7 @@ fm_watcher_lock_matches_pid() {
 
 FM_WATCHER_HEALTHY_PID=
 fm_watcher_healthy() {
-  local state=$1 watch_path=$2 grace=${3:-${FM_GUARD_GRACE:-300}} home=${4:-$FM_HOME} lockdir beat pid age
+  local state=$1 watch_path=$2 grace=${3:-${FM_GUARD_GRACE:-900}} home=${4:-$FM_HOME} lockdir beat pid age
   FM_WATCHER_HEALTHY_PID=
   lockdir="$state/.watch.lock"
   beat="$state/.last-watcher-beat"

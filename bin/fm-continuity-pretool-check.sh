@@ -79,7 +79,7 @@ POLICY="$SCRIPT_DIR/fm-continuity-command-policy.mjs"
 . "$SCRIPT_DIR/fm-wake-lib.sh"
 
 fm_primary_scope_matches "$FM_ROOT" "$STATE" || exit 0
-fm_supervision_status "$STATE" "${FM_GUARD_GRACE:-300}"
+fm_supervision_status "$STATE" "${FM_GUARD_GRACE:-900}"
 [ "$FM_SUP_IN_FLIGHT" -gt 0 ] || exit 0
 LOCK_PID=$(cat "$STATE/.watch.lock/pid" 2>/dev/null || true)
 if fm_pid_alive "$LOCK_PID" && fm_watcher_lock_matches_pid "$STATE" "$WATCH" "$LOCK_PID" "$FM_HOME"; then

@@ -542,7 +542,7 @@ FM_SESSION_START_STATUS_TAIL=5   # state/*.status lines printed per task in the 
 FM_BOOTSTRAP_DETECT_ONLY=0   # internal/read-only session-start mode: skip bootstrap's mutating sweeps and print advisory TANGLE wording
 FM_GUARD_READ_ONLY=0    # internal/read-only guard mode: keep alarms but suppress drain, supervision repair, and checkout repair commands
 FM_GUARD_CONTINUE_LINE='This is a supervision warning only; the guarded operation WILL still run.'   # banner continuation line; fm-send.sh overrides it to name the requested message specifically
-FM_POLL=15              # seconds between watcher poll cycles; keep below the beacon grace (FM_WATCHER_STALE_GRACE, default 300) - see the POLL < grace invariant below
+FM_POLL=300             # seconds between watcher poll cycles; keep below the beacon grace (FM_WATCHER_STALE_GRACE, which defaults to FM_GUARD_GRACE and to 900) - see the POLL < grace invariant below
 FM_HEARTBEAT=600        # base seconds between heartbeat scans; no-change heartbeats are absorbed while idle
 FM_HEARTBEAT_MAX=7200   # heartbeat backoff cap
 FM_WATCH_ABSORB_TICK=0  # 1 makes a benign-absorbed wake end the cycle with a distinguishable "tick:" proof-of-life line (no wake record); default off = byte-identical silent absorb; only while work is under way. See docs/watcher-continuity.md "Absorbed-wake proof-of-life tick"
@@ -572,7 +572,7 @@ FMX_X_THREAD_MAX=25     # maximum messages in one auto-split reply thread
 FMX_FOLLOWUP_MAX_AGE_SECS=604800   # local window for posting X-mode completion follow-ups (7 days)
 FMX_FOLLOWUP_MAX_COUNT=3   # local cap on X-mode completion follow-ups per linked mention
 FM_LOCK_STALE_AFTER=2   # seconds before dead-pid lock records can be reclaimed; mid-acquire locks keep at least 2s grace
-FM_GUARD_GRACE=300      # seconds before guard warnings, arm health checks, and the primary turn-end guard treat a watcher beacon as stale
+FM_GUARD_GRACE=900      # seconds before guard warnings, arm health checks, and the primary turn-end guard treat a watcher beacon as stale
 FM_AFK_DAEMON_PENDING_TTL=300   # seconds an away-mode daemon-start intent marker (state/.supervise-daemon.starting) reads as owned before it decays to daemon-free; bounds the bring-up window (docs/turnend-guard.md "Away Mode")
 FM_AFK_DAEMON_STATE_TIMEOUT_MS=5000   # milliseconds the OpenCode auto-arm plugin waits for bin/fm-afk-daemon-state.sh to answer supervision ownership before treating away mode as daemon-owned and not arming
 FM_ARM_CONFIRM_TIMEOUT=10   # seconds fm-watch-arm waits to confirm a fresh watcher before reporting FAILED
@@ -585,7 +585,7 @@ FM_WATCH_REARM_RETRY_MAX_MS=4000   # Pi/OpenCode adapter cap for exponential con
 FM_WATCH_REARM_RETRY_LIMIT=5   # Pi/OpenCode adapter launch-failure retries before surfacing restoration failure
 FM_WATCH_CYCLE_LOG_MAX_BYTES=262144   # size cap for the arm-owned watcher lifecycle ledger
 FM_WATCH_CYCLE_LOG_KEEP_LINES=1000   # newest complete lifecycle rows considered when the ledger is capped
-FM_WATCHER_STALE_GRACE=300   # defaults to FM_GUARD_GRACE; seconds a live watcher lock may have a stale beacon before re-arm errors. POLL < grace invariant: FM_POLL must stay below this grace. The watcher refreshes its liveness beacon (state/.last-watcher-beat) at the top of each cycle, so a full cycle's terminal wait that outlives the grace would read a healthy sleeping watcher as dead (the guard prints WATCHER DOWN and re-arm refuses) for the back of every cycle. bin/fm-watch.sh keeps the beacon fresh by slicing that wait into pieces no longer than min(FM_POLL, grace/2) and re-touching the beacon each slice, and warns at start-up when FM_POLL >= grace, but the cadence and the liveness grace should still be set so FM_POLL is the smaller.
+FM_WATCHER_STALE_GRACE=900   # defaults to FM_GUARD_GRACE, which itself defaults to 900; seconds a live watcher lock may have a stale beacon before re-arm errors. POLL < grace invariant: FM_POLL must stay below this grace. The watcher refreshes its liveness beacon (state/.last-watcher-beat) at the top of each cycle, so a full cycle's terminal wait that outlives the grace would read a healthy sleeping watcher as dead (the guard prints WATCHER DOWN and re-arm refuses) for the back of every cycle. bin/fm-watch.sh keeps the beacon fresh by slicing that wait into pieces no longer than min(FM_POLL, grace/2) and re-touching the beacon each slice, and warns at start-up when FM_POLL >= grace, but the cadence and the liveness grace should still be set so FM_POLL is the smaller.
 FM_SIGNAL_GRACE=30      # seconds to coalesce nearby status and turn-end signals into one wake
 FM_CAPTAIN_RE='done:|needs-decision:|blocked:|failed:|PR ready|checks green|ready in branch|merged'   # captain-relevant status regex; nonterminal progress verbs remain excluded even when their prose matches
 FM_CLASSIFY_PAUSED_VERB=paused     # leading status verb for a declared external wait; excluded from FM_CAPTAIN_RE and distinct from blocked
