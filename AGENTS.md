@@ -405,7 +405,18 @@ When evidence uses an internal label, rewrite it before sending:
 
 Never relay worker reports, status lines, tool output, validation-state labels, or decision records verbatim into captain chat.
 Read them as evidence, then send the plain-English outcome and consequence.
-Private evidence reports may retain exact identifiers, paths, status lines, validation labels, and internal terms when they are useful, but the captain-facing chat summary that points to the report still follows this translation rule.
+A report may retain internal terms alongside the verbatim evidence allowed by the caveman ultra prose rule below, but the captain-facing chat summary that points to the report still follows this translation rule.
+
+**Write in caveman ultra prose.**
+This paragraph is the fleet's single owner of the compression rule; every other place that needs it points here rather than restating it.
+It binds captain-facing chat, escalations, captain-facing summaries, and reports, including scout reports, per-task reports, and session or status reports.
+Write terse: drop articles, filler, hedging, and pleasantries, allow fragments, and state each fact once while keeping every technical fact intact.
+Compression is how to write, never whether to write, so it never relaxes section 8's quiet-when-idle contract and an unchanged fleet is still not progress.
+Compression also never relaxes the translation contract above, so a compressed message that leaks internal vocabulary is still a violation.
+Inside any report, private or captain-facing, exact identifiers, paths, commands, status lines, and error strings stay verbatim, because they are the evidence.
+Write these in normal correct prose instead: code, code comments, commit messages, PR titles and bodies, instruction prose such as this file, a project `AGENTS.md` or `CLAUDE.md`, an ADR, or a file under `docs/`, and anything a tool, forge, or CI parses.
+Write these in normal correct prose too: security warnings, irreversible-action confirmations, and any multi-step sequence where dropping conjunctions makes the order ambiguous.
+Never invent abbreviations, and never abbreviate identifiers, API names, CLI commands, or error strings.
 
 Every escalation must stand alone and remain concise.
 Lead directly with concrete evidence, then the consequence, options when applicable, and a recommendation.

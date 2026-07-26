@@ -96,11 +96,13 @@ test_verbatim_internal_evidence_is_rejected_from_chat() {
   contract=$(section_9)
   assert_contains "$contract" "Never relay worker reports, status lines, tool output, validation-state labels, or decision records verbatim into captain chat." \
     "section 9 does not reject verbatim internal evidence in captain chat"
-  assert_contains "$contract" "Private evidence reports may retain exact identifiers, paths, status lines, validation labels, and internal terms" \
-    "section 9 does not preserve private evidence precision"
+  assert_contains "$contract" "A report may retain internal terms alongside the verbatim evidence allowed by the caveman ultra prose rule below" \
+    "section 9 does not preserve report precision for every report"
+  assert_not_contains "$contract" "Private evidence reports may retain" \
+    "section 9 still limits report precision to private reports"
   assert_contains "$contract" "the captain-facing chat summary that points to the report still follows this translation rule" \
     "section 9 does not keep chat summaries plain English"
-  pass "captain chat rejects verbatim internal evidence while private reports stay precise"
+  pass "captain chat rejects verbatim internal evidence while reports stay precise"
 }
 
 test_outward_facing_skill_points_reference_section_9_owner() {
@@ -129,16 +131,71 @@ test_outward_facing_skill_points_reference_section_9_owner() {
   pass "outward-facing skill handoffs point to the section 9 owner"
 }
 
-test_section_9_owner_is_not_duplicated_into_skills() {
-  local duplicate_count file
-  duplicate_count=0
-  for file in "$BOOTSTRAP" "$AFK" "$DECISION" "$RECOVERY" "$HARNESS" "$CODEXAPP" "$UPDATE"; do
-    if grep -Fq "When evidence uses an internal label, rewrite it before sending:" "$file"; then
-      duplicate_count=$((duplicate_count + 1))
+assert_no_skill_duplicates() {
+  local marker="$1" message="$2"
+  local duplicates file
+  duplicates=""
+  for file in "$ROOT"/.agents/skills/*/SKILL.md; do
+    [ -e "$file" ] || continue
+    if grep -Fq "$marker" "$file"; then
+      duplicates="$duplicates $file"
     fi
   done
-  [ "$duplicate_count" -eq 0 ] || fail "skills duplicated section 9's mapping owner"
+  [ -z "$duplicates" ] || fail "$message:$duplicates"
+}
+
+test_section_9_owner_is_not_duplicated_into_skills() {
+  assert_no_skill_duplicates "When evidence uses an internal label, rewrite it before sending:" \
+    "skills duplicated section 9's mapping owner"
   pass "skills cross-reference section 9 instead of duplicating the mapping list"
+}
+
+# The caveman ultra prose rule used to live only in one home's private captain
+# preferences, so it bound by memory and every live worker had to be hand-steered.
+# Section 9 is now its structural owner, next to the translation contract it must
+# never override.
+test_section_9_owns_the_caveman_ultra_prose_rule() {
+  local contract
+  contract=$(section_9)
+  assert_contains "$contract" "**Write in caveman ultra prose.**" \
+    "section 9 does not own the caveman ultra prose rule"
+  assert_contains "$contract" "It binds captain-facing chat, escalations, captain-facing summaries, and reports, including scout reports, per-task reports, and session or status reports." \
+    "section 9 does not bind reports to the compression rule"
+  assert_contains "$contract" "never relaxes section 8's quiet-when-idle contract" \
+    "section 9 lets compression relax the quiet-when-idle contract"
+  assert_contains "$contract" "a compressed message that leaks internal vocabulary is still a violation" \
+    "section 9 lets compression override the translation contract"
+  assert_contains "$contract" "Inside any report, private or captain-facing, exact identifiers, paths, commands, status lines, and error strings stay verbatim" \
+    "section 9 does not grant the verbatim-evidence carve-out to any report"
+  pass "section 9 owns the caveman ultra prose rule for chat and reports"
+}
+
+# The exceptions must be stated where the rule is stated, so an agent that reads
+# only this paragraph never compresses text a tool, a forge, or a human safety
+# decision depends on.
+test_caveman_rule_states_its_exceptions_in_place() {
+  local contract phrase
+  contract=$(section_9)
+  for phrase in \
+    "commit messages" \
+    "PR titles and bodies" \
+    "anything a tool, forge, or CI parses" \
+    "security warnings" \
+    "irreversible-action confirmations" \
+    "dropping conjunctions makes the order ambiguous" \
+    "Never invent abbreviations"; do
+    assert_contains "$contract" "$phrase" \
+      "section 9's caveman rule lost its \"$phrase\" exception"
+  done
+  pass "the caveman rule states its exceptions next to the rule"
+}
+
+# One owner: skills must point at section 9 rather than carry a second copy of
+# the rule that will drift the moment only one is edited.
+test_caveman_rule_is_not_duplicated_into_skills() {
+  assert_no_skill_duplicates "**Write in caveman ultra prose.**" \
+    "skills duplicated section 9's caveman ultra prose owner"
+  pass "skills do not duplicate the caveman ultra prose owner"
 }
 
 test_ahoy_is_an_internal_user_invocable_skill() {
@@ -245,6 +302,9 @@ test_mapping_list_covers_high_risk_internal_families
 test_verbatim_internal_evidence_is_rejected_from_chat
 test_outward_facing_skill_points_reference_section_9_owner
 test_section_9_owner_is_not_duplicated_into_skills
+test_section_9_owns_the_caveman_ultra_prose_rule
+test_caveman_rule_states_its_exceptions_in_place
+test_caveman_rule_is_not_duplicated_into_skills
 test_ahoy_is_an_internal_user_invocable_skill
 test_ahoy_readme_uses_cross_harness_convention
 test_ahoy_owns_only_the_visible_session_recap

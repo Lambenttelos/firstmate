@@ -519,21 +519,28 @@ test_ship_and_scout_briefs_bind_the_standing_captain_rules() {
       "$kind brief must keep planning mandatory on every harness, not only where wayfinder resolves"
     assert_grep "plan by your own means" "$brief" \
       "$kind brief must stay satisfiable on a runtime without the wayfinder skill"
-    # C4. caveman ultra prose for ephemeral output only, durable documents in normal English
-    assert_grep "EPHEMERAL prose in caveman ultra style" "$brief" \
-      "$kind brief must scope caveman ultra prose to ephemeral output"
-    assert_grep "DURABLE documents stay in normal" "$brief" \
-      "$kind brief must keep durable documents in normal English"
+    # C4. caveman ultra prose, reports included. The captain widened the scope on
+    # 2026-07-25, so a report compresses too and only its evidence stays verbatim.
+    assert_grep "C4. Write your prose in caveman ultra style" "$brief" \
+      "$kind brief must bind caveman ultra prose without an ephemeral-only escape hatch"
+    assert_no_grep "EPHEMERAL prose in caveman ultra style" "$brief" \
+      "$kind brief must not scope caveman ultra prose to ephemeral output only"
+    assert_no_grep "DURABLE documents stay in normal" "$brief" \
+      "$kind brief must not exempt durable documents wholesale"
+    assert_grep "AND your reports, including the scout" "$brief" \
+      "$kind brief must bind reports to the compression rule"
     # shellcheck disable=SC2016 # Literal backticks must remain unexpanded.
     assert_grep 'data/<id>/report.md' "$brief" \
-      "$kind brief must name the scout report as a durable normal-English document"
+      "$kind brief must name the scout report as a compressed report"
+    assert_grep "status lines, and error strings stay VERBATIM" "$brief" \
+      "$kind brief must keep report evidence verbatim inside a compressed report"
     # shellcheck disable=SC2016 # Literal backticks must remain unexpanded.
     assert_grep '`AGENTS.md`' "$brief" \
-      "$kind brief must name project AGENTS.md as a durable normal-English document"
-    assert_grep "anything a tool or CI parses" "$brief" \
+      "$kind brief must keep project AGENTS.md in normal English"
+    assert_grep "anything a tool, forge, or CI parses" "$brief" \
       "$kind brief must keep code, commits, PR text, and tool-parsed output in normal English"
-    assert_grep "read cold months later" "$brief" \
-      "$kind brief must state why durable documents keep normal English"
+    assert_grep "Section 9 of the firstmate repo" "$brief" \
+      "$kind brief must point at the single tracked owner of the rule"
     assert_grep "irreversible-action confirmations" "$brief" \
       "$kind brief must keep the security and irreversible-action carve-outs"
     assert_grep "abbreviate identifiers, API names, CLI commands, or error strings" "$brief" \
@@ -590,22 +597,28 @@ test_secondmate_charter_binds_the_applicable_captain_rules() {
   # Labels are stable fleet-wide: the caveman rule is C4 in every block, and the
   # secondmate subset keeps the C3 gap rather than renumbering, so a steer that
   # names a rule always means the same rule to a crewmate and to a secondmate.
-  assert_grep "C4. Write EPHEMERAL prose in caveman ultra style" "$brief" \
+  assert_grep "C4. Write your prose in caveman ultra style" "$brief" \
     "secondmate charter must label the caveman rule C4, matching the ship and scout block"
   assert_no_grep "C3." "$brief" \
     "secondmate charter must keep the C3 gap instead of renumbering its rules contiguously"
-  assert_grep "EPHEMERAL prose in caveman ultra style" "$brief" \
-    "secondmate charter must scope caveman ultra prose to ephemeral reports"
-  assert_grep "DURABLE documents stay in normal" "$brief" \
-    "secondmate charter must keep durable documents in normal English"
+  assert_no_grep "EPHEMERAL prose in caveman ultra style" "$brief" \
+    "secondmate charter must not scope caveman ultra prose to ephemeral reports only"
+  assert_no_grep "DURABLE documents stay in normal" "$brief" \
+    "secondmate charter must not exempt durable documents wholesale"
+  assert_grep "AND every report you or your" "$brief" \
+    "secondmate charter must bind every report to the compression rule"
   # shellcheck disable=SC2016 # Literal backticks must remain unexpanded.
   assert_grep 'data/<id>/report.md' "$brief" \
-    "secondmate charter must name the scout report as a durable normal-English document"
+    "secondmate charter must name the scout report as a compressed report"
+  assert_grep "status lines, and error strings stay VERBATIM" "$brief" \
+    "secondmate charter must keep report evidence verbatim"
   # shellcheck disable=SC2016 # Literal backticks must remain unexpanded.
   assert_grep '`AGENTS.md`' "$brief" \
-    "secondmate charter must name project AGENTS.md as a durable normal-English document"
-  assert_grep "anything a tool or CI parses" "$brief" \
+    "secondmate charter must keep project AGENTS.md in normal English"
+  assert_grep "anything a tool, forge, or CI parses" "$brief" \
     "secondmate charter must keep tool-parsed text in normal English"
+  assert_grep "Section 9 of the firstmate repo" "$brief" \
+    "secondmate charter must point at the single tracked owner of the rule"
   pass "fm-brief.sh: secondmate charter binds the captain rules that apply to a supervising home"
 }
 

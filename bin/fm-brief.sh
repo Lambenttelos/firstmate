@@ -62,7 +62,9 @@
 # your own to delete a branch, though the guarded teardown and fleet-sync paths removing
 # their own refs are exempt), understand the reason behind an instruction before acting and ask firstmate for a
 # grilling session when it is unclear, plan with the wayfinder skill before changing code,
-# write prose in caveman ultra style while keeping code and tool-parsed text normal, and bind
+# write prose in caveman ultra style - reports included, with their identifiers, paths,
+# commands, and error strings kept verbatim as evidence - while keeping code and tool-parsed
+# text normal, and bind
 # no server to port 443 or 3000. The Mattermost-sourced rule is written as a self-guarding
 # conditional on the same section rather than behind a flag, because a rule firstmate can
 # forget to pass is worth nothing. The secondmate charter carries the subset that applies to a
@@ -166,17 +168,18 @@ These bind you for the whole task. They are not optional and they outrank conven
 - **C3. Plan before you change code.** Planning first is MANDATORY, whatever runtime you are
    running on. If your runtime provides the `wayfinder` skill, invoke it to plan the work.
    If it does not, plan by your own means before touching code; the mandate stands either way.
-- **C4. Write EPHEMERAL prose in caveman ultra style.** Ephemeral prose means status lines and
-   the reports or replies you send back to firstmate: drop articles, filler, hedging, and
-   pleasantries; fragments are fine; state each fact once. DURABLE documents stay in normal
-   English: the scout report at `data/<id>/report.md`, any project `AGENTS.md` or
-   `CLAUDE.md`, ADRs, files under `docs/`, code, code comments, commit messages, PR titles
-   and bodies, and anything a tool or CI parses. The style exists to cut chat noise, not to
-   make the permanent record harder to read - durable documents are read cold months later
-   by people and agents with no context. Also drop the style for security warnings,
-   irreversible-action confirmations, and any multi-step sequence where dropping
-   conjunctions would make the order ambiguous. Never invent abbreviations and never
+- **C4. Write your prose in caveman ultra style.** Drop articles, filler, hedging, and
+   pleasantries; fragments are fine; state each fact once; keep every technical fact. This
+   binds your status lines, your replies to firstmate, AND your reports, including the scout
+   report at `data/<id>/report.md`. Inside a report, exact identifiers, paths, commands,
+   status lines, and error strings stay VERBATIM - they are evidence, not prose. Written in
+   normal correct prose instead: code, code comments, commit messages, PR titles and bodies,
+   any project `AGENTS.md` or `CLAUDE.md`, ADRs, files under `docs/`, and
+   anything a tool, forge, or CI parses. Normal prose too for security warnings,
+   irreversible-action confirmations, and any multi-step sequence where dropping conjunctions would make the
+   order ambiguous. Never invent abbreviations and never
    abbreviate identifiers, API names, CLI commands, or error strings.
+   Section 9 of the firstmate repo `AGENTS.md` owns this rule in full.
 - **C5. Never bind port 443 or 3000.** Those ports are reserved for the servers the captain
    runs personally. Any server you start runs on a non-default port.
 - **C6. If this task came from a Mattermost thread**, your FIRST action is to re-read the full
@@ -209,17 +212,18 @@ These bind you and every crewmate you dispatch.
    line to the main status file, carrying the same `corr=<id>` token when the request you are
    questioning arrived marked. Never ask only in this chat: the main firstmate does not read
    it, so a chat-only question is lost. Asking is never treated as a failure.
-- **C4. Write EPHEMERAL prose in caveman ultra style.** Ephemeral prose means status lines and
-   the reports or replies you send back to the main firstmate: drop articles, filler,
-   hedging, and pleasantries; state each fact once. DURABLE documents stay in normal
-   English: the scout report at `data/<id>/report.md`, any project `AGENTS.md` or
-   `CLAUDE.md`, ADRs, files under `docs/`, code, code comments, commit messages, PR titles
-   and bodies, and anything a tool or CI parses. The style exists to cut chat noise, not to
-   make the permanent record harder to read - durable documents are read cold months later
-   by people and agents with no context. Also drop the style for security warnings,
+- **C4. Write your prose in caveman ultra style.** Drop articles, filler, hedging, and
+   pleasantries; fragments are fine; state each fact once; keep every technical fact. This
+   binds your status lines, your replies to the main firstmate, AND every report you or your
+   crewmates produce, including the scout report at `data/<id>/report.md`. Inside a report,
+   exact identifiers, paths, commands, status lines, and error strings stay VERBATIM - they
+   are evidence, not prose. Written in normal correct prose instead: code, code comments,
+   commit messages, PR titles and bodies, any project `AGENTS.md` or `CLAUDE.md`, ADRs, files
+   under `docs/`, and anything a tool, forge, or CI parses. Normal prose too for security warnings,
    irreversible-action confirmations, and any multi-step sequence where dropping
    conjunctions would make the order ambiguous. Never invent abbreviations and never
    abbreviate identifiers, API names, CLI commands, or error strings.
+   Section 9 of the firstmate repo `AGENTS.md` owns this rule in full.
 EOF
 )
 

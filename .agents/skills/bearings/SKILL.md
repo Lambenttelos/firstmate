@@ -72,6 +72,7 @@ Rules that keep the contract unambiguous:
 
 ## Tone and content rules
 
+- The report file itself is a status report, so its prose obeys the compression rule `AGENTS.md` section 9 owns, exactly as the chat digest does; identifiers, paths, commands, status lines, and error strings inside it stay verbatim because they are the evidence.
 - This report is a private, captain-facing internal artifact that lives in gitignored `data/`, so unlike normal captain chat it MAY reference task ids, PR URLs, and repo names - the captain works with these directly and needs them to resume; keep it organized and scannable, not a raw dump.
 - Every PR reference is a full `https://...` URL, never a bare `#number`; a shorthand `#number` is fine only as a back-reference after the full URL has already appeared in the same report.
 - Never include PHI or secret values; the report is an operational artifact, but it is still subject to the same security and compliance rules that govern everything else in this fleet.
