@@ -11,6 +11,8 @@
 #     unrecorded when it is not
 #   - the stats file is append-only across sessions
 #   - report renders the most recent record, including model and effort
+#   - the default `record` close leaves every worker running, tears nothing down,
+#     and records an accurate workers_live count
 #   - report with no record yet fails loudly instead of printing an empty report
 set -u
 
@@ -154,6 +156,55 @@ test_report_renders_last_record() {
   pass "report renders the most recent record with model, effort, and away time"
 }
 
+test_record_leaves_workers_running() {
+  local home; home=$(make_home recordlive)
+  fm_write_meta "$home/state/a.meta" 'kind=ship'
+  fm_write_meta "$home/state/b.meta" 'kind=scout'
+  fm_write_secondmate_meta "$home/state/domain.meta" "$home/sub"
+  fake_teardown "$home" >/dev/null
+
+  local out rc=0
+  out=$(run_cli "$home" record --model claude-opus-5 --effort low 2>&1) || rc=$?
+  expect_code 0 "$rc" "a record-only close must exit 0"
+  assert_absent "$home/teardown.log" 'a record-only close must never tear a worker down'
+  assert_contains "$out" 'workers left running: 2' 'both ordinary workers must be reported as left running'
+  assert_contains "$out" 'secondmates left running: 1' 'the secondmate must be reported as still up'
+  assert_grep 'workers_live=2' "$home/data/session-stats.log" 'the live worker count must be recorded'
+  assert_grep 'released=0' "$home/data/session-stats.log" 'a record-only close releases nothing'
+  assert_grep 'refused=0' "$home/data/session-stats.log" 'a record-only close refuses nothing'
+  assert_grep 'refused_ids=-' "$home/data/session-stats.log" 'no refusals must record as -'
+  assert_grep 'secondmates_left=1' "$home/data/session-stats.log" 'the secondmate must be recorded'
+  assert_grep 'model=claude-opus-5' "$home/data/session-stats.log" 'the model must be recorded'
+  pass "record leaves every worker running and records the session accurately"
+}
+
+test_record_reports_away_and_appends() {
+  local home; home=$(make_home recordaway)
+  fake_teardown "$home" >/dev/null
+  printf '%s\n' 1000 > "$home/state/.afk"
+  FM_END_SESSION_NOW=8200 run_cli "$home" record --model m --effort low >/dev/null
+  FM_END_SESSION_NOW=9000 run_cli "$home" record --model m --effort low >/dev/null
+
+  local count
+  count=$(grep -c '^ended=' "$home/data/session-stats.log")
+  [ "$count" = 2 ] || fail "expected 2 records from two record-only closes, got $count"
+  assert_grep 'away_source=open-flag' "$home/data/session-stats.log" 'an open away stretch must be measured in a record close'
+  pass "record measures open away time and appends, never overwrites"
+}
+
+test_record_renders_in_report() {
+  local home; home=$(make_home recordreport)
+  fm_write_meta "$home/state/x.meta" 'kind=ship'
+  fake_teardown "$home" >/dev/null
+  run_cli "$home" record --model claude-opus-5 --effort high >/dev/null
+
+  local out
+  out=$(run_cli "$home" report)
+  assert_contains "$out" 'workers left running: 1' 'the report must state workers left running'
+  assert_contains "$out" 'workers stood down: 0' 'a record close stood nothing down'
+  pass "report renders the live-worker count from a record-only close"
+}
+
 test_report_without_record_fails() {
   local home; home=$(make_home noreport)
   local rc=0
@@ -169,4 +220,7 @@ test_away_time_from_open_flag
 test_away_time_unrecorded_without_flag
 test_stats_file_is_append_only
 test_report_renders_last_record
+test_record_leaves_workers_running
+test_record_reports_away_and_appends
+test_record_renders_in_report
 test_report_without_record_fails

@@ -1,19 +1,25 @@
 #!/usr/bin/env bash
 # fm-end-session.sh - close this firstmate home's session down in one pass:
-# stand every ordinary live worker down safely, then append one durable record of
-# the session to data/session-stats.log.
+# append one durable record of the session to data/session-stats.log, and, only
+# when the caller opts in, also stand every ordinary live worker down safely.
 #
-# Policy - stow before anything is stood down, and ask about the session report
-# only after the record is written - lives in the end-session skill
+# The default close (the `record` command) leaves every live worker running: a
+# session close is a bookkeeping event, not a teardown, so workers keep working
+# across it. Standing the fleet down is a separate, opt-in action (the
+# `standdown` command) taken only on the captain's explicit word.
+#
+# Policy - stow before the record is written, and ask about the session report
+# only after it - lives in the end-session skill
 # (.agents/skills/end-session/SKILL.md). This script owns only the mechanics.
 #
-# SAFETY: stand-down calls bin/fm-teardown.sh once per task and NEVER passes
+# SAFETY: `standdown` calls bin/fm-teardown.sh once per task and NEVER passes
 # --force, so teardown's landed-work test stays the authority on what may be
 # released. A refusal is reported by task id with the line teardown printed, and
 # is never retried, forced, stashed, or worked around; the session closes with
 # that worker still standing. Registered secondmates are persistent (AGENTS.md
 # section 6), so they are listed as left running and never torn down: retiring
-# one needs an explicit captain decision.
+# one needs an explicit captain decision. `record` tears nothing down at all -
+# it only counts what is live and writes the history line.
 #
 # Away-mode time is reported only from durable state. state/.afk holds the epoch
 # second away mode was entered, so an away stretch still open at session close is
@@ -30,18 +36,27 @@
 #   away_seconds      seconds in the away stretch still open at close, else 0
 #   away_source       open-flag when away_seconds came from state/.afk, else
 #                     unrecorded (no durable record of ended stretches)
-#   released refused  counts of ordinary tasks stood down and refused
+#   released refused  counts of ordinary tasks stood down and refused; both 0
+#                     for a `record` close, which stands nothing down
 #   refused_ids       comma-separated task ids still standing, else -
 #   secondmates_left  registered secondmates deliberately left running
 #   merge_queue       branches still waiting to merge at close
+#   workers_live      ordinary tasks still running at close: every ordinary task
+#                     for a `record` close, the refused (still-standing) tasks
+#                     for a `standdown` close
 # Fields are appended, never rewritten: the file is session history. Only durable
 # identifiers and counts are recorded - no worktree paths, pane ids, tool
 # versions, or other detail that rots (AGENTS.md section 10 note hygiene).
 #
 # Usage:
+#   fm-end-session.sh record [--model <name>] [--effort <level>]
+#                        append the session record and print the outcome, leaving
+#                        every live worker running. Exit 0. This is the default
+#                        session close.
 #   fm-end-session.sh standdown [--model <name>] [--effort <level>]
-#                        stand the fleet down, append the session record, print
-#                        the outcome. Exit 0 when every ordinary task was
+#                        stand the fleet down AND append the session record, then
+#                        print the outcome. Opt-in, taken only on the captain's
+#                        explicit word. Exit 0 when every ordinary task was
 #                        released, 3 when at least one teardown refused. The
 #                        record is appended either way.
 #   fm-end-session.sh report
@@ -111,7 +126,7 @@ merge_queue_count() {
 
 append_record() {
   # append_record <model> <effort> <away_secs> <away_src> <released> <refused>
-  #               <refused_ids> <secondmates_left> <merge_queue>
+  #               <refused_ids> <secondmates_left> <merge_queue> <workers_live>
   local ended
   if [ -n "${FM_END_SESSION_NOW:-}" ]; then
     ended=$(date -u -r "$FM_END_SESSION_NOW" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null \
@@ -126,8 +141,8 @@ append_record() {
     printf '# Field meanings live in bin/fm-end-session.sh; never rewrite or prune a record.\n' \
       >>"$STATS"
   fi
-  printf 'ended=%s\tmodel=%s\teffort=%s\taway_seconds=%s\taway_source=%s\treleased=%s\trefused=%s\trefused_ids=%s\tsecondmates_left=%s\tmerge_queue=%s\n' \
-    "$ended" "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9" >>"$STATS"
+  printf 'ended=%s\tmodel=%s\teffort=%s\taway_seconds=%s\taway_source=%s\treleased=%s\trefused=%s\trefused_ids=%s\tsecondmates_left=%s\tmerge_queue=%s\tworkers_live=%s\n' \
+    "$ended" "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9" "${10}" >>"$STATS"
 }
 
 last_record() {
@@ -139,15 +154,75 @@ record_field() {
   printf '%s\n' "$1" | tr '\t' '\n' | sed -n "s/^$2=//p" | tail -1
 }
 
-cmd_standdown() {
-  local model=unrecorded effort=unrecorded
+# parse_model_effort <args...> - set OPT_MODEL and OPT_EFFORT from --model/--effort.
+OPT_MODEL=unrecorded
+OPT_EFFORT=unrecorded
+parse_model_effort() {
+  OPT_MODEL=unrecorded
+  OPT_EFFORT=unrecorded
   while [ "$#" -gt 0 ]; do
     case "$1" in
-      --model) model=${2:-}; [ -n "$model" ] || { echo "error: --model needs a value" >&2; exit 2; }; shift 2 ;;
-      --effort) effort=${2:-}; [ -n "$effort" ] || { echo "error: --effort needs a value" >&2; exit 2; }; shift 2 ;;
+      --model) OPT_MODEL=${2:-}; [ -n "$OPT_MODEL" ] || { echo "error: --model needs a value" >&2; exit 2; }; shift 2 ;;
+      --effort) OPT_EFFORT=${2:-}; [ -n "$OPT_EFFORT" ] || { echo "error: --effort needs a value" >&2; exit 2; }; shift 2 ;;
       *) echo "error: unknown option '$1'" >&2; usage >&2; exit 2 ;;
     esac
   done
+}
+
+# count_live_ordinary - print "<ordinary> <secondmate> <secondmate_ids>": the
+# number of ordinary tasks and of registered secondmates with a state/*.meta.
+count_live_ordinary() {
+  local meta id kind ordinary=0 secondmates=0 secondmate_ids=''
+  for meta in "$STATE"/*.meta; do
+    [ -e "$meta" ] || continue
+    id=$(basename "$meta" .meta)
+    kind=$(meta_field "$meta" kind)
+    if [ "$kind" = secondmate ]; then
+      secondmates=$((secondmates + 1))
+      secondmate_ids="$secondmate_ids $id"
+    else
+      ordinary=$((ordinary + 1))
+    fi
+  done
+  printf '%s %s%s\n' "$ordinary" "$secondmates" "$secondmate_ids"
+}
+
+cmd_record() {
+  parse_model_effort "$@"
+  local model=$OPT_MODEL effort=$OPT_EFFORT
+
+  local counts ordinary secondmates secondmate_ids
+  counts=$(count_live_ordinary)
+  ordinary=${counts%% *}
+  counts=${counts#* }
+  secondmates=${counts%% *}
+  case "$counts" in *' '*) secondmate_ids=${counts#* } ;; *) secondmate_ids='' ;; esac
+
+  local away away_secs away_src queue
+  away=$(away_time)
+  away_secs=${away% *}
+  away_src=${away#* }
+  queue=$(merge_queue_count)
+
+  append_record "$model" "$effort" "$away_secs" "$away_src" 0 0 - \
+    "$secondmates" "$queue" "$ordinary"
+
+  echo
+  echo "Session close (record only, no worker stood down):"
+  printf -- '- workers left running: %s\n' "$ordinary"
+  printf -- '- secondmates left running: %s%s\n' "$secondmates" "$secondmate_ids"
+  if [ "$away_src" = open-flag ]; then
+    printf -- '- away mode open at close: %s\n' "$(human_duration "$away_secs")"
+  else
+    echo "- away mode: no open stretch; ended stretches are not recorded durably"
+  fi
+  printf -- '- branches waiting to merge: %s\n' "$queue"
+  printf -- '- session record appended: %s\n' "$STATS"
+}
+
+cmd_standdown() {
+  parse_model_effort "$@"
+  local model=$OPT_MODEL effort=$OPT_EFFORT
 
   local released=0 refused=0 secondmates=0
   local released_ids='' refused_ids='' refusal_report='' secondmate_ids=''
@@ -189,7 +264,7 @@ cmd_standdown() {
   queue=$(merge_queue_count)
 
   append_record "$model" "$effort" "$away_secs" "$away_src" "$released" "$refused" \
-    "${refused_ids:--}" "$secondmates" "$queue"
+    "${refused_ids:--}" "$secondmates" "$queue" "$refused"
 
   echo
   echo "Session close:"
@@ -233,6 +308,9 @@ cmd_report() {
   printf -- '- workers stood down: %s\n' "$(record_field "$record" released)"
   printf -- '- workers still standing: %s (%s)\n' \
     "$(record_field "$record" refused)" "$(record_field "$record" refused_ids)"
+  local live
+  live=$(record_field "$record" workers_live)
+  [ -n "$live" ] && printf -- '- workers left running: %s\n' "$live"
   printf -- '- secondmates left running: %s\n' "$(record_field "$record" secondmates_left)"
   printf -- '- branches waiting to merge: %s\n' "$(record_field "$record" merge_queue)"
 }
@@ -240,6 +318,7 @@ cmd_report() {
 cmd=${1:-}
 [ "$#" -gt 0 ] && shift || true
 case "$cmd" in
+  record) cmd_record "$@" ;;
   standdown) cmd_standdown "$@" ;;
   report) cmd_report ;;
   -h | --help | help) usage ;;

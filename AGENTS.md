@@ -162,7 +162,7 @@ A silent bootstrap section needs no action; for any printed actionable diagnosti
 `BOOTSTRAP_INFO:` lines are completed no-action facts and do not require loading a skill.
 `secondmate-provisioning` owns startup secondmate sync, liveness, and inherited local-material convergence.
 
-When the captain invokes `/endsession` or says they are done for the session, load the `end-session` skill, which owns closing a session down: the stow-first ordering, the safe stand-down, the session-stats record, and the offered session report.
+When the captain invokes `/endsession` or says they are done for the session, load the `end-session` skill, which owns closing a session down: the stow-first ordering, the session-stats record, the offered session report, and the opt-in stand-down that runs only on the captain's explicit word (a plain close leaves every live worker running).
 
 ## 4. Harness and runtime dispatch
 
