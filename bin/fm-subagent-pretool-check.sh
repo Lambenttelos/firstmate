@@ -65,6 +65,12 @@ DELEGATION_STEMS='agent subagent task workflow cron schedul worktree delegate sp
 # reason a runaway task cannot be stopped.
 OBSERVE_ONLY_TOOLS='taskoutput taskstop taskget tasklist cronlist bashoutput killshell'
 
+# Self-scheduling tools deliver a PROMPT back to THIS session later; they
+# create no untracked worker, no isolated workspace, and no delegated work,
+# so denying them only strands the away-mode cron backstop and the captain's
+# scheduled self-checks (captain 2026-07-24; task fix-subagent-guard-allow-self-schedule).
+SELF_SCHEDULE_TOOLS='croncreate crondelete schedulewakeup'
+
 TOOL=""
 TOOL_SET=0
 CLAUDE_MODE=0
@@ -140,6 +146,10 @@ case "$TOOL" in
 esac
 
 for allowed in $OBSERVE_ONLY_TOOLS; do
+  [ "$NORMALIZED" != "$allowed" ] || exit 0
+done
+
+for allowed in $SELF_SCHEDULE_TOOLS; do
   [ "$NORMALIZED" != "$allowed" ] || exit 0
 done
 
