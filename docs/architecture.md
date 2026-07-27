@@ -196,8 +196,10 @@ The `data/secondmates.md` line contract is owned by the [`secondmate-provisionin
 
 ## Project modes are explicit
 
-`data/projects.md` records each project's delivery mode and optional `+yolo` autonomy flag.
-`no-mistakes` projects run the full validation pipeline, `direct-PR` projects open PRs without that pipeline, `direct-push` projects run the full pipeline then push the validated branch to a forge firstmate cannot open PRs on (e.g. Bitbucket) for the configured merge authority to land, and `local-only` projects stay local until firstmate performs an approved fast-forward merge.
+`data/projects.md` records each project's delivery mode and optional `+yolo` autonomy and `+autoland` self-land flags.
+`no-mistakes` projects run the full validation pipeline, `direct-PR` projects open PRs without that pipeline, `direct-push` projects run the full pipeline then push the validated branch to a forge firstmate cannot open PRs on (e.g. Bitbucket) for the configured merge authority to land, and `local-only` projects stay local until firstmate performs an approved `--no-ff` merge.
+The `+autoland` flag (owned repos only, orthogonal to mode and `+yolo`) is a durable standing captain grant that green work self-lands without waiting: a `direct-push +autoland` crew merges its own green `fm/<id>` branch onto the origin default branch as a clean `--no-ff` merge itself and reports the merge evidence, and a `local-only +autoland` lane has firstmate fire the guarded local merge automatically once the review gate is green; a conflict, or any destructive, irreversible, or security-sensitive choice, still escalates.
+The header of `bin/fm-project-mode.sh` owns the full flag semantics and registry syntax.
 When a selected delivery path calls for a diff, `bin/fm-review-diff.sh` refreshes the authoritative base and, when task meta records `pr=`, always fetches and compares against `refs/pull/<n>/head` by default (recorded `pr_head=` is only an offline fallback) before falling back to the local branch with a warning.
 For target project repos shipped through their own no-mistakes pipeline, commits under `.no-mistakes/evidence/` are the pipeline's PR-viewable validation evidence and are expected to stay in the crew branch until the evidence-hosting design changes.
 The firstmate repo itself is the exception: its `.no-mistakes/` directory is local state, stays gitignored, and is rejected by CI if tracked.

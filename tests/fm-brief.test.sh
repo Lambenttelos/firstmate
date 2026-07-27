@@ -44,6 +44,7 @@ write_registry() {
   cat > "$home/data/projects.md" <<'EOF'
 - direct-proj [direct-PR] - fixture for direct-PR mode (added 2026-07-01)
 - push-proj [direct-push] - fixture for direct-push mode (added 2026-07-24)
+- push-autoland-proj [direct-push +autoland] - fixture for direct-push self-land (added 2026-07-26)
 - local-proj [local-only] - fixture for local-only mode (added 2026-07-01)
 EOF
 }
@@ -58,7 +59,7 @@ test_ship_modes_generate_clean_briefs() {
   home="$TMP_ROOT/ship-home"
   write_registry "$home"
 
-  for id_proj in "brief-nomistakes-a1:no-registry-proj" "brief-directpr-a2:direct-proj" "brief-directpush-a2b:push-proj" "brief-localonly-a3:local-proj"; do
+  for id_proj in "brief-nomistakes-a1:no-registry-proj" "brief-directpr-a2:direct-proj" "brief-directpush-a2b:push-proj" "brief-autoland-a2c:push-autoland-proj" "brief-localonly-a3:local-proj"; do
     id=${id_proj%%:*}
     proj=${id_proj##*:}
     FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" "$proj" >/dev/null 2>&1; status=$?
@@ -110,6 +111,55 @@ test_direct_push_dod_semantics() {
   assert_no_grep "open a PR" "$brief" \
     "direct-push brief must not tell the worker to open a PR"
   pass "fm-brief.sh: direct-push DOD runs the full pipeline then pushes to origin without a PR wait"
+}
+
+# The direct-push +autoland DOD keeps the full-pipeline body but replaces the
+# push-and-stop tail with a guarded self-land: after the pipeline is green the crew
+# merges its OWN fm/<id> branch onto the origin default branch as a clean --no-ff
+# merge (through a private landing ref, since the default branch is checked out in
+# the shared primary), reports the merge evidence, and never opens a PR. The
+# guardrails - green only, own branch only, conflict escalates, never delete a
+# branch - must be baked into the generated contract.
+test_direct_push_autoland_dod_semantics() {
+  local home id brief
+  home="$TMP_ROOT/autoland-home"
+  write_registry "$home"
+  id="brief-autoland-b4"
+  FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" push-autoland-proj >/dev/null 2>&1
+  brief="$home/data/$id/brief.md"
+  assert_present "$brief" "direct-push +autoland brief was not scaffolded"
+  assert_grep "ships **direct-push +autoland**" "$brief" \
+    "autoland brief did not declare the self-land delivery mode"
+  # Still the full pipeline body: doctor setup, preflight guard, skipped-PR/CI note.
+  assert_grep "no-mistakes doctor" "$brief" \
+    "autoland brief lost the no-mistakes doctor setup step"
+  assert_grep "$ROOT/bin/fm-nm-preflight.sh" "$brief" \
+    "autoland brief lost the wrong-branch-attach preflight guard"
+  assert_grep "a run ending \`passed\` with those steps skipped is COMPLETE" "$brief" \
+    "autoland brief did not carry the full pipeline body"
+  # Self-land mechanics and guardrails.
+  assert_grep "ONLY after the pipeline reports \`passed\`" "$brief" \
+    "autoland brief did not gate self-land on a green pipeline"
+  assert_grep "ONLY as a clean \`--no-ff\` merge" "$brief" \
+    "autoland brief did not require a --no-ff merge"
+  assert_grep "git merge --no-ff \"fm/$id\"" "$brief" \
+    "autoland brief did not spell out the --no-ff merge of its own branch"
+  assert_grep "fm-landing:" "$brief" \
+    "autoland brief did not land through a private landing ref"
+  assert_grep "git merge --abort" "$brief" \
+    "autoland brief did not tell the worker to abort on conflict"
+  assert_grep "needs authoring-lane resolve" "$brief" \
+    "autoland brief did not escalate a conflict to the authoring lane"
+  assert_grep "Never delete any branch" "$brief" \
+    "autoland brief did not forbid deleting a branch"
+  assert_grep "done: landed fm/$id" "$brief" \
+    "autoland brief did not require the merge-evidence done line"
+  # It self-lands, so it must NOT keep the push-and-stop tail or open a PR.
+  assert_no_grep "git push origin HEAD:fm/$id" "$brief" \
+    "autoland brief must not keep the plain push-and-stop tail"
+  assert_no_grep "open a PR" "$brief" \
+    "autoland brief must not tell the worker to open a PR"
+  pass "fm-brief.sh: direct-push +autoland DOD self-lands the green branch with the baked-in guardrails"
 }
 
 test_faster_paths_use_configured_authority_without_stacked_review() {
@@ -651,6 +701,7 @@ test_secondmate_charter_binds_the_applicable_captain_rules
 test_captain_rules_preserve_existing_brief_contracts
 test_ship_modes_generate_clean_briefs
 test_direct_push_dod_semantics
+test_direct_push_autoland_dod_semantics
 test_faster_paths_use_configured_authority_without_stacked_review
 test_no_mistakes_dod_wording
 test_no_mistakes_dod_requires_preflight

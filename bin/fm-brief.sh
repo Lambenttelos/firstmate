@@ -38,6 +38,13 @@
 #                configured merge authority lands the branch on the forge (e.g. Bitbucket).
 #   local-only   implement on branch, stop and report "ready in branch" (no push/PR);
 #                captain approves, firstmate merges to local main
+# The +autoland registry flag (owned repos only) reshapes the direct-push definition
+# of done: after the pipeline is green the crew self-lands its OWN fm/<id> branch onto
+# the origin default branch as a clean --no-ff merge and reports the merge evidence,
+# instead of pushing and waiting for the merge authority. local-only +autoland is not a
+# brief change - firstmate fires the guarded local merge itself once the review gate is
+# green (bin/fm-merge-local.sh). Guardrails baked into the generated contract: green
+# only, own branch only, --no-ff only, conflict escalates, never delete a branch.
 # Ship briefs begin with a worktree-isolation assertion before the branch step.
 # Scout tasks ignore mode - their deliverable is a report, not a merge.
 # Every scaffold's status protocol distinguishes the configured
@@ -410,9 +417,12 @@ fi
 
 # Ship task: shape Setup / Rule 1 / Definition of done by the project's delivery mode.
 # yolo does not affect the brief (it governs firstmate's approval behaviour), so discard it.
-read -r MODE _ <<EOF
+# autoland DOES affect the brief: a direct-push +autoland lane self-lands its own green
+# branch onto the default branch, so the generated Rule 1 and Definition of done change.
+read -r MODE _YOLO AUTOLAND _ <<EOF
 $("$FM_ROOT/bin/fm-project-mode.sh" "$REPO")
 EOF
+: "${AUTOLAND:=off}"
 
 case "$MODE" in
   direct-PR)
@@ -430,10 +440,8 @@ EOF
   direct-push)
     SETUP2="
 2. Run \`no-mistakes doctor\`; if it reports the repo is not initialized here, run \`no-mistakes init\`."
-    RULE1='1. Never push to the default branch (push only your `fm/'"$ID"'` branch to origin). Never merge a PR.'
-    DOD=$(cat <<EOF
-# Definition of done
-This project ships **direct-push**: the forge cannot host firstmate-opened PRs (e.g. Bitbucket), so there is no PR and no CI to wait on.
+    # Shared direct-push pipeline body: identical whether or not the lane self-lands.
+    DP_BODY=$(cat <<EOF
 You still run the FULL /no-mistakes pipeline; its \`pr\` and \`ci\` steps not applying is expected, and a run ending \`passed\` with those steps skipped is COMPLETE - do not treat skipped PR/CI as a failure or a wait.
 A run reporting \`missing NO_MISTAKES_BITBUCKET_EMAIL\` is expected and is NOT a blocker; do not append \`blocked:\` for it.
 
@@ -453,6 +461,44 @@ Two firstmate-specific rules layer on top of that guidance:
 - ask-user findings are not yours to answer: escalate to firstmate (rule 6) and stop.
   When the decision comes back, feed it to the gate with \`no-mistakes axi respond\` and let the pipeline apply it - do not route the question to "the user" or implement the fix yourself.
 - Avoid \`--yes\`: the captain, not you, owns the ask-user decisions it would silently auto-resolve.
+EOF
+)
+    if [ "$AUTOLAND" = on ]; then
+      RULE1='1. Push only your `fm/'"$ID"'` branch to origin while you work, and NEVER force-push. After the pipeline is green you self-land that branch onto the default branch through the guarded steps in the Definition of done - land only your own branch, never any other lane, and never merge a PR.'
+      DOD=$(cat <<EOF
+# Definition of done
+This project ships **direct-push +autoland**: an owned Bitbucket repo firstmate cannot open PRs on, and green work SELF-LANDS - after the pipeline is green you merge your own branch onto the shared default branch yourself, without waiting for the captain.
+
+$DP_BODY
+
+## Self-land (ONLY after the pipeline reports \`passed\`)
+Land your OWN \`fm/$ID\` branch, ONLY when the pipeline is green, ONLY as a clean \`--no-ff\` merge.
+Never land red or unvalidated work. Never land another lane's branch. Never delete any branch. Never force anything.
+A merge conflict is a STOP-and-escalate - never resolve another lane's code yourself, because a clean cross-lane resolve needs the authoring lane's intent.
+
+Your worktree shares its checkout with firstmate's, which already has the default branch checked out, so a plain \`git checkout <default>\` fails here. Land through a private landing ref instead:
+  DEFAULT=\$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null | sed 's#^origin/##'); : "\${DEFAULT:=dev}"
+  git fetch origin "\$DEFAULT"
+  git branch -f fm-landing "origin/\$DEFAULT"
+  git checkout fm-landing
+  git merge --no-ff "fm/$ID" -m "Merge fm/$ID into \$DEFAULT"
+  # On CONFLICT: run \`git merge --abort\`, then append
+  #   \`blocked: [key=autoland-conflict] fm/$ID conflicts with \$DEFAULT, needs authoring-lane resolve\`
+  #   to the status file and STOP. Do not resolve it yourself.
+  git push origin "fm-landing:\$DEFAULT"
+  git checkout "fm/$ID"
+
+After the push succeeds, append the merge evidence and stop:
+  \`done: landed fm/$ID -> \$DEFAULT @ {before-sha}..{after-sha} (merge {merge-sha})\`
+Firstmate reads that line, records a captain-review hold for the landed change, and refreshes the local copy. Do NOT wait for a PR url or checks-green - none will arrive.
+EOF
+)
+    else
+      RULE1='1. Never push to the default branch (push only your `fm/'"$ID"'` branch to origin). Never merge a PR.'
+      DOD=$(cat <<EOF
+# Definition of done
+This project ships **direct-push**: the forge cannot host firstmate-opened PRs (e.g. Bitbucket), so there is no PR and no CI to wait on.
+$DP_BODY
 
 After the pipeline reports \`passed\`, push your validated branch explicitly - a pipeline "push" only reaches the local internal gate:
   \`git push origin HEAD:fm/$ID\`
@@ -460,6 +506,7 @@ Then append \`done: pushed origin fm/$ID @ {short-sha}\` (the branch head commit
 Do NOT wait for a PR url or checks-green - none will arrive. The configured merge authority lands the branch on the forge; firstmate verifies it on origin.
 EOF
 )
+    fi
     ;;
   local-only)
     SETUP2=""

@@ -1322,13 +1322,15 @@ SECONDMATE_PROJECTS=
 if [ "$KIND" = secondmate ]; then
   MODE=secondmate
   YOLO=off
+  AUTOLAND=off
   SECONDMATE_PROJECTS=$(secondmate_registry_value "$ID" projects || true)
 else
   PROJ_NAME=$(basename "$PROJ_ABS")
-  read -r MODE YOLO <<EOF
+  read -r MODE YOLO AUTOLAND _ <<EOF
 $("$FM_ROOT/bin/fm-project-mode.sh" "$PROJ_NAME")
 EOF
 fi
+: "${AUTOLAND:=off}"
 
 META_WINDOW=$T
 [ "$BACKEND" = orca ] && META_WINDOW=$W
@@ -1340,6 +1342,7 @@ META_WINDOW=$T
   echo "kind=$KIND"
   echo "mode=$MODE"
   echo "yolo=$YOLO"
+  echo "autoland=$AUTOLAND"
   echo "tasktmp=$TASK_TMP"
   echo "model=${MODEL:-default}"
   echo "effort=${EFFORT:-default}"

@@ -73,9 +73,9 @@
 #          refresh relays any completed fm-fleet-sync.sh output before the
 #          aggregate timeout skip line with timeout and elapsed seconds.
 #          Set FM_FLEET_PRUNE=0 to skip branch pruning during that refresh.
-#          Set FM_BOOTSTRAP_DETECT_ONLY=1 to skip the six MUTATING sweeps
-#          (PR-check migration, present_daemon_sweep, secondmate_sync,
-#          secondmate_liveness_sweep,
+#          Set FM_BOOTSTRAP_DETECT_ONLY=1 to skip the seven MUTATING sweeps
+#          (PR-check migration, present_daemon_sweep, afk_daemon_revive_sweep,
+#          secondmate_sync, secondmate_liveness_sweep,
 #          x_mode_setup, fleet_sync) while still printing every read-only detect line
 #          above; the TANGLE line switches to advisory-only wording with no
 #          checkout command. Used by
@@ -493,6 +493,31 @@ secondmate_liveness_sweep() {
   return 0
 }
 
+afk_daemon_revive_sweep() {
+  # Idempotent away-mode daemon revive - SESSION START ONLY, and only while this
+  # session holds the fleet lock. The away-mode daemon and the watcher it owns as
+  # a child do not survive a firstmate session turnover (compaction, restart, or
+  # a return-on-unmarked-message flow that stopped away mode). Evidence 2026-07-26:
+  # the daemon shut down cleanly at a session boundary, state/.afk was cleared, and
+  # the captain's standing "keep away mode" order survived only as prose in
+  # data/captain.md - nothing machine-readable re-entered away mode. Durable
+  # hosting (bin/fm-afk-launch.sh start-paneless, detached tmux) fixes the reap,
+  # but not a cleared away flag; this sweep closes that gap.
+  #
+  # bin/fm-afk-launch.sh revive owns the whole decision (AGENTS.md one-owner rule):
+  # it is a silent no-op unless the DURABLE persist intent (state/.afk-persist) is
+  # set, and even then acts only on a confident dead reading (the identity-backed
+  # daemon lock). When it revives, it re-enters durable paneless away mode, which
+  # brings the daemon and its watcher child back. A healthy or non-persistent home
+  # produces no output; only a revive FAILURE is actionable and surfaces as one
+  # AFK_DAEMON line.
+  local out
+  if ! out=$(FM_HOME="$FM_HOME" "$SCRIPT_DIR/fm-afk-launch.sh" revive 2>&1); then
+    echo "AFK_DAEMON: away-mode revive failed: $(first_line "$out")"
+  fi
+  return 0
+}
+
 present_daemon_sweep() {
   # Idempotent present-mode daemon liveness guarantee - SESSION START ONLY, and
   # only while this session actually holds the fleet lock. The daemon
@@ -902,6 +927,7 @@ if [ "${FM_BOOTSTRAP_VERBOSE_FACTS:-0}" = 1 ] \
 fi
 if [ "${FM_BOOTSTRAP_DETECT_ONLY:-0}" != 1 ]; then
   present_daemon_sweep
+  afk_daemon_revive_sweep
   secondmate_liveness_sweep
   secondmate_sync
   x_mode_setup

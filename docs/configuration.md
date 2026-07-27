@@ -121,6 +121,18 @@ An alarm whose own inbox read then finds every record already acknowledged recor
 A read that cannot even look into `state/` is a failed read too, not an empty outbox, so an untraversable state directory blocks the reader and return catch-up rather than reading as nothing pending.
 The [`afk`](../.agents/skills/afk/SKILL.md) skill owns the operating procedure.
 
+A paneless home hosts the daemon durably in a detached tmux session through `bin/fm-afk-launch.sh start-paneless`, which forces `FM_AFK_DELIVERY=paneless` so the daemon selects pull delivery unconditionally rather than discovering the tmux pane it is itself hosted in.
+tmux is present as the runtime backend even though a paneless firstmate runs outside it, so a detached tmux session is a session-independent host that outlives a firstmate session turnover; the older `start-native` path hosted the daemon as a harness-native background job that was a child of the firstmate session and was reaped on turnover, silently taking away supervision down (evidence 2026-07-26).
+The daemon owns `bin/fm-watch.sh` as its child, so hosting the daemon durably makes the watcher durable too.
+
+## Away-mode persist intent (state/.afk-persist)
+
+`state/.afk-persist` is the durable, machine-readable record that the captain ordered away supervision to survive a session turnover, distinct from the session-operational `state/.afk` flag.
+[`bin/fm-afk-launch.sh`](../bin/fm-afk-launch.sh) owns it: `persist` sets it and enters durable paneless away mode, and `unpersist` is the only path that clears it - the auto-return-on-unmarked-message flow ([`bin/fm-afk-return.sh`](../bin/fm-afk-return.sh)) deliberately does not, so a turnover during a still-standing away order resumes supervision rather than dropping it.
+It is not a session-scoped delivery artifact, so a fresh away entry never clears it.
+While it is set and no live daemon owns the home, the session-start revive sweep ([`bin/fm-bootstrap.sh`](../bin/fm-bootstrap.sh) `afk_daemon_revive_sweep`) re-enters durable paneless away mode automatically, reporting only a revive failure as an `AFK_DAEMON:` line.
+Plain `/afk` without `persist` keeps its single-session auto-exit behavior.
+
 ## Away-mode wedge alarm channels (config/wedge-alarm)
 
 When away-mode injection wedges past `FM_MAX_DEFER_SECS`, the sub-supervisor raises a loud, rate-limited alarm.
