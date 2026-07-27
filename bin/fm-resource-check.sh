@@ -40,31 +40,46 @@
 #
 # THRESHOLDS - this header owns them; docs/configuration.md owns the knobs:
 #   load per core     >= 4.0 critical, >= 2.0 degraded
-#   swap used         >= 80% critical, >= 50% degraded
+#   swap used         >= 80% critical, >= 50% degraded  (NON-Darwin only)
 #   available memory  <  1024 MB critical
 # The worst of the three decides the status.
+#
+# On Darwin the swap-used percentage is INFORMATIONAL ONLY and never classifies
+# the host. macOS uses fully dynamic swap: the swap file grows on demand, so a
+# high used/total ratio just means the current file is small relative to what is
+# paged, not that the host is starved. Keying pressure on that ratio produced
+# false degraded/critical readings with gigabytes of RAM still free. On Darwin,
+# memory pressure is keyed on AVAIL_MB alone (the <1024 MB critical floor below),
+# which is the genuine binding constraint there. The percentage stays in the
+# printed reading so the figure is still visible, it just drives no status. The
+# swap percentage remains a real signal on non-Darwin hosts with fixed-size swap,
+# so the >=80/>=50 thresholds are kept for them. The OS is resolved once from
+# uname -s, overridable for tests with FM_RESOURCE_OS.
 #
 # CEILING - the smaller of what memory and CPU support. Both components, and the
 # over-ceiling comparison that triggers the SHED line, are computed on the ACTIVE
 # running agents (ordinary crews plus persistent secondmates that have work in
 # flight), so the two sides of that comparison always share one basis; only the
 # shed COUNT is capped at the number of ordinary crews:
-#   by memory: one active agent per 640 MB of available memory, floor 1. Memory
+#   by memory: one active agent per 560 MB of available memory, floor 1. Memory
 #              is the binding constraint on a laptop-class host, and available
 #              memory deliberately excludes anything that only exists because the
 #              kernel is already swapping.
 #   by CPU:    the current ACTIVE-agent count adjusted by load per core (+3 under
 #              1.0, +1 under 2.0, -1 under 4.0, halved at or above 4.0), floor 1.
 #
-# The 640 MB figure is measured, not assumed. data/measure-ccstatusline-cost's
+# The 560 MB figure is measured, not assumed. data/measure-ccstatusline-cost's
 # report (2026-07-24, five idle agents added to a 16 GB host, 20 samples over 60s
 # per condition) puts a working agent at 394-491 MB resident and an idle one at
 # ~290 MB decaying toward ~180 MB over hours. The previous 1024 MB per agent
 # over-charged even a working agent, and over-charged an idle one by roughly 3.5x.
-# 640 MB sits about 30% above the top of the measured working range, which is the
-# conservative choice the report's own caveat asks for: it measured
-# never-prompted sessions, so ~290 MB is a FLOOR for a working-then-idle
-# secondmate and context size is the variable that moves it.
+# 560 MB sits about 14% above the 491 MB top of the measured working range: still
+# headroom over a working agent, but trimmed from the earlier 640 MB (~30% over
+# that top) so the recommendation is less falsely conservative and hands the same
+# host a modestly higher ceiling (about 14% more agents for the same memory). The
+# report measured never-prompted sessions, so ~290 MB is a FLOOR for a
+# working-then-idle secondmate and context size is the variable that moves it; the
+# retained headroom is what covers that variation without over-charging.
 # Live agents are the RUNNING ones, and ONLY the watcher's slow sweep pays for
 # that answer. Under --sweep every state/*.meta is probed with bin/fm-backend.sh's
 # fm_backend_agent_alive, only a CONFIDENT `dead` verdict is excluded - so a meta
@@ -131,8 +146,10 @@
 # FM_RESOURCE_RAM_GB, FM_RESOURCE_LOAD1, FM_RESOURCE_AVAIL_MB,
 # FM_RESOURCE_SWAP_USED_MB, FM_RESOURCE_SWAP_TOTAL_MB, FM_RESOURCE_LIVE, and
 # FM_RESOURCE_PROC_ROOT (alternate /proc root). FM_RESOURCE_LIVE injects the
-# ordinary-crew count, with no persistent secondmates. Injection is a test seam,
-# not an operating knob: an injected reading is used verbatim and never probed for.
+# ordinary-crew count, with no persistent secondmates. FM_RESOURCE_OS overrides
+# the uname -s the swap classification keys on, so the Darwin informational-only
+# swap behavior is testable on any host. Injection is a test seam, not an
+# operating knob: an injected reading is used verbatim and never probed for.
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -537,7 +554,16 @@ case "$(awk -v l="$LOAD_PER_CORE_EXACT" 'BEGIN{print (l >= 4) ? "crit" : ((l >= 
   crit) STATUS=critical; RC=2 ;;
   deg)  STATUS=degraded; RC=1 ;;
 esac
-SWAP_CLASS=$(awk -v p="$SWAP_PCT_EXACT" 'BEGIN{print (p >= 80) ? "crit" : ((p >= 50) ? "deg" : "ok")}')
+# macOS uses fully dynamic swap, so the swap-used percentage is not a memory
+# pressure signal there (see the header). On Darwin the class is forced to ok so
+# the percentage stays informational-only and memory pressure is keyed on
+# AVAIL_MB alone; other platforms keep the >=80/>=50 percentage thresholds.
+RESOURCE_OS="${FM_RESOURCE_OS:-$(uname -s)}"
+if [ "$RESOURCE_OS" = Darwin ]; then
+  SWAP_CLASS=ok
+else
+  SWAP_CLASS=$(awk -v p="$SWAP_PCT_EXACT" 'BEGIN{print (p >= 80) ? "crit" : ((p >= 50) ? "deg" : "ok")}')
+fi
 if [ "$SWAP_CLASS" = crit ] || [ "$AVAIL_MB" -lt 1024 ]; then
   STATUS=critical; RC=2
 elif [ "$SWAP_CLASS" = deg ] && [ "$RC" -lt 1 ]; then
@@ -549,7 +575,7 @@ fi
 # PERSISTENT SECONDMATES section).
 ACTIVE=$(( CREWS + SECONDMATES ))
 LIVE=$(( ACTIVE + IDLE_SECONDMATES ))
-PER_AGENT_MB=640
+PER_AGENT_MB=560
 BY_MEM=$(awk -v a="$AVAIL_MB" -v p="$PER_AGENT_MB" 'BEGIN{c=int(a/p); print (c < 1 ? 1 : c)}')
 BY_CPU=$(awk -v l="$LOAD_PER_CORE_EXACT" -v n="$ACTIVE" 'BEGIN{
   if (l < 1.0) print n+3;

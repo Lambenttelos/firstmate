@@ -96,34 +96,76 @@ test_load_thresholds() {
 }
 
 test_swap_thresholds() {
-  run_check FM_RESOURCE_SWAP_USED_MB=4095   # 49.99% of 8192
+  # The swap-used PERCENTAGE only classifies the host on non-Darwin platforms
+  # (fixed-size swap), so pin the OS to keep this test deterministic on any host.
+  run_check FM_RESOURCE_OS=Linux FM_RESOURCE_SWAP_USED_MB=4095   # 49.99% of 8192
   expect_code 0 "$RC" "just under the degraded swap edge"
   assert_contains "$OUT" "resources: healthy" "just under 50% swap must stay healthy"
 
-  run_check FM_RESOURCE_SWAP_USED_MB=4096   # exactly 50%
+  run_check FM_RESOURCE_OS=Linux FM_RESOURCE_SWAP_USED_MB=4096   # exactly 50%
   expect_code 1 "$RC" "degraded swap exit"
   assert_contains "$OUT" "resources: degraded" "50% swap must be degraded"
 
-  run_check FM_RESOURCE_SWAP_USED_MB=6553   # 79.99%, displays as 80%
+  run_check FM_RESOURCE_OS=Linux FM_RESOURCE_SWAP_USED_MB=6553   # 79.99%, displays as 80%
   expect_code 1 "$RC" "just under the critical swap edge"
   assert_contains "$OUT" "resources: degraded" \
     "a reading that only ROUNDS to 80% must not be classified critical"
 
-  run_check FM_RESOURCE_SWAP_USED_MB=6554   # 80.005%
+  run_check FM_RESOURCE_OS=Linux FM_RESOURCE_SWAP_USED_MB=6554   # 80.005%
   expect_code 2 "$RC" "critical swap exit"
   assert_contains "$OUT" "resources: critical" "80% swap must be critical"
-  pass "swap occupancy classifies degraded at 50% and critical at 80%, on exact values"
+  pass "on non-Darwin, swap occupancy classifies degraded at 50% and critical at 80%"
+}
+
+test_darwin_swap_percentage_is_informational_only() {
+  # macOS uses fully dynamic swap, so a high used/total ratio is not a memory
+  # pressure signal: it must not classify the host degraded or critical.
+  run_check FM_RESOURCE_OS=Darwin FM_RESOURCE_SWAP_USED_MB=7373 FM_RESOURCE_SWAP_TOTAL_MB=8192  # ~90%
+  expect_code 0 "$RC" "high swap% on Darwin must stay healthy"
+  assert_contains "$OUT" "resources: healthy" \
+    "90% dynamic swap on Darwin must not classify the host"
+  assert_contains "$OUT" "swap 90% of 8192M" "the swap figure must still be reported informationally"
+
+  # A 90% ratio that would be critical on a fixed-size-swap host, to prove the OS
+  # is what makes the difference and the percentage path itself is unchanged.
+  run_check FM_RESOURCE_OS=Linux FM_RESOURCE_SWAP_USED_MB=7373 FM_RESOURCE_SWAP_TOTAL_MB=8192
+  expect_code 2 "$RC" "the same 90% ratio is still critical on a non-Darwin host"
+  assert_contains "$OUT" "resources: critical" "fixed-size swap keeps the percentage signal"
+
+  # AVAIL_MB remains the memory-pressure signal on Darwin: below 1024 MB is still
+  # critical even with idle swap.
+  run_check FM_RESOURCE_OS=Darwin FM_RESOURCE_AVAIL_MB=1023
+  expect_code 2 "$RC" "sub-gigabyte memory on Darwin is still critical"
+  assert_contains "$OUT" "resources: critical" \
+    "AVAIL_MB stays the binding memory signal on Darwin"
+  pass "on Darwin swap% is informational-only while AVAIL_MB still drives memory pressure"
+}
+
+test_recommended_ceiling_uses_the_560_mb_divisor() {
+  # The memory-bound ceiling is avail_mb / PER_AGENT_MB, floor 1. A low load and a
+  # live count high enough that the CPU bound (live+3 here) does not cap below the
+  # memory bound, so the memory divisor is what the ceiling reflects.
+  run_check FM_RESOURCE_AVAIL_MB=5600 FM_RESOURCE_LOAD1=1.0 FM_RESOURCE_LIVE=8
+  expect_code 0 "$RC" "healthy memory-bound exit"
+  assert_contains "$OUT" "recommended ceiling 10 active agents" \
+    "5600 MB must support ten agents at 560 MB each, not eight at 640"
+
+  run_check FM_RESOURCE_AVAIL_MB=559 FM_RESOURCE_LOAD1=1.0 FM_RESOURCE_LIVE=1
+  expect_code 2 "$RC" "sub-560 MB is under the 1024 MB critical floor"
+  assert_contains "$OUT" "recommended ceiling 1 active agents" \
+    "the memory ceiling never drops below one agent"
+  pass "the memory-bound ceiling divides available memory by the trimmed 560 MB"
 }
 
 test_memory_headroom_threshold_and_ceiling() {
   run_check FM_RESOURCE_AVAIL_MB=1024
   expect_code 0 "$RC" "1024 MB available is still healthy"
-  assert_contains "$OUT" "recommended ceiling 1" "1024 MB supports exactly one agent at 640 MB each"
+  assert_contains "$OUT" "recommended ceiling 1" "1024 MB supports exactly one agent at 560 MB each"
 
   run_check FM_RESOURCE_AVAIL_MB=1280
   expect_code 0 "$RC" "two-agent headroom is healthy"
   assert_contains "$OUT" "recommended ceiling 2" \
-    "the memory bound is one active agent per measured 640 MB, not per 1024 MB"
+    "the memory bound is one active agent per measured 560 MB, not per 1024 MB"
 
   run_check FM_RESOURCE_AVAIL_MB=1023
   expect_code 2 "$RC" "sub-gigabyte headroom exit"
@@ -842,6 +884,8 @@ test_stale_reading_never_annotates_a_heartbeat() {
 test_healthy_reading_reports_every_metric
 test_load_thresholds
 test_swap_thresholds
+test_darwin_swap_percentage_is_informational_only
+test_recommended_ceiling_uses_the_560_mb_divisor
 test_memory_headroom_threshold_and_ceiling
 test_worst_of_three_decides_the_status
 test_shed_advice_names_the_overage_only_when_over_ceiling
