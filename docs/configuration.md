@@ -13,6 +13,7 @@ The tracked code root contains the shared instruction, skill, documentation, wor
 `data/` holds durable private fleet records such as the project and secondmate registries, captain preferences, optional shared captain preferences, learnings, backlog, briefs, scout reports, and the merge queue of released-but-unmerged ship branches (`data/merge-queue.tsv`, owned by `bin/fm-merge-queue-lib.sh`; see [merge-queue.md](merge-queue.md)).
 `state/` holds volatile runtime records such as task metadata, append-only status events, endpoint signals, watcher and wake-queue coordination, away-mode state, generated X-mode artifacts, private secondmate config-reread generations with their retry and quarantine state, and parent-owned secondmate pending-reply records under `state/pending-replies/` (`bin/fm-pending-reply-lib.sh`).
 `config/` holds local gitignored operating choices, and `projects/` holds the local project clones that Firstmate reads but changes only through the guarded exceptions in `AGENTS.md`.
+`.treehouse/` holds this home's own Treehouse worktree pools for those clones, so a spawn can never be handed a worktree belonging to another copy of the same repo; it is gitignored, created by Treehouse rather than by Firstmate, and pinned per clone by `bin/fm-treehouse-pin.sh` (see [treehouse-pools.md](treehouse-pools.md)).
 
 `bin/fm-spawn.sh` owns the base task-metadata fields it emits, while the runtime-backend section below owns backend-specific fields and selector interpretation.
 The producing PR and X helpers own the fields they append, `bin/fm-classify-lib.sh` owns status-event vocabulary, and `bin/fm-crew-state.sh` owns current-state reconciliation.
@@ -454,8 +455,10 @@ An absent `quota-axi` reports `MISSING: quota-axi (install: npm install -g quota
 Bootstrap also reports a `TANGLE:` line when `FM_ROOT` is on a named non-default branch; follow the printed checkout remediation rather than treating it as an installable tool problem.
 In a read-only session that did not get the fleet lock, the same line is advisory and omits the checkout command.
 The locked session-start bootstrap step also runs a best-effort project clone refresh through `fm-fleet-sync.sh`.
-It emits `FLEET_SYNC:` for skipped refreshes that may matter, recovered self-heals, `STUCK:` alarms, and `FETCH FAILED:` reports.
+It emits `FLEET_SYNC:` for skipped refreshes that may matter, recovered self-heals, `STUCK:` alarms, `FETCH FAILED:` reports, and `PIN FAILED:` reports.
 Normal completed runs keep local-only and no-origin skips silent.
+Every sync also converges each clone's Treehouse worktree pool pin through `bin/fm-treehouse-pin.sh`, before the local-only and no-origin skips, so existing clones self-heal and a home that moves re-pins itself.
+A converged pin stays silent; a pin that cannot be applied is reported as `PIN FAILED:` and never aborts the refresh, because an unpinned clone shares one pool with every other copy of the same repo on the machine and its spawns will be refused (see [treehouse-pools.md](treehouse-pools.md)).
 A failed fetch is deliberately reported as `FETCH FAILED:` rather than as a skip, because a clone that stops fetching still presents a clean tree on its default branch and is otherwise indistinguishable from a healthy one, so a quiet skip lets work be reasoned against silently stale code.
 If bootstrap kills a timed-out refresh, it replays any completed `fm-fleet-sync.sh` output before the aggregate timeout skip so no finished result is lost.
 A killed refresh (or a teardown process kill) can leave an orphaned `.git/packed-refs.lock` in a clone, which makes the next refresh's fetch fail with Git's `Unable to create '...packed-refs.lock': File exists`.

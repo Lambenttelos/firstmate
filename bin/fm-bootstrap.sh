@@ -9,7 +9,7 @@
 #                 "MISSING_MANUAL: <tool> (instructions: <url>)", "NEEDS_GH_AUTH",
 #                 "BACKEND_INVALID: <name> (known: <names>)",
 #                 "CREW_DISPATCH: invalid config/crew-dispatch.json - <reason>",
-#                 "FLEET_SYNC: <repo>: skipped|recovered|STUCK|FETCH FAILED: <detail>",
+#                 "FLEET_SYNC: <repo>: skipped|recovered|STUCK|FETCH FAILED|PIN FAILED: <detail>",
 #                 "PRESENT_DAEMON: <reason>",
 #                 "PR_CHECK_MIGRATION: <private remediation>",
 #                 "TANGLE: <remediation>",
@@ -147,6 +147,10 @@ fleet_sync_relay_filtered_output() {
       # A failed fetch is a distinct, louder outcome than a skip: the clone stops
       # receiving new commits while still reading as healthy everywhere else.
       *': FETCH FAILED:'*) echo "FLEET_SYNC: $line" ;;
+      # An unpinned clone can draw a task worktree from another copy of the same
+      # repo, so a failed pin is actionable even though the sync itself succeeded.
+      # A successful pin stays silent: it is a one-time convergence, not news.
+      *': PIN FAILED:'*) echo "FLEET_SYNC: $line" ;;
       *': skipped:'*) echo "FLEET_SYNC: $line" ;;
       *': STUCK:'*) echo "FLEET_SYNC: $line" ;;
       *': recovered:'*) echo "FLEET_SYNC: $line" ;;

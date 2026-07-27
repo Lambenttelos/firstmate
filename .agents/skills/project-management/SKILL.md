@@ -22,6 +22,8 @@ Use the registry format and parser contract owned by the header of `bin/fm-proje
 Keep each registry description useful for identifying the project, but keep delivery posture, captain-private state, and detailed project knowledge in their existing designated homes.
 Do not turn the registry into project documentation.
 
+Every clone under `projects/` also needs its Treehouse worktree pool pinned to this home with `bin/fm-treehouse-pin.sh projects/<name>`, so a spawn cannot be handed a worktree of another copy of the same repo; run it after cloning rather than waiting for the next fleet sync to converge it (see `docs/treehouse-pools.md`).
+
 Resolve the project name, destination, delivery mode, and autonomy posture before changing local or remote state.
 Keep a newly added clone and its registry entry consistent, and roll back only artifacts created by the incomplete operation when a later initialization step fails and that rollback is safe.
 Do not overwrite or repurpose an existing path.

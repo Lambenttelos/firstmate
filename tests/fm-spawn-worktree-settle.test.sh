@@ -67,7 +67,9 @@ make_settle_case() {
   local name=$1 id=$2 stale_reads=$3 case_dir home proj wt stale fakebin countfile
   case_dir="$TMP_ROOT/$name"
   home="$case_dir/home"
-  proj="$case_dir/project"
+  # The project must be one of the home's OWN clones: fm-spawn refuses a ship or
+  # scout project that is not a direct child of this home's projects directory.
+  proj="$case_dir/home/projects/project"
   wt="$case_dir/wt"
   stale="$case_dir/stale-other-checkout"
   countfile="$case_dir/pane-call-count"
