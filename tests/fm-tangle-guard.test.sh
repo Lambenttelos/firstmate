@@ -189,7 +189,10 @@ test_spawn_isolation_abort() {
   local home proj fakebin out status
   home="$TMP_ROOT/spawn-home"
   mkdir -p "$home/data"
-  proj=$(make_repo "$TMP_ROOT/spawn-proj")
+  # The project must be one of this home's own clones (a direct child of
+  # $home/projects), or fm-spawn's own-clone assertion refuses it before the
+  # worktree-isolation check these cases exercise ever runs.
+  proj=$(make_repo "$home/projects/spawn-proj")
   fakebin=$(make_spawn_fakebin "$TMP_ROOT/spawn-fake")
   # A genuine isolated linked worktree of the project, detached on the default.
   git -C "$proj" worktree add -q --detach "$TMP_ROOT/spawn-wt" >/dev/null 2>&1
@@ -269,7 +272,8 @@ test_spawn_tmux_window_construction() {
   local home proj fakebin rec wt out status
   home="$TMP_ROOT/spawn-rec-home"
   mkdir -p "$home/data"
-  proj=$(make_repo "$TMP_ROOT/spawn-rec-proj")
+  # Own-clone: keep the project under this home's projects dir (see above).
+  proj=$(make_repo "$home/projects/spawn-rec-proj")
   fakebin=$(make_spawn_record_fakebin "$TMP_ROOT/spawn-rec-fake")
   rec="$TMP_ROOT/spawn-rec.log"
   : > "$rec"
