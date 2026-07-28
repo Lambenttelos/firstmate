@@ -88,6 +88,11 @@
 #   Ship/scout spawns refuse to launch unless the project is one of THIS home's
 #   own clones (a direct child of $PROJECTS) and the resolved task path is a real
 #   git worktree root of that same clone, distinct from the primary checkout.
+#   Every spawn also refuses a brief that still carries the literal {TASK}
+#   placeholder fm-brief.sh scaffolds: firstmate never filled in the task, so
+#   dispatching it would only waste the spawn on a crewmate that can do nothing
+#   but report the empty brief. The scaffold cannot know the task text, so the
+#   check lives here rather than in fm-brief.sh.
 # Batch dispatch: pass one or more `id=repo` pairs instead of a single <id> <project>, e.g.
 #     fm-spawn.sh fix-a-k3=projects/foo add-b-q7=projects/bar [--scout]
 #   Each pair re-execs this script in single-task mode, so the single path stays the only
@@ -836,6 +841,17 @@ else
   BRIEF="$DATA/$ID/brief.md"
 fi
 [ -f "$BRIEF" ] || { echo "error: no brief at $BRIEF" >&2; exit 1; }
+# An unfilled {TASK} placeholder means firstmate scaffolded the brief but never
+# replaced it with the actual task description. Dispatching it wastes the spawn:
+# the crewmate can only stop and report the empty brief. Refuse loudly here so
+# the dispatch never happens. The scaffold (fm-brief.sh) writes the literal
+# {TASK} placeholder on purpose and cannot know the task text, so this guard
+# belongs at spawn time, not in the scaffold. Batch dispatch re-execs this script
+# in single-task mode, so every pair passes through this check.
+if grep -qF '{TASK}' "$BRIEF"; then
+  echo "error: brief at $BRIEF still contains an unfilled {TASK} placeholder; replace it with the task description before spawning" >&2
+  exit 1
+fi
 
 # PROJ_ABS can still carry a symlinked path component (e.g. macOS's /tmp ->
 # /private/tmp) when it came from the ship/scout branch's logical `pwd` above.
