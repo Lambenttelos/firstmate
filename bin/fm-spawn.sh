@@ -946,6 +946,37 @@ validate_spawn_worktree() {  # <source> <inspect-target>
   fi
 }
 
+# No two tasks may record the same worktree. Two metas pointing at one worktree
+# silently alias: tearing down either task inspects the SAME worktree, so one
+# task's teardown verdict is really about the other task's work. treehouse pins a
+# pool slot per clone, but a stale or double-drawn allocation can still hand the
+# same path to a second spawn; validate_spawn_worktree proves the slot is a
+# genuine isolated worktree of the right clone, not that no other task already
+# claims it. This is the same class of assertion as the isolation check above,
+# for a different aliasing failure. Refuse here, naming the task that holds the
+# worktree, and record nothing.
+assert_worktree_unclaimed() {  # <worktree>
+  local wt=$1 wt_real m other other_real other_id
+  if ! wt_real=$(cd "$wt" 2>/dev/null && pwd -P); then
+    wt_real=$wt
+  fi
+  [ -d "$STATE" ] || return 0
+  for m in "$STATE"/*.meta; do
+    [ -e "$m" ] || continue
+    other_id=$(basename "$m" .meta)
+    [ "$other_id" = "$ID" ] && continue
+    other=$(grep '^worktree=' "$m" 2>/dev/null | head -n1 | cut -d= -f2-) || continue
+    [ -n "$other" ] || continue
+    if ! other_real=$(cd "$other" 2>/dev/null && pwd -P); then
+      other_real=$other
+    fi
+    if [ "$other_real" = "$wt_real" ]; then
+      echo "error: worktree '$wt' is already claimed by task '$other_id' (state/$other_id.meta); refusing to launch $ID so the two tasks cannot alias one worktree and corrupt each other's teardown verdict." >&2
+      exit 1
+    fi
+  done
+}
+
 # A stale presentation journal never grants launch authority.
 # When authoritative metadata already exists, require its endpoint to be
 # positively dead before the journal's read-only token inspection may allow a
@@ -1358,6 +1389,10 @@ $("$FM_ROOT/bin/fm-project-mode.sh" "$PROJ_NAME")
 EOF
 fi
 : "${AUTOLAND:=off}"
+
+# WT is now final for every backend. Refuse before writing meta if another task
+# already claims this worktree, so nothing is recorded on refusal.
+assert_worktree_unclaimed "$WT"
 
 META_WINDOW=$T
 [ "$BACKEND" = orca ] && META_WINDOW=$W
