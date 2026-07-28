@@ -1247,6 +1247,19 @@ if [ "$KIND" = secondmate ] && [ "$FORCE" = "--force" ]; then
   cleanup_firstmate_home_children "$HOME_PATH"
 fi
 
+# Ledger-wide backstop against the retention-loss bug: a teardown is immediately
+# followed by a `tasks-axi done` whose auto-prune can bury a captain hold that was
+# closed without an answer. The per-scout `verify` above never sees a sibling hold, so
+# run the fail-closed `guard` across the whole backlog and archive before proceeding.
+if [ "$FORCE" != "--force" ] && fm_tasks_axi_backend_available "$CONFIG"; then
+  if ! FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" FM_DATA_OVERRIDE="$DATA" \
+      FM_CONFIG_OVERRIDE="$CONFIG" "$SCRIPT_DIR/fm-decision-hold.sh" guard; then
+    echo "REFUSED: an unanswered captain decision hold is closed in the backlog or archive." >&2
+    echo "Restore it with bin/fm-decision-hold.sh guard --restore before tearing down and pruning." >&2
+    exit 1
+  fi
+fi
+
 if [ "$KIND" = scout ] && [ "$FORCE" != "--force" ]; then
   REPORT="$DATA/$ID/report.md"
   if [ ! -f "$REPORT" ]; then
