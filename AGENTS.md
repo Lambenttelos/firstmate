@@ -253,6 +253,8 @@ Classify work as dispatchable when it does not overlap work under way, or queued
 Dispatch independent work immediately with no concurrency cap, serialize coarse overlaps, and record blockers durably.
 Write the task-specific brief under section 11 before spawning.
 
+When the captain invokes `/grilling-handoff` to stress-test a design before building, load the `grilling-handoff` skill; it owns preparing a captain-driven griller session (brief, ADR-number reservation, captain-gated tracking item) and later intaking the finished handback into backlog items.
+
 ### Dispatch and supervision handoff
 
 Spawn only through `bin/fm-spawn.sh` after the profile and backend checks in section 4.
