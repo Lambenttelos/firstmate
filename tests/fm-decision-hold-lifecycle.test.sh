@@ -550,8 +550,114 @@ test_resolve_matches_quoted_blocked_by_edges() {
   pass "resolve matches first/middle/last in quoted blocked_by and rejects a genuinely absent id"
 }
 
+# Reproduces the 2026-07-23 retention-loss bug and its structural backstop: a captain
+# decision hold is closed by a bare `tasks-axi done` (leaving the "awaiting" sentinel),
+# and retention pruning would then bury it in the archive. The guard must catch both the
+# active and archived shapes and refuse, `hold` must recover an active corrupt hold
+# instead of misreading it as resolved, and a genuinely resolved hold plus an ordinary
+# captain tracking hold must never be flagged.
+test_guard_backstops_retention_loss() {
+  local home id hold_id show
+  home=$(make_home retention-loss)
+  id=sample-guard-review
+  mkdir -p "$home/data/$id"
+  tasks_in "$home" add "$id" "Investigate sample guard" --kind scout --repo sample --start >/dev/null \
+    || fail "could not create guard investigation fixture"
+  write_origin_meta "$home" "$id"
+
+  hold_id=$(run_decisions "$home" hold "$id" route \
+    --title "Choose the sample route" --reason "captain route choice pending" --repo sample) \
+    || fail "could not register guard route hold"
+
+  # A held, unanswered decision is a healthy state: guard passes.
+  run_decisions "$home" guard >/dev/null 2>&1 || fail "guard flagged a correctly held captain decision"
+
+  # Reproduce the bug exactly: close the hold with a bare done, leaving the sentinel.
+  tasks_in "$home" "done" "$hold_id" >/dev/null || fail "could not simulate the bare-done retention-loss"
+  show=$(tasks_in "$home" show "$hold_id" --full)
+  assert_contains "$show" "state: done" "bare done did not close the fixture hold"
+  assert_contains "$show" "awaiting captain decision" "fixture must retain the awaiting sentinel"
+
+  # The hold/verify contradiction: hold and verify_hold_durable must now AGREE that this
+  # is an unanswered close, not a durable resolution.
+  if run_decisions "$home" guard > "$home/guard.out" 2> "$home/guard.err"; then
+    fail "guard must fail closed when an unanswered captain hold is Done"
+  fi
+  assert_grep "REFUSED" "$home/guard.err" "guard refusal must be explicit"
+  assert_grep "$hold_id" "$home/guard.err" "guard must name the offending hold"
+
+  # A teardown - the point just before the pruning `tasks-axi done` - must refuse while
+  # the lost hold is closed, so retention pruning can never bury it.
+  if run_teardown "$home" "$id" > "$home/guard-teardown.out" 2> "$home/guard-teardown.err"; then
+    fail "teardown must refuse while an unanswered captain hold is closed"
+  fi
+  assert_grep "unanswered captain decision hold" "$home/guard-teardown.err" \
+    "teardown refusal must cite the decision-hold guard"
+
+  # Restore recovers the active-backlog offender to a held state.
+  run_decisions "$home" guard --restore > "$home/restore.out" 2>&1 \
+    || fail "guard --restore must recover an active-backlog offender"
+  assert_grep "restored: $hold_id" "$home/restore.out" "restore must report the recovered hold"
+  show=$(tasks_in "$home" show "$hold_id" --full)
+  assert_contains "$show" "state: queued" "restored hold must return to queued"
+  assert_contains "$show" "held: yes" "restored hold must be held again"
+  run_decisions "$home" guard >/dev/null 2>&1 || fail "guard must pass after a successful restore"
+
+  # `hold` alone must also recover an active corrupt hold rather than refusing it as
+  # already resolved (the exact contradiction being fixed).
+  tasks_in "$home" "done" "$hold_id" >/dev/null || fail "could not re-simulate the bare-done loss"
+  run_decisions "$home" hold "$id" route \
+    --title "Choose the sample route" --reason "captain route choice pending" --repo sample >/dev/null \
+    || fail "hold must recover an unanswered Done hold instead of refusing it"
+  show=$(tasks_in "$home" show "$hold_id" --full)
+  assert_contains "$show" "state: queued" "hold recovery must return the hold to queued"
+  assert_contains "$show" "held: yes" "hold recovery must re-hold the decision"
+
+  # An archived offender - the buried shape - is detected across the archive file and
+  # reported for un-archiving rather than silently skipped.
+  cat >> "$home/data/done-archive.md" <<'EOF'
+
+## Archived 2026-07-22
+- [x] rev-buried-decision-lost - buried decision (repo: sample) (kind: captain) (done 2026-07-21) (hold-kind: captain)
+  Origin: rev-buried
+  Decision key: lost
+  State: awaiting captain decision.
+
+## Archived 2026-07-22
+- [x] rev-buried-decision-answered - answered decision (repo: sample) (kind: captain) (done 2026-07-21) (hold-kind: captain)
+  Resolution recorded by fm-decision-hold.
+  Decision digest: deadbeef
+  Routed identities: fix-buried
+
+  Captain decision:
+  route north
+
+  Routed work:
+  - fix-buried
+
+## Archived 2026-07-22
+- [x] review-merged-tracking - ordinary captain tracking hold (repo: sample) (kind: captain) (done 2026-07-21)
+EOF
+  if run_decisions "$home" guard > "$home/archive.out" 2> "$home/archive.err"; then
+    fail "guard must fail closed on an archived unanswered captain hold"
+  fi
+  assert_grep "rev-buried-decision-lost" "$home/archive.err" "guard must detect the buried lost hold"
+  assert_no_grep "rev-buried-decision-answered" "$home/archive.err" \
+    "guard must not flag a durably resolved archived hold"
+  assert_no_grep "review-merged-tracking" "$home/archive.err" \
+    "guard must not flag an ordinary captain tracking hold with no sentinel"
+  # An archived offender cannot be recovered through tasks-axi, so --restore reports it
+  # and exits nonzero; that nonzero is expected here (the suite runs under set -e).
+  run_decisions "$home" guard --restore > "$home/archive-restore.out" 2> "$home/archive-restore.err" || true
+  assert_grep "archived-unanswered: rev-buried-decision-lost" "$home/archive-restore.err" \
+    "restore must report an archived offender for un-archiving"
+
+  pass "guard backstops the retention-loss bug across active and archived captain holds"
+}
+
 test_uninventoried_report_decision_refuses_completion
 
+test_guard_backstops_retention_loss
 test_scout_teardown_always_requires_inventory_verification
 test_structured_holds_survive_teardown_and_route_resolution
 test_origin_slug_validation_precedes_path_construction
