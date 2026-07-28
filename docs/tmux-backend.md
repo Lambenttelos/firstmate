@@ -89,6 +89,28 @@ a busy pane means the harness accepted and queued the Enter (reported as `empty`
 This is the only place that exception lives; the herdr adapter observes the same opencode behavior but needs a separate fix (see the opencode note in [harness-adapters](../.agents/skills/harness-adapters/SKILL.md) and the opencode-busy gap recorded in [herdr-backend.md](herdr-backend.md)).
 Regression coverage: `tests/fm-tmux-submit-busy.test.sh` covers the four scenarios (busy pane + pending composer -> `empty`, idle pane + pending composer -> `pending`, busy pane + cleared composer -> `empty`, idle pane + cleared composer -> `empty`).
 
+**NBSP composer padding (claude 2.1.220, 2026-07-28).** claude draws its empty composer prompt as `❯` followed by a U+00A0 NO-BREAK SPACE, not an ASCII space.
+Every adapter trims a candidate composer row with an ASCII-only `[:space:]` class, which leaves that NBSP attached, so the shared classifier received `❯ ` (glyph plus NBSP) and missed its bare-`❯` empty-composer case, classifying an empty claude composer as `pending`.
+On an idle pane, where the busy-queue fallback above does not apply, this turned every just-delivered submit's cleared-composer check into a false `pending`, so `fm-send` reported `Enter swallowed; text left in composer` for a message that had in fact been submitted (observed live twice in one night; a single manual Enter appeared to "fix" it because the message was already sent and the composer was already clear).
+The fix folds the NBSP class to an ASCII space inside the one shared owner `fm_composer_classify_content` (`bin/fm-composer-lib.sh`) via `fm_composer_normalize_ws`, so every adapter benefits and cannot drift; `tests/fm-composer-lib.test.sh` and `tests/fm-tmux-submit-busy.test.sh` add the regression coverage (empty NBSP composer -> `empty`, NBSP-padded real text -> `pending`, and the end-to-end verified-first-try / verified-after-one-retry / genuinely-swallowed submit paths).
+
+Verified live against real claude 2.1.220 in an isolated tmux 3.7b session on macOS (Darwin 24.6.0), 2026-07-28:
+
+```sh
+# empty composer cursor row bytes (tmux capture-pane -e, ghost-stripped): "❯" + c2a0 (U+00A0 NBSP)
+$ printf '%s' "$stripped_trim" | xxd
+00000000: e29d afc2 a0                             .....
+# before the fix
+$ fm_composer_classify_content 0 "❯$(printf '\302\240')"
+pending
+# after the fix
+$ fm_tmux_composer_state <live-claude-pane>
+empty
+# end-to-end submit to an idle claude pane after its turn ended
+$ fm_tmux_submit_core <pane> "just say the single word acknowledged" 3 0.4 0.3
+empty            # claude then printed "⏺ acknowledged" - delivered, correctly verified
+```
+
 Verified empirically with real tmux 3.6a on macOS (Darwin 25.5.0), 2026-07-07:
 
 ```sh

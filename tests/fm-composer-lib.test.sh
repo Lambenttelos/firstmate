@@ -125,8 +125,39 @@ test_real_text_is_pending() {
   pass "fm_composer_classify_content: real unsubmitted text reads pending (including a popup argument-hint fill)"
 }
 
+# --- NBSP prompt-padding fold (root cause of the false "Enter swallowed") -----
+
+test_nbsp_padded_empty_composer_is_empty() {
+  local nbsp nnbsp out
+  nbsp=$(printf '\302\240')       # U+00A0 NO-BREAK SPACE
+  nnbsp=$(printf '\342\200\257')  # U+202F NARROW NO-BREAK SPACE
+  # claude 2.1.220 pads its empty composer prompt with a NO-BREAK SPACE, which
+  # the callers' ASCII [:space:] trim leaves attached, so the classifier receives
+  # "❯ ". It must still read empty, not pending.
+  out=$(classify 0 "❯${nbsp}")
+  [ "$out" = empty ] || fail "an NBSP-padded empty claude composer must read empty, got '$out'"
+  out=$(classify 0 "❯${nnbsp}")
+  [ "$out" = empty ] || fail "a narrow-NBSP-padded empty claude composer must read empty, got '$out'"
+  # The same fold applies to the codex glyph and via plain_content.
+  out=$(classify 0 '' '' sensitive "❯${nbsp}")
+  [ "$out" = empty ] || fail "an NBSP-padded empty composer via plain_content must read empty, got '$out'"
+  pass "fm_composer_classify_content: an NBSP-padded empty agent composer reads empty (claude 2.1.220)"
+}
+
+test_nbsp_padded_real_text_is_pending() {
+  local nbsp out
+  nbsp=$(printf '\302\240')
+  # A genuinely pending composer padded the same way still reads pending: the
+  # fold must not swallow real typed text.
+  out=$(classify 0 "❯${nbsp}fix findings 1 and 3")
+  [ "$out" = pending ] || fail "NBSP-padded real text must stay pending, got '$out'"
+  pass "fm_composer_classify_content: NBSP folding never turns real typed text into empty"
+}
+
 test_bare_shell_glyphs_are_unknown
 test_stripped_unbordered_content_uses_plain_content
+test_nbsp_padded_empty_composer_is_empty
+test_nbsp_padded_real_text_is_pending
 test_bare_shell_prompt_with_command_is_not_empty
 test_bordered_shell_glyph_is_empty
 test_agent_glyphs_are_empty_bordered_and_bare
