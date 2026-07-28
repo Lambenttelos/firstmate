@@ -44,14 +44,20 @@ approval authority; they differ only in what supervises.
 2. **Ensure the sub-supervisor daemon is running as a tracked background process.**
    Its hosting differs by harness.
    Pick the right path:
-   - **Harness WITH a native in-pane tracked-background tool** (e.g. claude's
-     background bash, grok's background tool): first run
-     `bin/fm-afk-launch.sh start-native`, then run
-     `FM_AFK_STATE_PREPARED=1 bin/fm-afk-start.sh` through that native tool.
-     This is a deliberate no-separate-terminal exception because the harness-hosted job creates no terminal or layout mutation, and a shell launcher cannot invoke a harness-native background tool.
-     The launcher still owns lifecycle state and records the no-terminal mode, while the daemon inherits and auto-discovers the captain pane.
-     If the native launch fails, run `bin/fm-afk-launch.sh stop` to roll back the prepared lifecycle.
-     Do not wrap it in `nohup ... &` (Codex/herdr can reap fire-and-forget shell children after a tool call returns).
+   - **Paneless home** (no injectable supervisor pane, e.g. a claude desktop-app
+     session): run `bin/fm-afk-launch.sh start-paneless`. It hosts the daemon in
+     a detached tmux session with pull delivery forced on, so the daemon (and the
+     watcher it owns as a child) survives a firstmate session turnover.
+     tmux is present as the runtime backend even though firstmate itself runs
+     outside it, so a detached tmux session is a session-independent host.
+     Do NOT use the older `start-native` path here: it hosts the daemon as a
+     harness-native background job that is a CHILD of the firstmate session and is
+     reaped on the next turnover, silently taking away supervision down with it
+     (evidence 2026-07-26). `start-native` remains only for a home with no tmux
+     CLI at all; a genuinely tmux-less home should prefer the daemon-free entry.
+     Never wrap the daemon in `nohup ... &` (Codex/herdr can reap fire-and-forget
+     shell children after a tool call returns); a detached tmux session is not
+     that.
    - **Harness WITHOUT one** (e.g. pi): run `bin/fm-afk-launch.sh start`. It is
      the single owner of the daemon terminal: it creates a NON-VISIBLE tracked
      terminal for the current backend (a herdr dedicated `--no-focus` workspace,
@@ -61,9 +67,8 @@ approval authority; they differ only in what supervises.
      active pane** (`herdr pane split`): a split co-tenants the tab and visibly
      shrinks the captain's pane (docs/herdr-backend.md "Away-mode daemon terminal
      launch").
-   The paneless form always uses the harness-native path, because there is no supervisor pane to capture and nothing to inject into; the daemon detects that honestly and selects pull delivery itself.
-   Both paths share `bin/fm-afk-start.sh` as the daemon entry.
-   The native path tells it that the launcher already prepared lifecycle state; the terminal-backed path lets the entry perform its existing state setup inside the new terminal.
+   The paneless form captures no supervisor pane and injects into nothing; it forces `FM_AFK_DELIVERY=paneless` so the daemon selects pull delivery unconditionally rather than discovering the tmux pane it is itself hosted in and typing there.
+   All hosting paths share `bin/fm-afk-start.sh` as the daemon entry, which performs its state setup inside the new terminal.
    It exits immediately if the identity-backed daemon lock already names a live process, otherwise it execs `bin/fm-supervise-daemon.sh` in the foreground.
    The daemon is **presence-gated**: it injects escalations only while
    `state/.afk` exists, and stays quiet otherwise.
@@ -76,12 +81,44 @@ approval authority; they differ only in what supervises.
    Read the digests it printed and act on them.
    Then obey its final line for whether to arm it again: every exit ends in either `re-arm to keep listening` or `- do not re-arm`.
    Re-arming after a `do not re-arm` line is an immediate-exit loop, because that line means the pane is delivering or the away session is over, so nothing will ever arrive here.
+   A run that failed exits non-zero with a loud diagnostic and still ends in a `re-arm to keep listening` line, because its records are still pending and nothing else is listening for them: re-arm it once and report the diagnostic, and treat a second identical failure as a blocker for the captain rather than a loop to keep running.
+   An argument error is the one exit with no verdict at all; fix the invocation instead of re-arming it.
 
 4. **Do not separately arm the watcher.**
    The daemon manages `bin/fm-watch.sh` as its child, and the singleton lock
    no-ops a stray arm harmlessly.
 
 5. **Acknowledge** in `AGENTS.md` section 9 language: "Captain, away mode is active; I will batch routine updates and surface only decisions, failures, credentials, or review-ready work until you return."
+
+## Persisting away mode across a session turnover
+
+By default away mode is a single-session posture: the operational `state/.afk`
+flag is cleared when the captain becomes responsive again (the return flow) or
+at an explicit stop, and a fresh session after a turnover starts responsive.
+
+When the captain orders away supervision to SURVIVE turnovers - "stay away until
+I tell you otherwise" - record that as a durable, machine-readable intent, not
+just prose in `data/captain.md`:
+
+- **Enter persistent away** with `bin/fm-afk-launch.sh persist`.
+  It records the durable persist intent (`state/.afk-persist`) and enters durable
+  paneless away mode in one step.
+- **Session start then self-heals.** While the persist intent is set, the
+  session-start revive sweep (`bin/fm-bootstrap.sh` afk_daemon_revive_sweep) sees
+  no live daemon after a turnover and re-enters durable paneless away mode
+  automatically, bringing the daemon and its watcher child back with no manual
+  re-arm. Only a revive failure surfaces, as a bootstrap `AFK_DAEMON:` line.
+- **The auto-return flow does NOT clear the persist intent.** A first unmarked
+  message still makes THIS session responsive (stops the daemon, clears `.afk`),
+  but the standing away order remains, so the next turnover resumes supervision.
+  This is the `afk-exit-only-on-explicit-word` contract: persistent away ends
+  only on an explicit exit.
+- **End persistent away** with `bin/fm-afk-launch.sh unpersist` (the only path
+  that clears the intent), then run the normal return flow below. After that a
+  turnover no longer re-enters away mode.
+
+Plain `/afk` (without `persist`) keeps its single-session auto-exit behavior
+unchanged.
 
 ## Daemon-free entry (no delivery channel at all)
 
@@ -121,6 +158,7 @@ question and every script asks it there.
 ## How to exit afk
 
 Both entry paths exit the same way, through `bin/fm-afk-return.sh`, and differ only in what that shutdown has to stop.
+When the durable persist intent is set (see "Persisting away mode across a session turnover" above), this auto-return still makes THIS session responsive but deliberately leaves the intent in place, so a later turnover resumes supervision; a full stop needs `bin/fm-afk-launch.sh unpersist` first.
 After a daemon entry it stops the daemon, so per-wake responsiveness comes back when the daemon is gone.
 After a daemon-free entry there is no daemon to stop and per-wake responsiveness was never handed away: exit clears the away posture and this session simply keeps its own watcher-arm supervision running.
 Every other part of the return contract, including the durable catch-up gate, is identical on both paths.

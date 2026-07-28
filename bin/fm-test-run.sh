@@ -123,6 +123,7 @@ family_for_basename() {
     fm-continuity-pretool-check.test.sh|fm-crew-state.test.sh|fm-decision-hold-lifecycle.test.sh|\
     fm-dispatch-select.test.sh|fm-ensure-agents-md.test.sh|fm-grok-harness.test.sh|\
     fm-herdr-lab.test.sh|fm-instruction-owners.test.sh|fm-lint.test.sh|\
+    fm-memory-report.test.sh|\
     fm-install-herdr.test.sh|fm-nm-test-contract.test.sh|fm-no-mistakes-ownership.test.sh|\
     fm-nm-preflight.test.sh|\
     fm-operational-input.test.sh|fm-pi-primary-types.test.sh|fm-project-mode.test.sh|\
@@ -132,7 +133,8 @@ family_for_basename() {
     fm-test-run.test.sh|fm-test-isolation-proof.test.sh)
       printf '%s\n' pure-contract-unit
       ;;
-    fm-daemon.test.sh|fm-guard-stale-banner.test.sh|fm-pi-watch-extension.test.sh|\
+    fm-daemon.test.sh|fm-guard-stale-banner.test.sh|fm-heavy-run.test.sh|fm-hourly-passes.test.sh|\
+    fm-pi-watch-extension.test.sh|\
     fm-supervision-events.test.sh|fm-turnend-guard.test.sh|fm-wake-daemon-lifecycle-e2e.test.sh|\
     fm-wake-queue.test.sh|fm-watch-checkpoint.test.sh|fm-watch-triage.test.sh|\
     fm-watcher-lock.test.sh)
@@ -162,7 +164,8 @@ family_for_basename() {
       ;;
     fm-backend-herdr.test.sh|fm-backend-tmux-smoke.test.sh|fm-backend.test.sh|\
     fm-send-strict.test.sh|fm-spawn-batch.test.sh|fm-spawn-dispatch-profile.test.sh|\
-    fm-spawn-foreign-clone.test.sh|fm-spawn-worktree-settle.test.sh)
+    fm-spawn-foreign-clone.test.sh|fm-spawn-worktree-settle.test.sh|\
+    fm-treehouse-pin.test.sh|fm-treehouse-pin-e2e.test.sh)
       printf '%s\n' backend-dispatch
       ;;
     fm-pr-check-security.test.sh|fm-pr-merge.test.sh|fm-review-diff.test.sh|\
@@ -666,7 +669,7 @@ families_for_changed_path() {
       printf '%s\n' pr-forge
       ;;
     bin/fm-spawn.sh|bin/fm-send.sh|bin/fm-dispatch-select.sh|bin/fm-harness.sh|\
-    bin/fm-peek.sh|bin/fm-composer*)
+    bin/fm-peek.sh|bin/fm-composer*|bin/fm-treehouse-pin.sh)
       printf '%s\n' backend-dispatch
       printf '%s\n' pure-contract-unit
       ;;

@@ -578,6 +578,11 @@ test_escalate_batches_into_one_digest() {
   grep -F "event B" "$sent" >/dev/null || fail "batch digest missing event B"
   grep -F 'event A: done: PR 1 | event B: done: PR 2' "$sent" >/dev/null \
     || fail "batch digest did not join events with literal ' | '"
+  # The count is rendered straight into the line the captain reads, and BSD wc
+  # pads its output, so it must be stripped rather than shipped as
+  # "Supervisor escalate (       2 event(s))".
+  grep -F 'Supervisor escalate (2 event(s))' "$sent" >/dev/null \
+    || fail "batch digest did not carry an unpadded event count: $(cat "$sent")"
   [ -s "$state/.subsuper-escalations" ] && fail "escalation buffer not cleared after flush"
   [ -e "$state/.subsuper-escalations.since" ] && fail "first-append sidecar not cleared after flush"
   n=$(grep -c '\[ENTER\]' "$sent")

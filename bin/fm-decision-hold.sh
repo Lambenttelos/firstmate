@@ -24,6 +24,7 @@
 #   fm-decision-hold.sh verify <origin-id>
 #   fm-decision-hold.sh resolve <origin-id> <decision-key> \
 #     --decision-file <path> --routed-to <task-id> [--routed-to <task-id>...]
+#   fm-decision-hold.sh guard [--restore]
 #
 # `complete` is the shared investigation and visual-review completion gate.
 # `--none` is an explicit semantic attestation that the just-reviewed surface has
@@ -31,7 +32,16 @@
 # metadata inventory is unioned idempotently. A post-teardown visual review can
 # complete against the surviving report and holds without recreating task state.
 # `verify` is read-only and is called by scout teardown so teardown cannot erase a
-# source before this gate has succeeded.
+# source before this gate has succeeded. `verify` only checks a single origin's own
+# inventory, so it never sees a sibling hold being buried; `guard` is the ledger-wide
+# backstop for that. `guard` reads the active backlog and the retention archive and
+# fails closed if any kind captain hold is Done while still bearing the
+# "State: awaiting captain decision." sentinel (closed without routing through
+# `resolve`). `--restore` reopens and re-holds active-backlog offenders; an archived
+# offender is reported for manual un-archiving because tasks-axi cannot address an item
+# once retention pruning has moved it into the archive file. fm-teardown.sh runs the
+# read-only `guard` as a fail-closed gate before its own close-and-prune reminder, the
+# closest firstmate-owned point ahead of the pruning `tasks-axi done`.
 #
 # `resolve` requires every --routed-to task to exist and to be blocked by the hold.
 # It writes the captain decision and routed identities into the hold body, clears
@@ -170,6 +180,25 @@ verify_hold_active() {  # <hold-id>
   [ "$hold_kind" = captain ] || fail "backlog item $id is not held for the captain"
 }
 
+# A captain decision hold is created with the sentinel body line
+# "State: awaiting captain decision." (command_hold) and resolve() replaces the whole
+# body with a "Resolution recorded by fm-decision-hold." record. So the presence of
+# the sentinel, or the absence of the resolution record, is the byte-level truth of
+# whether the captain has actually answered - never the tasks-axi Done flag alone.
+body_has_resolution() {  # <body>
+  case "$1" in
+    *"Resolution recorded by fm-decision-hold."*"Routed work:"*) return 0 ;;
+  esac
+  return 1
+}
+
+body_awaiting_captain() {  # <body>
+  case "$1" in
+    *"State: awaiting captain decision."*) return 0 ;;
+  esac
+  return 1
+}
+
 verify_hold_resolved() {  # <hold-id>
   local id=$1 show state kind body
   show=$(task_show "$id") || return 1
@@ -178,10 +207,7 @@ verify_hold_resolved() {  # <hold-id>
   body=$(show_field "$show" body)
   [ "$state" = "done" ] || return 1
   [ "$kind" = captain ] || return 1
-  case "$body" in
-    *"Resolution recorded by fm-decision-hold."*"Routed work:"*) return 0 ;;
-  esac
-  return 1
+  body_has_resolution "$body"
 }
 
 verify_hold_durable() {  # <hold-id>
@@ -195,10 +221,8 @@ verify_hold_durable() {  # <hold-id>
   if [ "$state" = queued ] && [ "$held" = yes ] && [ "$kind" = captain ] && [ "$hold_kind" = captain ]; then
     return 0
   fi
-  if [ "$state" = "done" ] && [ "$kind" = captain ]; then
-    case "$body" in
-      *"Resolution recorded by fm-decision-hold."*"Routed work:"*) return 0 ;;
-    esac
+  if [ "$state" = "done" ] && [ "$kind" = captain ] && body_has_resolution "$body"; then
+    return 0
   fi
   fail "captain decision $id is neither actively held nor durably resolved"
 }
@@ -253,8 +277,19 @@ command_hold() {
     state=$(show_field "$show" state)
     kind=$(show_field "$show" kind)
     existing_title=$(show_field "$show" title)
-    [ "$state" != "done" ] || fail "captain decision $id is already durably resolved; use a new decision key for a new decision"
     [ "$kind" = captain ] || fail "existing backlog identity $id is not kind captain"
+    # A Done hold is "already resolved" only when it carries the durable resolution
+    # record. A Done hold without that record still bears the awaiting sentinel: it was
+    # closed without an answer (the retention-loss bug), so recover it rather than
+    # refusing. Keying off state=done alone was the hold/verify contradiction: hold
+    # called every Done hold resolved while verify_hold_durable, which checks the
+    # record, called the same id neither held nor resolved.
+    if [ "$state" = "done" ]; then
+      ! body_has_resolution "$(show_field "$show" body)" \
+        || fail "captain decision $id is already durably resolved; use a new decision key for a new decision"
+      tasks_axi reopen "$id" >/dev/null \
+        || fail "could not reopen unanswered captain hold $id to recover it"
+    fi
     [ "$existing_title" = "$title" ] || fail "existing captain hold $id has a different title"
   else
     if [ -z "$repo" ] && [ -f "$STATE/$origin.meta" ]; then
@@ -453,12 +488,107 @@ command_resolve() {
   printf 'resolved: %s -> %s\n' "$id" "$routed"
 }
 
+# --- guard: the structural retention-loss backstop --------------------------
+# Owns the invariant that no captain decision hold may be Done while its body still
+# reads the "State: awaiting captain decision." sentinel, i.e. while it was closed
+# without ever routing through resolve(). It reads both the active backlog and the
+# retention archive directly, because tasks-axi cannot address an item once retention
+# pruning has moved it into the archive (the archive is a flat, non-backlog file).
+
+toml_markdown_value() {  # <key> -> value from the [markdown] table of FM_HOME/.tasks.toml
+  local key=$1 toml="$FM_HOME/.tasks.toml"
+  [ -f "$toml" ] || return 0
+  awk -v k="$key" '
+    /^[[:space:]]*\[/ { in_md = ($0 ~ /^[[:space:]]*\[markdown\]/); next }
+    in_md && $0 ~ "^[[:space:]]*"k"[[:space:]]*=" {
+      sub(/^[^=]*=[[:space:]]*/, ""); gsub(/^"|"[[:space:]]*$/, ""); print; exit
+    }
+  ' "$toml"
+}
+
+resolve_backlog_path() {  # <toml-key> <default-relative>
+  local p; p=$(toml_markdown_value "$1"); [ -n "$p" ] || p=$2
+  case "$p" in /*) printf '%s\n' "$p" ;; *) printf '%s/%s\n' "$FM_HOME" "$p" ;; esac
+}
+
+# Emit the id of every kind captain item in <file> that is Done (- [x]) yet still bears
+# the awaiting sentinel and carries no resolution record - the exact corrupt state.
+scan_unanswered_captain_dones() {  # <file>
+  [ -f "$1" ] || return 0
+  awk '
+    function flush() {
+      if (have && is_done && is_captain && awaiting && !resolution) print id
+      have=0; is_done=0; is_captain=0; awaiting=0; resolution=0; id=""
+    }
+    /^- \[/ {
+      flush(); have=1
+      is_done = ($0 ~ /^- \[x\]/)
+      is_captain = ($0 ~ /\(kind: captain\)/)
+      s=$0; sub(/^- \[.\] /,"",s); sub(/ .*/,"",s); id=s
+      if ($0 ~ /State: awaiting captain decision\./) awaiting=1
+      if ($0 ~ /Resolution recorded by fm-decision-hold\./) resolution=1
+      next
+    }
+    /^## / { flush(); next }
+    have {
+      if ($0 ~ /State: awaiting captain decision\./) awaiting=1
+      if ($0 ~ /Resolution recorded by fm-decision-hold\./) resolution=1
+    }
+    END { flush() }
+  ' "$1"
+}
+
+command_guard() {
+  local restore=0 backlog archive active_ids archive_ids id rc=0
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --restore) restore=1 ;;
+      *) usage >&2; exit 2 ;;
+    esac
+    shift
+  done
+  # Detection is pure file reading and never needs tasks-axi, so the read-only guard can
+  # gate teardown even where the backend is unavailable. Only recovery mutates the backlog.
+  [ "$restore" = 0 ] || require_tasks_axi
+  backlog=$(resolve_backlog_path path data/backlog.md)
+  archive=$(resolve_backlog_path archive data/done-archive.md)
+  active_ids=$(scan_unanswered_captain_dones "$backlog")
+  archive_ids=$(scan_unanswered_captain_dones "$archive")
+
+  if [ -z "$active_ids" ] && [ -z "$archive_ids" ]; then
+    printf 'guard: no unanswered captain hold is closed in %s or %s\n' "$backlog" "$archive"
+    return 0
+  fi
+
+  if [ "$restore" = 0 ]; then
+    echo "guard: REFUSED - captain decision hold(s) closed without a captain answer:" >&2
+    for id in $active_ids; do printf '  %s (active backlog: %s)\n' "$id" "$backlog" >&2; done
+    for id in $archive_ids; do printf '  %s (retention archive: %s)\n' "$id" "$archive" >&2; done
+    fail "these hold(s) are Done while still awaiting a decision; run 'fm-decision-hold.sh guard --restore' (archived holds must be moved back into $backlog first)"
+  fi
+
+  # Restore recovers active-backlog offenders deterministically through tasks-axi.
+  for id in $active_ids; do
+    tasks_axi reopen "$id" >/dev/null || { echo "guard: could not reopen $id" >&2; rc=1; continue; }
+    tasks_axi hold "$id" --reason "reopened by guard: closed while awaiting a captain decision" --kind captain >/dev/null \
+      || { echo "guard: could not re-hold $id" >&2; rc=1; continue; }
+    printf 'restored: %s\n' "$id"
+  done
+  # Archived offenders are outside tasks-axi's reach; report them for un-archiving.
+  for id in $archive_ids; do
+    printf 'archived-unanswered: %s (move from %s into %s, then rerun --restore)\n' "$id" "$archive" "$backlog" >&2
+    rc=1
+  done
+  return "$rc"
+}
+
 case "${1:-}" in
   id) shift; command_id "$@" ;;
   hold) shift; command_hold "$@" ;;
   complete) shift; command_complete "$@" ;;
   verify) shift; command_verify "$@" ;;
   resolve) shift; command_resolve "$@" ;;
+  guard) shift; command_guard "$@" ;;
   -h|--help) usage ;;
   *) usage >&2; exit 2 ;;
 esac

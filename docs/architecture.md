@@ -29,6 +29,9 @@ On its own slow cadence the watcher also reads the host itself through `bin/fm-r
 It wakes firstmate with `check: host-resources <reading>` only when pressure first gets worse than the level firstmate was last told about, annotates a heartbeat with the last cached reading, and re-arms silently when the host recovers; `bin/fm-spawn.sh` prints the same reading as a pre-dispatch advisory and `bin/fm-session-start.sh` prints one in its digest.
 Nothing on that path pauses, sheds, or kills anything, because shedding load is the captain's decision; [configuration.md](configuration.md#host-resource-monitoring-fm_resource_interval) owns the cadence knob and the script header owns the thresholds and the ceiling formula.
 
+The same slow poll carries the two hourly passes that `bin/fm-session-start.sh` arms for the life of a session: a session review that reports only what has not moved, and a cleanup sweep that reclaims bookkeeping and reports - never removes - anything that could hold unlanded work.
+They ride the one watcher precisely so a recurring duty needs no second supervision cycle, and both stay silent unless they have something the fleet has not already been told about; [configuration.md](configuration.md#hourly-session-passes-fm_hourly_review_interval--fm_hourly_cleanup_interval) owns the cadence knobs.
+
 Crew status files are append-only wake-event logs, not current-state fields.
 `bin/fm-crew-state.sh <id>` is the cheap current-state read for an actionable heartbeat review: it attributes a no-mistakes run, active or terminal, only when it matches the crew's branch and current code identity, then keeps that run-step authoritative even if the pane has closed.
 The script header owns the exact run-head ancestry rules.
@@ -117,8 +120,11 @@ Codex App support is recorded in `docs/codex-app-backend.md`; it is not selectab
 ## Worktrees, not branches in your checkout
 
 Crewmates never intentionally touch your project clone; [treehouse](https://github.com/kunchenguid/treehouse) pools clean worktrees for tmux, herdr, zellij, and cmux tasks, while Orca creates its own worktrees for `backend=orca`.
-For ship and scout work, `fm-spawn.sh` refuses to launch unless the resolved task path is a real git worktree root that is distinct from the project primary checkout and belongs to the same clone as that checkout.
+For ship and scout work, `fm-spawn.sh` refuses to launch unless the project is one of this home's own clones and the resolved task path is a real git worktree root that is distinct from the project primary checkout and belongs to the same clone as that checkout.
 A shared treehouse pool can hand back a real, isolated worktree of a different clone of the same repo, so `fm-spawn.sh` compares each side's shared git directory (`git rev-parse --git-common-dir`, the clone's identity) and refuses when they differ or either is indeterminate, so a task can never commit into another copy of the repo where its branch is invisible.
+That comparison is relative and proves only that the two agree, so it cannot see that the project itself is the wrong clone; `fm-spawn.sh` therefore applies an absolute test first, requiring the project to be a direct child of this home's projects directory, which is what the registry model already means by a registered project.
+It fails closed with no bypass flag, and a test that needs a different location moves the whole projects directory with `FM_PROJECTS_OVERRIDE`.
+Treehouse keys a pool by the origin URL rather than by the clone, so `bin/fm-treehouse-pin.sh` pins each of this home's clones to a pool under `$FM_HOME/.treehouse/`, applied by `fm-fleet-sync.sh` on every sync and by `fm-home-seed.sh` for each seeded secondmate clone; [treehouse-pools.md](treehouse-pools.md) records the measured evidence, the rejected alternatives, and the migration behaviour.
 
 The firstmate repo has one extra exposure because it can dispatch crewmates to work on itself.
 Its operating checkout (`FM_ROOT`) and the disposable crewmate worktrees are all linked git worktrees of the same repository, so the valid discriminator is branch state, not whether the checkout is linked.
@@ -190,15 +196,21 @@ The `data/secondmates.md` line contract is owned by the [`secondmate-provisionin
 
 ## Project modes are explicit
 
-`data/projects.md` records each project's delivery mode and optional `+yolo` autonomy flag.
-`no-mistakes` projects run the full validation pipeline, `direct-PR` projects open PRs without that pipeline, `direct-push` projects run the full pipeline then push the validated branch to a forge firstmate cannot open PRs on (e.g. Bitbucket) for the configured merge authority to land, and `local-only` projects stay local until firstmate performs an approved fast-forward merge.
+`data/projects.md` records each project's delivery mode and optional `+yolo` autonomy and `+autoland` self-land flags.
+`no-mistakes` projects run the full validation pipeline, `direct-PR` projects open PRs without that pipeline, `direct-push` projects run the full pipeline then push the validated branch to a forge firstmate cannot open PRs on (e.g. Bitbucket) for the configured merge authority to land, and `local-only` projects stay local until firstmate performs an approved `--no-ff` merge.
+The `+autoland` flag (owned repos only, orthogonal to mode and `+yolo`) is a durable standing captain grant that green work self-lands without waiting: a `direct-push +autoland` crew merges its own green `fm/<id>` branch onto the origin default branch as a clean `--no-ff` merge itself and reports the merge evidence, and a `local-only +autoland` lane has firstmate fire the guarded local merge automatically once the review gate is green; a conflict, or any destructive, irreversible, or security-sensitive choice, still escalates.
+The header of `bin/fm-project-mode.sh` owns the full flag semantics and registry syntax.
 When a selected delivery path calls for a diff, `bin/fm-review-diff.sh` refreshes the authoritative base and, when task meta records `pr=`, always fetches and compares against `refs/pull/<n>/head` by default (recorded `pr_head=` is only an offline fallback) before falling back to the local branch with a warning.
 For target project repos shipped through their own no-mistakes pipeline, commits under `.no-mistakes/evidence/` are the pipeline's PR-viewable validation evidence and are expected to stay in the crew branch until the evidence-hosting design changes.
 The firstmate repo itself is the exception: its `.no-mistakes/` directory is local state, stays gitignored, and is rejected by CI if tracked.
 PR-based task merges go through `bin/fm-pr-merge.sh`, which records `pr=` and any available `pr_head=` through `bin/fm-pr-check.sh` before calling `gh-axi pr merge`.
 The helper requires a full `https://github.com/<owner>/<repo>/pull/<n>` URL, invokes `gh-axi pr merge <n> --repo <owner>/<repo>`, defaults to `--squash`, preserves explicit merge-method flags, and rejects malformed URLs or repo override flags before recording merge state; a well-formed GitLab merge request URL (see [docs/gitlab-merge-watch.md](gitlab-merge-watch.md)) is refused too, explicitly, rather than sent to the wrong forge.
 Teardown is fail-closed for ship worktrees: dirty worktrees refuse, and committed work must be either landed or fully pushed to its own origin ref before the worktree is returned.
-Release-on-pushed frees a finished worker's memory slot without waiting for the merge; a commit that is absent from the remote ref, and the no-remote or offline case, still refuse rather than release on an unverifiable claim, and `--force` stays the only discard path.
+Release-on-pushed frees a finished worker's memory slot without waiting for the merge, and `--force` stays the only discard path for work that reaches none of the landed proofs.
+A commit that is absent from the remote ref, and the no-remote or offline case, refuse rather than release on an unverifiable claim, unless the remaining containment proof below verifies locally.
+Containment in a default branch that outlives the worktree counts as landed on its own, proved by exact commit reachability rather than content equivalence: the freshly fetched `refs/remotes/origin/<default>`, or the project clone's own `refs/heads/<default>` when the task worktree is a linked worktree of that clone.
+That proof releases a lane which finished on a detached HEAD or a scratch branch name after landing on origin, and one whose approved landing target is local rather than origin.
+A standalone clone's own default branch never counts, because that ref dies with the worktree, so the fallback narrows a false refusal instead of making origin optional.
 Every released-but-unmerged ship branch is recorded in the durable per-repo merge queue so it cannot be silently forgotten - see [merge-queue.md](merge-queue.md) for its format, its content-in-base sweep, and the merge-workers-on-demand contract.
 [`bin/fm-teardown.sh`](../bin/fm-teardown.sh)'s header owns the landed-work proofs, the fully-pushed proof, PR-discovery fallback, and stale-lock recovery procedure.
 
@@ -243,6 +255,7 @@ The full ownership rule - what is project-intrinsic versus fleet-private, and ho
 `/stow` sweeps the current session for durable knowledge that only exists in conversation and routes each finding to the most specific disk home.
 Home-domain captain preferences go to `data/captain.md`, cross-domain shared captain preferences go to the primary home's `data/captain-shared.md`, fleet-local operational facts and gotchas go to home-local `data/learnings.md`, project-intrinsic knowledge goes through normal crewmate delivery into that project's committed `AGENTS.md`, and task-scoped notes or undone next steps go to the backlog.
 Memory writes use inspect-then-update: read the current destination first, then rewrite or prune matching bullets or notes in place instead of appending by default.
+A finding that is an operating value some config file already owns is recorded as a pointer at that file rather than a restated value, per the pointer-not-value rule in [configuration.md](configuration.md#captain-preferences-datacaptainmd--datacaptain-sharedmd).
 Task-scoped notes use `tasks-axi show <id> --full` followed by `tasks-axi update <id> --body-file <path>`, adding `--archive-body` when the prior body should remain recoverable.
 Generalizable firstmate knowledge goes to shared tracked docs through the normal PR pipeline; the firstmate-internal `/stow` deliberately never stores findings in either skill directory.
 

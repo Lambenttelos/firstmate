@@ -61,6 +61,7 @@ It has the knowledge-placement rules that keep `AGENTS.md` from regrowing after 
 There is no reliable way for `bin/fm-brief.sh`'s scaffold to detect that a task's repo is firstmate itself, so firstmate adds this skill's load line to firstmate-repo briefs by hand.
 A crewmate picking up such a brief should load the skill even if the brief predates this instruction.
 When supervising live crewmates, keep firstmate's own long validation or build commands in the background so watcher wakes can still be handled.
+When other work is live on the same machine, run heavy commands - suites, lint sweeps, builds - through `bin/fm-heavy-run.sh -- <command>`, which queues them behind a configurable ceiling and hands back the command's real output and exit status; `docs/configuration.md` owns that ceiling.
 Crewmate validation follows the installed no-mistakes version's SKILL.md and live `axi` help instead of duplicating gate mechanics in firstmate docs.
 Firstmate's wrapper still matters: `ask-user` findings route to the captain through firstmate, and crewmates avoid `--yes` because it silently resolves captain-owned decisions without escalation.
 Local `.no-mistakes/` state and test evidence stay out of this repo; `.no-mistakes.yaml` keeps evidence in a temp directory and pins the gate's lint command to `bin/fm-lint.sh`, matching the Linux CI lint job.
@@ -95,6 +96,8 @@ Family selection is the ordinary local path; `--all` is deliberate full regressi
 CI owns broad regression across required portable parallel shards, the portable serial lane, the Herdr lane, lint, invariants, the coverage guard, and macOS snapshot compatibility in [`.github/workflows/ci.yml`](.github/workflows/ci.yml).
 Use `bin/fm-test-run.sh --help` for lane names, `--jobs` rules, and required gate-skip flags when reproducing a lane locally.
 Discover tests by listing `tests/*.test.sh`: each is a self-contained bash script named `<subject>.test.sh`, and its header comment describes what it covers, so pass one to `bin/fm-test-run.sh` to focus on a subject with canonical timing output.
+A test that races a real background process (a watcher, a daemon, a spawned agent) must wait on the condition it actually depends on rather than sleeping a guessed number of seconds, because process start-up cost is unbounded on a loaded host.
+Wait on the process's own observable signal, such as the watcher's liveness beacon `state/.last-watcher-beat`, and use a generous `--seconds` style bound only as a hang guard that a green run never spends; see `tests/fm-watch-checkpoint.test.sh` for the pattern.
 Tests that need a real optional backend or an explicit opt-in (real herdr/zellij/cmux smoke tests, the live Pi regression) skip themselves and print the tool or environment gate needed to enable them, so the portable suite remains safe on machines without those tools.
 The [Herdr backend guide](docs/herdr-backend.md) owns the lane's safety and isolation rationale, including why live harness credential tests remain opt-in.
 

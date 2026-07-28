@@ -9,7 +9,8 @@
 #                 "MISSING_MANUAL: <tool> (instructions: <url>)", "NEEDS_GH_AUTH",
 #                 "BACKEND_INVALID: <name> (known: <names>)",
 #                 "CREW_DISPATCH: invalid config/crew-dispatch.json - <reason>",
-#                 "FLEET_SYNC: <repo>: skipped|recovered|STUCK: <detail>",
+#                 "FLEET_SYNC: <repo>: skipped|recovered|STUCK|FETCH FAILED|PIN FAILED: <detail>",
+#                 "PRESENT_DAEMON: <reason>",
 #                 "PR_CHECK_MIGRATION: <private remediation>",
 #                 "TANGLE: <remediation>",
 #                 "SECONDMATE_SYNC: secondmate <id>: skipped: <reason>",
@@ -40,6 +41,11 @@
 #          skipped means the probe could not confidently classify the endpoint,
 #          and respawn failed means relaunch did not complete. Already-live and
 #          successfully respawned secondmates are silent.
+#          A PRESENT_DAEMON line means the opted-in present-mode supervision
+#          daemon (bin/fm-present-daemon.sh) could not be launched, so this
+#          session keeps arming the watcher itself per turn. The sweep is silent
+#          when the feature is not opted in, when away mode owns supervision,
+#          and when the daemon is already running.
 #          A TANGLE line means the firstmate primary checkout (FM_ROOT) is stranded
 #          on a feature branch instead of its default branch - a crewmate's work
 #          landed in the primary instead of its own worktree; restore it per the line.
@@ -67,8 +73,9 @@
 #          refresh relays any completed fm-fleet-sync.sh output before the
 #          aggregate timeout skip line with timeout and elapsed seconds.
 #          Set FM_FLEET_PRUNE=0 to skip branch pruning during that refresh.
-#          Set FM_BOOTSTRAP_DETECT_ONLY=1 to skip the five MUTATING sweeps
-#          (PR-check migration, secondmate_sync, secondmate_liveness_sweep,
+#          Set FM_BOOTSTRAP_DETECT_ONLY=1 to skip the seven MUTATING sweeps
+#          (PR-check migration, present_daemon_sweep, afk_daemon_revive_sweep,
+#          secondmate_sync, secondmate_liveness_sweep,
 #          x_mode_setup, fleet_sync) while still printing every read-only detect line
 #          above; the TANGLE line switches to advisory-only wording with no
 #          checkout command. Used by
@@ -137,6 +144,13 @@ fleet_sync_relay_filtered_output() {
     case "$line" in
       *': skipped: local-only project') ;;
       *': skipped: no origin remote') ;;
+      # A failed fetch is a distinct, louder outcome than a skip: the clone stops
+      # receiving new commits while still reading as healthy everywhere else.
+      *': FETCH FAILED:'*) echo "FLEET_SYNC: $line" ;;
+      # An unpinned clone can draw a task worktree from another copy of the same
+      # repo, so a failed pin is actionable even though the sync itself succeeded.
+      # A successful pin stays silent: it is a one-time convergence, not news.
+      *': PIN FAILED:'*) echo "FLEET_SYNC: $line" ;;
       *': skipped:'*) echo "FLEET_SYNC: $line" ;;
       *': STUCK:'*) echo "FLEET_SYNC: $line" ;;
       *': recovered:'*) echo "FLEET_SYNC: $line" ;;
@@ -476,6 +490,51 @@ secondmate_liveness_sweep() {
         ;;
     esac
   done
+  return 0
+}
+
+afk_daemon_revive_sweep() {
+  # Idempotent away-mode daemon revive - SESSION START ONLY, and only while this
+  # session holds the fleet lock. The away-mode daemon and the watcher it owns as
+  # a child do not survive a firstmate session turnover (compaction, restart, or
+  # a return-on-unmarked-message flow that stopped away mode). Evidence 2026-07-26:
+  # the daemon shut down cleanly at a session boundary, state/.afk was cleared, and
+  # the captain's standing "keep away mode" order survived only as prose in
+  # data/captain.md - nothing machine-readable re-entered away mode. Durable
+  # hosting (bin/fm-afk-launch.sh start-paneless, detached tmux) fixes the reap,
+  # but not a cleared away flag; this sweep closes that gap.
+  #
+  # bin/fm-afk-launch.sh revive owns the whole decision (AGENTS.md one-owner rule):
+  # it is a silent no-op unless the DURABLE persist intent (state/.afk-persist) is
+  # set, and even then acts only on a confident dead reading (the identity-backed
+  # daemon lock). When it revives, it re-enters durable paneless away mode, which
+  # brings the daemon and its watcher child back. A healthy or non-persistent home
+  # produces no output; only a revive FAILURE is actionable and surfaces as one
+  # AFK_DAEMON line.
+  local out
+  if ! out=$(FM_HOME="$FM_HOME" "$SCRIPT_DIR/fm-afk-launch.sh" revive 2>&1); then
+    echo "AFK_DAEMON: away-mode revive failed: $(first_line "$out")"
+  fi
+  return 0
+}
+
+present_daemon_sweep() {
+  # Idempotent present-mode daemon liveness guarantee - SESSION START ONLY, and
+  # only while this session actually holds the fleet lock. The daemon
+  # (bin/fm-present-daemon.sh) keeps a watcher continuously armed so the active
+  # session stops paying the per-turn re-arm tax. It is inert unless the local
+  # config/present-daemon flag exists, and it must never run alongside away
+  # mode, which owns supervision through its own daemon. Both conditions are
+  # owned by the daemon itself, so this sweep can call `start` unconditionally:
+  # disabled, away-mode, and already-running all return 0 silently. Only a real
+  # launch failure is actionable, and that surfaces as one PRESENT_DAEMON line.
+  # Never blind either way: if the daemon is absent or dies, the turn-end guard
+  # (bin/fm-turnend-guard.sh) still fires its normal alarm and the session
+  # degrades to arming supervision per turn, exactly as before this feature.
+  local out
+  if ! out=$(FM_HOME="$FM_HOME" "$SCRIPT_DIR/fm-present-daemon.sh" start 2>&1); then
+    echo "PRESENT_DAEMON: $(first_line "$out")"
+  fi
   return 0
 }
 
@@ -867,6 +926,8 @@ if [ "${FM_BOOTSTRAP_VERBOSE_FACTS:-0}" = 1 ] \
   echo "BOOTSTRAP_INFO: tasks-axi available"
 fi
 if [ "${FM_BOOTSTRAP_DETECT_ONLY:-0}" != 1 ]; then
+  present_daemon_sweep
+  afk_daemon_revive_sweep
   secondmate_liveness_sweep
   secondmate_sync
   x_mode_setup

@@ -85,8 +85,17 @@
 #   provisioned firstmate home; the default is kind=ship.
 #   Before a secondmate launch, the home is locally fast-forwarded to the primary
 #   default-branch commit when safe; skipped syncs warn and launch unchanged.
-#   Ship/scout spawns refuse to launch unless the resolved task path is a real
-#   git worktree root distinct from the primary project checkout.
+#   Ship/scout spawns refuse to launch unless the project is one of THIS home's
+#   own clones (a direct child of $PROJECTS) and the resolved task path is a real
+#   git worktree root of that same clone, distinct from the primary checkout.
+#   Every spawn also refuses a brief that still holds the bare {TASK}
+#   placeholder fm-brief.sh scaffolds as the Task section body: firstmate never
+#   filled in the task, so dispatching it would only waste the spawn on a
+#   crewmate that can do nothing but report the empty brief. The match is
+#   structural - the placeholder standing alone as a line - so a mention of the
+#   token inside explanatory prose or backticks (the scaffold's own Herdr
+#   declaration quotes it) does not trip the guard. The scaffold cannot know the
+#   task text, so the check lives here rather than in fm-brief.sh.
 # Batch dispatch: pass one or more `id=repo` pairs instead of a single <id> <project>, e.g.
 #     fm-spawn.sh fix-a-k3=projects/foo add-b-q7=projects/bar [--scout]
 #   Each pair re-execs this script in single-task mode, so the single path stays the only
@@ -652,6 +661,31 @@ resolve_project_dir_arg() {
   esac
 }
 
+# The clone-identity assertion in validate_spawn_worktree is RELATIVE: it compares
+# the allocated worktree against this spawn's project and refuses when they
+# disagree. That catches a pool handing back another clone's slot, but it cannot
+# see that the project ITSELF is the wrong clone. resolve_project_dir_arg above
+# rewrites only a "projects/<name>" argument; every other string passes through
+# verbatim, so a spawn given another checkout of the same repo - the captain's own
+# working copy, say - opens its pane there, `treehouse get` allocates a slot of
+# THAT clone's object store, and both sides of the clone comparison then name the
+# same foreign clone. The assertion passes and the crew commits where the home
+# that dispatched it cannot see the branch: a refusal that does not refuse.
+#
+# Closing it needs an ABSOLUTE test, and the registry model already supplies one -
+# every registered project is this home's own clone at $PROJECTS/<name>. Fail
+# closed on anything else rather than offering a bypass flag; tests that need a
+# different location move the whole projects dir with FM_PROJECTS_OVERRIDE.
+validate_project_is_own_clone() {  # <raw-arg> <resolved-abs>
+  local raw=$1 abs=$2 abs_real projects_real
+  abs_real=$(cd "$abs" 2>/dev/null && pwd -P) || abs_real=$abs
+  projects_real=$(cd "$PROJECTS" 2>/dev/null && pwd -P) || projects_real=$PROJECTS
+  if [ "$(dirname "$abs_real")" != "$projects_real" ]; then
+    echo "error: project '$raw' resolves to '$abs_real', which is not one of this home's project clones (expected a direct child of '$projects_real'); refusing to launch so the task cannot work in a copy of this repo that this home does not own" >&2
+    exit 1
+  fi
+}
+
 path_is_ancestor_of() {
   local ancestor=$1 path=$2
   [ -n "$ancestor" ] || return 1
@@ -805,10 +839,30 @@ if [ "$KIND" = secondmate ]; then
   fi
 else
   PROJ_ABS="$(cd "$(resolve_project_dir_arg "$PROJ")" && pwd)"
+  validate_project_is_own_clone "$PROJ" "$PROJ_ABS"
   WT=""
   BRIEF="$DATA/$ID/brief.md"
 fi
 [ -f "$BRIEF" ] || { echo "error: no brief at $BRIEF" >&2; exit 1; }
+# An unfilled {TASK} placeholder means firstmate scaffolded the brief but never
+# replaced it with the actual task description. Dispatching it wastes the spawn:
+# the crewmate can only stop and report the empty brief. Refuse loudly here so
+# the dispatch never happens. The scaffold (fm-brief.sh) writes the literal
+# {TASK} placeholder on purpose and cannot know the task text, so this guard
+# belongs at spawn time, not in the scaffold. Batch dispatch re-execs this script
+# in single-task mode, so every pair passes through this check.
+#
+# The honest signal is structural: fm-brief.sh writes the placeholder as the
+# entire body of the `# Task` section, on its own line. A correctly filled brief
+# replaces that line. The guard therefore matches only the bare placeholder
+# standing alone as a line, not a mention of the token inside explanatory prose
+# or backticks - the scaffold's own Herdr safety declaration quotes `{TASK}`
+# inline, and refusing on that would force the operator to edit generated safety
+# text to spawn a fully filled brief.
+if grep -Eq '^[[:space:]]*\{TASK\}[[:space:]]*$' "$BRIEF"; then
+  echo "error: brief at $BRIEF still contains an unfilled {TASK} placeholder; replace it with the task description before spawning" >&2
+  exit 1
+fi
 
 # PROJ_ABS can still carry a symlinked path component (e.g. macOS's /tmp ->
 # /private/tmp) when it came from the ship/scout branch's logical `pwd` above.
@@ -890,6 +944,37 @@ validate_spawn_worktree() {  # <source> <inspect-target>
     echo "error: $source yielded a worktree of a different clone (resolved '$WT' belongs to '${wt_common:-unknown}'; project '$PROJ_ABS' belongs to '${proj_common:-unknown}'); refusing to launch so the task cannot commit into another copy of this repo. Inspect target $inspect_target" >&2
     exit 1
   fi
+}
+
+# No two tasks may record the same worktree. Two metas pointing at one worktree
+# silently alias: tearing down either task inspects the SAME worktree, so one
+# task's teardown verdict is really about the other task's work. treehouse pins a
+# pool slot per clone, but a stale or double-drawn allocation can still hand the
+# same path to a second spawn; validate_spawn_worktree proves the slot is a
+# genuine isolated worktree of the right clone, not that no other task already
+# claims it. This is the same class of assertion as the isolation check above,
+# for a different aliasing failure. Refuse here, naming the task that holds the
+# worktree, and record nothing.
+assert_worktree_unclaimed() {  # <worktree>
+  local wt=$1 wt_real m other other_real other_id
+  if ! wt_real=$(cd "$wt" 2>/dev/null && pwd -P); then
+    wt_real=$wt
+  fi
+  [ -d "$STATE" ] || return 0
+  for m in "$STATE"/*.meta; do
+    [ -e "$m" ] || continue
+    other_id=$(basename "$m" .meta)
+    [ "$other_id" = "$ID" ] && continue
+    other=$(grep '^worktree=' "$m" 2>/dev/null | head -n1 | cut -d= -f2-) || continue
+    [ -n "$other" ] || continue
+    if ! other_real=$(cd "$other" 2>/dev/null && pwd -P); then
+      other_real=$other
+    fi
+    if [ "$other_real" = "$wt_real" ]; then
+      echo "error: worktree '$wt' is already claimed by task '$other_id' (state/$other_id.meta); refusing to launch $ID so the two tasks cannot alias one worktree and corrupt each other's teardown verdict." >&2
+      exit 1
+    fi
+  done
 }
 
 # A stale presentation journal never grants launch authority.
@@ -1295,13 +1380,19 @@ SECONDMATE_PROJECTS=
 if [ "$KIND" = secondmate ]; then
   MODE=secondmate
   YOLO=off
+  AUTOLAND=off
   SECONDMATE_PROJECTS=$(secondmate_registry_value "$ID" projects || true)
 else
   PROJ_NAME=$(basename "$PROJ_ABS")
-  read -r MODE YOLO <<EOF
+  read -r MODE YOLO AUTOLAND _ <<EOF
 $("$FM_ROOT/bin/fm-project-mode.sh" "$PROJ_NAME")
 EOF
 fi
+: "${AUTOLAND:=off}"
+
+# WT is now final for every backend. Refuse before writing meta if another task
+# already claims this worktree, so nothing is recorded on refusal.
+assert_worktree_unclaimed "$WT"
 
 META_WINDOW=$T
 [ "$BACKEND" = orca ] && META_WINDOW=$W
@@ -1313,6 +1404,7 @@ META_WINDOW=$T
   echo "kind=$KIND"
   echo "mode=$MODE"
   echo "yolo=$YOLO"
+  echo "autoland=$AUTOLAND"
   echo "tasktmp=$TASK_TMP"
   echo "model=${MODEL:-default}"
   echo "effort=${EFFORT:-default}"

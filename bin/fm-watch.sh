@@ -41,6 +41,17 @@
 #                          the host-resource sweep found CPU/memory/swap pressure
 #                          WORSE than the level firstmate was last told about.
 #                          Report-only: nothing is paused, shed or killed here.
+#   check: session-review <headline>
+#                          the hourly session review found something that has
+#                          NOT moved (a silent worker, an unanswered decision,
+#                          queued work with nothing running, a batch of unmerged
+#                          branches). Silent when there is nothing new to say.
+#   check: session-cleanup <headline>
+#                          the hourly cleanup sweep found accumulated material it
+#                          deliberately did NOT remove because it could hold
+#                          unlanded work. Report-only; nothing is discarded here.
+#                          Both are armed by bin/fm-session-start.sh and run on
+#                          this watcher's slow poll (bin/fm-hourly-lib.sh).
 #   tick: <note>           env-gated proof-of-life close (FM_WATCH_ABSORB_TICK=1,
 #                          default off) for a benign-ABSORBED wake while work is
 #                          under way. Not an actionable wake: nothing is queued,
@@ -116,9 +127,14 @@ mkdir -p "$STATE"
 # shellcheck source=bin/fm-secondmate-context-lib.sh
 . "$SCRIPT_DIR/fm-secondmate-context-lib.sh"
 
+# Arming, cadence, and script mapping for the two session-lifetime hourly
+# passes (hourly_pass_sweep below). Unarmed homes never run them.
+# shellcheck source=bin/fm-hourly-lib.sh
+. "$SCRIPT_DIR/fm-hourly-lib.sh"
+
 WATCH_LOCK="$STATE/.watch.lock"
 WATCH_PATH="$SCRIPT_DIR/fm-watch.sh"
-WATCHER_STALE_GRACE=${FM_WATCHER_STALE_GRACE:-${FM_GUARD_GRACE:-300}}
+WATCHER_STALE_GRACE=${FM_WATCHER_STALE_GRACE:-${FM_GUARD_GRACE:-900}}
 # The singleton-lock acquisition, EXIT trap, and the blocking supervision loop
 # all live below the source guard at the very bottom of this file (see "Main
 # entry"). Sourcing this file for unit tests therefore loads the functions -
@@ -141,11 +157,17 @@ else
   stat_sig()   { stat -c '%s:%Y' "$1" 2>/dev/null; }
 fi
 
-POLL=${FM_POLL:-600}                  # seconds between cycles (captain default: 10 min).
-                                      # Keep POLL < grace (WATCHER_STALE_GRACE, set
-                                      # above) so a full cycle's wait never outlives
-                                      # the liveness beacon - see beacon_sleep and the
-                                      # start-up invariant check in the runtime section.
+POLL=${FM_POLL:-300}                  # seconds between cycles (captain default: 5 min).
+                                      # INVARIANT: POLL < grace (WATCHER_STALE_GRACE,
+                                      # set above from FM_WATCHER_STALE_GRACE, then
+                                      # FM_GUARD_GRACE) so a full cycle's wait never
+                                      # outlives the liveness beacon - see beacon_sleep
+                                      # and the start-up invariant check in the runtime
+                                      # section, which warns when it is violated.
+                                      # This default of 300 sits below the tracked
+                                      # grace default of 900, which is the captain's
+                                      # operating pair. If either value is changed,
+                                      # keep POLL below the grace.
 HEARTBEAT=${FM_HEARTBEAT:-600}        # base seconds between heartbeat scans
 HEARTBEAT_MAX=${FM_HEARTBEAT_MAX:-7200}  # heartbeat backoff cap
 CHECK_INTERVAL=${FM_CHECK_INTERVAL:-600}  # seconds between *.check.sh sweeps (captain default: 10 min)
@@ -382,31 +404,66 @@ $(recorded_windows)
 EOF
 }
 
-# resource_sweep: the slow-poll HOST monitor. Reads kernel-wide CPU load, memory
-# headroom and swap through bin/fm-resource-check.sh (its own cadence, see
-# RESOURCE_INTERVAL) and wakes firstmate when host pressure first gets WORSE than
-# the level it was last told about, so a thrashing host is reported once instead
-# of nagged about every sweep. It is monitor-and-report only: nothing here pauses,
-# sheds or kills anything, because shedding load is the captain's decision.
+# The slow-poll HOST monitor, split into a probe CYCLE and a surface DECISION so
+# the crew-liveness probe never runs on this loop. The probe (kernel-wide CPU,
+# memory and swap plus a per-crew backend liveness read) is bounded by seconds,
+# not milliseconds, so running it inline delayed every wake behind it. It now
+# runs in its own short-lived process (bin/fm-resource-probe.sh) that this loop
+# launches on the resource cadence and never waits on; the loop only READS the
+# reading that process published. Both halves are monitor-and-report only:
+# nothing here pauses, sheds or kills anything, because shedding load is the
+# captain's decision.
 #
-# This sweep is the ONLY caller that runs the check with --sweep, so crew-liveness
-# probing happens once per cadence here and never on a synchronous path.
-# .resource-status caches the latest reading for the heartbeat annotation.
+# resource_probe_launch: on the RESOURCE_INTERVAL cadence (time-based via
+# .last-resource so it survives watcher restarts), fire the probe in the
+# background and return at once. It is NOT a second supervision cycle: the probe
+# handles no wakes, enqueues nothing, and takes its own lock rather than the
+# watcher singleton (see bin/fm-resource-probe.sh). Skip a launch while a probe
+# is still running so a fast cadence cannot pile processes up; the probe's own
+# lock is the authoritative guard against a genuine overlap.
+resource_probe_running() {
+  local pid
+  pid=$(cat "$STATE/.resource-probe.lock/pid" 2>/dev/null || true)
+  case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+  fm_pid_alive "$pid"
+}
+resource_probe_launch() {
+  [ "$RESOURCE_INTERVAL" -gt 0 ] || return 0
+  [ "$(age_of "$STATE/.last-resource")" -ge "$RESOURCE_INTERVAL" ] || return 0
+  resource_probe_running && return 0
+  # Stamp at launch so the cadence does not re-fire every poll while the probe
+  # runs; the probe re-touches it on completion so the interval is measured from
+  # when a reading was actually published.
+  touch "$STATE/.last-resource"
+  FM_HOME="$FM_HOME" FM_ROOT_OVERRIDE="$FM_ROOT" FM_STATE_OVERRIDE="$STATE" \
+    "$SCRIPT_DIR/fm-resource-probe.sh" >/dev/null 2>&1 &
+  disown 2>/dev/null || true
+}
+
+# resource_surface_check: the cheap main-loop half. Reads the timestamped reading
+# the probe published (state/.resource-reading = "<epoch>\t<status>\t<reading>")
+# and wakes firstmate when host pressure first gets WORSE than the level it was
+# last told about, so a thrashing host is reported once instead of nagged every
+# poll. FRESHNESS: the age comes from the record's own <epoch>, not a file mtime;
+# a reading at least two sweep intervals old is stale and never surfaced, the same
+# bound the heartbeat annotation and the .resource-live count use, so a probe that
+# stopped publishing degrades to silence rather than to a confidently wrong wake.
 # .resource-surfaced remembers the worst level already reported; recovery to
-# healthy re-arms it SILENTLY (no wake), so the fleet is only interrupted for
-# pressure it has not already been told about. An unknown or disabled reading
-# leaves both markers untouched and never wakes - the same
+# healthy re-arms it SILENTLY (no wake). A missing, malformed, stale, or
+# unknown/disabled reading surfaces nothing - the same
 # never-wake-on-an-unreadable-probe rule as secondmate_context_sweep.
-resource_sweep() {
-  local out rc status last rank last_rank reason
-  out=$("$SCRIPT_DIR/fm-resource-check.sh" --sweep 2>/dev/null) && rc=0 || rc=$?
-  case "$rc" in
-    0) status=healthy ;;
-    1) status=degraded ;;
-    2) status=critical ;;
-    *) return 0 ;;
-  esac
-  printf '%s\n' "$status" > "$STATE/.resource-status"
+resource_surface_check() {
+  local rec epoch rest status reading age last rank last_rank reason
+  rec=$(cat "$STATE/.resource-reading" 2>/dev/null || true)
+  [ -n "$rec" ] || return 0
+  epoch=${rec%%$'\t'*}
+  rest=${rec#*$'\t'}
+  status=${rest%%$'\t'*}
+  reading=${rest#*$'\t'}
+  case "$epoch" in ''|*[!0-9]*) return 0 ;; esac
+  age=$(( $(date +%s) - epoch ))
+  [ "$age" -lt $(( RESOURCE_INTERVAL * 2 )) ] || return 0
+  case "$status" in healthy|degraded|critical) : ;; *) return 0 ;; esac
   last=$(cat "$STATE/.resource-surfaced" 2>/dev/null || printf 'healthy')
   case "$status" in healthy) rank=0 ;; degraded) rank=1 ;; *) rank=2 ;; esac
   case "$last" in healthy) last_rank=0 ;; degraded) last_rank=1 ;; critical) last_rank=2 ;; *) last_rank=0 ;; esac
@@ -420,12 +477,46 @@ resource_sweep() {
     return 0
   fi
   printf '%s\n' "$status" > "$STATE/.resource-surfaced"
-  # Flatten the reading (and its SHED advice, when present) onto the single line
-  # a wake record holds.
-  reason="check: host-resources $(printf '%s\n' "$out" \
-    | awk '{sub(/^resources: /, ""); printf "%s%s", sep, $0; sep="; "}')"
+  reason="check: host-resources $reading"
   fm_wake_append check host-resources "$reason" || exit 1
   wake "$reason"
+}
+
+# hourly_pass_sweep: run the session-lifetime hourly passes that
+# bin/fm-session-start.sh armed - the session review and the cleanup sweep.
+# They live here, on the one watcher, precisely so no second supervision cycle
+# is needed: this loop is already the home's single scheduler, so an hourly duty
+# becomes one more cadence-gated sweep rather than a competing timer.
+#
+# Each pass runs at most once per its own interval, time-based via its stamp
+# mtime so the cadence survives watcher restarts, and the stamp is touched
+# BEFORE the run so a slow or failing pass cannot re-fire every poll. Only
+# repository-owned, non-symlinked bin/ scripts are executed, the same trust rule
+# the X-mode poll shim uses. A pass that prints nothing is the normal case and
+# wakes nobody; output means it has something the fleet has not been told about,
+# so it is flattened onto one wake record. wake() ends the cycle, so a second
+# due pass runs on a later poll.
+hourly_pass_sweep() {
+  local pass interval stamp script script_name out reason
+  fm_hourly_is_armed "$STATE" || return 0
+  for pass in $FM_HOURLY_PASSES; do
+    interval=$(fm_hourly_interval "$pass") || continue
+    [ "$interval" -gt 0 ] || continue
+    stamp=$(fm_hourly_stamp "$STATE" "$pass")
+    [ "$(age_of "$stamp")" -ge "$interval" ] || continue
+    touch "$stamp"
+    script_name=$(fm_hourly_pass_script "$pass") || continue
+    [ -n "$script_name" ] || continue
+    script="$SCRIPT_DIR/$script_name"
+    [ -f "$script" ] && [ ! -L "$script" ] || continue
+    FM_HOME="$FM_HOME" run_check_capture "$script" || exit 1
+    out=$FM_CHECK_RESULT
+    [ -n "$out" ] || continue
+    reason="check: session-$pass $(printf '%s\n' "$out" \
+      | awk 'NF {printf "%s%s", sep, $0; sep="; "}')"
+    fm_wake_append check "session-$pass" "$reason" || exit 1
+    wake "$reason"
+  done
 }
 
 # Exit reporting a wake. Consecutive heartbeats with no other wake in between
@@ -1076,15 +1167,20 @@ while :; do
     touch "$STATE/.last-check"
   fi
 
-  # Host-resource sweep, on its own cadence (see RESOURCE_INTERVAL). Time-based
-  # via .last-resource mtime so the cadence survives watcher restarts. Like the
-  # check block above it runs before the signal scan, so a chatty crewmate cannot
-  # starve it; unlike that block it is off entirely when the monitor is disabled.
-  if [ "$RESOURCE_INTERVAL" -gt 0 ] \
-    && [ "$(age_of "$STATE/.last-resource")" -ge "$RESOURCE_INTERVAL" ]; then
-    touch "$STATE/.last-resource"
-    resource_sweep
+  # Host-resource monitor. The slow crew-liveness probe runs in its OWN process
+  # (resource_probe_launch, backgrounded and never waited on), so this loop never
+  # blocks on it; the surface decision (resource_surface_check) only reads the
+  # timestamped reading that process published and is cheap. Both are off when the
+  # monitor is disabled. Placed before the signal scan like the check block above,
+  # so a chatty crewmate cannot starve a worsened-pressure wake.
+  if [ "$RESOURCE_INTERVAL" -gt 0 ]; then
+    resource_probe_launch
+    resource_surface_check
   fi
+
+  # Hourly session passes, each on its own stamp cadence. Placed with the other
+  # slow sweeps, before the signal scan, so a chatty crewmate cannot starve them.
+  hourly_pass_sweep
 
   # On the first changed signal, linger one grace period and re-scan before
   # classifying: a crewmate's final status write and the same turn's turn-end
@@ -1334,7 +1430,7 @@ EOF
     # every heartbeat.
     # Every heartbeat carries the host's latest known pressure, so a fleet review
     # is never done against a machine whose state firstmate cannot see. The value
-    # is the one resource_sweep already cached, so annotating costs no probe; a
+    # is the one the background probe cycle already cached, so annotating costs no probe; a
     # healthy or disabled host annotates nothing. An unknown reading, on a host
     # whose probes stopped answering, deliberately leaves the last known level in
     # place: going quiet on a machine that was just critical would hide real

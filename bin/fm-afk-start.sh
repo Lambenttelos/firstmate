@@ -163,6 +163,14 @@ fm_afk_start_main() {
     fi
   fi
 
+  # Away-mode interlock: the present-mode daemon (bin/fm-present-daemon.sh) keeps
+  # a watcher armed for an ACTIVE session. Away mode hands supervision to the
+  # sub-supervisor daemon, which owns triage instead, so the two must never run
+  # together. Stopping it here is the immediate handover; the present daemon also
+  # re-checks state/.afk between its own cycles as a backstop. Inert and silent
+  # when the feature is not opted in.
+  FM_HOME="$FM_HOME" "$FM_AFK_START_DIR/fm-present-daemon.sh" stop >/dev/null 2>&1 || true
+
   local pid
   pid=$(daemon_lock_pid 2>/dev/null || true)
   if daemon_lock_held_by_live_daemon; then
@@ -170,7 +178,15 @@ fm_afk_start_main() {
     return 0
   fi
 
-  if fm_pid_alive "$pid" && [ -n "$pid" ]; then
+  # Reclaim the lock only from a live process this probe CONFIDENTLY reads as some
+  # other program. Removing it whenever the owner pid is merely alive also fired on
+  # an undetermined probe - an unreadable pid identity, or an empty ps command line
+  # under fork pressure - which tore the lock away from a daemon that was in fact
+  # running and started a second one beside it, two supervisors both believing they
+  # own escalation delivery. An undetermined holder now keeps its lock, and the
+  # daemon exec'd below refuses loudly against it instead
+  # (bin/fm-afk-daemon-lib.sh, fm_afk_daemon_lock_held_by_foreign_live_process).
+  if fm_afk_daemon_lock_held_by_foreign_live_process "$FM_AFK_LOCK" "$FM_AFK_DAEMON"; then
     fm_lock_remove_path "$FM_AFK_LOCK" 2>/dev/null || true
   fi
 

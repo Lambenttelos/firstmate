@@ -38,6 +38,13 @@
 #                configured merge authority lands the branch on the forge (e.g. Bitbucket).
 #   local-only   implement on branch, stop and report "ready in branch" (no push/PR);
 #                captain approves, firstmate merges to local main
+# The +autoland registry flag (owned repos only) reshapes the direct-push definition
+# of done: after the pipeline is green the crew self-lands its OWN fm/<id> branch onto
+# the origin default branch as a clean --no-ff merge and reports the merge evidence,
+# instead of pushing and waiting for the merge authority. local-only +autoland is not a
+# brief change - firstmate fires the guarded local merge itself once the review gate is
+# green (bin/fm-merge-local.sh). Guardrails baked into the generated contract: green
+# only, own branch only, --no-ff only, conflict escalates, never delete a branch.
 # Ship briefs begin with a worktree-isolation assertion before the branch step.
 # Scout tasks ignore mode - their deliverable is a report, not a merge.
 # Every scaffold's status protocol distinguishes the configured
@@ -49,6 +56,28 @@
 # it carries the AGENTS.md authoring bar (widely useful knowledge only, pointers
 # over copied detail) and has the crewmate add the fm-ensure-agents-md.sh
 # self-governance section when a touched project AGENTS.md lacks it.
+# Every ship and scout scaffold also carries the fleet's shared-machine rules, so a
+# freshly spawned crewmate obeys them without being steered: heavy commands go through
+# bin/fm-heavy-run.sh, test parallelism is capped at VITEST_MAX_WORKERS=2, every test run
+# is announced with TEST START / TEST END status lines, and a live browser reproduction
+# waits for firstmate's go-ahead because at most TWO may run fleet-wide at once.
+# Ship scaffolds additionally require the final report to declare whether the change was
+# built test-first and whether it has end-to-end coverage.
+# Every ship and scout scaffold also carries the standing captain rules that bind every
+# worker, so they are structural instead of hand-pasted per dispatch: never force anything
+# (push to a NEW branch when blocked, never force-push, never force-release, never decide on
+# your own to delete a branch, though the guarded teardown and fleet-sync paths removing
+# their own refs are exempt), understand the reason behind an instruction before acting and ask firstmate for a
+# grilling session when it is unclear, plan with the wayfinder skill before changing code,
+# write prose in caveman ultra style - reports included, with their identifiers, paths,
+# commands, and error strings kept verbatim as evidence - while keeping code and tool-parsed
+# text normal, and bind
+# no server to port 443 or 3000. The Mattermost-sourced rule is written as a self-guarding
+# conditional on the same section rather than behind a flag, because a rule firstmate can
+# forget to pass is worth nothing. The secondmate charter carries the subset that applies to a
+# supervising home: never force, understand the reason, and caveman ultra prose. The rules are
+# labelled C1-C6 so a steer referencing a rule number cannot collide with the brief's own
+# numbered Rules list.
 # Refuses to overwrite an existing brief.
 set -eu
 
@@ -112,6 +141,99 @@ shell_quote() {
 
 STATUS_FILE=$(shell_quote "$STATE/$ID.status")
 
+# Standing captain rules. These bind every worker, so they are generated here
+# rather than pasted onto each brief by hand: a rule that lives only in
+# firstmate memory never reaches a worker whose brief predates it.
+# Both blocks use quoted heredocs, so their text is literal and apostrophes in it
+# are safe: the issue #166 regression class came from UNQUOTED heredoc bodies
+# inside a command substitution, which this is not.
+# Rule labels are stable across both blocks so a steer that names a rule always
+# means the same rule: the secondmate subset carries C1, C2, and C4, keeping the
+# gap rather than renumbering.
+# Rule C3's planning mandate is unconditional on every harness. Its `wayfinder`
+# skill is installed at the user level (~/.claude/skills/wayfinder), not tracked
+# in this repo, so a repo-presence check is the wrong test; only claude resolves
+# that path, while firstmate also dispatches to codex, opencode, pi, and grok.
+# C3 therefore names wayfinder as the way to plan where the runtime provides it
+# and still requires a worker on any other runtime to plan first by its own means.
+CAPTAIN_RULES=$(cat <<'EOF'
+# Standing captain rules
+
+These bind you for the whole task. They are not optional and they outrank convenience.
+
+- **C1. Never force anything.** Never force-push, never force a release, and never decide on
+   your own to delete a branch - deleting a branch is the captain decision alone. If a push
+   is rejected or a branch is otherwise blocked, push to a NEW branch instead and report the
+   new branch name, so nothing that exists can be lost. Running the guarded
+   machinery as designed, such as `bin/fm-teardown.sh` or `bin/fm-fleet-sync.sh` removing
+   their own worktrees and already-landed or pruned refs through their existing safety
+   checks, is ordinary tooling behavior and is not what this rule prohibits.
+- **C2. Understand the WHY before acting.** Never work the wording of this brief mechanically.
+   If the reason behind an instruction is not clear enough to act on, STOP and ask firstmate
+   for a grilling session. Asking is far cheaper than a wrong implementation and is never
+   treated as a failure.
+- **C3. Plan before you change code.** Planning first is MANDATORY, whatever runtime you are
+   running on. If your runtime provides the `wayfinder` skill, invoke it to plan the work.
+   If it does not, plan by your own means before touching code; the mandate stands either way.
+- **C4. Write your prose in caveman ultra style.** Drop articles, filler, hedging, and
+   pleasantries; fragments are fine; state each fact once; keep every technical fact. This
+   binds your status lines, your replies to firstmate, AND your reports, including the scout
+   report at `data/<id>/report.md`. Inside a report, exact identifiers, paths, commands,
+   status lines, and error strings stay VERBATIM - they are evidence, not prose. Written in
+   normal correct prose instead: code, code comments, commit messages, PR titles and bodies,
+   any project `AGENTS.md` or `CLAUDE.md`, ADRs, files under `docs/`, and
+   anything a tool, forge, or CI parses. Normal prose too for security warnings,
+   irreversible-action confirmations, and any multi-step sequence where dropping conjunctions would make the
+   order ambiguous. Never invent abbreviations and never
+   abbreviate identifiers, API names, CLI commands, or error strings.
+   Section 9 of the firstmate repo `AGENTS.md` owns this rule in full.
+- **C5. Never bind port 443 or 3000.** Those ports are reserved for the servers the captain
+   runs personally. Any server you start runs on a non-default port.
+- **C6. If this task came from a Mattermost thread**, your FIRST action is to re-read the full
+   thread; never trust the queue-time summary in this brief. If the reported bug turns out to
+   be already fixed, verify that and ADD the missing end-to-end coverage rather than closing
+   the task as done.
+EOF
+)
+
+# The supervising subset for a persistent secondmate home. A secondmate delegates
+# implementation to its own crewmates, whose briefs carry the full set, so the
+# planning, port, and Mattermost rules do not apply to the charter itself.
+# The labels match the ship and scout block exactly - C1, C2, C4 - because
+# firstmate steers by label; the missing C3 is deliberate, not a renumbering.
+CAPTAIN_RULES_SECONDMATE=$(cat <<'EOF'
+# Standing captain rules
+
+These bind you and every crewmate you dispatch.
+
+- **C1. Never force anything.** Never force-push, never force a release, and never decide on
+   your own to delete a branch - deleting a branch is the captain decision alone. When a push
+   is blocked, push to a NEW branch and report it, so nothing that exists can be lost.
+   Running the guarded machinery as designed, such as `bin/fm-teardown.sh` or
+   `bin/fm-fleet-sync.sh` removing their own worktrees and already-landed or pruned refs
+   through their existing safety checks, is ordinary tooling behavior and is not what this
+   rule prohibits.
+- **C2. Understand the WHY before acting.** Never work routed instructions mechanically. When
+   the reason behind a request is not clear enough to act on, STOP and ask the main firstmate
+   for a grilling session through the escalation path below - append a `needs-decision` status
+   line to the main status file, carrying the same `corr=<id>` token when the request you are
+   questioning arrived marked. Never ask only in this chat: the main firstmate does not read
+   it, so a chat-only question is lost. Asking is never treated as a failure.
+- **C4. Write your prose in caveman ultra style.** Drop articles, filler, hedging, and
+   pleasantries; fragments are fine; state each fact once; keep every technical fact. This
+   binds your status lines, your replies to the main firstmate, AND every report you or your
+   crewmates produce, including the scout report at `data/<id>/report.md`. Inside a report,
+   exact identifiers, paths, commands, status lines, and error strings stay VERBATIM - they
+   are evidence, not prose. Written in normal correct prose instead: code, code comments,
+   commit messages, PR titles and bodies, any project `AGENTS.md` or `CLAUDE.md`, ADRs, files
+   under `docs/`, and anything a tool, forge, or CI parses. Normal prose too for security warnings,
+   irreversible-action confirmations, and any multi-step sequence where dropping
+   conjunctions would make the order ambiguous. Never invent abbreviations and never
+   abbreviate identifiers, API names, CLI commands, or error strings.
+   Section 9 of the firstmate repo `AGENTS.md` owns this rule in full.
+EOF
+)
+
 if [ "$KIND" = secondmate ]; then
 SECONDMATE_PROJECTS=""
 idx=1
@@ -165,6 +287,8 @@ For a terse result, a status line is the whole answer.
 For a detailed answer (an investigation, a plan, an audit), write it to a doc under your home's \`data/\` and append a status line that points to that doc - the scout-report pattern - so the main firstmate is woken and can read it.
 Before treating an investigation or visual review as complete, load \`decision-hold-lifecycle\` from this home's \`.agents/skills/\` and pass its shared completion gate.
 A message with NO marker is the captain typing directly into your pane: treat it as authoritative captain intervention and stay conversational exactly as you would for any captain message; do not force it onto the status path.
+
+$CAPTAIN_RULES_SECONDMATE
 
 # Escalation to main firstmate
 Handle routine work yourself.
@@ -264,6 +388,21 @@ The report is the only thing that survives, so anything worth keeping must be in
 7. Never stop, restart, or update the shared \`no-mistakes\` daemon - it is one instance serving
    every lane/home, so restarting it kills other lanes' in-flight pipeline runs. On ANY no-mistakes
    daemon error, append \`blocked: {the daemon error}\` and stop; only firstmate manages the daemon.
+8. Run every heavy command - unit suites, end-to-end suites, lint sweeps, builds - through
+   \`$FM_ROOT/bin/fm-heavy-run.sh --task $ID -- <command>\`. It queues the run so the whole fleet
+   is not thrashing one machine, then gives you the command's real output and exit status.
+   It prints a queued notice while you wait; that is normal, not a hang.
+   Cap test parallelism at \`VITEST_MAX_WORKERS=2\` - never 4: vitest sizes its pool from the CPU
+   count and is the fleet's dominant memory consumer.
+9. Announce every test run in the status file: \`working: TEST START - {what is running, rough scale}\`
+   before it, \`working: TEST END - {outcome}\` after it. Firstmate coordinates the shared machine
+   from those two lines, so a silent suite is a defect.
+10. At most TWO live browser reproductions may run across the whole fleet at once.
+   Before you start one, append \`working: BROWSER WAIT - {what you will drive}\` and STOP until
+   firstmate replies with a go-ahead - the one line in this brief you do wait on.
+   Append \`working: BROWSER END - {outcome}\` the moment it finishes so the slot is released.
+
+$CAPTAIN_RULES
 
 # Definition of done
 Write your findings to \`$DATA/$ID/report.md\`.
@@ -278,9 +417,12 @@ fi
 
 # Ship task: shape Setup / Rule 1 / Definition of done by the project's delivery mode.
 # yolo does not affect the brief (it governs firstmate's approval behaviour), so discard it.
-read -r MODE _ <<EOF
+# autoland DOES affect the brief: a direct-push +autoland lane self-lands its own green
+# branch onto the default branch, so the generated Rule 1 and Definition of done change.
+read -r MODE _YOLO AUTOLAND _ <<EOF
 $("$FM_ROOT/bin/fm-project-mode.sh" "$REPO")
 EOF
+: "${AUTOLAND:=off}"
 
 case "$MODE" in
   direct-PR)
@@ -298,10 +440,8 @@ EOF
   direct-push)
     SETUP2="
 2. Run \`no-mistakes doctor\`; if it reports the repo is not initialized here, run \`no-mistakes init\`."
-    RULE1='1. Never push to the default branch (push only your `fm/'"$ID"'` branch to origin). Never merge a PR.'
-    DOD=$(cat <<EOF
-# Definition of done
-This project ships **direct-push**: the forge cannot host firstmate-opened PRs (e.g. Bitbucket), so there is no PR and no CI to wait on.
+    # Shared direct-push pipeline body: identical whether or not the lane self-lands.
+    DP_BODY=$(cat <<EOF
 You still run the FULL /no-mistakes pipeline; its \`pr\` and \`ci\` steps not applying is expected, and a run ending \`passed\` with those steps skipped is COMPLETE - do not treat skipped PR/CI as a failure or a wait.
 A run reporting \`missing NO_MISTAKES_BITBUCKET_EMAIL\` is expected and is NOT a blocker; do not append \`blocked:\` for it.
 
@@ -321,6 +461,44 @@ Two firstmate-specific rules layer on top of that guidance:
 - ask-user findings are not yours to answer: escalate to firstmate (rule 6) and stop.
   When the decision comes back, feed it to the gate with \`no-mistakes axi respond\` and let the pipeline apply it - do not route the question to "the user" or implement the fix yourself.
 - Avoid \`--yes\`: the captain, not you, owns the ask-user decisions it would silently auto-resolve.
+EOF
+)
+    if [ "$AUTOLAND" = on ]; then
+      RULE1='1. Push only your `fm/'"$ID"'` branch to origin while you work, and NEVER force-push. After the pipeline is green you self-land that branch onto the default branch through the guarded steps in the Definition of done - land only your own branch, never any other lane, and never merge a PR.'
+      DOD=$(cat <<EOF
+# Definition of done
+This project ships **direct-push +autoland**: an owned Bitbucket repo firstmate cannot open PRs on, and green work SELF-LANDS - after the pipeline is green you merge your own branch onto the shared default branch yourself, without waiting for the captain.
+
+$DP_BODY
+
+## Self-land (ONLY after the pipeline reports \`passed\`)
+Land your OWN \`fm/$ID\` branch, ONLY when the pipeline is green, ONLY as a clean \`--no-ff\` merge.
+Never land red or unvalidated work. Never land another lane's branch. Never delete any branch. Never force anything.
+A merge conflict is a STOP-and-escalate - never resolve another lane's code yourself, because a clean cross-lane resolve needs the authoring lane's intent.
+
+Your worktree shares its checkout with firstmate's, which already has the default branch checked out, so a plain \`git checkout <default>\` fails here. Land through a private landing ref instead:
+  DEFAULT=\$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null | sed 's#^origin/##'); : "\${DEFAULT:=dev}"
+  git fetch origin "\$DEFAULT"
+  git branch -f fm-landing "origin/\$DEFAULT"
+  git checkout fm-landing
+  git merge --no-ff "fm/$ID" -m "Merge fm/$ID into \$DEFAULT"
+  # On CONFLICT: run \`git merge --abort\`, then append
+  #   \`blocked: [key=autoland-conflict] fm/$ID conflicts with \$DEFAULT, needs authoring-lane resolve\`
+  #   to the status file and STOP. Do not resolve it yourself.
+  git push origin "fm-landing:\$DEFAULT"
+  git checkout "fm/$ID"
+
+After the push succeeds, append the merge evidence and stop:
+  \`done: landed fm/$ID -> \$DEFAULT @ {before-sha}..{after-sha} (merge {merge-sha})\`
+Firstmate reads that line, records a captain-review hold for the landed change, and refreshes the local copy. Do NOT wait for a PR url or checks-green - none will arrive.
+EOF
+)
+    else
+      RULE1='1. Never push to the default branch (push only your `fm/'"$ID"'` branch to origin). Never merge a PR.'
+      DOD=$(cat <<EOF
+# Definition of done
+This project ships **direct-push**: the forge cannot host firstmate-opened PRs (e.g. Bitbucket), so there is no PR and no CI to wait on.
+$DP_BODY
 
 After the pipeline reports \`passed\`, push your validated branch explicitly - a pipeline "push" only reaches the local internal gate:
   \`git push origin HEAD:fm/$ID\`
@@ -328,6 +506,7 @@ Then append \`done: pushed origin fm/$ID @ {short-sha}\` (the branch head commit
 Do NOT wait for a PR url or checks-green - none will arrive. The configured merge authority lands the branch on the forge; firstmate verifies it on origin.
 EOF
 )
+    fi
     ;;
   local-only)
     SETUP2=""
@@ -416,6 +595,21 @@ $RULE1
 7. Never stop, restart, or update the shared \`no-mistakes\` daemon - it is one instance serving
    every lane/home, so restarting it kills other lanes' in-flight pipeline runs. On ANY no-mistakes
    daemon error, append \`blocked: {the daemon error}\` and stop; only firstmate manages the daemon.
+8. Run every heavy command - unit suites, end-to-end suites, lint sweeps, builds - through
+   \`$FM_ROOT/bin/fm-heavy-run.sh --task $ID -- <command>\`. It queues the run so the whole fleet
+   is not thrashing one machine, then gives you the command's real output and exit status.
+   It prints a queued notice while you wait; that is normal, not a hang.
+   Cap test parallelism at \`VITEST_MAX_WORKERS=2\` - never 4: vitest sizes its pool from the CPU
+   count and is the fleet's dominant memory consumer.
+9. Announce every test run in the status file: \`working: TEST START - {what is running, rough scale}\`
+   before it, \`working: TEST END - {outcome}\` after it. Firstmate coordinates the shared machine
+   from those two lines, so a silent suite is a defect.
+10. At most TWO live browser reproductions may run across the whole fleet at once.
+   Before you start one, append \`working: BROWSER WAIT - {what you will drive}\` and STOP until
+   firstmate replies with a go-ahead - the one line in this brief you do wait on.
+   Append \`working: BROWSER END - {outcome}\` the moment it finishes so the slot is released.
+
+$CAPTAIN_RULES
 
 # Project memory
 If \`AGENTS.md\` or \`CLAUDE.md\` already exists, or if this task produced durable project-intrinsic knowledge, run \`$FM_ROOT/bin/fm-ensure-agents-md.sh .\` in the worktree.
@@ -423,6 +617,10 @@ Record only project knowledge useful to almost every future session.
 For anything the codebase already shows, prefer a pointer to the authoritative file, command, or doc over copying the detail.
 If you touch a project \`AGENTS.md\` that lacks \`## Maintaining this file\`, add that short self-governance section from \`$FM_ROOT/bin/fm-ensure-agents-md.sh\` in the same pass.
 Keep it proportionate: skip \`AGENTS.md\` edits for trivial tasks that produced no durable project knowledge.
+
+# Test coverage declaration
+Your final report must state plainly whether you built this change test-first and whether it has end-to-end coverage.
+A gap does not block the merge, but name the gap and its reason; the captain reviews every untested product change.
 
 $DOD
 EOF

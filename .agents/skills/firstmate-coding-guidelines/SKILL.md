@@ -30,6 +30,7 @@ Before writing a new fact anywhere in this repo, ask where it belongs, in this o
 
 Stop at the first tier that answers yes.
 Do not place a fact at a more convenient tier than the one this tree gives you.
+A fact that is an operating value some config file already owns belongs in that config file, recorded elsewhere only as a pointer, per the pointer-not-value rule in [docs/configuration.md](../../../docs/configuration.md#captain-preferences-datacaptainmd--datacaptain-sharedmd).
 
 ## One-owner rule
 
@@ -79,6 +80,7 @@ Keep instructions as the authority and discovery layer, but make repeated execut
 - Put one full sentence per line in tracked Markdown.
 - Never wrap multiple sentences onto one physical line.
 - Plain dash `-`, never an em dash.
+- Tracked Markdown, instruction prose, ADRs, and files under `docs/` stay in normal correct prose; the compression rule that `AGENTS.md` section 9 owns exempts them by name and never applies here.
 - Never add an agent name as a commit co-author.
 - `bin/*.sh` and `bin/backends/*.sh` must pass `shellcheck`.
 - Run `bin/fm-lint.sh` before treating a script change as done; it is the single owner of the lint definition (file set, config, and pinned shellcheck version) that CI and the no-mistakes pre-push gate both invoke, and it refuses to run under any other shellcheck version.

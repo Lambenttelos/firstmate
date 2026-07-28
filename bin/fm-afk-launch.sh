@@ -29,6 +29,26 @@
 #   fm-afk-launch.sh start-native
 #                              Prepare lifecycle state for a harness-native
 #                              background job and record that no terminal exists.
+#                              Fragile: the job is a child of the firstmate
+#                              session and is reaped on session turnover. Prefer
+#                              start-paneless for a paneless home.
+#   fm-afk-launch.sh start-paneless
+#                              Host the daemon durably in a detached tmux session
+#                              with pull delivery forced on, for a home with NO
+#                              injectable supervisor pane. Survives session
+#                              turnover (unlike start-native). Idempotent; needs
+#                              the tmux CLI as a session-independent host.
+#   fm-afk-launch.sh persist   Record the durable persist intent (state/.afk-persist)
+#                              and enter durable paneless away mode. The intent
+#                              makes session start re-enter away mode after a
+#                              turnover until an explicit exit clears it.
+#   fm-afk-launch.sh unpersist Clear the durable persist intent (the ONLY path
+#                              that does). Auto-return never clears it, so a
+#                              turnover during a standing away order resumes.
+#   fm-afk-launch.sh revive    Session-start belt-and-suspenders: if the persist
+#                              intent is set and no live daemon owns this home,
+#                              re-enter durable paneless away mode. No-op and
+#                              silent otherwise.
 #   fm-afk-launch.sh start-daemonless
 #                              Enter the away POSTURE with NO daemon at all, for
 #                              a home whose captain session has no injectable
@@ -63,6 +83,16 @@ FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 FM_AFK_LAUNCH_STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 FM_AFK_LAUNCH_RECORD="$FM_AFK_LAUNCH_STATE/.afk-daemon-terminal"
 FM_AFK_LAUNCH_LOCK="$FM_AFK_LAUNCH_STATE/.afk-launch.lock"
+# Durable away-mode PERSIST INTENT, distinct from the operational state/.afk flag.
+# state/.afk is session-operational: the return flow and stop clear it when the
+# captain becomes responsive again. .afk-persist records the captain's standing
+# order that away supervision must SURVIVE a session turnover, so session-start
+# (bin/fm-bootstrap.sh's afk_daemon_revive_sweep) re-enters away mode and hosts a
+# fresh durable daemon. It is cleared ONLY by an explicit exit (the `unpersist`
+# subcommand), never by the auto-return-on-unmarked-message path, and never by
+# session-scoped stale-artifact clearing (it is deliberately NOT in
+# fm_afk_session_artifact_names).
+FM_AFK_LAUNCH_PERSIST="$FM_AFK_LAUNCH_STATE/.afk-persist"
 FM_AFK_LAUNCH_WS_LABEL="firstmate-afk-daemon"
 
 # shellcheck source=bin/fm-backend.sh
@@ -135,7 +165,7 @@ fm_afk_launch_lock_release() {
 }
 
 fm_afk_launch_usage() {
-  sed -n '2,49p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '2,69p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 # The command run inside the created terminal. Real launch runs the shared
@@ -156,6 +186,23 @@ fm_afk_launch_flag_write() {
   local pending="$FM_AFK_LAUNCH_STATE/.afk.pending.$$"
   date '+%s' > "$pending" || { rm -f "$pending"; return 1; }
   mv "$pending" "$FM_AFK_LAUNCH_STATE/.afk" || { rm -f "$pending"; return 1; }
+}
+
+fm_afk_launch_persist_active() {
+  [ -f "$FM_AFK_LAUNCH_PERSIST" ]
+}
+
+# Set the durable persist intent atomically. Records the epoch second the order
+# was set, for later reporting; the presence of the file is what matters.
+fm_afk_launch_persist_write() {
+  local pending="$FM_AFK_LAUNCH_PERSIST.pending.$$"
+  mkdir -p "$FM_AFK_LAUNCH_STATE" || return 1
+  date '+%s' > "$pending" || { rm -f "$pending"; return 1; }
+  mv "$pending" "$FM_AFK_LAUNCH_PERSIST" || { rm -f "$pending"; return 1; }
+}
+
+fm_afk_launch_persist_clear() {
+  rm -f "$FM_AFK_LAUNCH_PERSIST"
 }
 
 # Read the recorded terminal into FM_AFK_REC_BACKEND/FM_AFK_REC_TARGET. The third
@@ -434,15 +481,30 @@ fm_afk_launch_create_herdr() {  # <captain-target> <captain-backend>
 # Launch the daemon in a detached tmux session (never a split-window in the
 # captain's window). tmux pane ids are server-global, so the daemon reaches the
 # captain pane by its %id from this separate session.
-fm_afk_launch_create_tmux() {  # <captain-target> <captain-backend>
-  local captain_target=$1 captain_backend=$2 session entry cmd hash nonce
+#
+# A third argument of "paneless" hosts the daemon durably for a home with NO
+# injectable supervisor pane (a primary firstmate running outside every terminal
+# backend, e.g. a claude desktop-app session). The daemon must NOT discover the
+# tmux pane it is itself running in and inject there, so this branch passes NO
+# FM_SUPERVISOR_TARGET and forces FM_AFK_DELIVERY=paneless, which makes the daemon
+# select pull delivery (durable outbox + armed inbox reader) unconditionally and
+# never touch a pane. The record's third field is "paneless" so lifecycle and
+# revive can tell it apart from a pane-delivery tmux daemon.
+fm_afk_launch_create_tmux() {  # <captain-target> <captain-backend> [paneless]
+  local captain_target=$1 captain_backend=$2 mode=${3:-pane} session entry cmd hash nonce extra=""
   hash=$(printf '%s' "$FM_HOME" | cksum | cut -d' ' -f1)
   nonce="$$-${RANDOM:-0}-$(date '+%s')"
   session="fm-afk-daemon-$hash-$nonce"
   entry=$(fm_afk_launch_entry_cmd)
-  cmd=$(printf 'exec env FM_HOME=%q FM_SUPERVISOR_TARGET=%q FM_SUPERVISOR_BACKEND=%q %q' \
-    "$FM_HOME" "$captain_target" "$captain_backend" "$entry")
-  if ! fm_afk_launch_record_write tmux "$session" ""; then
+  if [ "$mode" = paneless ]; then
+    extra=paneless
+    cmd=$(printf 'exec env FM_HOME=%q FM_AFK_DELIVERY=paneless %q' \
+      "$FM_HOME" "$entry")
+  else
+    cmd=$(printf 'exec env FM_HOME=%q FM_SUPERVISOR_TARGET=%q FM_SUPERVISOR_BACKEND=%q %q' \
+      "$FM_HOME" "$captain_target" "$captain_backend" "$entry")
+  fi
+  if ! fm_afk_launch_record_write tmux "$session" "$extra"; then
     fm_afk_launch_log "failed to persist planned tmux daemon session '$session'"
     return 1
   fi
@@ -453,8 +515,12 @@ fm_afk_launch_create_tmux() {  # <captain-target> <captain-backend>
     fi
     return 1
   fi
-  fm_afk_launch_commit_terminal tmux "$session" "" 1 || return 1
-  fm_afk_launch_log "daemon launched in detached tmux session '$session', supervising $captain_target"
+  fm_afk_launch_commit_terminal tmux "$session" "$extra" 1 || return 1
+  if [ "$mode" = paneless ]; then
+    fm_afk_launch_log "daemon launched in detached tmux session '$session' (paneless pull delivery)"
+  else
+    fm_afk_launch_log "daemon launched in detached tmux session '$session', supervising $captain_target"
+  fi
 }
 
 fm_afk_launch_start() {
@@ -526,6 +592,124 @@ fm_afk_launch_start() {
     rm -rf "$backup" || result=1
   fi
   return "$result"
+}
+
+# Durable paneless away entry: host the daemon in a detached tmux session (which
+# outlives the launching firstmate session, unlike the harness-native background
+# job start-native records) with pull delivery forced on. This is THE entry for a
+# primary firstmate with no injectable supervisor pane (a claude desktop-app
+# session): tmux is present as the runtime backend even though firstmate itself
+# runs outside it, so a detached tmux session is a session-independent host. The
+# daemon it starts owns bin/fm-watch.sh as its child, so hosting the daemon
+# durably makes the watcher durable too. Transactional shape mirrors
+# fm_afk_launch_start; it discovers no supervisor pane (there is none) and always
+# hosts through the tmux paneless primitive.
+fm_afk_launch_start_paneless() {
+  local backup artifact had_afk=0 result
+  if [ -e "$FM_AFK_LAUNCH_STATE/.afk-return-catchup" ]; then
+    fm_afk_launch_log "return catch-up is still pending; run bin/fm-afk-return.sh check before re-entering away mode"
+    return 1
+  fi
+  if ! command -v tmux >/dev/null 2>&1; then
+    fm_afk_launch_log "durable paneless hosting needs the tmux CLI as a session-independent daemon host; install tmux, or use the daemon-free entry (start-daemonless)"
+    return 1
+  fi
+
+  mkdir -p "$FM_AFK_LAUNCH_STATE"
+
+  if daemon_lock_held_by_live_daemon; then
+    fm_afk_launch_record_validate_if_present || return 1
+    if ! fm_afk_launch_flag_write; then
+      fm_afk_launch_log "failed to refresh away-mode flag"
+      return 1
+    fi
+    fm_afk_launch_log "daemon already running; refreshed away-mode flag (no new terminal)"
+    return 0
+  fi
+
+  backup=$(mktemp -d "$FM_AFK_LAUNCH_STATE/.afk-launch-backup.XXXXXX") || return 1
+  if [ -f "$FM_AFK_LAUNCH_STATE/.afk" ]; then
+    had_afk=1
+    cp "$FM_AFK_LAUNCH_STATE/.afk" "$backup/.afk" || { rm -rf "$backup"; return 1; }
+  fi
+  while IFS= read -r artifact; do
+    [ -n "$artifact" ] || continue
+    if [ -e "$FM_AFK_LAUNCH_STATE/$artifact" ]; then
+      cp -p "$FM_AFK_LAUNCH_STATE/$artifact" "$backup/$artifact" || { rm -rf "$backup"; return 1; }
+    fi
+  done < <(fm_afk_session_artifact_names)
+  if ! fm_afk_launch_reconcile; then
+    result=1
+  else
+    fm_afk_clear_stale_artifacts "$FM_AFK_LAUNCH_STATE" \
+      || fm_afk_launch_log "$(fm_afk_stale_artifact_continue_message)"
+    result=0
+  fi
+  if [ "$result" -eq 0 ]; then
+    fm_afk_launch_mark_daemon_starting
+    if ! fm_afk_launch_flag_write; then
+      fm_afk_launch_log "failed to write away-mode flag"
+      result=1
+    fi
+  fi
+
+  if [ "$result" -eq 0 ]; then
+    fm_afk_launch_create_tmux "" "" paneless
+    result=$?
+  fi
+  if [ "$result" -ne 0 ]; then
+    fm_afk_daemon_pending_clear "$FM_AFK_LAUNCH_STATE" || fm_afk_launch_log "failed to clear the daemon-starting marker after a failed start"
+    fm_afk_launch_restore_backup "$backup" "$had_afk" || result=1
+  else
+    rm -rf "$backup" || result=1
+  fi
+  return "$result"
+}
+
+# Enter PERSISTENT away mode: record the durable persist intent, then host the
+# daemon durably through the paneless path. The persist intent makes session
+# start re-enter away mode after a turnover (bin/fm-bootstrap.sh). Set the intent
+# FIRST so a crash after hosting still leaves the intent recoverable; a stale
+# intent with no daemon is exactly what the revive sweep repairs.
+fm_afk_launch_persist() {
+  if ! fm_afk_launch_persist_write; then
+    fm_afk_launch_log "failed to record the durable away-mode persist intent"
+    return 1
+  fi
+  fm_afk_launch_start_paneless
+}
+
+# Explicit away-mode exit: clear the durable persist intent so session start no
+# longer re-enters away mode. This is the ONLY path that clears it; the
+# auto-return-on-unmarked-message flow (bin/fm-afk-return.sh) deliberately does
+# not, so a turnover during a still-standing away order resumes supervision.
+fm_afk_launch_unpersist() {
+  if ! fm_afk_launch_persist_clear; then
+    fm_afk_launch_log "failed to clear the durable away-mode persist intent"
+    return 1
+  fi
+  fm_afk_launch_log "durable away-mode persist intent cleared; session start will no longer re-enter away mode"
+}
+
+# Session-start belt-and-suspenders revive (bin/fm-bootstrap.sh). A no-op unless
+# the durable persist intent is set. When it is set and no live daemon owns this
+# home, re-enter durable paneless away mode, which brings the daemon (and its
+# watcher child) back. Prints a one-line outcome only when it acted or failed, so
+# a healthy or non-persistent home stays silent.
+fm_afk_launch_revive() {
+  if ! fm_afk_launch_persist_active; then
+    return 0
+  fi
+  if daemon_lock_held_by_live_daemon; then
+    return 0
+  fi
+  fm_afk_launch_log "persist intent set but no live away daemon; reviving durable paneless away mode"
+  if fm_afk_launch_start_paneless; then
+    fm_afk_launch_log "away mode revived (durable paneless host)"
+    return 0
+  fi
+  fm_afk_launch_log "away-mode revive failed"
+  return 1
 }
 
 fm_afk_launch_start_native() {
@@ -699,7 +883,11 @@ fm_afk_launch_main() {
   case "${1:-start}" in
     start) fm_afk_launch_start ;;
     start-native) fm_afk_launch_start_native ;;
+    start-paneless) fm_afk_launch_start_paneless ;;
     start-daemonless) fm_afk_launch_start_daemonless ;;
+    persist) fm_afk_launch_persist ;;
+    unpersist) fm_afk_launch_unpersist ;;
+    revive) fm_afk_launch_revive ;;
     stop) fm_afk_launch_stop ;;
     reconcile) fm_afk_launch_reconcile ;;
     -h|--help|help) fm_afk_launch_usage ;;

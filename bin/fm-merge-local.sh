@@ -1,14 +1,16 @@
 #!/usr/bin/env bash
-# Perform the approved local merge for a local-only ship task: fast-forward the
-# project's default branch to the crewmate's fm/<id> branch.
+# Perform the approved local merge for a local-only ship task: merge the crewmate's
+# fm/<id> branch into the project's default branch as a clean --no-ff merge.
 #
 # This is firstmate's merge gate-action (the captain's merge authority applied
 # locally instead of via a GitHub PR). It is the one sanctioned exception to hard
 # rule #1 "never run state-changing git in projects/", and it is narrow: it only
-# runs for mode=local-only tasks, only after the captain approves (or yolo=on
-# auto-approves), and only as a clean fast-forward - it refuses a diverged branch
-# and tells you to have the crewmate rebase. See AGENTS.md prime directives,
-# project management, and task lifecycle.
+# runs for mode=local-only tasks, only after the captain approves (or yolo=on or a
+# +autoland grant auto-approves), and only as a clean merge - it refuses a diverged
+# branch and tells you to have the crewmate rebase, so the merge never resolves a
+# conflict blind. --no-ff always records a merge commit, so each landed change stays
+# a single reviewable, revertable unit even when a fast-forward was possible. See
+# AGENTS.md prime directives, project management, and task lifecycle.
 # Usage: fm-merge-local.sh <task-id>
 set -eu
 
@@ -62,14 +64,15 @@ if [ -n "$(git -C "$PROJ" status --porcelain 2>/dev/null | head -1)" ]; then
   exit 1
 fi
 
-# Clean fast-forward only: DEFAULT must be an ancestor of BRANCH.
+# Clean merge only: DEFAULT must be an ancestor of BRANCH, so the --no-ff merge can
+# never hit a conflict (a diverged branch is refused and rebased, never resolved here).
 if ! git -C "$PROJ" merge-base --is-ancestor "$DEFAULT" "$BRANCH"; then
-  echo "REFUSED: $BRANCH is not a fast-forward of $DEFAULT (it has diverged)." >&2
+  echo "REFUSED: $BRANCH has diverged from $DEFAULT ($DEFAULT is not an ancestor)." >&2
   echo "Have the crewmate rebase $BRANCH onto $DEFAULT, then retry." >&2
   exit 1
 fi
 
 before=$(git -C "$PROJ" rev-parse --short "$DEFAULT")
-git -C "$PROJ" merge --ff-only "$BRANCH" >/dev/null
+git -C "$PROJ" merge --no-ff --no-edit -m "Merge $BRANCH into $DEFAULT" "$BRANCH" >/dev/null
 after=$(git -C "$PROJ" rev-parse --short "$DEFAULT")
 echo "merged $BRANCH into local $DEFAULT ($before -> $after) in $PROJ"

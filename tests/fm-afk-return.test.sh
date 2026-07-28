@@ -17,7 +17,12 @@ install_runner() {  # <case-dir>
   local dir=$1
   mkdir -p "$dir/bin" "$dir/home/state" "$dir/home/data" "$dir/home/config"
   cp "$ROOT/bin/fm-afk-return.sh" "$dir/bin/"
+  # fm-wake-lib.sh sources fm-mutex-lib.sh at load time. Without it the portable
+  # lock helpers never get defined, every outbox read fails its bounded acquire,
+  # and this fixture silently exercises a degraded no-lock path instead of the
+  # real one.
   cp "$ROOT/bin/fm-wake-lib.sh" "$dir/bin/"
+  cp "$ROOT/bin/fm-mutex-lib.sh" "$dir/bin/"
   cp "$ROOT/bin/fm-pid-lib.sh" "$dir/bin/"
   cp "$ROOT/bin/fm-classify-lib.sh" "$dir/bin/"
   cp "$ROOT/bin/fm-afk-outbox-lib.sh" "$dir/bin/"
@@ -39,6 +44,14 @@ file="$FM_HOME/state/.fake-drain"
 : > "$file"
 SH
   chmod +x "$dir/bin/"*.sh
+  # Fail loudly on an incomplete library set. A missing sourced dependency leaves
+  # the portable lock helpers undefined, which degrades every outbox assertion
+  # below into a no-lock path that reports a lock timeout instead of exercising
+  # the real one - a fixture gap that reads as a product regression.
+  FM_HOME="$dir/home" FM_STATE_OVERRIDE="$dir/home/state" \
+    bash -c '. "$1" >/dev/null 2>&1; declare -F fm_lock_acquire_wait >/dev/null' \
+    _ "$dir/bin/fm-wake-lib.sh" \
+    || fail "install_runner copied an incomplete library set: fm_lock_acquire_wait is undefined"
 }
 
 run_return() {  # <case-dir> <mode>
@@ -333,6 +346,61 @@ test_return_refuses_to_clear_an_unreadable_inbox_file() {
   pass "return catch-up blocks on an unreadable inbox FILE and never deletes records it did not read"
 }
 
+# The reader this away session armed exits only on its NEXT poll, so it can still
+# be running when return clears the delivery artifacts, and that poll may be
+# inside an acknowledgement's compaction - which lands by renaming a sibling over
+# the outbox file. Deleting outbox state outside the outbox lock races that
+# rename: the finished session's records come back with the acknowledgement mark
+# gone, so the next away session's reader replays them as fresh escalations. The
+# clear must therefore go through the library's own locked owner and simply leave
+# everything alone when it cannot take the lock.
+#
+# The outbox FILE is left absent on purpose: a pending read short-circuits on an
+# absent outbox without taking the lock, so the gate still reaches the clearing
+# step while the lock is held.
+test_return_clears_inbox_state_only_under_the_outbox_lock() {
+  local dir gate out holder lock i=0
+  dir="$TMP_ROOT/locked-clear"
+  install_runner "$dir"
+  gate="$dir/home/state/.afk-return-catchup"
+  date +%s > "$dir/home/state/.afk"
+  : > "$dir/home/state/.fake-drain"
+  printf 'paneless\n' > "$dir/home/state/.afk-delivery"
+  printf '7\n' > "$dir/home/state/.afk-outbox.ack"
+  printf '7\n' > "$dir/home/state/.afk-outbox.seq"
+  lock="$dir/home/state/.afk-outbox.lock"
+
+  bash -c '
+    # shellcheck disable=SC1090
+    . "$1/bin/fm-wake-lib.sh"
+    fm_lock_acquire_wait "$2"
+    sleep 30
+  ' _ "$ROOT" "$lock" >/dev/null 2>&1 &
+  holder=$!
+  while [ ! -e "$lock" ]; do
+    [ "$i" -lt 100 ] || fail "the background lock holder never took the outbox lock"
+    sleep 0.1
+    i=$((i + 1))
+  done
+
+  set +e
+  out=$(FM_AFK_OUTBOX_LOCK_TRIES=2 run_return "$dir" begin)
+  set -e
+  kill "$holder" 2>/dev/null || true
+  wait "$holder" 2>/dev/null || true
+
+  [ ! -e "$gate" ] || fail "a clear that could not take the lock reopened the return gate: $out"
+  [ -e "$dir/home/state/.afk-outbox.ack" ] \
+    || fail "return deleted the acknowledgement mark while another process held the outbox lock"
+  [ -e "$dir/home/state/.afk-outbox.seq" ] \
+    || fail "return deleted the sequence counter while another process held the outbox lock"
+  [ -e "$dir/home/state/.afk-delivery" ] \
+    || fail "return deleted the recorded delivery mode while another process held the outbox lock"
+  assert_contains "$out" 'could not clear stale away-mode artifact' \
+    "return cleared inbox state without naming the lock it could not take: $out"
+  pass "return clears inbox state under the outbox lock and leaves it intact when the lock is held"
+}
+
 test_return_gate_orders_catchup_before_bearings
 test_explicit_reclassification_requires_durable_reason
 test_captain_decision_does_not_masquerade_as_firstmate_blocker
@@ -341,3 +409,4 @@ test_check_retries_recorded_terminal_teardown
 test_return_reports_undelivered_inbox_records
 test_return_refuses_to_clear_an_unreadable_inbox
 test_return_refuses_to_clear_an_unreadable_inbox_file
+test_return_clears_inbox_state_only_under_the_outbox_lock

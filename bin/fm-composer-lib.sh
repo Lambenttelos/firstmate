@@ -170,6 +170,26 @@ fm_composer_strip_ghost() {
 #              "Type a message...") that reads as empty; matched both before and
 #              after a leading prompt glyph is stripped, so a pattern written
 #              with or without the glyph both land.
+# fm_composer_normalize_ws: fold the non-breaking-space class that a harness uses
+# as prompt padding into a regular ASCII space, so the shared [:space:] trimming
+# and the bare-glyph empty-composer cases below match. claude 2.1.220 draws its
+# empty composer prompt as "❯" followed by a U+00A0 NO-BREAK SPACE, not an ASCII
+# space, and every adapter trims with an ASCII-only [:space:] class that leaves
+# the NBSP attached; the stripped content is then "❯ ", which misses the
+# bare "❯" empty case and classifies an EMPTY claude composer as `pending`. On an
+# idle pane that turned the just-delivered submit's cleared-composer check into a
+# false "Enter swallowed" report (evidence: docs/tmux-backend.md). U+202F NARROW
+# NO-BREAK SPACE is folded too, the other non-breaking pad a TUI is likely to
+# use. Byte-literal substitution keeps it bash 3.2 and locale independent.
+fm_composer_normalize_ws() {  # <string> -> string with the NBSP class folded to ' '
+  local s=$1 nbsp nnbsp
+  nbsp=$(printf '\302\240')
+  nnbsp=$(printf '\342\200\257')
+  s=${s//"$nbsp"/ }
+  s=${s//"$nnbsp"/ }
+  printf '%s' "$s"
+}
+
 fm_composer_idle_matches() {
   local content=$1 idle_re=$2 idle_case=$3
   [ -n "$idle_re" ] || return 1
@@ -182,6 +202,15 @@ fm_composer_idle_matches() {
 fm_composer_classify_content() {  # <bordered> <content> [idle_re] [idle_case] [plain_content]
   local bordered=$1 content=$2 idle_re=${3:-} idle_case=${4:-sensitive} plain_content
   plain_content=${5:-$content}
+  # Fold the NBSP prompt-padding class the callers' ASCII [:space:] trim missed,
+  # then re-trim, so a claude "❯ " empty composer reaches the bare-glyph
+  # cases as a clean "❯" instead of misclassifying as pending.
+  content=$(fm_composer_normalize_ws "$content")
+  content="${content#"${content%%[![:space:]]*}"}"
+  content="${content%"${content##*[![:space:]]}"}"
+  plain_content=$(fm_composer_normalize_ws "$plain_content")
+  plain_content="${plain_content#"${plain_content%%[![:space:]]*}"}"
+  plain_content="${plain_content%"${plain_content##*[![:space:]]}"}"
   if [ "$bordered" != 1 ] && [ -z "$content" ] && [ -n "$plain_content" ]; then
     case "$plain_content" in
       '❯'|'›') printf 'empty'; return 0 ;;
@@ -205,10 +234,24 @@ fm_composer_classify_content() {  # <bordered> <content> [idle_re] [idle_case] [
   if fm_composer_idle_matches "$content" "$idle_re" "$idle_case"; then
     printf 'empty'; return 0
   fi
-  # Strip a leading prompt glyph, then re-judge the remainder.
+  # Strip a leading prompt glyph, then re-judge the remainder. Remove the exact
+  # matched glyph literally rather than with `?`/`??`: `?` matches a single BYTE
+  # under a C/POSIX locale, so a `${content#??}` on the 3-byte "❯ " would leave a
+  # mangled glyph tail and misread a known idle placeholder ("❯ Type a message...")
+  # as pending. Literal removal is locale independent.
   case "$content" in
-    '❯ '*|'› '*|'> '*|'$ '*|'% '*|'# '*) content=${content#??} ;;
-    '❯'*|'›'*|'>'*|'$'*|'%'*|'#'*) content=${content#?} ;;
+    '❯ '*) content=${content#'❯ '} ;;
+    '› '*) content=${content#'› '} ;;
+    '> '*) content=${content#'> '} ;;
+    '$ '*) content=${content#'$ '} ;;
+    '% '*) content=${content#'% '} ;;
+    '# '*) content=${content#'# '} ;;
+    '❯'*) content=${content#'❯'} ;;
+    '›'*) content=${content#'›'} ;;
+    '>'*) content=${content#'>'} ;;
+    '$'*) content=${content#'$'} ;;
+    '%'*) content=${content#'%'} ;;
+    '#'*) content=${content#'#'} ;;
   esac
   content="${content#"${content%%[![:space:]]*}"}"
   content="${content%"${content##*[![:space:]]}"}"

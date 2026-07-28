@@ -13,6 +13,7 @@ The tracked code root contains the shared instruction, skill, documentation, wor
 `data/` holds durable private fleet records such as the project and secondmate registries, captain preferences, optional shared captain preferences, learnings, backlog, briefs, scout reports, and the merge queue of released-but-unmerged ship branches (`data/merge-queue.tsv`, owned by `bin/fm-merge-queue-lib.sh`; see [merge-queue.md](merge-queue.md)).
 `state/` holds volatile runtime records such as task metadata, append-only status events, endpoint signals, watcher and wake-queue coordination, away-mode state, generated X-mode artifacts, private secondmate config-reread generations with their retry and quarantine state, and parent-owned secondmate pending-reply records under `state/pending-replies/` (`bin/fm-pending-reply-lib.sh`).
 `config/` holds local gitignored operating choices, and `projects/` holds the local project clones that Firstmate reads but changes only through the guarded exceptions in `AGENTS.md`.
+`.treehouse/` holds this home's own Treehouse worktree pools for those clones, so a spawn can never be handed a worktree belonging to another copy of the same repo; it is gitignored, created by Treehouse rather than by Firstmate, and pinned per clone by `bin/fm-treehouse-pin.sh` (see [treehouse-pools.md](treehouse-pools.md)).
 
 `bin/fm-spawn.sh` owns the base task-metadata fields it emits, while the runtime-backend section below owns backend-specific fields and selector interpretation.
 The producing PR and X helpers own the fields they append, `bin/fm-classify-lib.sh` owns status-event vocabulary, and `bin/fm-crew-state.sh` owns current-state reconciliation.
@@ -106,7 +107,9 @@ Paneless state lives in the effective home's `state/`: `.afk-delivery` records t
 [`bin/fm-afk-outbox-lib.sh`](../bin/fm-afk-outbox-lib.sh) is the single owner of that record format and its acknowledgement contract, including why only the reader may consume a record.
 Firstmate arms [`bin/fm-afk-inbox.sh`](../bin/fm-afk-inbox.sh) as its own harness-tracked background task the way it arms the watcher; that script's header and `--help` own its flags, its exit lines, and the `FM_AFK_INBOX_TIMEOUT` and `FM_AFK_INBOX_POLL` knobs.
 All of these are session-scoped delivery state: `bin/fm-afk-start.sh` clears them on a fresh away entry - the lock and the atomic-rename temporary files included - and `bin/fm-afk-return.sh` reports any unacknowledged record as return catch-up evidence before clearing it.
+Return catch-up retires that state through the outbox library's own locked clearing owner rather than deleting the files directly, because the reader this session armed exits only on its next poll and can still be inside an acknowledgement's compaction, whose atomic rename would otherwise resurrect the finished session's records with the acknowledgement mark gone; a clear that cannot take the lock leaves everything in place, names the lock, and does not reopen the gate.
 A read of the outbox that fails is never treated as an outbox that is empty: the reader exits non-zero rather than printing a healthy idle line, and return catch-up reports the failure as a blocker and leaves the records on disk instead of deleting escalations it never read.
+That non-zero exit still carries a `re-arm to keep listening` verdict, because its records stay pending and nothing else is listening for them; only an argument error exits with no verdict, since re-arming the same bad invocation would loop without ever listening.
 A read that failed only because the bounded outbox-lock acquire timed out is reported as its own condition, because that one is transient: a blocking reader stays alive, prints no status line, acknowledges nothing, and retries on its next poll, and only after `FM_AFK_INBOX_LOCK_TIMEOUT_MAX` consecutive timeouts does it exit non-zero naming the lock it could not acquire.
 Return catch-up gets a single pass and then clears the outbox, so it treats that same timeout as a blocker exactly like any other failed read.
 Because appending to the outbox always succeeds, the pane path's max-defer wedge alarm cannot detect a stall here, so the daemon raises that same alarm from the age of the oldest unacknowledged record when it exceeds `FM_MAX_DEFER_SECS`, and clears it once the reader has acknowledged everything.
@@ -118,6 +121,18 @@ An alarm whose own inbox read then finds every record already acknowledged recor
 A read that cannot even look into `state/` is a failed read too, not an empty outbox, so an untraversable state directory blocks the reader and return catch-up rather than reading as nothing pending.
 The [`afk`](../.agents/skills/afk/SKILL.md) skill owns the operating procedure.
 
+A paneless home hosts the daemon durably in a detached tmux session through `bin/fm-afk-launch.sh start-paneless`, which forces `FM_AFK_DELIVERY=paneless` so the daemon selects pull delivery unconditionally rather than discovering the tmux pane it is itself hosted in.
+tmux is present as the runtime backend even though a paneless firstmate runs outside it, so a detached tmux session is a session-independent host that outlives a firstmate session turnover; the older `start-native` path hosted the daemon as a harness-native background job that was a child of the firstmate session and was reaped on turnover, silently taking away supervision down (evidence 2026-07-26).
+The daemon owns `bin/fm-watch.sh` as its child, so hosting the daemon durably makes the watcher durable too.
+
+## Away-mode persist intent (state/.afk-persist)
+
+`state/.afk-persist` is the durable, machine-readable record that the captain ordered away supervision to survive a session turnover, distinct from the session-operational `state/.afk` flag.
+[`bin/fm-afk-launch.sh`](../bin/fm-afk-launch.sh) owns it: `persist` sets it and enters durable paneless away mode, and `unpersist` is the only path that clears it - the auto-return-on-unmarked-message flow ([`bin/fm-afk-return.sh`](../bin/fm-afk-return.sh)) deliberately does not, so a turnover during a still-standing away order resumes supervision rather than dropping it.
+It is not a session-scoped delivery artifact, so a fresh away entry never clears it.
+While it is set and no live daemon owns the home, the session-start revive sweep ([`bin/fm-bootstrap.sh`](../bin/fm-bootstrap.sh) `afk_daemon_revive_sweep`) re-enters durable paneless away mode automatically, reporting only a revive failure as an `AFK_DAEMON:` line.
+Plain `/afk` without `persist` keeps its single-session auto-exit behavior.
+
 ## Away-mode wedge alarm channels (config/wedge-alarm)
 
 When away-mode injection wedges past `FM_MAX_DEFER_SECS`, the sub-supervisor raises a loud, rate-limited alarm.
@@ -128,6 +143,30 @@ Directives are `off` (a position-independent kill switch that disables every act
 An absent file means `auto`, i.e. default-on on macOS: the alarm exists precisely so a wedged away-mode primary is never silent, and it fires at most once per max-defer window after a genuine wedge.
 A missing or failing channel logs and falls through to the next, never crashing the daemon.
 See [`wedge-alarm.md`](wedge-alarm.md) for the channel reference and macOS verification evidence, and [`examples/wedge-alarm`](examples/wedge-alarm) for a copyable config.
+
+## Present-mode supervision daemon (config/present-daemon)
+
+The watcher is single-shot on an actionable wake, so an active session normally pays a per-turn tax to re-arm it and wait for that arm to confirm.
+The optional local `config/present-daemon` presence flag moves that re-arm loop off the session and into `bin/fm-present-daemon.sh`, a small detached background process that runs `bin/fm-watch-arm.sh` again whenever a watcher cycle ends.
+The feature is inert without the flag: nothing launches, and supervision behaves exactly as it did before.
+The file's contents are ignored; only its presence matters.
+It is not inherited into secondmate homes, because a secondmate is idle by default and pays no per-turn supervision tax.
+
+The daemon only keeps a watcher alive.
+It never classifies a wake, decides anything, or acts on a finding, and it changes no approval authority: every wake stays in `state/.wake-queue` for firstmate to drain at the top of its next turn.
+That is the line separating it from the away-mode sub-supervisor, which does own triage and escalation.
+
+Session start launches it when this session actually holds the fleet lock, through `bin/fm-bootstrap.sh`'s `present_daemon_sweep`, and only a real launch failure prints an actionable `PRESENT_DAEMON:` line.
+While the daemon is live, `bin/fm-supervision-instructions.sh` reports it in the emitted supervision block and tells firstmate not to arm per turn; the wake queue must still be drained at the top of every turn.
+
+Never-blind is unchanged.
+The daemon touches neither guard and never touches the session lock `state/.lock`; it holds only its own `state/.present-daemon.lock` while its watcher child holds `state/.watch.lock`.
+If the daemon dies, its orphaned watcher ends on the next actionable wake, the beacon ages past the guard grace, and `bin/fm-turnend-guard.sh` fires its normal alarm, so the session degrades to per-turn arming rather than to blind supervision.
+
+Away mode and present mode never supervise concurrently.
+The daemon refuses to start while `state/.afk` exists, `bin/fm-afk-start.sh` stops it before the away daemon takes over, and a running loop re-checks the flag between arm cycles.
+
+`bin/fm-present-daemon.sh --help` owns the subcommands, the exact status lines, and the `FM_PRESENT_*` tuning knobs.
 
 ## Gate defaults (.no-mistakes.yaml)
 
@@ -141,6 +180,9 @@ Portable shard evidence and coverage rules are in [fm-test-portable-shards.md](f
 
 Domain-local preferences for one captain's fleet live locally in each home's `data/captain.md`; it is gitignored and printed in the session-start context digest after `data/projects.md` and optional `data/secondmates.md`.
 Before changing it, inspect the current file and rewrite or prune the matching bullet in place; add a new bullet only for a genuinely new durable preference.
+A preference that a config file already owns is recorded as a pointer at that file, never as a restated value.
+Prose binds only when an agent reads and obeys it, while a config file binds mechanically, so a second copy of a harness, model, effort level, ceiling, threshold, cadence, path, or retention count is pure drift risk: the two disagree the moment only one is edited, and the prose copy is what gets believed.
+Keep the durable ruling in prose - what to prefer, what to escalate, what never to force - and keep the number in its config.
 Shared captain preferences that apply across secondmate domains live only in the primary home's optional `data/captain-shared.md`.
 `secondmate-provisioning` owns its propagation contract, including the required header, read-only secondmate copies, quarantine diagnostics, and the rollout rule that existing homes trim `data/captain.md` by hand after first propagation rather than deleting private content automatically.
 
@@ -149,6 +191,18 @@ Shared captain preferences that apply across secondmate domains live only in the
 Fleet-local operational facts and gotchas live locally in `data/learnings.md`; it is gitignored and printed after the captain-preference files in the session-start context digest.
 The file is created lazily on first learning and follows the same dated, evidence-backed, curated style as `data/captain.md`: inspect the current file first, then rewrite or prune stale entries instead of appending forever.
 There is no shared learnings file by captain decision.
+The pointer-not-value rule from the captain-preference section above applies here too: a learning may record what a value WAS on a dated occasion as evidence, but the live value is always read from its config file.
+
+## Session stats (data/session-stats.log)
+
+`data/session-stats.log` is this home's append-only session history: one tab-separated `key=value` line per session closed through `bin/fm-end-session.sh`, whose header owns the exact field list.
+It is gitignored like the rest of `data/`, and it is history rather than state, so records are never rewritten, reordered, or pruned.
+Only durable identifiers and counts are recorded - no worktree paths, pane ids, or tool versions, which rot the moment the session ends.
+
+Away-mode time in that record is deliberately incomplete.
+`state/.afk` holds the epoch second away mode was entered, so a stretch still open when the session closes is measurable to the second and records as `away_source=open-flag`.
+A stretch that already ended leaves no durable duration behind, because return clears the flag without recording how long it was held, so those sessions record `away_source=unrecorded` rather than an estimate.
+Making cumulative away time recoverable would require away-mode entry and return to append a durable stretch ledger (entered and exited epochs per stretch); until they do, no consumer may infer total away time from this file.
 
 ## Secondmate routes (data/secondmates.md)
 
@@ -239,9 +293,17 @@ The crew count in the reading is the number of crews whose agent is actually run
 Only the watcher's sweep pays for that liveness answer, and it caches the verdict, so the count every other caller shows is at most two sweep intervals old (`FM_RESOURCE_INTERVAL`, default 900 seconds, so 1800 seconds at the default).
 Two intervals rather than one is deliberate: the watcher exits on every wake and is re-armed, so a home between arms routinely has no sweep running while the other callers keep reading the cache.
 When no cached verdict is available, or it is older than that, the reading falls back to the count of recorded tasks and says so with "liveness unverified" instead of presenting it as a verified count.
-Persistent secondmates are running agents and real load, so they are counted and reported separately in the reading and they count toward the ceiling and the overage, but the number of crews the shed advice names is capped at the ordinary crews, because AGENTS.md makes an idle secondmate endpoint healthy and its retirement an explicit decision.
-The reading names the all-agents total and labels the ceiling in agents, so the number the ceiling is compared against is visible on the line and the shed advice reads as a consequence of it.
-A home whose only running agents are persistent secondmates therefore never gets shed advice.
+The ceiling's memory component allows one active agent per 640 MB of available memory.
+That figure is measured rather than assumed: the 2026-07-24 measurement recorded in `data/measure-ccstatusline-cost/report.md` puts a working agent at 394-491 MB resident and an idle one at roughly 290 MB decaying toward 180 MB over hours of genuine inactivity.
+It replaced an earlier 1024 MB per agent, which over-charged even a working agent and over-charged an idle one by around 3.5 times.
+640 MB sits about 30 percent above the top of the measured working range, the conservative choice the report's own caveat asks for, since it measured never-prompted sessions and so treats 290 MB as a floor that context size moves upward.
+
+A persistent secondmate whose own home has no routed work in flight is idle, and by the captain's ruling of 2026-07-24 an idle secondmate is charged nothing: it counts toward neither the ceiling's memory component, nor its processor component, nor the overage that produces shed advice.
+The measurement is what justifies that: idle agents changed the host's load average by -0.11 and its swap by -239 MB while five were added.
+A working secondmate is charged exactly like an ordinary crew.
+Idleness is decided from files alone, by looking for recorded tasks under the secondmate's own home, so the synchronous callers still never touch a backend, and a secondmate whose home cannot be read is charged as active rather than silently discounted.
+Nothing disappears from the reading by ceasing to be charged: the line names the all-agents total, then the active figure the ceiling and overage are measured on, then the crew and secondmate breakdown, and labels the ceiling in active agents.
+The number of crews the shed advice names is still capped at the ordinary crews, because AGENTS.md makes an idle secondmate endpoint healthy and its retirement an explicit decision, so a home whose only running agents are persistent secondmates never gets shed advice.
 
 `FM_RESOURCE_SWEEP_BUDGET` is the number of seconds one sweep may spend checking crew liveness in total, defaulting to `30`, and `0` or a malformed value falls back to that default rather than disabling the budget.
 It bounds the watcher's poll loop however many crews are recorded and however unresponsive a backend is, since bounding each check on its own would still allow one timeout per recorded crew.
@@ -249,6 +311,10 @@ A check started near the deadline gets only the time the budget has left, so the
 Crews left unchecked when the budget runs out count toward the live total anyway, the same conservative direction an unanswered check already takes, and the reading says "liveness partly unverified" so a partly checked count is never shown as a fully verified one.
 That marker is cached with the count, so a partly checked count keeps the same label on the later synchronous readings that reuse it.
 `FM_RESOURCE_PROBE_TIMEOUT` bounds each individual crew-liveness check inside that budget, defaulting to `5`, with the same fallback for `0` or a malformed value; each check is terminated as a process group, so a wedged backend leaves no stuck process behind.
+
+`FM_RESOURCE_SWEEP_BUDGET` is the number of seconds one sweep may spend checking crew liveness in total, defaulting to `30`, and a malformed value falls back to that default rather than disabling the budget.
+It bounds the watcher's poll loop however many crews are recorded and however unresponsive a backend is, since bounding each check on its own would still allow one timeout per recorded crew.
+Crews left unchecked when the budget runs out count toward the live total anyway, the same conservative direction an unanswered check already takes, and the reading says "liveness partly unverified" so a partly checked count is never shown as a fully verified one.
 
 Three callers consult the monitor, and all three only report:
 
@@ -263,7 +329,32 @@ Nothing in this path pauses, sheds, or kills anything.
 Shedding load is the captain's decision, so the monitor's job ends at reporting the pressure and the crew count the host can support.
 An unknown reading, on a host where no kernel-wide probe answers, and a disabled monitor both stay silent instead of alarming, the same never-wake-on-an-unreadable-probe rule the secondmate context monitor follows.
 
-The watcher keeps its sweep state in `state/.last-resource` (sweep cadence), `state/.resource-status` (latest reading, read by the heartbeat annotation), `state/.resource-live` (last running-agent counts and whether the sweep could check them all, read by the synchronous callers), and `state/.resource-surfaced` (worst level already reported, so recovery to healthy re-arms the monitor silently).
+The watcher keeps its sweep state in `state/.last-resource` (sweep cadence), `state/.resource-status` (latest reading, read by the heartbeat annotation), `state/.resource-live` (last running-agent counts, split into crews, working secondmates and idle secondmates, plus whether the sweep could check them all, read by the synchronous callers), and `state/.resource-surfaced` (worst level already reported, so recovery to healthy re-arms the monitor silently).
+These are watcher internals; never edit them by hand.
+
+## Hourly session passes (FM_HOURLY_REVIEW_INTERVAL / FM_HOURLY_CLEANUP_INTERVAL)
+
+Every session start arms two recurring passes that then run for the life of the session: an hourly session review and an hourly cleanup sweep.
+[`bin/fm-session-start.sh`](../bin/fm-session-start.sh) arms them, [`bin/fm-hourly-lib.sh`](../bin/fm-hourly-lib.sh) owns the arming, cadence, and suppression contract, and the two pass scripts own what they look at.
+
+Arming writes durable schedule state only.
+The one live watcher runs a due pass on its existing slow poll and wakes firstmate with `check: session-review <headline>` or `check: session-cleanup <headline>`, so no second supervision cycle and no extra timer exists.
+Arming is a mutating step, so a read-only session (one that did not acquire the home's session lock) leaves it to the session holding the lock, and an unarmed home never runs a pass at all.
+Arming is idempotent and creates a cadence stamp only when it is absent, so elapsed time survives a session restart and a home whose sessions restart faster than the interval still runs its passes.
+
+Both passes are silent unless they have something the fleet has not already been told about.
+The session review reports only what has not moved - an open decision nobody has answered, a worker that has posted nothing for hours, queued work with nothing running, a batch of finished-but-unmerged branches - because a point-in-time fleet review is what the watcher heartbeat already provides.
+A queued item that is blocked by another item or captain-held is not dispatchable, so it never counts toward the idle-capacity finding.
+Both passes ignore a persistent secondmate's record, which is idle by contract, so it neither counts as work under way nor reads as a stalled worker.
+The cleanup sweep silently reclaims bookkeeping that can hold no work (watcher temp residue, suppression markers for a fleet that no longer exists) and reports without removing anything that could hold unlanded work, leaving [`bin/fm-teardown.sh`](../bin/fm-teardown.sh) the single owner of the landed-work test.
+It never writes into a project clone and never touches the network, so the merge queue is swept only by firstmate's own [`bin/fm-merge-queue.sh`](../bin/fm-merge-queue.sh) run, and per-task temp roots under a shared `/tmp` are not scanned at all because they carry no reliable home ownership.
+A finding surfaces once and stays silent while it is unchanged; an emptied finding set re-arms the report silently, the same shape the host-resource monitor uses.
+
+`FM_HOURLY_REVIEW_INTERVAL` and `FM_HOURLY_CLEANUP_INTERVAL` are the seconds between runs of each pass, both defaulting to `3600`.
+`0` disables that pass for this home, and a malformed value falls back to the default rather than silently disabling it.
+The thresholds each pass applies (`FM_REVIEW_DECISION_SECS`, `FM_REVIEW_STALL_SECS`, `FM_REVIEW_MERGE_BATCH`, `FM_CLEANUP_TEMP_SECS`, `FM_CLEANUP_MARKER_SECS`, `FM_CLEANUP_ORPHAN_SECS`) are owned by the two script headers.
+
+State lives in `state/.hourly-armed` (armed for this session), `state/.last-hourly-review` and `state/.last-hourly-cleanup` (cadence stamps), `state/.hourly-review-surfaced` and `state/.hourly-cleanup-surfaced` (what has already been reported), `state/.hourly-review.latest` and `state/.hourly-cleanup.latest` (the full report behind each one-line headline), and `state/.hourly-decision-<id>__<key>` (when an open decision was first seen, so a later unrelated status append cannot reset its age), and `state/.hourly-cleanup.log` (what the cleanup sweep reclaimed, size-capped like the watcher's triage log).
 These are watcher internals; never edit them by hand.
 
 ## Crew dispatch profiles (config/crew-dispatch.json)
@@ -311,6 +402,53 @@ Malformed JSON, an empty or malformed rule/default array, an unverified harness,
 Because the spawn backstop is gated by file presence, any fallback path after a missing match, validation error, or missing `jq` still passes a resolved harness explicitly until the file is fixed or removed.
 Secondmate homes inherit this file from the primary, so a secondmate's own crewmates apply the same dispatch profile behavior.
 
+## Heavy-run serialization (config/heavy-run-slots)
+
+`config/heavy-run-slots` is an optional local, gitignored file holding a single positive integer: the number of HEAVY runs - unit suites, end-to-end suites, lint sweeps, builds - that may execute at one instant in this home.
+The first non-empty line is parsed, and the default is `1`.
+This section is the single owner of the knob; [`bin/fm-heavy-run.sh`](../bin/fm-heavy-run.sh)'s header and `--help` own the lease-queue mechanism, the record format, the refusal cases, and the exit statuses.
+
+A malformed or below-floor value falls back to `1` and warns, rather than falling back to something permissive.
+That direction is deliberate: guessing high recreates the host thrash the ceiling exists to prevent, while guessing low only makes runs wait.
+
+Crewmates reach it by wrapping their heavy command:
+
+```sh
+bin/fm-heavy-run.sh --task <id> -- npm test
+```
+
+The command runs unchanged, its output streams straight through, and the wrapper exits with the command's own status, so a crewmate always acts on its real result.
+While a run waits its turn it prints a queued notice naming its position, so a waiting crewmate is visibly queued rather than apparently hung.
+The generated crewmate briefs ([`bin/fm-brief.sh`](../bin/fm-brief.sh)) carry that instruction, which is how the runner actually gets adopted.
+
+The same scaffold carries three further shared-machine rules, for the same reason: a rule that only exists as a hand-typed steer does not bind a crewmate that was just spawned.
+
+- Test parallelism is capped at `VITEST_MAX_WORKERS=2`, never 4, because vitest sizes its worker pool from the CPU count and is the fleet's dominant memory consumer.
+- Every test run is announced in the status file, `working: TEST START - ...` before and `working: TEST END - ...` after, which is the signal firstmate coordinates the machine from.
+- At most TWO live browser reproductions may run across the whole fleet at once, so a crewmate announces `working: BROWSER WAIT - ...` and waits for firstmate's go-ahead before starting one, then releases the slot with `working: BROWSER END - ...`.
+
+For the same reason, every ship and scout scaffold also generates the standing captain rules as a labelled `C1`-`C6` block, and the secondmate charter generates the supervising subset under the same stable labels; [`bin/fm-brief.sh`](../bin/fm-brief.sh)'s header and `--help` own their exact wording and scope.
+
+Ship scaffolds also require the final report to declare whether the change was built test-first and whether it has end-to-end coverage.
+A gap does not block the merge; leaving it unstated does, because the captain reviews every untested product change.
+
+This is deliberately NOT the host-resource monitor.
+That monitor answers "is this machine healthy right now" and only reports; this ceiling answers "how many heavy runs may proceed right now" and actually blocks.
+The two stay uncoupled because a resource reading is momentary and advisory, while the failure mode being prevented - several parked crewmates unblocked at once, all starting a suite before any new reading is taken - needs a hard, stateful count.
+
+Inspect the queue at any time:
+
+```sh
+bin/fm-heavy-run.sh --status
+```
+
+It prints `ceiling=`, `running=`, `waiting=`, then one line per run and per waiter in queue order.
+The runner's state lives under `state/heavy-runs/`; these are runtime records, not files to edit by hand.
+
+The queue is per operational home, because it lives under that home's `state/`.
+A fleet whose secondmate homes share one physical host therefore gets one queue per home, not one for the machine.
+Set the same ceiling in each home, or point every home at one queue by exporting `FM_HEAVY_RUN_DIR` to a shared directory, when the machine rather than the home is the thing being protected.
+
 ## Toolchain
 
 On session start the first mate detects what its required toolchain is missing or too old and lists each problem with either an exact install command or manual instructions.
@@ -333,8 +471,11 @@ An absent `quota-axi` reports `MISSING: quota-axi (install: npm install -g quota
 Bootstrap also reports a `TANGLE:` line when `FM_ROOT` is on a named non-default branch; follow the printed checkout remediation rather than treating it as an installable tool problem.
 In a read-only session that did not get the fleet lock, the same line is advisory and omits the checkout command.
 The locked session-start bootstrap step also runs a best-effort project clone refresh through `fm-fleet-sync.sh`.
-It emits `FLEET_SYNC:` for skipped refreshes that may matter, recovered self-heals, and `STUCK:` alarms.
+It emits `FLEET_SYNC:` for skipped refreshes that may matter, recovered self-heals, `STUCK:` alarms, `FETCH FAILED:` reports, and `PIN FAILED:` reports.
 Normal completed runs keep local-only and no-origin skips silent.
+Every sync also converges each clone's Treehouse worktree pool pin through `bin/fm-treehouse-pin.sh`, before the local-only and no-origin skips, so existing clones self-heal and a home that moves re-pins itself.
+A converged pin stays silent; a pin that cannot be applied is reported as `PIN FAILED:` and never aborts the refresh, because an unpinned clone shares one pool with every other copy of the same repo on the machine and its spawns will be refused (see [treehouse-pools.md](treehouse-pools.md)).
+A failed fetch is deliberately reported as `FETCH FAILED:` rather than as a skip, because a clone that stops fetching still presents a clean tree on its default branch and is otherwise indistinguishable from a healthy one, so a quiet skip lets work be reasoned against silently stale code.
 If bootstrap kills a timed-out refresh, it replays any completed `fm-fleet-sync.sh` output before the aggregate timeout skip so no finished result is lost.
 A killed refresh (or a teardown process kill) can leave an orphaned `.git/packed-refs.lock` in a clone, which makes the next refresh's fetch fail with Git's `Unable to create '...packed-refs.lock': File exists`.
 On that signature only, `fm-fleet-sync.sh` retries the fetch with a bounded wait for the lock to self-clear, then removes the lock and retries once more only when it can prove the lock stale, exactly like the `fm-teardown.sh` `index.lock` recovery.
@@ -456,15 +597,22 @@ FM_SESSION_START_STATUS_TAIL=5   # state/*.status lines printed per task in the 
 FM_BOOTSTRAP_DETECT_ONLY=0   # internal/read-only session-start mode: skip bootstrap's mutating sweeps and print advisory TANGLE wording
 FM_GUARD_READ_ONLY=0    # internal/read-only guard mode: keep alarms but suppress drain, supervision repair, and checkout repair commands
 FM_GUARD_CONTINUE_LINE='This is a supervision warning only; the guarded operation WILL still run.'   # banner continuation line; fm-send.sh overrides it to name the requested message specifically
-FM_POLL=15              # seconds between watcher poll cycles; keep below the beacon grace (FM_WATCHER_STALE_GRACE, default 300) - see the POLL < grace invariant below
+FM_POLL=300             # seconds between watcher poll cycles; keep below the beacon grace (FM_WATCHER_STALE_GRACE, which defaults to FM_GUARD_GRACE and to 900) - see the POLL < grace invariant below
 FM_HEARTBEAT=600        # base seconds between heartbeat scans; no-change heartbeats are absorbed while idle
 FM_HEARTBEAT_MAX=7200   # heartbeat backoff cap
 FM_WATCH_ABSORB_TICK=0  # 1 makes a benign-absorbed wake end the cycle with a distinguishable "tick:" proof-of-life line (no wake record); default off = byte-identical silent absorb; only while work is under way. See docs/watcher-continuity.md "Absorbed-wake proof-of-life tick"
 FM_CHECK_INTERVAL=300   # seconds between slow checks (authenticated merge polls, custom checks, or X-mode dispatch)
 FM_CHECK_TIMEOUT=30     # seconds allowed per slow check script
 FM_RESOURCE_INTERVAL=900   # seconds between host CPU/memory/swap sweeps; own cadence, NOT tied to FM_POLL or FM_CHECK_INTERVAL; 0 disables the monitor, malformed falls back to the default (see the host resource monitoring section above)
+FM_HOURLY_REVIEW_INTERVAL=3600   # seconds between hourly session-review passes; 0 disables it, malformed falls back to the default (see the hourly session passes section above)
+FM_HOURLY_CLEANUP_INTERVAL=3600  # seconds between hourly cleanup sweeps; same 0/malformed rules
 FM_RESOURCE_SWEEP_BUDGET=30   # seconds one sweep may spend on crew-liveness checks in total; 0 or malformed falls back to the default
 FM_RESOURCE_PROBE_TIMEOUT=5   # seconds allowed per crew-liveness check inside a sweep; 0 or malformed falls back to the default
+FM_HEAVY_SLOTS=         # heavy-run ceiling override; wins over config/heavy-run-slots, malformed or below-floor values fall back to 1 (see the heavy-run serialization section above)
+FM_HEAVY_RUN_DIR=       # alternate heavy-run queue dir, default state/heavy-runs; point several homes at one dir to cap a whole host
+FM_HEAVY_POLL=2         # seconds between admission attempts while a heavy run is queued
+FM_HEAVY_NOTICE=30      # seconds between "still queued" notices printed by a waiting heavy run
+FM_HEAVY_LOCK_WAIT=30   # seconds a heavy run waits for the admission lock before refusing without running
 FM_CODEX_WATCH_CHECKPOINT=180   # seconds per foreground watcher checkpoint in Codex primary supervision
 FM_CREW_STATE_NM_TIMEOUT=10   # seconds allowed per no-mistakes query inside fm-crew-state.sh
 FM_CREW_STATE_RUNS_LIMIT=200  # recent no-mistakes run rows scanned when axi status cannot be attributed to the current code
@@ -481,7 +629,7 @@ FMX_X_THREAD_MAX=25     # maximum messages in one auto-split reply thread
 FMX_FOLLOWUP_MAX_AGE_SECS=604800   # local window for posting X-mode completion follow-ups (7 days)
 FMX_FOLLOWUP_MAX_COUNT=3   # local cap on X-mode completion follow-ups per linked mention
 FM_LOCK_STALE_AFTER=2   # seconds before dead-pid lock records can be reclaimed; mid-acquire locks keep at least 2s grace
-FM_GUARD_GRACE=300      # seconds before guard warnings, arm health checks, and the primary turn-end guard treat a watcher beacon as stale
+FM_GUARD_GRACE=900      # seconds before guard warnings, arm health checks, and the primary turn-end guard treat a watcher beacon as stale
 FM_AFK_DAEMON_PENDING_TTL=300   # seconds an away-mode daemon-start intent marker (state/.supervise-daemon.starting) reads as owned before it decays to daemon-free; bounds the bring-up window (docs/turnend-guard.md "Away Mode")
 FM_AFK_DAEMON_STATE_TIMEOUT_MS=5000   # milliseconds the OpenCode auto-arm plugin waits for bin/fm-afk-daemon-state.sh to answer supervision ownership before treating away mode as daemon-owned and not arming
 FM_ARM_CONFIRM_TIMEOUT=10   # seconds fm-watch-arm waits to confirm a fresh watcher before reporting FAILED
@@ -494,7 +642,7 @@ FM_WATCH_REARM_RETRY_MAX_MS=4000   # Pi/OpenCode adapter cap for exponential con
 FM_WATCH_REARM_RETRY_LIMIT=5   # Pi/OpenCode adapter launch-failure retries before surfacing restoration failure
 FM_WATCH_CYCLE_LOG_MAX_BYTES=262144   # size cap for the arm-owned watcher lifecycle ledger
 FM_WATCH_CYCLE_LOG_KEEP_LINES=1000   # newest complete lifecycle rows considered when the ledger is capped
-FM_WATCHER_STALE_GRACE=300   # defaults to FM_GUARD_GRACE; seconds a live watcher lock may have a stale beacon before re-arm errors. POLL < grace invariant: FM_POLL must stay below this grace. The watcher refreshes its liveness beacon (state/.last-watcher-beat) at the top of each cycle, so a full cycle's terminal wait that outlives the grace would read a healthy sleeping watcher as dead (the guard prints WATCHER DOWN and re-arm refuses) for the back of every cycle. bin/fm-watch.sh keeps the beacon fresh by slicing that wait into pieces no longer than min(FM_POLL, grace/2) and re-touching the beacon each slice, and warns at start-up when FM_POLL >= grace, but the cadence and the liveness grace should still be set so FM_POLL is the smaller.
+FM_WATCHER_STALE_GRACE=900   # defaults to FM_GUARD_GRACE, which itself defaults to 900; seconds a live watcher lock may have a stale beacon before re-arm errors. POLL < grace invariant: FM_POLL must stay below this grace. The watcher refreshes its liveness beacon (state/.last-watcher-beat) at the top of each cycle, so a full cycle's terminal wait that outlives the grace would read a healthy sleeping watcher as dead (the guard prints WATCHER DOWN and re-arm refuses) for the back of every cycle. bin/fm-watch.sh keeps the beacon fresh by slicing that wait into pieces no longer than min(FM_POLL, grace/2) and re-touching the beacon each slice, and warns at start-up when FM_POLL >= grace, but the cadence and the liveness grace should still be set so FM_POLL is the smaller.
 FM_SIGNAL_GRACE=30      # seconds to coalesce nearby status and turn-end signals into one wake
 FM_CAPTAIN_RE='done:|needs-decision:|blocked:|failed:|PR ready|checks green|ready in branch|merged'   # captain-relevant status regex; nonterminal progress verbs remain excluded even when their prose matches
 FM_CLASSIFY_PAUSED_VERB=paused     # leading status verb for a declared external wait; excluded from FM_CAPTAIN_RE and distinct from blocked

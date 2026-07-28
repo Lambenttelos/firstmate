@@ -34,7 +34,9 @@ make_spawn_case() {
   local name=$1 case_dir home proj wt fakebin grok_home id
   case_dir="$TMP_ROOT/$name"
   home="$case_dir/home"
-  proj="$case_dir/project"
+  # The project must be a direct child of this home's projects dir, or fm-spawn's
+  # own-clone assertion refuses the launch before the grok codepath is reached.
+  proj="$case_dir/home/projects/project"
   wt="$case_dir/wt"
   fakebin=$(make_spawn_fakebin "$case_dir/fake")
   grok_home="$case_dir/grok"

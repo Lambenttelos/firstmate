@@ -920,13 +920,25 @@ unit_refresh_validates_record() {
 # holds a mode-000 non-empty subdirectory, so neither the portable lock helper's
 # removal path nor `rm -rf` can retire it.
 unit_clear_failure_still_enters_away_mode() {
-  local st out
+  local st out continue_message
   if [ "$(id -u)" = 0 ]; then
     pass "clear failure: skipped, running as root where mode 000 does not deny a removal"
     return 0
   fi
   st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-clear-fail.XXXXXX")
   mkdir -p "$st/state"
+
+  # Resolve the shared continue wording through the launcher itself. Calling
+  # fm_afk_stale_artifact_continue_message directly in THIS shell would expand to
+  # the empty string (it is defined only inside the sourced launcher), and a
+  # `grep -F ''` matches every output, so the assertion below would pass no matter
+  # what the entry points printed.
+  continue_message=$(FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" bash -c '
+    . "$1"
+    fm_afk_stale_artifact_continue_message
+  ' _ "$LAUNCH" 2>/dev/null)
+  [ -n "$continue_message" ] \
+    || fail "clear failure: could not resolve the shared stale-artifact continue message"
 
   seed_unclearable_lock() {
     rm -rf "$st/state/.afk-outbox.lock"
@@ -947,7 +959,7 @@ unit_clear_failure_still_enters_away_mode() {
   ' _ "$LAUNCH" 2>&1)
   if [ -e "$st/state/.afk" ] \
     && printf '%s' "$out" | grep -F "could not clear stale away-mode artifact $st/state/.afk-outbox.lock" >/dev/null \
-    && printf '%s' "$out" | grep -F "$(fm_afk_stale_artifact_continue_message)" >/dev/null; then
+    && printf '%s' "$out" | grep -F "$continue_message" >/dev/null; then
     pass "clear failure: native entry names the artifact and still enters away mode"
   else
     fail "clear failure: native entry refused or did not name the artifact: $out"
@@ -965,12 +977,77 @@ unit_clear_failure_still_enters_away_mode() {
   ' _ "$LAUNCH" 2>&1)
   if [ -e "$st/state/.afk" ] \
     && printf '%s' "$out" | grep -F "could not clear stale away-mode artifact $st/state/.afk-outbox.lock" >/dev/null \
-    && printf '%s' "$out" | grep -F "$(fm_afk_stale_artifact_continue_message)" >/dev/null; then
+    && printf '%s' "$out" | grep -F "$continue_message" >/dev/null; then
     pass "clear failure: terminal entry names the artifact and still enters away mode"
   else
     fail "clear failure: terminal entry refused or did not name the artifact: $out"
   fi
   release_unclearable_lock
+  rm -rf "$st"
+}
+
+# The daemon lock may be reclaimed only from a live process the probe CONFIDENTLY
+# reads as some other program. An UNDETERMINED probe - an unreadable pid identity,
+# or an empty ps command line under fork pressure - must leave the lock alone: it
+# can belong to a daemon that really is running, and tearing it out starts a second
+# supervisor beside the first, with both believing they own escalation delivery.
+# The daemon started afterwards refuses loudly against a held lock instead, which
+# is loud and self-correcting.
+unit_lock_steal_requires_a_confident_foreign_holder() {
+  local st lock holder stub
+
+  # (1) UNDETERMINED holder: the lock records an identity and the probe cannot
+  # complete. The lock must survive.
+  st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-steal-undetermined.XXXXXX")
+  mkdir -p "$st/state"
+  stub="$st/stub-daemon.sh"
+  printf '#!/usr/bin/env bash\nexit 0\n' > "$stub"
+  chmod +x "$stub"
+  sleep 600 &
+  holder=$!
+  lock="$st/state/.supervise-daemon.lock"
+  mkdir -p "$lock"
+  printf '%s' "$holder" > "$lock/pid"
+  printf 'recorded-identity\n' > "$lock/pid-identity"
+  FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" bash -c '
+    . "$1"
+    FM_AFK_DAEMON=$2
+    fm_pid_identity() { return 1; }
+    fm_afk_start_main
+  ' _ "$START" "$stub" >/dev/null 2>&1 || true
+  if [ -e "$lock/pid" ]; then
+    pass "lock steal: an undetermined holder keeps its daemon lock"
+  else
+    fail "lock steal: an undetermined probe tore out a lock that may belong to a live daemon"
+  fi
+  kill "$holder" 2>/dev/null || true
+  wait "$holder" 2>/dev/null || true
+  rm -rf "$st"
+
+  # (2) CONFIDENTLY FOREIGN holder: a live process with a readable command line
+  # that is not this daemon. Its lock is reclaimed, exactly as before.
+  st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-steal-foreign.XXXXXX")
+  mkdir -p "$st/state"
+  stub="$st/stub-daemon.sh"
+  printf '#!/usr/bin/env bash\nexit 0\n' > "$stub"
+  chmod +x "$stub"
+  sleep 600 &
+  holder=$!
+  lock="$st/state/.supervise-daemon.lock"
+  mkdir -p "$lock"
+  printf '%s' "$holder" > "$lock/pid"
+  FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" bash -c '
+    . "$1"
+    FM_AFK_DAEMON=$2
+    fm_afk_start_main
+  ' _ "$START" "$stub" >/dev/null 2>&1 || true
+  if [ ! -e "$lock/pid" ]; then
+    pass "lock steal: a confidently foreign live holder still has its lock reclaimed"
+  else
+    fail "lock steal: a foreign live holder kept a lock that blocks the daemon"
+  fi
+  kill "$holder" 2>/dev/null || true
+  wait "$holder" 2>/dev/null || true
   rm -rf "$st"
 }
 
@@ -1124,6 +1201,130 @@ e2e_tmux() {
   rm -rf "$home_tmp" 2>/dev/null || true
 }
 
+# ---------------------------------------------------------------------------
+# UNIT: durable persist-intent flag semantics, independent of any backend.
+# The intent (state/.afk-persist) must be settable, probeable, survive a
+# fresh-entry stale-artifact clear (it is NOT a session-scoped delivery
+# artifact), and clear explicitly.
+# ---------------------------------------------------------------------------
+unit_persist_flag_semantics() {
+  local st rc
+  st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-persist.XXXXXX")
+  mkdir -p "$st/state"
+  : > "$st/state/.subsuper-escalations"   # a genuine session-scoped artifact
+  FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" \
+    bash -c '
+      . "$1"
+      fm_afk_launch_persist_write || exit 3
+      [ -f "$2/.afk-persist" ] || exit 4
+      fm_afk_launch_persist_active || exit 5
+      # A fresh-entry stale clear must NOT remove the durable persist intent,
+      # but must remove the session-scoped artifact.
+      fm_afk_clear_stale_artifacts "$2" || true
+      [ -f "$2/.afk-persist" ] || exit 6
+      [ -e "$2/.subsuper-escalations" ] && exit 7
+      fm_afk_launch_persist_clear || exit 8
+      [ ! -e "$2/.afk-persist" ] || exit 9
+      exit 0
+    ' _ "$LAUNCH" "$st/state"
+  rc=$?
+  if [ "$rc" -eq 0 ]; then
+    pass "persist flag: set, active probe, survives fresh-entry clear, explicit clear"
+  else
+    fail "persist flag: semantics wrong (exit $rc)"
+  fi
+  rm -rf "$st"
+}
+
+# ---------------------------------------------------------------------------
+# UNIT (tmux): revive is gated on the durable persist intent. Without it, a
+# no-op; with it and no live daemon, it re-enters durable paneless away mode.
+# ---------------------------------------------------------------------------
+unit_revive_gating() {
+  command -v tmux >/dev/null 2>&1 || { echo "skip: tmux not found (revive gating)"; return 0; }
+  local st rec rec_mode
+  st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-revive.XXXXXX")
+  mkdir -p "$st/state"
+  FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" FM_AFK_LAUNCH_ENTRY="$SLEEPER" \
+    "$LAUNCH" revive >/dev/null 2>&1
+  if [ ! -e "$st/state/.afk" ] && [ ! -e "$st/state/.afk-daemon-terminal" ]; then
+    pass "revive: silent no-op without persist intent"
+  else
+    fail "revive: acted without a persist intent"
+  fi
+  : > "$st/state/.afk-persist"
+  FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" FM_AFK_LAUNCH_ENTRY="$SLEEPER" \
+    "$LAUNCH" revive >/dev/null 2>&1
+  rec=$(cut -f2 "$st/state/.afk-daemon-terminal" 2>/dev/null || true)
+  rec_mode=$(cut -f1,3 "$st/state/.afk-daemon-terminal" 2>/dev/null || true)
+  TRACK_TMUX_SESSIONS="$TRACK_TMUX_SESSIONS $rec"
+  if [ -e "$st/state/.afk" ] && [ "$rec_mode" = "$(printf 'tmux\tpaneless')" ] \
+    && tmux has-session -t "$rec" 2>/dev/null; then
+    pass "revive: persist intent + no live daemon re-enters durable paneless away"
+  else
+    fail "revive: did not revive under a persist intent (rec_mode='$rec_mode')"
+  fi
+  FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" "$LAUNCH" stop >/dev/null 2>&1
+  rm -rf "$st"
+}
+
+# ---------------------------------------------------------------------------
+# E2E tmux paneless: durable hosting + persist lifecycle. The daemon lands in a
+# detached tmux session recorded as paneless, `persist` records the durable
+# intent, `stop` (the auto-return path) clears operational state but PRESERVES
+# the intent, and `unpersist` is the only path that clears it.
+# ---------------------------------------------------------------------------
+e2e_tmux_paneless() {
+  command -v tmux >/dev/null 2>&1 || { echo "skip: tmux not found (tmux paneless e2e)"; return 0; }
+  local home_tmp rec rec_mode
+  home_tmp=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-paneless-home.XXXXXX")
+  FM_HOME="$home_tmp" FM_STATE_OVERRIDE="$home_tmp/state" FM_AFK_LAUNCH_ENTRY="$SLEEPER" \
+    "$LAUNCH" persist >/dev/null 2>&1
+  rec=$(cut -f2 "$home_tmp/state/.afk-daemon-terminal" 2>/dev/null || true)
+  rec_mode=$(cut -f1,3 "$home_tmp/state/.afk-daemon-terminal" 2>/dev/null || true)
+  TRACK_TMUX_SESSIONS="$TRACK_TMUX_SESSIONS $rec"
+  if [ -n "$rec" ] && tmux has-session -t "$rec" 2>/dev/null; then
+    pass "paneless e2e: daemon hosted in a detached tmux session (survives turnover)"
+  else
+    fail "paneless e2e: no detached daemon session ($rec)"
+  fi
+  if [ "$rec_mode" = "$(printf 'tmux\tpaneless')" ]; then
+    pass "paneless e2e: record marks paneless pull delivery"
+  else
+    fail "paneless e2e: unexpected record ($rec_mode)"
+  fi
+  if [ -e "$home_tmp/state/.afk" ] && [ -e "$home_tmp/state/.afk-persist" ]; then
+    pass "paneless e2e: persist enters away and records the durable intent"
+  else
+    fail "paneless e2e: away flag or persist intent missing"
+  fi
+
+  FM_HOME="$home_tmp" FM_STATE_OVERRIDE="$home_tmp/state" "$LAUNCH" stop >/dev/null 2>&1
+  if [ ! -e "$home_tmp/state/.afk" ] && [ ! -e "$home_tmp/state/.afk-daemon-terminal" ]; then
+    pass "paneless e2e: stop clears operational away state"
+  else
+    fail "paneless e2e: stop retained operational state"
+  fi
+  if [ -e "$home_tmp/state/.afk-persist" ]; then
+    pass "paneless e2e: stop PRESERVES the durable persist intent (auto-return safe)"
+  else
+    fail "paneless e2e: stop wrongly cleared the persist intent"
+  fi
+  if [ -n "$rec" ] && ! tmux has-session -t "$rec" 2>/dev/null; then
+    pass "paneless e2e: daemon session killed by exact id on stop"
+  else
+    fail "paneless e2e: daemon session leaked ($rec)"
+  fi
+
+  FM_HOME="$home_tmp" FM_STATE_OVERRIDE="$home_tmp/state" "$LAUNCH" unpersist >/dev/null 2>&1
+  if [ ! -e "$home_tmp/state/.afk-persist" ]; then
+    pass "paneless e2e: unpersist (explicit exit) clears the durable intent"
+  else
+    fail "paneless e2e: unpersist did not clear the intent"
+  fi
+  rm -rf "$home_tmp" 2>/dev/null || true
+}
+
 unit_clear_stale
 unit_clear_stale_outbox_under_lock
 unit_fresh_vs_refresh
@@ -1159,10 +1360,14 @@ unit_stop_surfaces_afk_removal_failure
 unit_stop_confirms_daemon_exit
 unit_refresh_validates_record
 unit_clear_failure_still_enters_away_mode
+unit_lock_steal_requires_a_confident_foreign_holder
 unit_confirmed_absence_succeeds
 unit_incomplete_restore_retains_backup
 unit_flag_write_failure_aborts
+unit_persist_flag_semantics
+unit_revive_gating
 e2e_herdr
 e2e_tmux
+e2e_tmux_paneless
 
 [ "$FAILED" -eq 0 ] || exit 1

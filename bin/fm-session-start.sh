@@ -18,7 +18,7 @@
 # standalone with unchanged default behavior - other flows (fm-bootstrap.sh
 # install <tools> after consent, /updatefirstmate, the afk daemon, existing
 # tests) still call them directly. The one seam this script needed -
-# bootstrap running its detect-only diagnostics without its five mutating
+# bootstrap running its detect-only diagnostics without its six mutating
 # sweeps - is an opt-in FM_BOOTSTRAP_DETECT_ONLY=1 flag on fm-bootstrap.sh
 # itself (default unset/0 = unchanged behavior), not a fork.
 #
@@ -33,6 +33,12 @@
 #                       when this session actually holds the lock.
 #   3. wake-drain     - mutates the durable wake queue, so it also only runs
 #                       when locked.
+#   3b. hourly passes - arm the hourly session review and hourly cleanup sweep
+#                       for the life of the session (bin/fm-hourly-lib.sh).
+#                       Writes durable schedule state only - the existing
+#                       watcher runs them on its slow poll, so no second
+#                       supervision cycle exists - and is mutating, so it too
+#                       runs only when locked.
 #   4. context digest - data/projects.md, data/secondmates.md, data/captain.md,
 #                       data/captain-shared.md, data/learnings.md: read-only,
 #                       always safe, always runs.
@@ -68,7 +74,7 @@
 # tasks-axi and quota-axi tool checks, and tasks-axi availability - none of
 # which mutate shared state and all of which are safe to compute from a second
 # session.
-# Only the five mutating sweeps and the wake-queue drain are skipped.
+# Only the six mutating sweeps and the wake-queue drain are skipped.
 # The context and fleet-state digests
 # below are always read-only, so they run unconditionally in both modes.
 #
@@ -107,6 +113,8 @@ PRIMARY_HARNESS=$("$SCRIPT_DIR/fm-harness.sh" 2>/dev/null || printf unknown)
 . "$SCRIPT_DIR/fm-tasks-axi-lib.sh"
 # shellcheck source=bin/fm-afk-daemon-lib.sh
 . "$SCRIPT_DIR/fm-afk-daemon-lib.sh"
+# shellcheck source=bin/fm-hourly-lib.sh
+. "$SCRIPT_DIR/fm-hourly-lib.sh"
 
 STATUS_TAIL=${FM_SESSION_START_STATUS_TAIL:-5}
 case "$STATUS_TAIL" in ''|*[!0-9]*) STATUS_TAIL=5 ;; esac
@@ -304,6 +312,21 @@ else
   else
     printf '(no queued wakes)\n'
   fi
+fi
+
+# --- 3b. hourly passes ---------------------------------------------------
+# Arm the two session-lifetime hourly passes (the session review and the
+# cleanup sweep). Arming is durable schedule state only: the ONE live watcher
+# runs them on its existing slow poll, so this creates no second supervision
+# cycle and starts no process. Mutating, so it is skipped on the read-only
+# path like every other mutating step. bin/fm-hourly-lib.sh owns the mechanism.
+subsection "HOURLY PASSES"
+if [ "$READ_ONLY" -eq 1 ]; then
+  printf 'skipped (read-only session) - the session holding the lock owns them.\n'
+elif fm_hourly_arm "$STATE"; then
+  printf 'armed: an hourly review and an hourly cleanup run for the life of this session, and surface only when they have something worth acting on.\n'
+else
+  printf 'HOURLY_PASSES: could not arm (state directory not writable) - the hourly review and cleanup will not run this session.\n'
 fi
 
 # --- 4. supervision operating instructions ----------------------------------

@@ -20,8 +20,10 @@
 # Usage:
 #   fm-resource-check.sh              print one reading line, exit with its status
 #   fm-resource-check.sh --sweep      same, but probe crew liveness and refresh the
-#                                     cache. The watcher's slow sweep is the ONLY
-#                                     caller that may use it; see CEILING below.
+#                                     cache. The watcher's background probe cycle
+#                                     (bin/fm-resource-probe.sh, launched off the
+#                                     supervision main loop) is the ONLY caller
+#                                     that may use it; see CEILING below.
 #   fm-resource-check.sh --interval   print the resolved sweep interval in seconds
 #   fm-resource-check.sh --help
 #
@@ -40,21 +42,46 @@
 #
 # THRESHOLDS - this header owns them; docs/configuration.md owns the knobs:
 #   load per core     >= 4.0 critical, >= 2.0 degraded
-#   swap used         >= 80% critical, >= 50% degraded
+#   swap used         >= 80% critical, >= 50% degraded  (NON-Darwin only)
 #   available memory  <  1024 MB critical
 # The worst of the three decides the status.
 #
+# On Darwin the swap-used percentage is INFORMATIONAL ONLY and never classifies
+# the host. macOS uses fully dynamic swap: the swap file grows on demand, so a
+# high used/total ratio just means the current file is small relative to what is
+# paged, not that the host is starved. Keying pressure on that ratio produced
+# false degraded/critical readings with gigabytes of RAM still free. On Darwin,
+# memory pressure is keyed on AVAIL_MB alone (the <1024 MB critical floor below),
+# which is the genuine binding constraint there. The percentage stays in the
+# printed reading so the figure is still visible, it just drives no status. The
+# swap percentage remains a real signal on non-Darwin hosts with fixed-size swap,
+# so the >=80/>=50 thresholds are kept for them. The OS is resolved once from
+# uname -s, overridable for tests with FM_RESOURCE_OS.
+#
 # CEILING - the smaller of what memory and CPU support. Both components, and the
-# over-ceiling comparison that triggers the SHED line, are computed on ALL
-# running agents (ordinary crews plus persistent secondmates), so the two sides
-# of that comparison always share one basis; only the shed COUNT is capped at the
-# number of ordinary crews:
-#   by memory: one live crew per 1024 MB of available memory, floor 1. Memory is
-#              the binding constraint on a laptop-class host, and available
+# over-ceiling comparison that triggers the SHED line, are computed on the ACTIVE
+# running agents (ordinary crews plus persistent secondmates that have work in
+# flight), so the two sides of that comparison always share one basis; only the
+# shed COUNT is capped at the number of ordinary crews:
+#   by memory: one active agent per 560 MB of available memory, floor 1. Memory
+#              is the binding constraint on a laptop-class host, and available
 #              memory deliberately excludes anything that only exists because the
 #              kernel is already swapping.
-#   by CPU:    the current live-agent count adjusted by load per core (+3 under
+#   by CPU:    the current ACTIVE-agent count adjusted by load per core (+3 under
 #              1.0, +1 under 2.0, -1 under 4.0, halved at or above 4.0), floor 1.
+#
+# The 560 MB figure is measured, not assumed. data/measure-ccstatusline-cost's
+# report (2026-07-24, five idle agents added to a 16 GB host, 20 samples over 60s
+# per condition) puts a working agent at 394-491 MB resident and an idle one at
+# ~290 MB decaying toward ~180 MB over hours. The previous 1024 MB per agent
+# over-charged even a working agent, and over-charged an idle one by roughly 3.5x.
+# 560 MB sits about 14% above the 491 MB top of the measured working range: still
+# headroom over a working agent, but trimmed from the earlier 640 MB (~30% over
+# that top) so the recommendation is less falsely conservative and hands the same
+# host a modestly higher ceiling (about 14% more agents for the same memory). The
+# report measured never-prompted sessions, so ~290 MB is a FLOOR for a
+# working-then-idle secondmate and context size is the variable that moves it; the
+# retained headroom is what covers that variation without over-charging.
 # Live agents are the RUNNING ones, and ONLY the watcher's slow sweep pays for
 # that answer. Under --sweep every state/*.meta is probed with bin/fm-backend.sh's
 # fm_backend_agent_alive, only a CONFIDENT `dead` verdict is excluded - so a meta
@@ -77,18 +104,28 @@
 # cached with the count so a partly probed count is never shown as a fully
 # verified one on any later synchronous reading either.
 #
-# CREWS vs PERSISTENT SECONDMATES - a kind=secondmate meta is a running agent and
-# real load, so it counts toward the reported live figure, toward the ceiling and
-# toward the overage, and the reading labels it separately. It is never a shed
-# candidate (AGENTS.md sections 7 and 8: an idle secondmate endpoint is healthy
-# and retirement is an explicit captain or main-firstmate decision), so the shed
-# COUNT alone is min(live agents - ceiling, ordinary crews) and no shed line is
-# printed when that is zero or less. A home whose only running agents are
-# persistent secondmates therefore never produces shed advice.
-# The reading names the all-agents total ("live agents 8 (4 crew(s) + 4
-# persistent secondmate(s))") next to a ceiling labelled in agents, so the number
-# the ceiling is compared against is on the line and the shed count below it
-# needs no conversion in the reader's head.
+# CREWS vs PERSISTENT SECONDMATES - a kind=secondmate meta is a running agent, so
+# it is always reported, but only a WORKING one is charged. Captain's ruling of
+# 2026-07-24: an idle persistent secondmate counts toward neither the ceiling nor
+# the overage, because the measurement above shows it costs no processor time, no
+# swap, and a memory footprint that decays with idleness. IDLE means that
+# secondmate's own home has no routed work in flight - no ordinary state/*.meta
+# under the home= it records - which is a file-only test that costs no probe and
+# is therefore safe on the synchronous path. That test reads the child home's
+# records without probing them, so a secondmate still holding a torn-down task's
+# record reads as working; like an unreadable home= it errs toward charging, and
+# the child home's own sweep is what clears it.
+# A secondmate is never a shed candidate either (AGENTS.md sections 7 and 8: an
+# idle secondmate endpoint is healthy and retirement is an explicit captain or
+# main-firstmate decision), so the shed COUNT is min(active agents - ceiling,
+# ordinary crews) and no shed line is printed when that is zero or less. A home
+# whose only running agents are persistent secondmates therefore never produces
+# shed advice.
+# Nothing becomes invisible by ceasing to be charged: the reading still names the
+# all-agents total and then splits it ("live agents 8 = 6 active (4 crew(s) + 2
+# persistent secondmate(s)) + 2 idle secondmate(s)"), next to a ceiling labelled
+# in active agents, so the number the ceiling is compared against is on the line
+# and the shed count below it needs no conversion in the reader's head.
 #
 # Every OTHER caller (bin/fm-spawn.sh before a dispatch, bin/fm-session-start.sh
 # inside its fast digest) READS that cache and never probes, so a wedged backend
@@ -111,8 +148,10 @@
 # FM_RESOURCE_RAM_GB, FM_RESOURCE_LOAD1, FM_RESOURCE_AVAIL_MB,
 # FM_RESOURCE_SWAP_USED_MB, FM_RESOURCE_SWAP_TOTAL_MB, FM_RESOURCE_LIVE, and
 # FM_RESOURCE_PROC_ROOT (alternate /proc root). FM_RESOURCE_LIVE injects the
-# ordinary-crew count, with no persistent secondmates. Injection is a test seam,
-# not an operating knob: an injected reading is used verbatim and never probed for.
+# ordinary-crew count, with no persistent secondmates. FM_RESOURCE_OS overrides
+# the uname -s the swap classification keys on, so the Darwin informational-only
+# swap behavior is testable on any host. Injection is a test seam, not an
+# operating knob: an injected reading is used verbatim and never probed for.
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -318,9 +357,10 @@ probe_verdict() {  # <backend> <target> <seconds>
 }
 
 # The live-agent readers run inside a command substitution, so they cannot set a
-# variable for the caller: each prints "<note><TAB><crews><TAB><secondmates>" and
-# the caller splits it. The note comes first because a command substitution
-# strips trailing whitespace; it is empty for a verified count and names the
+# variable for the caller: each prints
+# "<note><TAB><crews><TAB><active-secondmates><TAB><idle-secondmates>" and the
+# caller splits it. The note comes first because a command substitution strips
+# trailing whitespace; it is empty for a verified count and names the
 # degradation otherwise, so a recorded-work count is never displayed as a
 # verified one.
 UNVERIFIED_NOTE=' (recorded work, liveness unverified)'
@@ -328,17 +368,36 @@ PARTIAL_NOTE=' (liveness partly unverified, probe budget spent)'
 
 is_secondmate_meta() { grep -q '^kind=secondmate$' "$1" 2>/dev/null; }
 
+# secondmate_idle <meta-file>: true when that secondmate's own home has no routed
+# work in flight. Routed work is recorded in the secondmate's home exactly as it
+# is here, one state/<id>.meta per dispatched task, so the presence of an
+# ordinary meta under its home= is the whole test. It reads files only and never
+# touches a backend, which is what makes it safe on the synchronous dispatch and
+# session-start paths. A meta with no readable home= is charged as active, so an
+# unreadable record can only over-report load, never hide it.
+secondmate_idle() {  # <meta-file>
+  local home child
+  home=$(sed -n 's/^home=//p' "$1" 2>/dev/null | head -n 1)
+  [ -n "$home" ] || return 1
+  for child in "$home"/state/*.meta; do
+    [ -f "$child" ] || continue
+    is_secondmate_meta "$child" && continue
+    return 1
+  done
+  return 0
+}
+
 count_metas() {  # <note>
-  local meta crews=0 smates=0
+  local meta crews=0 smates=0 idle=0
   for meta in "$STATE"/*.meta; do
     [ -f "$meta" ] || continue
     if is_secondmate_meta "$meta"; then
-      smates=$((smates + 1))
+      if secondmate_idle "$meta"; then idle=$((idle + 1)); else smates=$((smates + 1)); fi
     else
       crews=$((crews + 1))
     fi
   done
-  printf '%s\t%s\t%s' "$1" "$crews" "$smates"
+  printf '%s\t%s\t%s\t%s' "$1" "$crews" "$smates" "$idle"
 }
 
 mtime_of() {  # epoch seconds of <file>, empty when unreadable
@@ -362,7 +421,7 @@ LIVE_CACHE="$STATE/.resource-live"
 # The cache is replaced atomically, through a temp file in the same directory,
 # because the synchronous callers read it with no coordination and must never
 # observe a half-written record.
-write_live_cache() {  # <crews> <secondmates> <partial>
+write_live_cache() {  # <crews> <active-secondmates> <idle-secondmates> <partial>
   local tmp
   [ -d "$STATE" ] || return 0
   tmp=$(mktemp "$LIVE_CACHE.XXXXXX" 2>/dev/null) || return 0
@@ -372,7 +431,7 @@ write_live_cache() {  # <crews> <secondmates> <partial>
   trap 'rm -f "$CACHE_TMP" 2>/dev/null' EXIT
   trap 'rm -f "$CACHE_TMP" 2>/dev/null; exit 130' INT
   trap 'rm -f "$CACHE_TMP" 2>/dev/null; exit 143' TERM
-  if printf '%s %s %s\n' "$1" "$2" "$3" > "$tmp" 2>/dev/null; then
+  if printf '%s %s %s %s\n' "$1" "$2" "$3" "$4" > "$tmp" 2>/dev/null; then
     mv -f "$tmp" "$LIVE_CACHE" 2>/dev/null || rm -f "$tmp" 2>/dev/null || true
   else
     rm -f "$tmp" 2>/dev/null || true
@@ -387,7 +446,7 @@ write_live_cache() {  # <crews> <secondmates> <partial>
 # says the count is only partly verified. Each probe gets only the budget that is
 # left, so the last probe cannot run past the deadline.
 sweep_live_crews() {
-  local meta backend target crews=0 smates=0 deadline left partial='' note='' probe
+  local meta backend target crews=0 smates=0 idle=0 deadline left partial='' note='' probe
   # shellcheck source=bin/fm-backend.sh
   . "$FM_ROOT/bin/fm-backend.sh" 2>/dev/null || {
     count_metas "$UNVERIFIED_NOTE"
@@ -407,33 +466,78 @@ sweep_live_crews() {
       fi
     fi
     if is_secondmate_meta "$meta"; then
-      smates=$((smates + 1))
+      if secondmate_idle "$meta"; then idle=$((idle + 1)); else smates=$((smates + 1)); fi
     else
       crews=$((crews + 1))
     fi
   done
   [ -z "$partial" ] || note=$PARTIAL_NOTE
-  write_live_cache "$crews" "$smates" "${partial:-0}"
-  printf '%s\t%s\t%s' "$note" "$crews" "$smates"
+  write_live_cache "$crews" "$smates" "$idle" "${partial:-0}"
+  printf '%s\t%s\t%s\t%s' "$note" "$crews" "$smates" "$idle"
+}
+
+# clamp_cached_to_metas: lower a cached count so it can never claim more agents in
+# a class than that class still has meta files. A live agent always has a meta, so
+# the moment teardown removes one the cached count that still counts it is simply
+# wrong; the sweep that would refresh it may be up to two intervals away. This uses
+# only count_metas' cheap file test, never a backend probe, so the synchronous path
+# stays cheap while a torn-down worker stops inflating the count immediately. It
+# only ever LOWERS: a crew spawned after the last sweep keeps the existing
+# behaviour of not being counted until the next sweep, which errs toward
+# under-reporting rather than over-reporting. Reads and rewrites crews/smates/idle
+# in the caller's scope; the secondmate overage is capped on the total and trimmed
+# idle-first, so a still-present secondmate whose idle/active class merely flipped
+# since the sweep is never dropped, only a genuinely removed secondmate meta is.
+clamp_cached_to_metas() {
+  local rest nums fcrews fsmates fidle scap stot drop
+  # count_metas prefixes a note field; parse the tab record by expansion rather
+  # than read, because tab is IFS whitespace and read would collapse the empty
+  # leading note into the first number (the same reason the main body splits the
+  # live reading with %%/# below).
+  rest=$(count_metas '')
+  nums=${rest#*$'\t'}
+  fcrews=${nums%%$'\t'*}
+  nums=${nums#*$'\t'}
+  fsmates=${nums%%$'\t'*}
+  fidle=${nums##*$'\t'}
+  is_uint "${fcrews:-}" && is_uint "${fsmates:-}" && is_uint "${fidle:-}" || return 0
+  [ "$crews" -le "$fcrews" ] || crews=$fcrews
+  scap=$(( fsmates + fidle ))
+  stot=$(( smates + idle ))
+  if [ "$stot" -gt "$scap" ]; then
+    drop=$(( stot - scap ))
+    if [ "$idle" -ge "$drop" ]; then
+      idle=$(( idle - drop ))
+    else
+      drop=$(( drop - idle )); idle=0; smates=$(( smates - drop ))
+    fi
+  fi
 }
 
 # cached_live_crews: the synchronous path. Reads the sweep's verdict and NEVER
 # probes, so a wedged backend cannot delay a dispatch or a session start. The
 # sweep's partly-probed marker is cached with the counts and replayed here, so a
-# budget-truncated count is never presented as a fully verified one.
+# budget-truncated count is never presented as a fully verified one. The cached
+# count is clamped to the current meta files (clamp_cached_to_metas) so a worker
+# torn down since the sweep stops inflating the count on the very next reading,
+# without paying for a probe.
+# A record written before the idle-secondmate split carries three fields, so it
+# fails the four-field shape below and degrades to the honest recorded-work count
+# rather than being misread; the next sweep replaces it.
 cached_live_crews() {
-  local cached age m now crews smates partial
+  local cached age m now crews smates idle partial
   cached=$(cat "$LIVE_CACHE" 2>/dev/null || true)
   m=$(mtime_of "$LIVE_CACHE")
   now=$(date +%s)
   age=999999
   case "$m" in ''|*[!0-9]*) : ;; *) age=$(( now - m )) ;; esac
-  read -r crews smates partial <<<"$cached"
-  if is_uint "${crews:-}" && is_uint "${smates:-}" \
+  read -r crews smates idle partial <<<"$cached"
+  if is_uint "${crews:-}" && is_uint "${smates:-}" && is_uint "${idle:-}" \
     && [ "$age" -lt $(( $(resolve_interval) * 2 )) ]; then
+    clamp_cached_to_metas
     case "${partial:-}" in
-      0) printf '\t%s\t%s' "$crews" "$smates"; return 0 ;;
-      1) printf '%s\t%s\t%s' "$PARTIAL_NOTE" "$crews" "$smates"; return 0 ;;
+      0) printf '\t%s\t%s\t%s' "$crews" "$smates" "$idle"; return 0 ;;
+      1) printf '%s\t%s\t%s\t%s' "$PARTIAL_NOTE" "$crews" "$smates" "$idle"; return 0 ;;
     esac
   fi
   count_metas "$UNVERIFIED_NOTE"
@@ -443,7 +547,7 @@ read_live_crews() {
   local v
   v=${FM_RESOURCE_LIVE:-}
   if [ -n "$v" ]; then
-    printf '\t%s\t%s' "$v" 0
+    printf '\t%s\t%s\t%s' "$v" 0 0
     return 0
   fi
   if [ "$SWEEP" = 1 ]; then
@@ -463,12 +567,14 @@ LIVE_READING=$(read_live_crews)
 LIVE_NOTE=${LIVE_READING%%$'\t'*}
 LIVE_COUNTS=${LIVE_READING#*$'\t'}
 CREWS=${LIVE_COUNTS%%$'\t'*}
-SECONDMATES=${LIVE_COUNTS##*$'\t'}
+LIVE_REST=${LIVE_COUNTS#*$'\t'}
+SECONDMATES=${LIVE_REST%%$'\t'*}
+IDLE_SECONDMATES=${LIVE_REST##*$'\t'}
 
 if ! is_uint "$CORES" || [ "$CORES" -lt 1 ] \
   || ! is_num "$LOAD1" || ! is_num "$AVAIL_MB" \
   || ! is_num "$SWAP_USED" || ! is_num "$SWAP_TOTAL" \
-  || ! is_uint "$CREWS" || ! is_uint "$SECONDMATES"; then
+  || ! is_uint "$CREWS" || ! is_uint "$SECONDMATES" || ! is_uint "$IDLE_SECONDMATES"; then
   printf 'resources: unknown - no kernel-wide load/memory/swap reading is available on this host\n'
   exit 3
 fi
@@ -492,16 +598,30 @@ case "$(awk -v l="$LOAD_PER_CORE_EXACT" 'BEGIN{print (l >= 4) ? "crit" : ((l >= 
   crit) STATUS=critical; RC=2 ;;
   deg)  STATUS=degraded; RC=1 ;;
 esac
-SWAP_CLASS=$(awk -v p="$SWAP_PCT_EXACT" 'BEGIN{print (p >= 80) ? "crit" : ((p >= 50) ? "deg" : "ok")}')
+# macOS uses fully dynamic swap, so the swap-used percentage is not a memory
+# pressure signal there (see the header). On Darwin the class is forced to ok so
+# the percentage stays informational-only and memory pressure is keyed on
+# AVAIL_MB alone; other platforms keep the >=80/>=50 percentage thresholds.
+RESOURCE_OS="${FM_RESOURCE_OS:-$(uname -s)}"
+if [ "$RESOURCE_OS" = Darwin ]; then
+  SWAP_CLASS=ok
+else
+  SWAP_CLASS=$(awk -v p="$SWAP_PCT_EXACT" 'BEGIN{print (p >= 80) ? "crit" : ((p >= 50) ? "deg" : "ok")}')
+fi
 if [ "$SWAP_CLASS" = crit ] || [ "$AVAIL_MB" -lt 1024 ]; then
   STATUS=critical; RC=2
 elif [ "$SWAP_CLASS" = deg ] && [ "$RC" -lt 1 ]; then
   STATUS=degraded; RC=1
 fi
 
-LIVE=$(( CREWS + SECONDMATES ))
-BY_MEM=$(awk -v a="$AVAIL_MB" 'BEGIN{c=int(a/1024); print (c < 1 ? 1 : c)}')
-BY_CPU=$(awk -v l="$LOAD_PER_CORE_EXACT" -v n="$LIVE" 'BEGIN{
+# ACTIVE is the charged basis; LIVE is the reported total. An idle persistent
+# secondmate is in the second and not the first (see the header's CREWS vs
+# PERSISTENT SECONDMATES section).
+ACTIVE=$(( CREWS + SECONDMATES ))
+LIVE=$(( ACTIVE + IDLE_SECONDMATES ))
+PER_AGENT_MB=560
+BY_MEM=$(awk -v a="$AVAIL_MB" -v p="$PER_AGENT_MB" 'BEGIN{c=int(a/p); print (c < 1 ? 1 : c)}')
+BY_CPU=$(awk -v l="$LOAD_PER_CORE_EXACT" -v n="$ACTIVE" 'BEGIN{
   if (l < 1.0) print n+3;
   else if (l < 2.0) print n+1;
   else if (l < 4.0) print (n-1 < 1 ? 1 : n-1);
@@ -509,18 +629,21 @@ BY_CPU=$(awk -v l="$LOAD_PER_CORE_EXACT" -v n="$LIVE" 'BEGIN{
 if [ "$BY_MEM" -lt "$BY_CPU" ]; then CEILING=$BY_MEM; else CEILING=$BY_CPU; fi
 [ "$CEILING" -ge 1 ] || CEILING=1
 
-# The all-agents total is named first, because it is the figure the ceiling and
-# the overage are measured on; crews and persistent secondmates are then broken
-# out, because only crews are ever shed candidates (see the header).
+# The all-agents total is named first so nothing disappears from the reading just
+# because it stopped being charged, then the active figure the ceiling and the
+# overage are actually measured on, then its crew and secondmate breakdown,
+# because only crews are ever shed candidates (see the header).
 SECONDMATE_NOTE=
 [ "$SECONDMATES" -eq 0 ] || SECONDMATE_NOTE=" + $SECONDMATES persistent secondmate(s)"
+IDLE_NOTE=
+[ "$IDLE_SECONDMATES" -eq 0 ] || IDLE_NOTE=" + $IDLE_SECONDMATES idle secondmate(s)"
 
-printf 'resources: %s | load %s (%sx over %s cores) | avail %s MB of %s GB | swap %s%% of %sM | live agents %s (%s crew(s)%s)%s | recommended ceiling %s agents\n' \
+printf 'resources: %s | load %s (%sx over %s cores) | avail %s MB of %s GB | swap %s%% of %sM | live agents %s = %s active (%s crew(s)%s)%s%s | recommended ceiling %s active agents\n' \
   "$STATUS" "$LOAD1" "$LOAD_PER_CORE" "$CORES" "$AVAIL_MB" "$RAM_GB" "$SWAP_PCT" "$SWAP_TOTAL" \
-  "$LIVE" "$CREWS" "$SECONDMATE_NOTE" "$LIVE_NOTE" "$CEILING"
+  "$LIVE" "$ACTIVE" "$CREWS" "$SECONDMATE_NOTE" "$IDLE_NOTE" "$LIVE_NOTE" "$CEILING"
 
-if [ "$RC" -ne 0 ] && [ "$LIVE" -gt "$CEILING" ]; then
-  SHED=$(( LIVE - CEILING ))
+if [ "$RC" -ne 0 ] && [ "$ACTIVE" -gt "$CEILING" ]; then
+  SHED=$(( ACTIVE - CEILING ))
   [ "$SHED" -le "$CREWS" ] || SHED=$CREWS
   [ "$SHED" -lt 1 ] || printf 'resources: SHED %s crew(s) - stop the heaviest test and browser runs first, they cost far more than an idle agent\n' \
     "$SHED"

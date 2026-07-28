@@ -4,9 +4,64 @@ set -u
 
 # shellcheck source=tests/lib.sh
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+# shellcheck source=bin/fm-mutex-lib.sh
+. "$ROOT/bin/fm-mutex-lib.sh"
 
 CHECKPOINT="$ROOT/bin/fm-watch-checkpoint.sh"
 TMP_ROOT=$(fm_test_tmproot fm-watch-checkpoint)
+
+# These tests race a real watcher process: the checkpoint has to boot fm-watch.sh
+# (library sourcing, the PR-check migration scan, lock acquisition) before it can
+# see anything, and that boot cost is unbounded on a loaded host. So no assertion
+# here may depend on an elapsed-time guess.
+#
+# Two rules keep them deterministic:
+#   1. A test that must inject a signal AFTER the watcher is live waits for the
+#      watcher's own liveness beacon (state/.last-watcher-beat, touched at the top
+#      of every poll cycle) instead of sleeping a guessed number of seconds.
+#   2. A test that expects the checkpoint to WAKE passes a generous --seconds
+#      ceiling. The ceiling is a hang guard, not a timing assumption: the
+#      checkpoint exits the moment the wake lands, so a green run never spends it
+#      and a slow host just takes longer instead of failing.
+# Only the quiet test deliberately keeps a short window, because its assertion is
+# that nothing actionable happened - the short bound is the thing under test.
+WAKE_CEILING_SECONDS=90
+
+# wait_for <path> <deadline-seconds> - block until <path> exists. Returns 1 on
+# deadline so a caller can fail with a real message instead of hanging the suite.
+wait_for() {
+  local path=$1 deadline=$2 waited=0
+  while [ ! -e "$path" ]; do
+    [ "$waited" -lt "$((deadline * 20))" ] || return 1
+    sleep 0.05
+    waited=$((waited + 1))
+  done
+  return 0
+}
+
+# assert_no_live_watch_lock <home> <message> - the durable property after a
+# timed-out checkpoint is that the singleton lock is RE-ACQUIRABLE, i.e. a fresh
+# arm can actually take it, not that the lock directory was already reaped by the
+# instant the checkpoint returned. Those are different claims: the checkpoint's
+# timeout signals the watcher and the watcher's own EXIT trap releases the lock,
+# so on a loaded host the release can land microseconds after the signal returns.
+# So assert the property that matters by really acquiring the lock through
+# bin/fm-mutex-lib.sh's fm_lock_try_acquire (the same path the next arm uses,
+# including its dead-holder steal) and releasing it again, waiting on that
+# condition instead of asserting an instantaneous absence that races the signal.
+# A regression where the watcher stops releasing its lock still fails here,
+# because a live holder blocks acquisition until the deadline.
+assert_no_live_watch_lock() {
+  local home=$1 msg=$2 waited=0
+  local lockdir="$home/state/.watch.lock"
+  while ! fm_lock_try_acquire "$lockdir"; do
+    [ "$waited" -lt $((WAKE_CEILING_SECONDS * 20)) ] \
+      || fail "$msg (lock still held by pid ${FM_LOCK_HELD_PID:-unknown})"
+    sleep 0.05
+    waited=$((waited + 1))
+  done
+  fm_lock_release "$lockdir"
+}
 
 make_home() {
   local name=$1 home
@@ -24,21 +79,32 @@ test_quiet_checkpoint_exits_124_cleanly() {
   FM_HOME="$home" FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 "$CHECKPOINT" --seconds 1 >"$out" 2>"$err" || status=$?
   expect_code 124 "$status" "quiet checkpoint exit"
   assert_contains "$(cat "$out")" "checkpoint: no actionable wake within 1s" "quiet checkpoint line missing"
-  assert_absent "$home/state/.watch.lock/pid" "watch lock pid survived quiet checkpoint timeout"
+  assert_no_live_watch_lock "$home" "a live watcher survived the quiet checkpoint timeout"
   pass "quiet checkpoint exits 124 with a clean checkpoint line and no live lock"
 }
 
 test_signal_passes_through_and_exits_zero() {
-  local home out err status drained
+  local home out err status drained nobeat
   home=$(make_home signal)
   out="$home/out.txt"
   err="$home/err.txt"
+  nobeat="$home/no-watcher-beat"
+  # Write the status only once the watcher is provably in its poll loop, so the
+  # wake is a real mid-checkpoint signal rather than a bet on watcher boot time.
+  # If the beacon never appears the watcher never reached its poll loop, and that
+  # is the real cause - record it so the assertion below reports it instead of a
+  # generic exit-code mismatch.
   (
-    sleep 1
+    if ! wait_for "$home/state/.last-watcher-beat" "$WAKE_CEILING_SECONDS"; then
+      printf 'no watcher liveness beacon within %ss\n' "$WAKE_CEILING_SECONDS" > "$nobeat"
+      exit 0
+    fi
     printf 'done: synthetic wake\n' > "$home/state/demo.status"
   ) &
   status=0
-  FM_HOME="$home" FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 "$CHECKPOINT" --seconds 8 >"$out" 2>"$err" || status=$?
+  FM_HOME="$home" FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 "$CHECKPOINT" --seconds "$WAKE_CEILING_SECONDS" >"$out" 2>"$err" || status=$?
+  wait
+  [ ! -e "$nobeat" ] || fail "watcher never reached its poll loop: $(cat "$nobeat")"
   expect_code 0 "$status" "signal checkpoint exit"
   assert_contains "$(cat "$out")" "signal:" "signal wake was not passed through"
   drained=$(FM_HOME="$home" "$ROOT/bin/fm-wake-drain.sh")
@@ -62,7 +128,7 @@ SH
   FM_HOME="$home" "$ROOT/bin/fm-check-register.sh" env-check >/dev/null \
     || fail "could not register checkpoint custom check"
   status=0
-  FM_HOME="$home" FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=1 "$CHECKPOINT" --seconds 5 >"$out" 2>"$err" || status=$?
+  FM_HOME="$home" FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=1 "$CHECKPOINT" --seconds "$WAKE_CEILING_SECONDS" >"$out" 2>"$err" || status=$?
   expect_code 0 "$status" "check checkpoint exit"
   assert_contains "$(cat "$out")" "check:" "check wake was not passed through"
   assert_contains "$(cat "$out")" "FM_CHECK_INTERVAL=1" "watcher environment was not preserved"
@@ -80,7 +146,8 @@ test_existing_singleton_watcher_is_not_success() {
   mkdir "$home/state/.watch.lock"
   printf '%s\n' "$$" > "$home/state/.watch.lock/pid"
   status=0
-  FM_HOME="$home" FM_GUARD_GRACE=300 "$CHECKPOINT" --seconds 5 >"$out" 2>"$err" || status=$?
+  # Same ceiling rule: the refusal is immediate, so the bound only guards a hang.
+  FM_HOME="$home" FM_GUARD_GRACE=300 "$CHECKPOINT" --seconds "$WAKE_CEILING_SECONDS">"$out" 2>"$err" || status=$?
   expect_code 1 "$status" "singleton checkpoint exit"
   assert_contains "$(cat "$out")" "watcher: already running" "singleton watcher output was not passed through"
   assert_contains "$(cat "$err")" "outside this foreground checkpoint" "singleton watcher failure was not explained"

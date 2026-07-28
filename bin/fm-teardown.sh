@@ -32,10 +32,24 @@
 # A gh lookup error falls back to the content check; if that is also inconclusive,
 # teardown refuses rather than risk discarding unlanded work.
 # Uncommitted changes are never landed.
+# Work is LANDED as well when HEAD's exact commit is CONTAINED in a default branch
+# that outlives this worktree - proved by git merge-base --is-ancestor, never by
+# content equivalence (head_contained_in_default_branch). Two forms count: the
+# freshly fetched refs/remotes/origin/<default>, and the project clone's own
+# refs/heads/<default> when this worktree is a LINKED worktree of that clone, so the
+# ref and its commits live in an object store teardown does not remove. This is what
+# releases a lane that finished on a detached HEAD or a scratch branch name after
+# landing on origin, and one whose approved landing target is local - the firstmate
+# repo under the captain's merge-locally rule. It narrows a false refusal rather than
+# widening "landed": a standalone clone's own default branch never counts, because it
+# dies with the worktree, and a commit absent from both forms still refuses.
 # direct-push projects additionally require positive proof that the task branch
 # exists on origin (git ls-remote origin refs/heads/<branch>), because that mode
 # has no PR or merge confirmation and the no-mistakes pipeline's internal
 # validation remote never counts as landed. An ls-remote failure refuses too.
+# That branch-name probe is skipped only when the containment test above already
+# proved the exact commit is in a surviving default branch, where a branch-name
+# lookup can prove nothing more.
 # local-only projects additionally accept work merged into the local default
 # branch (firstmate performs that merge after configured approval) as a fallback
 # for the common case where there is no remote at all.
@@ -405,6 +419,67 @@ content_in_default() {
   [ "$merged_tree" = "$default_tree" ]
 }
 
+# Absolute, symlink-resolved path of one of a repository's git directories
+# ("--git-dir" or "--git-common-dir"), or non-zero when it cannot be resolved.
+# git reports these relative to the queried directory in some layouts.
+git_dir_abs() {
+  local dir=$1 what=$2 path base
+  [ -n "$dir" ] && [ -d "$dir" ] || return 1
+  path=$(git -C "$dir" rev-parse "$what" 2>/dev/null) || return 1
+  [ -n "$path" ] || return 1
+  case "$path" in
+    /*) ;;
+    *)
+      base=$(canonical_existing_dir "$dir") || return 1
+      path="$base/$path"
+      ;;
+  esac
+  canonical_existing_dir "$path"
+}
+
+# Is this task worktree a LINKED git worktree of the project clone, so that refs and
+# commits held by the clone outlive the worktree teardown removes? Non-zero for a
+# standalone clone (whose refs die with it) and for the clone's own primary checkout
+# (which teardown must never treat as a disposable worktree).
+worktree_shares_project_repository() {
+  local wt_git wt_common proj_common
+  [ -n "$PROJ" ] && [ -d "$PROJ" ] || return 1
+  wt_git=$(git_dir_abs "$WT" --git-dir) || return 1
+  wt_common=$(git_dir_abs "$WT" --git-common-dir) || return 1
+  proj_common=$(git_dir_abs "$PROJ" --git-common-dir) || return 1
+  [ "$wt_git" != "$wt_common" ] || return 1
+  [ "$wt_common" = "$proj_common" ]
+}
+
+# Is HEAD's exact commit already contained in the project's default branch, in a form
+# that SURVIVES this teardown? Two accepted forms, both proved by exact commit
+# reachability (git merge-base --is-ancestor), never by content equivalence:
+#   1. the freshly fetched origin copy, refs/remotes/origin/<default>; and
+#   2. the project clone's own refs/heads/<default>, accepted ONLY when this worktree
+#      is a linked worktree of that clone, so the ref and the commit it reaches live
+#      in an object store teardown does not remove.
+# Form 1 answers the lane that landed on origin and left a detached HEAD or a scratch
+# branch name behind: the name is absent from origin but the commit is origin's own
+# default branch, so nothing is lost. Form 2 answers a repo whose approved landing
+# target is local - firstmate's own repo under the captain's merge-locally rule -
+# where the work is merged into local main and origin has not seen it yet.
+# This is a containment test, not a relaxation of the remote test: form 1 is still
+# tried first, form 2 only counts a ref that outlives the worktree, and a commit
+# absent from both still returns non-zero so the caller refuses.
+head_contained_in_default_branch() {
+  local name head
+  head=$(git -C "$WT" rev-parse --verify HEAD 2>/dev/null) || return 1
+  name=$(default_branch) || return 1
+  if git -C "$WT" remote get-url origin >/dev/null 2>&1 \
+    && git -C "$WT" fetch --quiet origin "+refs/heads/$name:refs/remotes/origin/$name" >/dev/null 2>&1 \
+    && git -C "$WT" merge-base --is-ancestor "$head" "refs/remotes/origin/$name" 2>/dev/null; then
+    return 0
+  fi
+  worktree_shares_project_repository || return 1
+  git -C "$WT" rev-parse --quiet --verify "refs/heads/$name^{commit}" >/dev/null 2>&1 || return 1
+  git -C "$WT" merge-base --is-ancestor "$head" "refs/heads/$name" 2>/dev/null
+}
+
 # Has the worktree's committed work actually LANDED, though its commits are not
 # reachable from any remote-tracking branch? True when a merged PR proves the
 # current local work is contained in the PR head, OR the content is already in the
@@ -768,12 +843,15 @@ validate_worktree_teardown_safety() {
   elif [ -n "$unpushed" ]; then
     worktree_safety_branch "$WT"
     branch=$TEARDOWN_WORKTREE_BRANCH_FOR_SAFETY
-    # Release when the work has LANDED (merged) OR the branch is fully pushed to its
-    # own origin ref: a pushed branch is durable on the remote, so the local copy is
-    # disposable even before it merges. The merge queue (recorded from the main flow)
-    # keeps the released-but-unmerged branch visible. A branch with commits absent
-    # from its remote ref still fails both checks and refuses.
-    if ! work_is_landed "$branch" && ! branch_fully_pushed_to_origin "$branch"; then
+    # Release when the work has LANDED (merged), OR the branch is fully pushed to its
+    # own origin ref, OR HEAD's exact commit is already contained in a default branch
+    # that outlives this worktree. A pushed branch is durable on the remote, so the
+    # local copy is disposable even before it merges; the merge queue (recorded from
+    # the main flow) keeps the released-but-unmerged branch visible. The containment
+    # test adds the locally-landed case, where the approved landing target is the
+    # clone's own default branch. Work absent from all three still refuses.
+    if ! work_is_landed "$branch" && ! branch_fully_pushed_to_origin "$branch" \
+      && ! head_contained_in_default_branch; then
       echo "REFUSED: worktree $WT has work not on any remote and not landed." >&2
       printf 'unpushed commits:\n%s\n' "$unpushed" >&2
       echo "Push the branch, land its PR, or get the captain's explicit OK to discard, then --force." >&2
@@ -784,7 +862,12 @@ validate_worktree_teardown_safety() {
   # direct-push has no PR or merge confirmation to catch a skipped push, and the
   # no-mistakes pipeline's internal validation remote never counts as landed, so
   # require positive proof that the branch reached origin.
-  if [ "$MODE" = direct-push ]; then
+  # The branch-name probe below is skipped only when HEAD's exact commit is already
+  # contained in a default branch that survives teardown: the work has demonstrably
+  # landed, so looking its branch name up on origin can prove nothing further. That
+  # is the case for a lane that finished on a detached HEAD or a scratch branch, and
+  # for one that landed by merging rather than by pushing this branch name.
+  if [ "$MODE" = direct-push ] && ! head_contained_in_default_branch; then
     local origin_sha head_sha
     worktree_safety_branch "$WT"
     branch=$TEARDOWN_WORKTREE_BRANCH_FOR_SAFETY
@@ -1162,6 +1245,19 @@ fi
 
 if [ "$KIND" = secondmate ] && [ "$FORCE" = "--force" ]; then
   cleanup_firstmate_home_children "$HOME_PATH"
+fi
+
+# Ledger-wide backstop against the retention-loss bug: a teardown is immediately
+# followed by a `tasks-axi done` whose auto-prune can bury a captain hold that was
+# closed without an answer. The per-scout `verify` above never sees a sibling hold, so
+# run the fail-closed `guard` across the whole backlog and archive before proceeding.
+if [ "$FORCE" != "--force" ] && fm_tasks_axi_backend_available "$CONFIG"; then
+  if ! FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" FM_DATA_OVERRIDE="$DATA" \
+      FM_CONFIG_OVERRIDE="$CONFIG" "$SCRIPT_DIR/fm-decision-hold.sh" guard; then
+    echo "REFUSED: an unanswered captain decision hold is closed in the backlog or archive." >&2
+    echo "Restore it with bin/fm-decision-hold.sh guard --restore before tearing down and pruning." >&2
+    exit 1
+  fi
 fi
 
 if [ "$KIND" = scout ] && [ "$FORCE" != "--force" ]; then

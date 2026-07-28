@@ -23,6 +23,17 @@ For an open keyed status decision, it appends a `captain-held [key=<key>]: ...` 
 Scout teardown calls the script's read-only `verify` subcommand after checking for the report and before removing any source state.
 The `--force` path remains the explicit captain-approved discard escape hatch.
 
+The `guard` subcommand is the ledger-wide retention-loss backstop.
+A captain decision hold is created with the sentinel body line `State: awaiting captain decision.`, and only `resolve` replaces the whole body with a `Resolution recorded by fm-decision-hold.` record.
+So a hold that is Done while still bearing the sentinel, and carrying no resolution record, was closed by a bare `tasks-axi done` without a captain answer.
+`guard` reads the active backlog and the retention archive directly and fails closed when any kind `captain` item is in that state, because tasks-axi cannot address an item once retention pruning has moved it into the archive file (the archive is a flat, non-backlog file).
+Detection is pure file reading and needs no tasks-axi; only `--restore` mutates, reopening and re-holding an active-backlog offender and reporting an archived offender for manual un-archiving.
+`fm-teardown.sh` runs the read-only `guard` as a fail-closed gate before its own close-and-prune reminder, the closest firstmate-owned point ahead of the pruning `tasks-axi done`; `verify` alone could not catch this because it only inspects the torn-down origin's own inventory, never a sibling hold being buried.
+
+The `hold` subcommand keys "already durably resolved" off the resolution record, not the tasks-axi Done flag.
+This resolves a former contradiction where `hold` reported a bare-`done` hold as already resolved while `verify_hold_durable` reported the same id as neither held nor durably resolved.
+`hold` now recovers an active Done-but-unanswered hold by reopening it, so re-registering a lost decision restores it instead of refusing.
+
 The `resolve` subcommand requires a decision file and at least one existing dependent task whose structured `blocked-by` edge points to the hold.
 It records the decision digest and routed task identities as a retry identity in the hold body, clears each dependency edge through tasks-axi, and marks the hold Done only after those writes succeed.
 An exact retry can finish a partial routing operation, while a changed decision or routed-task set is rejected.
@@ -43,6 +54,7 @@ The projection remains read-only and does not inspect historical prose.
 Verification date: 2026-07-14.
 Additional quoted `blocked_by` regression verification date: 2026-07-17.
 Plural blocker-readiness and mixed-home projection verification date: 2026-07-22.
+Retention-loss guard and hold/verify contradiction fix verification date: 2026-07-27.
 
 The focused end-to-end regression uses only synthetic `sample` identities and decision text.
 It begins with a completed investigation and visual review whose genuine unresolved choice exists only in the report.
@@ -54,6 +66,7 @@ The final verification commands and their exact summarized outputs follow.
 ```text
 $ bash tests/fm-decision-hold-lifecycle.test.sh
 ok - report-only unresolved decision is reproduced and completion refuses before loss
+ok - guard backstops the retention-loss bug across active and archived captain holds
 ok - non-forced scout teardown always requires durable inventory verification
 ok - captain holds are idempotent, distinct, teardown-safe, Bearings-visible, and durably routed before close
 ok - completion and verification validate origins before constructing paths

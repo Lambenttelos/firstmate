@@ -25,11 +25,22 @@
 # line, and every such line ends in either "re-arm to keep listening..." or
 # "- do not re-arm". Firstmate obeys that line rather than re-deriving the state:
 # re-arming after a "do not re-arm" exit is an immediate-exit loop, because those
-# exits mean this channel is not the one delivering. A genuine failure - an
-# unwritable state directory, an outbox that could not be READ at all, a delivery
-# that could not be acknowledged - exits non-zero instead of pretending the
-# channel is healthy. In particular, a failed read is never reported as an empty
-# outbox: it never gets an idle or nothing-pending line.
+# exits mean this channel is not the one delivering.
+#
+# A genuine OPERATIONAL failure - an outbox that could not be READ at all, a
+# delivery that could not be acknowledged, a lock that never came free - exits
+# NON-ZERO with a loud stderr diagnostic instead of pretending the channel is
+# healthy. In particular, a failed read is never reported as an empty outbox: it
+# never gets an idle or nothing-pending line. It still ends in its own re-arm
+# verdict, because records are pending and nothing else is listening for them, so
+# a mute exit would leave firstmate with no instruction and the channel unarmed -
+# the same unwatched silence this path exists to remove. Re-arm it once and report
+# the diagnostic; a second identical failure is a blocker for the captain, not a
+# loop to keep running.
+#
+# Argument and state-directory failures are the exception and stay mute: re-arming
+# with the same bad arguments, or against a state directory that cannot be
+# created, would loop without ever listening.
 #
 # LOCK CONTENTION. The outbox lock is held for short mutations by the daemon and
 # by any other reader, so a bounded acquire that simply times out is a transient
@@ -91,6 +102,29 @@ die() {
   exit 1
 }
 
+# An OPERATIONAL failure - the outbox could not be read, a delivery could not be
+# acknowledged, the lock never came free - still ends the run, but it must not end
+# it MUTE. Firstmate obeys this reader's final line to decide whether to arm it
+# again; a run that exits with only a stderr diagnostic leaves that decision
+# undefined, and the honest reading of "undefined" has historically been "do
+# nothing", which is exactly the unwatched channel this path exists to remove.
+# Records are still pending and nothing else is listening for them, so the verdict
+# is always re-arm. The exit stays non-zero and the diagnostic stays loud, so this
+# can never be mistaken for a healthy idle exit: it is deliberately not one of the
+# nothing-pending, idle, or delivered lines.
+#
+# The diagnostic is written FIRST so the verdict really is the final line even
+# when the caller merges both streams.
+#
+# Argument and state-directory failures deliberately keep the plain die above: a
+# reader re-armed with the same bad arguments, or against a state directory it
+# cannot create, would loop on the same failure without ever listening.
+die_operational() {
+  printf 'fm-afk-inbox: %s\n' "$*" >&2
+  printf 'afk-inbox: this run ended without delivering anything and any records stay pending; report the failure above and re-arm to keep listening\n'
+  exit 1
+}
+
 # Print and acknowledge everything pending, then announce what was delivered.
 # Returns 0 when something was delivered, 1 when the outbox was genuinely empty,
 # and 2 when the bounded outbox-lock acquire timed out - a retryable failure that
@@ -120,9 +154,9 @@ deliver() {
     1) LOCK_TIMEOUTS=0; return 1 ;;
     "$FM_AFK_OUTBOX_DELIVER_LOCK_TIMEOUT") return 2 ;;
     "$FM_AFK_OUTBOX_DELIVER_UNREADABLE")
-      die "the away-mode inbox could not be read (state directory unwritable, or the outbox lock is held); nothing was delivered and any records stay pending"
+      die_operational "the away-mode inbox could not be read (state directory unwritable, or the outbox lock is held); nothing was delivered and any records stay pending"
       ;;
-    *) die "delivered records could not be acknowledged; they stay pending and will be delivered again" ;;
+    *) die_operational "delivered records could not be acknowledged; they stay pending and will be delivered again" ;;
   esac
 }
 
@@ -138,7 +172,7 @@ away_mode_active() {
 note_lock_timeout() {
   LOCK_TIMEOUTS=$((LOCK_TIMEOUTS + 1))
   if [ "$LOCK_TIMEOUTS" -ge "$LOCK_TIMEOUT_MAX" ]; then
-    die "the away-mode inbox lock $(fm_afk_outbox_lock_file "$STATE") could not be acquired in $LOCK_TIMEOUTS consecutive attempts; nothing was delivered and any records stay pending"
+    die_operational "the away-mode inbox lock $(fm_afk_outbox_lock_file "$STATE") could not be acquired in $LOCK_TIMEOUTS consecutive attempts; nothing was delivered and any records stay pending"
   fi
 }
 
@@ -178,7 +212,7 @@ main() {
   # timeout counted.
   if [ "$deliver_rc" -eq 2 ]; then
     [ "$ONCE" -eq 0 ] \
-      || die "the away-mode inbox lock $(fm_afk_outbox_lock_file "$STATE") could not be acquired; nothing was delivered and any records stay pending"
+      || die_operational "the away-mode inbox lock $(fm_afk_outbox_lock_file "$STATE") could not be acquired; nothing was delivered and any records stay pending"
     LOCK_TIMEOUTS=1
   else
     # A recorded PANE delivery mode means the daemon has a real supervisor pane and

@@ -47,6 +47,7 @@ Retire or clean that home first, and re-scaffold a stale project-bearing charter
 Keep custom charter text focused on the persistent responsibility, available project clones, and genuinely domain-specific hard rules.
 The scaffolded charter, later copied to `data/charter.md`, owns the standard lifecycle and escalation wording.
 Preserve the generated charter sections unless the domain genuinely needs a hard rule.
+That includes the generated standing captain rules, which the charter carries as the supervising subset `C1`, `C2`, and `C4`; the labels match the ship and scout briefs so a steer naming a rule always means the same rule, so keep the `C3` gap rather than renumbering.
 
 Provision the persistent home and registry entry after the charter is filled:
 
@@ -60,6 +61,9 @@ It may only seed a home with no project clones or project-registry entries, and 
 The lease survives with no live process and is never recycled by later `treehouse get` or `prune`.
 The slot stays reserved across restarts until the lease is released.
 Release happens only on explicit retirement or seed rollback, never on routine restart or recovery.
+
+Each project clone the seed creates or adopts is pinned to that secondmate home's own Treehouse worktree pool through `bin/fm-treehouse-pin.sh`, because a seeded clone shares one pool with the primary's clone of the same remote otherwise.
+A pin that cannot be applied fails the seed, since an unpinned clone is exactly the state the pin exists to prevent; resolve the printed reason (see `docs/treehouse-pools.md`) and re-seed.
 
 `bin/fm-home-seed.sh` copies the charter into the secondmate home as `data/charter.md`.
 It also writes the required `.fm-secondmate-home` identity marker, which is gitignored and must remain in place for home validation.

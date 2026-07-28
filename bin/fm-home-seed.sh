@@ -536,6 +536,22 @@ EOF
   return 1
 }
 
+# A seeded project clone is a SECOND clone of the same remote as the primary's,
+# so both share one treehouse pool - treehouse keys its pool by the origin URL,
+# not by the clone (bin/fm-treehouse-pin.sh). Unpinned, a secondmate spawn can be
+# handed a worktree of the PRIMARY's clone, where its branch is invisible to the
+# home that dispatched it. Pin every seeded clone to its own home, including one
+# this seed adopted rather than created, and fail the seed if the pin cannot be
+# applied: an unpinned clone is exactly the state the pin exists to prevent.
+pin_seeded_clone() {
+  local home=$1 dst=$2 out
+  # FM_PROJECTS_OVERRIDE is cleared so the pin resolves the SECONDMATE home's own
+  # projects dir rather than inheriting the primary's from this process.
+  out=$(FM_HOME="$home" FM_PROJECTS_OVERRIDE='' "$FM_ROOT/bin/fm-treehouse-pin.sh" "$dst" 2>&1) && return 0
+  echo "error: failed to pin the treehouse worktree pool for $dst: $(printf '%s\n' "$out" | head -1)" >&2
+  return 1
+}
+
 clone_project() {
   local project=$1 home=$2 src dst url dst_url mode
   src="$PROJECTS/$project"
@@ -558,10 +574,12 @@ EOF
       echo "error: seeded project $project at $dst has origin $dst_url; expected $url" >&2
       return 1
     }
+    pin_seeded_clone "$home" "$dst" || return 1
     return 0
   fi
   url=$(source_origin_url "$project" "$mode" "$src") || return 1
   git clone --quiet "$url" "$dst"
+  pin_seeded_clone "$home" "$dst" || return 1
 }
 
 validate_seed_project() {
