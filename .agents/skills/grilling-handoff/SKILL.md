@@ -46,6 +46,7 @@ Given one or more tickets or a described chunk of work that needs grilling.
    ```
 
    It allocates the next free number as `max(scan max, highest already reserved in the ledger) + 1`, records the claim in the firstmate-private ledger at `data/grilling/adr-reservations.md` under a lock so two concurrent sessions cannot claim one number, and creates `data/grilling/<date>-<slug>/`.
+   The ledger is fleet-wide across every product repo, not per-repository, so the number reflects the highest reserved anywhere plus one; a repo that has never had an ADR can therefore receive a first number well above `0001`, which is correct and collision-free, not a bug.
    It prints `adr=`, `session_dir=`, and `slug=`; keep those values.
    It is idempotent per slug, so a retried prepare is safe.
    **Firstmate must not create the placeholder ADR file itself** - section 1 forbids firstmate writing into a project for any reason, including a stub.
@@ -60,7 +61,22 @@ Given one or more tickets or a described chunk of work that needs grilling.
    tasks-axi hold grill-<slug> --reason "grilling session out: <slug> (<project>), handback <session_dir>/handback.md" --kind captain
    ```
 
-6. **Report to the captain** the full absolute path to the brief (`<session_dir>/brief.md`), because the captain carries that path by hand to the griller agent, plus the reserved ADR number and the project.
+6. **Report to the captain** the reserved ADR number, the project, and a copy-pasteable command block that launches the griller, because the captain carries this by hand to the griller agent.
+   Fill every value from what prepare already holds:
+
+   ```
+   cd <captain's own checkout of <project>>
+   claude -w "grill/<slug>" --model claude-opus-5 --effort high "/grill-with-docs <session_dir>/brief.md"
+   ```
+
+   The brief path is the absolute `<session_dir>/brief.md`, and the worktree name is `grill/<slug>`.
+   `<captain's own checkout of <project>>` is the captain's own working copy of the product repo, which lives OUTSIDE firstmate's home - never firstmate's clone under `projects/<name>`.
+   This matters because `claude -w` creates the new worktree at `<checkout>/.claude/worktrees/`, inside whatever checkout the captain `cd`s into; using the captain's own clone lands that worktree outside firstmate's home, while pointing at firstmate's clone would put it inside firstmate's read-only, fleet-synced clone - exactly what the "Where you work" rule forbids.
+   The captain's clones live at `~/workspace/work/<repo>` or `~/workspace/personal/<repo>`.
+   Resolve the work-versus-personal half rather than assuming it: probe for `<repo>` under each root, and when it exists under both, disambiguate on the clone's `origin` remote against the project's registered remote.
+   Some repo names (e.g. `firstmate`) exist under both roots, so a naive guess picks wrong.
+   If it is still ambiguous after that, emit the command with the candidate you chose and state the other candidate plainly in the report rather than silently picking.
+   `claude-opus-5` and `high` are sensible defaults the captain can edit in place before running - `high` effort suits a grilling session.
 
 ### Brief template
 
@@ -89,9 +105,9 @@ You also have permission to conclude **"no map needed, this is one small ticket"
 
 ## Where you work
 
-- Product repo: <name> (clone lives read-only to firstmate; you create your own worktree of it OUTSIDE firstmate's working directory).
-- Branch: `grill/<slug>`; use the same slug `<slug>` as the worktree name.
-- Grilling skills: use `/grilling` and `/domain-modeling`; if the origin is firstmate-task, use `/wayfinder` to produce the map and tickets.
+- Product repo: <name>. The launch command your captain ran created your worktree under their own checkout of the product repo (at `.claude/worktrees/`), OUTSIDE firstmate's working directory, so firstmate's own read-only clone stays untouched.
+- Branch/worktree: `grill/<slug>`.
+- Grilling skill: use `/grill-with-docs`; it runs the interview and creates the decision records (ADRs) and a glossary as it goes, which fits the reserved ADR number this session already holds. If the origin is firstmate-task, use `/wayfinder` afterwards to produce the map and tickets.
 
 ## ADR
 
