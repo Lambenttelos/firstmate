@@ -325,6 +325,41 @@ test_stale_cached_verdict_degrades_honestly() {
   pass "a cached verdict older than two sweep intervals degrades and says so"
 }
 
+test_cached_verdict_never_over_reports_a_torn_down_crew() {
+  local home fakebin
+  home=$(make_home live-count-teardown)
+  fakebin=$(fake_tmux "$TMP_ROOT/live-count-teardown-bin" fm-alpha)
+  # The sweep verified three live crews and cached that count.
+  fm_write_meta "$home/state/alpha.meta" "window=firstmate:fm-alpha" "harness=claude"
+  fm_write_meta "$home/state/beta.meta" "window=firstmate:fm-beta" "harness=claude"
+  fm_write_meta "$home/state/gamma.meta" "window=firstmate:fm-gamma" "harness=claude"
+  printf '3 0 0 0\n' > "$home/state/.resource-live"
+  # Teardown removes one crew's meta before the next sweep runs.
+  rm -f "$home/state/gamma.meta"
+  run_in_home "$home" "$fakebin"
+  expect_code 0 "$RC" "post-teardown cached live-count exit"
+  assert_contains "$OUT" "live agents 2 = 2 active (2 crew(s))" \
+    "a crew torn down since the sweep must not still be counted from the cache"
+  assert_not_contains "$OUT" "liveness unverified" \
+    "clamping a verified cache to the current metas stays a cheap, verified reading"
+  pass "the cached count is clamped to the current metas immediately after a teardown"
+}
+
+test_cached_clamp_never_raises_a_count_above_the_cache() {
+  local home fakebin
+  home=$(make_home live-count-clamp-floor)
+  fakebin=$(fake_tmux "$TMP_ROOT/live-count-clamp-floor-bin" fm-alpha)
+  # A crew spawned after the last sweep has a meta the cache does not yet count.
+  fm_write_meta "$home/state/alpha.meta" "window=firstmate:fm-alpha" "harness=claude"
+  fm_write_meta "$home/state/beta.meta" "window=firstmate:fm-beta" "harness=claude"
+  printf '1 0 0 0\n' > "$home/state/.resource-live"
+  run_in_home "$home" "$fakebin"
+  expect_code 0 "$RC" "under-cache cached live-count exit"
+  assert_contains "$OUT" "live agents 1 = 1 active (1 crew(s))" \
+    "clamping only lowers a count; a not-yet-swept spawn must not be counted early"
+  pass "the clamp never raises a cached count above the sweep's verified verdict"
+}
+
 test_cached_partial_verdict_stays_labelled_partial() {
   local home fakebin i started elapsed
   home=$(make_home live-count-cached-partial)
@@ -894,6 +929,8 @@ test_live_crew_count_excludes_agents_that_are_not_running
 test_synchronous_reading_uses_the_cached_verdict
 test_synchronous_reading_never_probes_a_wedged_backend
 test_stale_cached_verdict_degrades_honestly
+test_cached_verdict_never_over_reports_a_torn_down_crew
+test_cached_clamp_never_raises_a_count_above_the_cache
 test_cached_partial_verdict_stays_labelled_partial
 test_persistent_secondmates_are_counted_but_never_shed
 test_a_home_of_only_secondmates_never_advises_shedding
