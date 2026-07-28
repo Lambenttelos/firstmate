@@ -53,13 +53,23 @@
 # single owner of that mapping.
 #
 # Test seams: FM_DESK_OUT overrides the output path, FM_DESK_TIMEOUT bounds each
-# source command, FM_DESK_NOW injects the rendered timestamp.
+# source command, FM_DESK_NOW injects the rendered timestamp, and
+# FM_DESK_SNAPSHOT_BIN overrides the fleet-projection command (the canonical
+# fm-bearings-snapshot.sh) so a test can drive the projection failure paths.
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
+
+# Export the resolved home so every child source (fm-bearings-snapshot.sh,
+# fm-merge-queue.sh, fm-resource-check.sh) reads the SAME home this desk resolved.
+# Those children each default FM_HOME to their own script-relative code root when
+# it is unset, so an unexported FM_HOME let them silently read a different,
+# possibly empty, home than the ticket band - which cd's into FM_HOME explicitly -
+# and render confident-empty sections for a populated fleet.
+export FM_HOME
 
 # The stable output path. The SAME file every refresh, never a dated one: an
 # already-open browser tab must stay valid so the captain only reloads.
@@ -272,8 +282,9 @@ else
   note_gap "Fleet records could not be read on this machine, so work under way, decisions, and finished work are missing."
 fi
 
+DESK_SNAPSHOT_BIN="${FM_DESK_SNAPSHOT_BIN:-$SCRIPT_DIR/fm-bearings-snapshot.sh}"
 if [ "$HAVE_JQ" -eq 1 ]; then
-  if BEAR=$(desk_bound "$SCRIPT_DIR/fm-bearings-snapshot.sh" --json 2>/dev/null) \
+  if BEAR=$(desk_bound "$DESK_SNAPSHOT_BIN" --json 2>/dev/null) \
     && [ -n "$BEAR" ] && printf '%s' "$BEAR" | jq -e . >/dev/null 2>&1; then
     :
   else
@@ -381,11 +392,33 @@ fi
 
 NOW=${FM_DESK_NOW:-$(date '+%Y-%m-%d %H:%M')}
 
-# desk_json: read one jq expression out of the fleet projection, or nothing when
-# that projection is missing.
+# A jq helper prepended to every desk_json filter: coerce a non-scalar value to a
+# string so a single object/array-valued field (which jq's @tsv rejects for the
+# WHOLE stream) degrades to a visible string instead of blanking the section.
+DESK_JQ_PRELUDE='def z: if (type == "array" or type == "object") then tostring else . end;'
+
+# desk_json: read one jq expression out of the fleet projection.
+#
+# Return status is the caller's signal, so an unreadable source is never confused
+# with a source that genuinely holds nothing:
+#   0  the query ran; stdout is the result, which may legitimately be empty
+#   2  the fleet projection is absent (a global gap is already recorded for it)
+#   3  the query itself failed against present data (a section-level gap is due)
 desk_json() {
-  [ -n "$BEAR" ] || return 0
-  printf '%s' "$BEAR" | jq -r "$1" 2>/dev/null || printf ''
+  [ -n "$BEAR" ] || return 2
+  local out st
+  out=$(printf '%s' "$BEAR" | jq -r "$DESK_JQ_PRELUDE $1" 2>/dev/null)
+  st=$?
+  printf '%s' "$out"
+  [ "$st" -eq 0 ] || return 3
+  return 0
+}
+
+# desk_section_gap: a visible, in-section gap line. Shown when a section's source
+# could not be read, so the section reads as "unknown", never as a confident
+# empty state.
+desk_section_gap() {
+  printf '    <p class="text-sm text-warning">%s</p>\n' "$(desk_text "$1")"
 }
 
 # --- render -----------------------------------------------------------------
@@ -395,22 +428,28 @@ desk_json() {
 # recognizes the new one immediately.
 
 render_header() {
-  local running decisions unmerged summary
-  running=$(desk_json '[.in_flight[] | select(.state != "done")] | length')
-  decisions=$(desk_json '.decisions_open | length')
+  local running running_st decisions decisions_st unmerged summary
+  running=$(desk_json '[.in_flight[] | select(.state != "done")] | length'); running_st=$?
+  decisions=$(desk_json '.decisions_open | length'); decisions_st=$?
   unmerged=0
   [ -n "$MERGEQ" ] && unmerged=$(printf '%s\n' "$MERGEQ" | grep -c .)
   summary=""
-  case "${decisions:-0}" in
-    ''|0) summary="Nothing needs your word." ;;
-    1) summary="One thing needs your word." ;;
-    *) summary="${decisions} things need your word." ;;
-  esac
-  case "${running:-0}" in
-    ''|0) summary="$summary Nothing is running." ;;
-    1) summary="$summary One job is running." ;;
-    *) summary="$summary ${running} jobs are running." ;;
-  esac
+  # A count the projection could not supply must not be stated as zero: that
+  # would read as a confident "nothing", the exact failure mode being fixed.
+  if [ "$decisions_st" -ne 0 ]; then
+    summary="Current fleet state could not be read, so this summary is incomplete."
+  else
+    case "${decisions:-0}" in
+      ''|0) summary="Nothing needs your word." ;;
+      1) summary="One thing needs your word." ;;
+      *) summary="${decisions} things need your word." ;;
+    esac
+    case "${running:-0}" in
+      ''|0) [ "$running_st" -eq 0 ] && summary="$summary Nothing is running." ;;
+      1) summary="$summary One job is running." ;;
+      *) summary="$summary ${running} jobs are running." ;;
+    esac
+  fi
   [ "${unmerged:-0}" -gt 0 ] && summary="$summary ${unmerged} finished branches are waiting to merge."
   [ "$AWAY" -eq 1 ] && summary="$summary You are marked away."
 
@@ -503,10 +542,15 @@ render_gaps() {
 }
 
 render_decisions() {
-  local rows
-  rows=$(desk_json ".decisions_open[:${DESK_MAX_DECISIONS}][] | [.id, .summary, .owner] | @tsv")
+  local rows st
+  rows=$(desk_json ".decisions_open[:${DESK_MAX_DECISIONS}][] | [.id, (.summary|z), (.owner|z)] | @tsv"); st=$?
   echo '  <section class="mb-10">'
   echo '    <h2 class="text-lg font-semibold mb-3">Needs your word</h2>'
+  if [ "$st" -ne 0 ]; then
+    desk_section_gap "The list of decisions waiting on you could not be read, so this section is unknown right now."
+    echo '  </section>'
+    return 0
+  fi
   if [ -z "$rows" ]; then
     echo '    <p class="text-sm opacity-60">Nothing is waiting on you.</p>'
     echo '  </section>'
@@ -533,10 +577,15 @@ HTML
 }
 
 render_running() {
-  local rows
-  rows=$(desk_json '[.in_flight[] | select(.state != "done")][] | [.id, .state, .doing] | @tsv')
+  local rows st
+  rows=$(desk_json '[.in_flight[] | select(.state != "done")][] | [.id, (.state|z), (.doing|z)] | @tsv'); st=$?
   echo '  <section class="mb-10">'
   echo '    <h2 class="text-lg font-semibold mb-3">Running now</h2>'
+  if [ "$st" -ne 0 ]; then
+    desk_section_gap "The list of running work could not be read, so this section is unknown right now."
+    echo '  </section>'
+    return 0
+  fi
   if [ -z "$rows" ]; then
     echo '    <p class="text-sm opacity-60">Nothing is running.</p>'
     echo '  </section>'
@@ -565,10 +614,15 @@ HTML
 }
 
 render_parked() {
-  local rows
-  rows=$(desk_json "[.gates[] | select(.id | startswith(\"(\") | not)][:${DESK_MAX_PARKED}][] | [.id, .title, .reason, .blocked_by] | @tsv")
+  local rows st
+  rows=$(desk_json "[.gates[] | select(.id | startswith(\"(\") | not)][:${DESK_MAX_PARKED}][] | [.id, (.title|z), (.reason|z), (.blocked_by|z)] | @tsv"); st=$?
   echo '  <section class="mb-10">'
   echo '    <h2 class="text-lg font-semibold mb-3">Parked on purpose</h2>'
+  if [ "$st" -ne 0 ]; then
+    desk_section_gap "The list of parked work could not be read, so this section is unknown right now."
+    echo '  </section>'
+    return 0
+  fi
   if [ -z "$rows" ]; then
     echo '    <p class="text-sm opacity-60">Nothing is parked.</p>'
     echo '  </section>'
@@ -597,10 +651,15 @@ HTML
 }
 
 render_finished() {
-  local rows
-  rows=$(desk_json ".landed[:${DESK_MAX_LANDED}][] | [.id, .what] | @tsv")
+  local rows st
+  rows=$(desk_json ".landed[:${DESK_MAX_LANDED}][] | [.id, (.what|z)] | @tsv"); st=$?
   echo '  <section class="mb-10">'
   echo '    <h2 class="text-lg font-semibold mb-3">Finished recently</h2>'
+  if [ "$st" -ne 0 ]; then
+    desk_section_gap "The list of recently finished work could not be read, so this section is unknown right now."
+    echo '  </section>'
+    return 0
+  fi
   if [ -z "$rows" ]; then
     echo '    <p class="text-sm opacity-60">Nothing has finished recently.</p>'
     echo '  </section>'
