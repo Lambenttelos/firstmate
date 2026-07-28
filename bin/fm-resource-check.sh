@@ -474,10 +474,51 @@ sweep_live_crews() {
   printf '%s\t%s\t%s\t%s' "$note" "$crews" "$smates" "$idle"
 }
 
+# clamp_cached_to_metas: lower a cached count so it can never claim more agents in
+# a class than that class still has meta files. A live agent always has a meta, so
+# the moment teardown removes one the cached count that still counts it is simply
+# wrong; the sweep that would refresh it may be up to two intervals away. This uses
+# only count_metas' cheap file test, never a backend probe, so the synchronous path
+# stays cheap while a torn-down worker stops inflating the count immediately. It
+# only ever LOWERS: a crew spawned after the last sweep keeps the existing
+# behaviour of not being counted until the next sweep, which errs toward
+# under-reporting rather than over-reporting. Reads and rewrites crews/smates/idle
+# in the caller's scope; the secondmate overage is capped on the total and trimmed
+# idle-first, so a still-present secondmate whose idle/active class merely flipped
+# since the sweep is never dropped, only a genuinely removed secondmate meta is.
+clamp_cached_to_metas() {
+  local rest nums fcrews fsmates fidle scap stot drop
+  # count_metas prefixes a note field; parse the tab record by expansion rather
+  # than read, because tab is IFS whitespace and read would collapse the empty
+  # leading note into the first number (the same reason the main body splits the
+  # live reading with %%/# below).
+  rest=$(count_metas '')
+  nums=${rest#*$'\t'}
+  fcrews=${nums%%$'\t'*}
+  nums=${nums#*$'\t'}
+  fsmates=${nums%%$'\t'*}
+  fidle=${nums##*$'\t'}
+  is_uint "${fcrews:-}" && is_uint "${fsmates:-}" && is_uint "${fidle:-}" || return 0
+  [ "$crews" -le "$fcrews" ] || crews=$fcrews
+  scap=$(( fsmates + fidle ))
+  stot=$(( smates + idle ))
+  if [ "$stot" -gt "$scap" ]; then
+    drop=$(( stot - scap ))
+    if [ "$idle" -ge "$drop" ]; then
+      idle=$(( idle - drop ))
+    else
+      drop=$(( drop - idle )); idle=0; smates=$(( smates - drop ))
+    fi
+  fi
+}
+
 # cached_live_crews: the synchronous path. Reads the sweep's verdict and NEVER
 # probes, so a wedged backend cannot delay a dispatch or a session start. The
 # sweep's partly-probed marker is cached with the counts and replayed here, so a
-# budget-truncated count is never presented as a fully verified one.
+# budget-truncated count is never presented as a fully verified one. The cached
+# count is clamped to the current meta files (clamp_cached_to_metas) so a worker
+# torn down since the sweep stops inflating the count on the very next reading,
+# without paying for a probe.
 # A record written before the idle-secondmate split carries three fields, so it
 # fails the four-field shape below and degrades to the honest recorded-work count
 # rather than being misread; the next sweep replaces it.
@@ -491,6 +532,7 @@ cached_live_crews() {
   read -r crews smates idle partial <<<"$cached"
   if is_uint "${crews:-}" && is_uint "${smates:-}" && is_uint "${idle:-}" \
     && [ "$age" -lt $(( $(resolve_interval) * 2 )) ]; then
+    clamp_cached_to_metas
     case "${partial:-}" in
       0) printf '\t%s\t%s\t%s' "$crews" "$smates" "$idle"; return 0 ;;
       1) printf '%s\t%s\t%s\t%s' "$PARTIAL_NOTE" "$crews" "$smates" "$idle"; return 0 ;;
