@@ -20,8 +20,10 @@
 # Usage:
 #   fm-resource-check.sh              print one reading line, exit with its status
 #   fm-resource-check.sh --sweep      same, but probe crew liveness and refresh the
-#                                     cache. The watcher's slow sweep is the ONLY
-#                                     caller that may use it; see CEILING below.
+#                                     cache. The watcher's background probe cycle
+#                                     (bin/fm-resource-probe.sh, launched off the
+#                                     supervision main loop) is the ONLY caller
+#                                     that may use it; see CEILING below.
 #   fm-resource-check.sh --interval   print the resolved sweep interval in seconds
 #   fm-resource-check.sh --help
 #

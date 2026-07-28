@@ -740,6 +740,69 @@ test_spawn_help_reaches_the_end_of_its_header() {
 
 # --- watcher wiring ---------------------------------------------------------
 
+# The main loop no longer runs the probe itself: it reads a timestamped reading
+# a separate probe cycle published. These two tests pin that the surface path
+# reacts to the CACHE alone (no probe runs here - the cadence is far away and the
+# stamp is fresh), and that the freshness token in the record gates staleness.
+seed_reading() {  # <home> <epoch> <status> <reading-tail>
+  printf '%s\t%s\t%s\n' "$2" "$3" "$4" > "$1/state/.resource-reading"
+  printf '%s\n' "$3" > "$1/state/.resource-status"
+  # A fresh cadence stamp keeps resource_probe_launch from firing a real probe
+  # that would overwrite the seeded reading this test is about.
+  touch "$1/state/.last-resource"
+}
+
+test_main_loop_surfaces_from_the_cache_without_probing() {
+  local home out status now
+  home=$(make_home surface-from-cache)
+  now=$(date +%s)
+  seed_reading "$home" "$now" critical "critical | load 40 (4.0x over 10 cores)"
+  printf 'healthy\n' > "$home/state/.resource-surfaced"
+  out="$home/out.txt"
+  status=0
+  # Interval far larger than the checkpoint window, so no probe runs: any wake
+  # can only come from the cheap surface read of the seeded cache.
+  env "${HEALTHY_ENV[@]}" FM_RESOURCE_INTERVAL=999999 \
+    FM_HOME="$home" FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 \
+    "$CHECKPOINT" --seconds 6 >"$out" 2>/dev/null || status=$?
+  expect_code 0 "$status" "cache-surface checkpoint exit"
+  assert_contains "$(cat "$out")" "check: host-resources" "the cached pressure was not surfaced"
+  assert_contains "$(cat "$out")" "load 40" "the surfaced wake lost the cached reading"
+  assert_grep critical "$home/state/.resource-surfaced" "the surfaced level was not recorded"
+  pass "the main loop surfaces host pressure from the published reading without probing"
+}
+
+test_stale_cached_reading_is_never_surfaced() {
+  local home out status old
+  home=$(make_home stale-reading)
+  # Age token two-plus intervals in the past: stale, so the surface path must
+  # ignore it however alarming the status word is.
+  old=$(( $(date +%s) - 4000000 ))
+  seed_reading "$home" "$old" critical "critical | load 40 (4.0x over 10 cores)"
+  printf 'healthy\n' > "$home/state/.resource-surfaced"
+  out="$home/out.txt"
+  status=0
+  env "${HEALTHY_ENV[@]}" FM_RESOURCE_INTERVAL=999999 \
+    FM_HOME="$home" FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 \
+    "$CHECKPOINT" --seconds 4 >"$out" 2>/dev/null || status=$?
+  expect_code 124 "$status" "stale-reading checkpoint should stay quiet"
+  assert_not_contains "$(cat "$out")" "host-resources" \
+    "a reading older than two sweep intervals must never be surfaced"
+  pass "the main loop never surfaces a reading older than two sweep intervals"
+}
+
+test_main_loop_does_not_run_the_sweep_itself() {
+  # Structural guard on the separation: the slow --sweep read lives ONLY in the
+  # dedicated probe cycle, never inline in the watcher main loop.
+  assert_no_grep "--sweep" "$ROOT/bin/fm-watch.sh" \
+    "the slow --sweep read must not appear in the watcher main loop"
+  assert_grep "--sweep" "$ROOT/bin/fm-resource-probe.sh" \
+    "the probe cycle must own the --sweep read"
+  assert_grep "resource_probe_launch" "$ROOT/bin/fm-watch.sh" \
+    "the watcher must launch the probe cycle rather than sweep inline"
+  pass "the probe's slow --sweep read is off the supervision main loop"
+}
+
 test_watcher_surfaces_pressure_once_and_queues_it() {
   local home out status drained
   home=$(make_home watcher-critical)
@@ -953,6 +1016,9 @@ test_disabled_monitor_reports_and_never_classifies
 test_usage_error_never_looks_like_a_status
 test_help_prints_the_whole_header_contract
 test_spawn_help_reaches_the_end_of_its_header
+test_main_loop_surfaces_from_the_cache_without_probing
+test_stale_cached_reading_is_never_surfaced
+test_main_loop_does_not_run_the_sweep_itself
 test_watcher_surfaces_pressure_once_and_queues_it
 test_watcher_absorbs_already_reported_pressure
 test_watcher_stays_quiet_on_a_healthy_host_and_rearms
