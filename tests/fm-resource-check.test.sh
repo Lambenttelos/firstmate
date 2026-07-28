@@ -62,6 +62,25 @@ make_home() {
   printf '%s\n' "$home"
 }
 
+# enter_daemon_owned_away_mode <home>: put <home> into away mode WITH a daemon
+# that owns triage. The heartbeat cases below assert fm-watch.sh's daemon-owned
+# heartbeat path (the afk_daemon_owns_triage branch), which queues EVERY
+# heartbeat so the annotation and quiet-host behaviour can be observed. That
+# branch requires a LIVE away-mode daemon, not merely state/.afk on disk: the
+# ownership question moved from "is state/.afk present" to "does a live daemon
+# hold this home's lock" (bin/fm-afk-daemon-lib.sh's
+# fm_afk_daemon_owns_supervision), so touching state/.afk alone now leaves the
+# watcher running its OWN triage, which absorbs the benign heartbeat and never
+# wakes - the checkpoint then times out with exit 124. A fresh
+# state/.supervise-daemon.starting bring-up marker is the documented "owned"
+# state (a daemon on its way up, within FM_AFK_DAEMON_PENDING_TTL seconds), so it
+# drives the same daemon-owned path a real daemon would, without spinning a real
+# daemon inside a unit test.
+enter_daemon_owned_away_mode() {
+  : > "$1/state/.afk"
+  date '+%s' > "$1/state/.supervise-daemon.starting"
+}
+
 test_healthy_reading_reports_every_metric() {
   run_check
   expect_code 0 "$RC" "healthy host exit"
@@ -870,7 +889,7 @@ test_disabled_monitor_leaves_the_watcher_untouched() {
 annotated_heartbeat_reason() {
   local home out status
   home=$(make_home "$1")
-  : > "$home/state/.afk"
+  enter_daemon_owned_away_mode "$home"
   printf 'critical\n' > "$home/state/.resource-surfaced"
   out="$home/out.txt"
   status=0
@@ -907,7 +926,7 @@ test_heartbeat_carries_the_cached_pressure() {
   # is ENABLED and reads critical, so the annotation comes from a live sweep; the
   # already-surfaced level absorbs the resource wake so the heartbeat is what the
   # checkpoint observes.
-  : > "$home/state/.afk"
+  enter_daemon_owned_away_mode "$home"
   printf 'critical\n' > "$home/state/.resource-surfaced"
   out="$home/out.txt"
   status=0
@@ -923,7 +942,7 @@ test_heartbeat_carries_the_cached_pressure() {
 test_heartbeat_is_unannotated_on_a_healthy_host() {
   local home out status
   home=$(make_home heartbeat-healthy)
-  : > "$home/state/.afk"
+  enter_daemon_owned_away_mode "$home"
   out="$home/out.txt"
   status=0
   env "${HEALTHY_ENV[@]}" FM_RESOURCE_INTERVAL=1 \
@@ -939,7 +958,7 @@ test_heartbeat_is_unannotated_on_a_healthy_host() {
 test_disabled_monitor_never_annotates_from_a_stale_reading() {
   local home out status
   home=$(make_home heartbeat-disabled-stale)
-  : > "$home/state/.afk"
+  enter_daemon_owned_away_mode "$home"
   # Nothing ever clears .resource-status, so a home that switches the monitor off
   # after a bad stretch keeps a critical file on disk forever. It must not leak
   # into the heartbeat.
@@ -959,7 +978,7 @@ test_disabled_monitor_never_annotates_from_a_stale_reading() {
 test_stale_reading_never_annotates_a_heartbeat() {
   local home out status
   home=$(make_home heartbeat-stale)
-  : > "$home/state/.afk"
+  enter_daemon_owned_away_mode "$home"
   printf 'critical\n' > "$home/state/.resource-status"
   touch -t 202001010000 "$home/state/.resource-status"
   # A fresh sweep marker keeps the long cadence from firing one immediately and
@@ -979,52 +998,65 @@ test_stale_reading_never_annotates_a_heartbeat() {
   pass "a heartbeat is never annotated from a reading older than two sweeps"
 }
 
-test_healthy_reading_reports_every_metric
-test_load_thresholds
-test_swap_thresholds
-test_darwin_swap_percentage_is_informational_only
-test_recommended_ceiling_uses_the_560_mb_divisor
-test_memory_headroom_threshold_and_ceiling
-test_worst_of_three_decides_the_status
-test_shed_advice_names_the_overage_only_when_over_ceiling
-test_live_crew_count_comes_from_recorded_work
-test_live_crew_count_excludes_agents_that_are_not_running
-test_synchronous_reading_uses_the_cached_verdict
-test_synchronous_reading_never_probes_a_wedged_backend
-test_stale_cached_verdict_degrades_honestly
-test_cached_verdict_never_over_reports_a_torn_down_crew
-test_cached_clamp_never_raises_a_count_above_the_cache
-test_cached_partial_verdict_stays_labelled_partial
-test_persistent_secondmates_are_counted_but_never_shed
-test_a_home_of_only_secondmates_never_advises_shedding
-test_an_idle_secondmate_is_reported_but_never_charged
-test_a_working_secondmate_is_charged_like_a_crew
-test_a_secondmate_whose_agent_has_exited_is_not_counted_at_all
-test_a_pre_split_cached_record_degrades_rather_than_being_misread
-test_the_ceiling_and_the_overage_share_one_basis
-test_sweep_without_the_backend_library_labels_its_count
-test_probe_timeout_leaves_no_stuck_backend_process
-test_sweep_probing_is_bounded_as_a_whole
-test_malformed_sweep_budget_never_disables_the_budget
-test_malformed_probe_timeout_never_takes_monitoring_dark
-test_injected_live_count_still_wins
-test_unreadable_host_is_unknown_and_never_alarms
-test_partial_reading_never_passes_as_healthy
-test_interval_knob_is_resolved_in_one_place
-test_interval_is_independent_of_the_watcher_poll_cadence
-test_disabled_monitor_reports_and_never_classifies
-test_usage_error_never_looks_like_a_status
-test_help_prints_the_whole_header_contract
-test_spawn_help_reaches_the_end_of_its_header
-test_main_loop_surfaces_from_the_cache_without_probing
-test_stale_cached_reading_is_never_surfaced
-test_main_loop_does_not_run_the_sweep_itself
-test_watcher_surfaces_pressure_once_and_queues_it
-test_watcher_absorbs_already_reported_pressure
-test_watcher_stays_quiet_on_a_healthy_host_and_rearms
-test_disabled_monitor_leaves_the_watcher_untouched
-test_annotated_heartbeat_is_still_an_actionable_wake
-test_heartbeat_carries_the_cached_pressure
-test_heartbeat_is_unannotated_on_a_healthy_host
-test_disabled_monitor_never_annotates_from_a_stale_reading
-test_stale_reading_never_annotates_a_heartbeat
+# Run every case in isolation. Each test function calls fail() on the first
+# failed assertion, and fail() exits the process (tests/lib.sh); a flat list of
+# bare calls therefore aborts the whole file on the first failure and silently
+# skips every case after it. Wrapping each call in a subshell contains that exit
+# to the one case, so a failing case still reports its "not ok" line (from fail)
+# and every later case still runs and reports. Order is preserved. A subshell ( )
+# does not fire the parent EXIT trap, so fm_test_cleanup's shared TMP_ROOT
+# survives until the real end of the file. rc latches non-zero on any failure, so
+# the runner (bin/fm-test-run.sh) still sees this file as failed. The calls stay
+# in command position (not names in an array) so ShellCheck's reachability
+# analysis still sees every function invoked and fm-lint stays clean.
+rc=0
+( test_healthy_reading_reports_every_metric ) || rc=1
+( test_load_thresholds ) || rc=1
+( test_swap_thresholds ) || rc=1
+( test_darwin_swap_percentage_is_informational_only ) || rc=1
+( test_recommended_ceiling_uses_the_560_mb_divisor ) || rc=1
+( test_memory_headroom_threshold_and_ceiling ) || rc=1
+( test_worst_of_three_decides_the_status ) || rc=1
+( test_shed_advice_names_the_overage_only_when_over_ceiling ) || rc=1
+( test_live_crew_count_comes_from_recorded_work ) || rc=1
+( test_live_crew_count_excludes_agents_that_are_not_running ) || rc=1
+( test_synchronous_reading_uses_the_cached_verdict ) || rc=1
+( test_synchronous_reading_never_probes_a_wedged_backend ) || rc=1
+( test_stale_cached_verdict_degrades_honestly ) || rc=1
+( test_cached_verdict_never_over_reports_a_torn_down_crew ) || rc=1
+( test_cached_clamp_never_raises_a_count_above_the_cache ) || rc=1
+( test_cached_partial_verdict_stays_labelled_partial ) || rc=1
+( test_persistent_secondmates_are_counted_but_never_shed ) || rc=1
+( test_a_home_of_only_secondmates_never_advises_shedding ) || rc=1
+( test_an_idle_secondmate_is_reported_but_never_charged ) || rc=1
+( test_a_working_secondmate_is_charged_like_a_crew ) || rc=1
+( test_a_secondmate_whose_agent_has_exited_is_not_counted_at_all ) || rc=1
+( test_a_pre_split_cached_record_degrades_rather_than_being_misread ) || rc=1
+( test_the_ceiling_and_the_overage_share_one_basis ) || rc=1
+( test_sweep_without_the_backend_library_labels_its_count ) || rc=1
+( test_probe_timeout_leaves_no_stuck_backend_process ) || rc=1
+( test_sweep_probing_is_bounded_as_a_whole ) || rc=1
+( test_malformed_sweep_budget_never_disables_the_budget ) || rc=1
+( test_malformed_probe_timeout_never_takes_monitoring_dark ) || rc=1
+( test_injected_live_count_still_wins ) || rc=1
+( test_unreadable_host_is_unknown_and_never_alarms ) || rc=1
+( test_partial_reading_never_passes_as_healthy ) || rc=1
+( test_interval_knob_is_resolved_in_one_place ) || rc=1
+( test_interval_is_independent_of_the_watcher_poll_cadence ) || rc=1
+( test_disabled_monitor_reports_and_never_classifies ) || rc=1
+( test_usage_error_never_looks_like_a_status ) || rc=1
+( test_help_prints_the_whole_header_contract ) || rc=1
+( test_spawn_help_reaches_the_end_of_its_header ) || rc=1
+( test_main_loop_surfaces_from_the_cache_without_probing ) || rc=1
+( test_stale_cached_reading_is_never_surfaced ) || rc=1
+( test_main_loop_does_not_run_the_sweep_itself ) || rc=1
+( test_watcher_surfaces_pressure_once_and_queues_it ) || rc=1
+( test_watcher_absorbs_already_reported_pressure ) || rc=1
+( test_watcher_stays_quiet_on_a_healthy_host_and_rearms ) || rc=1
+( test_disabled_monitor_leaves_the_watcher_untouched ) || rc=1
+( test_annotated_heartbeat_is_still_an_actionable_wake ) || rc=1
+( test_heartbeat_carries_the_cached_pressure ) || rc=1
+( test_heartbeat_is_unannotated_on_a_healthy_host ) || rc=1
+( test_disabled_monitor_never_annotates_from_a_stale_reading ) || rc=1
+( test_stale_reading_never_annotates_a_heartbeat ) || rc=1
+exit "$rc"
