@@ -88,11 +88,14 @@
 #   Ship/scout spawns refuse to launch unless the project is one of THIS home's
 #   own clones (a direct child of $PROJECTS) and the resolved task path is a real
 #   git worktree root of that same clone, distinct from the primary checkout.
-#   Every spawn also refuses a brief that still carries the literal {TASK}
-#   placeholder fm-brief.sh scaffolds: firstmate never filled in the task, so
-#   dispatching it would only waste the spawn on a crewmate that can do nothing
-#   but report the empty brief. The scaffold cannot know the task text, so the
-#   check lives here rather than in fm-brief.sh.
+#   Every spawn also refuses a brief that still holds the bare {TASK}
+#   placeholder fm-brief.sh scaffolds as the Task section body: firstmate never
+#   filled in the task, so dispatching it would only waste the spawn on a
+#   crewmate that can do nothing but report the empty brief. The match is
+#   structural - the placeholder standing alone as a line - so a mention of the
+#   token inside explanatory prose or backticks (the scaffold's own Herdr
+#   declaration quotes it) does not trip the guard. The scaffold cannot know the
+#   task text, so the check lives here rather than in fm-brief.sh.
 # Batch dispatch: pass one or more `id=repo` pairs instead of a single <id> <project>, e.g.
 #     fm-spawn.sh fix-a-k3=projects/foo add-b-q7=projects/bar [--scout]
 #   Each pair re-execs this script in single-task mode, so the single path stays the only
@@ -848,7 +851,15 @@ fi
 # {TASK} placeholder on purpose and cannot know the task text, so this guard
 # belongs at spawn time, not in the scaffold. Batch dispatch re-execs this script
 # in single-task mode, so every pair passes through this check.
-if grep -qF '{TASK}' "$BRIEF"; then
+#
+# The honest signal is structural: fm-brief.sh writes the placeholder as the
+# entire body of the `# Task` section, on its own line. A correctly filled brief
+# replaces that line. The guard therefore matches only the bare placeholder
+# standing alone as a line, not a mention of the token inside explanatory prose
+# or backticks - the scaffold's own Herdr safety declaration quotes `{TASK}`
+# inline, and refusing on that would force the operator to edit generated safety
+# text to spawn a fully filled brief.
+if grep -Eq '^[[:space:]]*\{TASK\}[[:space:]]*$' "$BRIEF"; then
   echo "error: brief at $BRIEF still contains an unfilled {TASK} placeholder; replace it with the task description before spawning" >&2
   exit 1
 fi
