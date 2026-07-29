@@ -9,7 +9,8 @@
 #   - the existing wedge alarm remains observable and deduped;
 #   - clearing the draft makes the genuinely idle Pi composer injectable;
 #   - verified submit preserves the terminal-safe marker and clears delivery state;
-#   - an unmarked return request opens the catch-up gate before Bearings;
+#   - an ordinary captain message never exits away mode, while an explicit exit
+#     instruction opens the catch-up gate before Bearings;
 #   - remediation/resolution clears the gate, and re-entry is idempotent.
 set -u
 
@@ -241,20 +242,36 @@ message_is_injection "$INJECT_PROMPT" || fail "terminal-delivered Pi escalation 
 assert_blocker_open 'after successful marked injection'
 pass "real idle Pi/Herdr accepts one marked escalation promptly, verifies submit, clears wedge state, and emits no duplicate alert"
 
-# The captain returns with an ordinary unmarked Bearings request. The request is
-# captured byte-exact, then the public return owner must gate it on the blocker.
+# An ordinary unmarked Bearings request must NOT end away mode; only the explicit
+# exit instruction that follows does, and the public return owner must then gate
+# it on the blocker.
 wait_for_idle || fail "real Pi did not settle after the injected catch-up"
 for _ in $(seq 1 80); do
   composer=$(PATH="$FAKEBIN:$ORIGINAL_PATH" HERDR_SESSION="$SESSION" fm_backend_composer_state herdr "$PRIMARY_TARGET")
   [ "$composer" = empty ] && break
   sleep 0.1
 done
-[ "$composer" = empty ] || fail "real Pi composer was not ready for the unmarked return request"
+[ "$composer" = empty ] || fail "real Pi composer was not ready for the return request"
 "$LAB_HELPER" run "$SESSION" pane send-text "$PRIMARY_PANE" 'Synthetic Bearings request' >/dev/null
 "$LAB_HELPER" run "$SESSION" pane send-keys "$PRIMARY_PANE" enter >/dev/null
-wait_for_prompt 'any(.[]; .prompt == "Synthetic Bearings request")' || fail "real Pi did not receive the unmarked return request"
-RETURN_PROMPT=$(jq -r 'select(.prompt == "Synthetic Bearings request") | .prompt' "$CAPTURE" | tail -1)
-should_exit_afk "$STATE" "$RETURN_PROMPT" || fail "unmarked Pi return request did not trigger the away exit contract"
+wait_for_prompt 'any(.[]; .prompt == "Synthetic Bearings request")' || fail "real Pi did not receive the ordinary captain request"
+ORDINARY_PROMPT=$(jq -r 'select(.prompt == "Synthetic Bearings request") | .prompt' "$CAPTURE" | tail -1)
+should_exit_afk "$STATE" "$ORDINARY_PROMPT" \
+  && fail "ordinary unmarked Pi request must not trigger the away exit contract"
+
+# Only an explicit exit instruction returns the captain.
+wait_for_idle || fail "real Pi did not settle after the ordinary request"
+for _ in $(seq 1 80); do
+  composer=$(PATH="$FAKEBIN:$ORIGINAL_PATH" HERDR_SESSION="$SESSION" fm_backend_composer_state herdr "$PRIMARY_TARGET")
+  [ "$composer" = empty ] && break
+  sleep 0.1
+done
+[ "$composer" = empty ] || fail "real Pi composer was not ready for the explicit exit instruction"
+"$LAB_HELPER" run "$SESSION" pane send-text "$PRIMARY_PANE" '/back' >/dev/null
+"$LAB_HELPER" run "$SESSION" pane send-keys "$PRIMARY_PANE" enter >/dev/null
+wait_for_prompt 'any(.[]; .prompt == "/back")' || fail "real Pi did not receive the explicit exit instruction"
+RETURN_PROMPT=$(jq -r 'select(.prompt == "/back") | .prompt' "$CAPTURE" | tail -1)
+should_exit_afk "$STATE" "$RETURN_PROMPT" || fail "explicit Pi exit instruction did not trigger the away exit contract"
 assert_blocker_open 'before return catch-up'
 [ -f "$STATE/repair-task.meta" ] || fail "live blocker metadata disappeared before return catch-up"
 
@@ -272,7 +289,7 @@ BEARINGS_OUT=$(PATH="$FAKEBIN:$ORIGINAL_PATH" HERDR_SESSION="$SESSION" FM_ROOT_O
 BEARINGS_RC=$?
 set -e
 [ "$BEARINGS_RC" -eq 3 ] || fail "Bearings bypassed the return gate (rc=$BEARINGS_RC): $BEARINGS_OUT"
-pass "real unmarked Pi return opens catch-up and blocks Bearings before the unresolved blocker can be deferred"
+pass "real explicit Pi return opens catch-up and blocks Bearings before the unresolved blocker can be deferred"
 
 printf 'resolved [key=synthetic-dependency]: refreshed the synthetic token and resumed the task\n' >> "$STATE/repair-task.status"
 PATH="$FAKEBIN:$ORIGINAL_PATH" HERDR_SESSION="$SESSION" FM_ROOT_OVERRIDE="$PROJECT" FM_HOME="$HOME_DIR" FM_STATE_OVERRIDE="$STATE" \

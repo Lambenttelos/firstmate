@@ -2,7 +2,7 @@
 name: afk
 description: >-
   Enter away-mode supervision when the captain invokes /afk, says they are going afk, `state/.afk` exists, an incoming message starts with `FM_INJECT_MARK`, or any `state/.subsuper-*` marker is involved.
-  It sets a durable away-mode flag so the sub-supervisor daemon can self-handle routine wakes and escalate captain-relevant events plus bounded declared-external-wait rechecks as batched digests during walk-away stretches, then exits automatically when any real unmarked message returns firstmate to full per-wake responsiveness.
+  It sets a durable away-mode flag so the sub-supervisor daemon can self-handle routine wakes and escalate captain-relevant events plus bounded declared-external-wait rechecks as batched digests during walk-away stretches, and it persists through ordinary captain messages until an explicit exit instruction returns firstmate to full per-wake responsiveness.
 user-invocable: true
 metadata:
   internal: true
@@ -108,11 +108,10 @@ just prose in `data/captain.md`:
   no live daemon after a turnover and re-enters durable paneless away mode
   automatically, bringing the daemon and its watcher child back with no manual
   re-arm. Only a revive failure surfaces, as a bootstrap `AFK_DAEMON:` line.
-- **The auto-return flow does NOT clear the persist intent.** A first unmarked
-  message still makes THIS session responsive (stops the daemon, clears `.afk`),
+- **The return flow does NOT clear the persist intent.** An explicit exit
+  instruction makes THIS session responsive (stops the daemon, clears `.afk`),
   but the standing away order remains, so the next turnover resumes supervision.
-  This is the `afk-exit-only-on-explicit-word` contract: persistent away ends
-  only on an explicit exit.
+  Persistent away ends completely only through `unpersist`.
 - **End persistent away** with `bin/fm-afk-launch.sh unpersist` (the only path
   that clears the intent), then run the normal return flow below. After that a
   turnover no longer re-enters away mode.
@@ -158,25 +157,34 @@ question and every script asks it there.
 ## How to exit afk
 
 Both entry paths exit the same way, through `bin/fm-afk-return.sh`, and differ only in what that shutdown has to stop.
-When the durable persist intent is set (see "Persisting away mode across a session turnover" above), this auto-return still makes THIS session responsive but deliberately leaves the intent in place, so a later turnover resumes supervision; a full stop needs `bin/fm-afk-launch.sh unpersist` first.
+When the durable persist intent is set (see "Persisting away mode across a session turnover" above), this return still makes THIS session responsive but deliberately leaves the intent in place, so a later turnover resumes supervision; a full stop needs `bin/fm-afk-launch.sh unpersist` first.
 After a daemon entry it stops the daemon, so per-wake responsiveness comes back when the daemon is gone.
 After a daemon-free entry there is no daemon to stop and per-wake responsiveness was never handed away: exit clears the away posture and this session simply keeps its own watcher-arm supervision running.
 Every other part of the return contract, including the durable catch-up gate, is identical on both paths.
 
-No `/back` is needed. The first genuine message is the return signal:
+Away mode ends ONLY on an explicit exit instruction from the captain.
+An ordinary captain message, including an answer to a question firstmate asked, does NOT end it.
+This is a standing captain order from 2026-07-25: the captain answers questions from a phone throughout the day while genuinely still away, so treating those replies as a return tore away supervision down repeatedly and cost a daemon restart, a full catch-up gate, and blocker reclassification each time.
 
-- A message **without** the current operational prefix or a legacy bare marker, and **not** starting with `/afk` -> the captain is back.
+`bin/fm-supervise-daemon.sh`'s `message_is_afk_exit` is the single owner of the exit grammar, and its header comment lists every accepted form: `/back`, `/unafk`, `/afk` with an `exit`, `off`, `stop`, `end`, or `done` subcommand, and a whole-message plain-language instruction such as "im back" or "exit away mode".
+Do not restate or widen that list here; ask the function.
+
+- An **explicit exit instruction** -> the captain is back.
   Run `bin/fm-afk-return.sh` before acting on the message that brought the captain back.
   That script owns correct-ordered daemon shutdown, durable wake draining, escalation and wedge evidence, any escalation the inbox reader never picked up, and the return-catch-up gate.
   If it reports a firstmate-actionable `blocked:` event, remediate it immediately through the normal lifecycle, or explicitly reclassify it with a durable reason and close its decision key with `resolved [key=...]`, then run `bin/fm-afk-return.sh check`.
   Once the daemon stops, or immediately when the daemon-free entry left none to stop, resume full per-wake responsiveness through the emitted primary-harness supervision protocol while blocker handling proceeds, so the gate never creates a blind wait.
   Do not answer a Bearings request or perform any other ordinary captain work until the check exits successfully.
 - A message **with** the current operational prefix (`FM_OPERATIONAL_PREFIX`, U+2063 INVISIBLE SEPARATOR followed by `FIRSTMATE_OP: `), or a legacy bare `FM_INJECT_MARK` daemon escalation -> stay afk and process it.
-- Re-invoking `/afk` while already away -> stay afk (refresh the flag); this
+- Re-invoking `/afk` while already away, including `/afk back in an hour` -> stay afk (refresh the flag); this
   does **not** trigger an exit.
+- Any other unmarked captain message -> stay afk and answer it in place, keeping the away posture and batched escalations intact.
+  Do not run `bin/fm-afk-return.sh`, do not stop the daemon, and do not open the catch-up gate.
+  Answering a question is not returning.
 
-Bias ambiguous cases toward exit: a present captain beats token savings, and
-a false exit is self-correcting (the captain re-runs `/afk`).
+Bias ambiguous cases toward STAYING away: a wrong exit tears down supervision
+the captain never asked to end, while a missed exit costs one more explicit
+word from a captain who is present anyway.
 
 ## Orthogonal to approval authority
 
