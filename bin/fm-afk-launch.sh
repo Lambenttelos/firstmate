@@ -89,7 +89,7 @@ FM_AFK_LAUNCH_LOCK="$FM_AFK_LAUNCH_STATE/.afk-launch.lock"
 # order that away supervision must SURVIVE a session turnover, so session-start
 # (bin/fm-bootstrap.sh's afk_daemon_revive_sweep) re-enters away mode and hosts a
 # fresh durable daemon. It is cleared ONLY by an explicit exit (the `unpersist`
-# subcommand), never by the auto-return-on-unmarked-message path, and never by
+# subcommand), never by the explicit-return flow, and never by
 # session-scoped stale-artifact clearing (it is deliberately NOT in
 # fm_afk_session_artifact_names).
 FM_AFK_LAUNCH_PERSIST="$FM_AFK_LAUNCH_STATE/.afk-persist"
@@ -681,7 +681,7 @@ fm_afk_launch_persist() {
 
 # Explicit away-mode exit: clear the durable persist intent so session start no
 # longer re-enters away mode. This is the ONLY path that clears it; the
-# auto-return-on-unmarked-message flow (bin/fm-afk-return.sh) deliberately does
+# explicit-return flow (bin/fm-afk-return.sh) deliberately does
 # not, so a turnover during a still-standing away order resumes supervision.
 fm_afk_launch_unpersist() {
   if ! fm_afk_launch_persist_clear; then

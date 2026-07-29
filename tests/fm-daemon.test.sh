@@ -767,9 +767,9 @@ test_marker_detection() {
   afk_enter "$state"
   should_exit_afk "$state" "${FM_INJECT_MARK}escalate" \
     && fail "marker message should not exit afk (internal escalation)"
-  should_exit_afk "$state" "status update please" \
-    || fail "plain message should exit afk (captain is back)"
-  pass "marker detection: marker -> stay afk, no marker -> exit afk"
+  should_exit_afk "$state" "/back" \
+    || fail "explicit exit instruction should exit afk"
+  pass "marker detection: marker -> stay afk, explicit exit instruction -> exit afk"
 }
 
 test_afk_turn_exemption() {
@@ -782,10 +782,64 @@ test_afk_turn_exemption() {
     && fail "bare /afk should not exit afk"
   should_exit_afk "$state" "/afk back in an hour" \
     && fail "/afk with args should not exit afk"
-  # a non-/afk skill invocation DOES exit (the captain is actively working)
+  # a non-/afk skill invocation is ordinary work, not a return instruction
   should_exit_afk "$state" "/no-mistakes" \
-    || fail "non-afk skill should exit afk"
+    && fail "non-afk skill should not exit afk"
   pass "/afk invocation is exempt from afk exit (no self-cancel)"
+}
+
+# The standing captain order (2026-07-25): away mode survives ordinary captain
+# messages, including replies sent from a phone while genuinely still away, and
+# ends only on an explicit exit instruction.
+test_afk_exit_requires_an_explicit_instruction() {
+  local dir state msg
+  dir=$(make_supercase afk-explicit-exit)
+  state="$dir/state"
+  afk_enter "$state"
+  for msg in \
+    "status update please" \
+    "yes go ahead with option B" \
+    "no, use the other branch" \
+    "merge it" \
+    "back up the database first" \
+    "what is blocking the fix?" \
+    "thanks" \
+    "/no-mistakes" \
+    "/bearings"; do
+    should_exit_afk "$state" "$msg" \
+      && fail "ordinary captain message must not exit afk: $msg"
+  done
+  for msg in \
+    "/back" \
+    "/back now" \
+    "/unafk" \
+    "/afk exit" \
+    "/afk off" \
+    "/afk stop" \
+    "/afk end" \
+    "/afk done" \
+    "back" \
+    "I'm back" \
+    "im back now" \
+    "Exit afk" \
+    "afk off" \
+    "stop afk" \
+    "end afk" \
+    "exit away mode." \
+    "away mode off" \
+    "stop away mode"; do
+    should_exit_afk "$state" "$msg" \
+      || fail "explicit exit instruction must exit afk: $msg"
+  done
+  # A marked daemon escalation stays internal even when its body would otherwise
+  # read as an exit instruction.
+  should_exit_afk "$state" "${FM_OPERATIONAL_PREFIX}im back" \
+    && fail "marked escalation must never exit afk"
+  # Nothing to exit when away mode is not active.
+  afk_exit "$state"
+  should_exit_afk "$state" "/back" \
+    && fail "should_exit_afk true when afk inactive"
+  pass "afk exits only on an explicit instruction, never on an ordinary message"
 }
 
 test_should_exit_afk_when_afk_inactive() {
@@ -2406,6 +2460,7 @@ test_afk_absent_daemon_does_not_inject
 test_busy_guard_defers_when_supervisor_busy
 test_marker_detection
 test_afk_turn_exemption
+test_afk_exit_requires_an_explicit_instruction
 test_should_exit_afk_when_afk_inactive
 test_strip_injection_marker
 test_pane_input_pending_detects_partial_input

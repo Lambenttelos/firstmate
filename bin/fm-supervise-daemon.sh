@@ -36,9 +36,11 @@
 # U+2063 from a normal
 # keyboard at the start of a message, and Herdr transports it as text.
 # Firstmate's contract: a message that starts with the current prefix, or a
-# legacy bare-marker daemon escalation, is internal (stay afk); an unmarked
-# message means the captain is back (exit afk, flush catch-up, resume per-wake
-# responsiveness). The prefix and busy-guard solve the same problem - the
+# legacy bare-marker daemon escalation, is internal (stay afk); an ordinary
+# unmarked captain message is answered in place and away mode continues; only an
+# explicit exit instruction (see message_is_afk_exit) ends away mode, flushes
+# catch-up, and resumes per-wake
+# responsiveness. The prefix and busy-guard solve the same problem - the
 # daemon and the human share one input channel - so they live together under
 # /afk.
 #
@@ -303,7 +305,7 @@ afk_active() {  # <state>
 }
 
 # afk_enter / afk_exit: write/clear the away-mode flag. Called by the /afk
-# skill (enter) and by firstmate on user return (exit). Durable: a plain file,
+# skill (enter) and by firstmate on an explicit captain return (exit). Durable: a plain file,
 # so recovery (§5) re-enters afk if it is present after a restart.
 afk_enter() {  # <state>
   mkdir -p "$1"
@@ -315,26 +317,81 @@ afk_exit() {  # <state>
 }
 
 # should_exit_afk: encodes firstmate's afk-exit contract as a testable function.
-#   afk inactive            -> 1 (nothing to exit)
-#   message has marker      -> 1 (internal escalation; stay afk)
-#   message is /afk command -> 1 (re-entering/extending afk; stay afk)
-#   anything else           -> 0 (captain is back; exit afk)
-# Bias toward exit: only the marker and an explicit /afk invocation keep afk
-# alive. A false exit is self-correcting (the captain re-runs /afk).
+#   afk inactive                       -> 1 (nothing to exit)
+#   message has marker                 -> 1 (internal escalation; stay afk)
+#   explicit exit instruction          -> 0 (the captain ordered the exit)
+#   anything else, including an ordinary captain message or reply -> 1 (stay afk)
+#
+# Bias toward STAYING away. Standing captain order, 2026-07-25: the captain
+# answers questions from a phone throughout the day while genuinely still away,
+# so an ordinary reply must never tear away supervision down. A missed exit
+# costs one more explicit word from the captain, while a false exit costs a
+# daemon restart, a full return catch-up gate, and blocker reclassification.
+# Away mode therefore ends only on an explicit exit instruction; see
+# message_is_afk_exit below for that grammar.
 should_exit_afk() {  # <state> <message-text>
   local state=$1 msg=$2
   afk_active "$state" || return 1
   message_is_injection "$msg" && return 1
-  case "$msg" in
-    /afk*) return 1 ;;
+  message_is_afk_exit "$msg"
+}
+
+# fm_afk_normalize_message: lowercase the text, drop apostrophes, collapse
+# whitespace, trim, and strip trailing sentence punctuation, so the exit
+# grammar below compares against one stable form.
+fm_afk_normalize_message() {  # <message-text>
+  local s=$1
+  s=$(printf '%s' "$s" | tr '[:upper:]' '[:lower:]')
+  s=${s//\'/}
+  s=${s//’/}
+  s=$(printf '%s' "$s" | tr -s '[:space:]' ' ')
+  s=${s# }
+  s=${s% }
+  while [ -n "$s" ]; do
+    case "$s" in
+      *[.!?,\;:]) s=${s%?} ;;
+      *) break ;;
+    esac
+  done
+  printf '%s' "$s"
+}
+
+# message_is_afk_exit: 0 when the message text is an explicit instruction to
+# leave away mode, 1 otherwise. This function is the single owner of that
+# grammar; the /afk skill and AGENTS.md point here rather than restating it.
+#
+# Accepted forms:
+#   - a slash command: /back or /unafk, with or without trailing text.
+#   - /afk with an exit subcommand: exit, off, stop, end, or done. Bare /afk and
+#     /afk with any other argument (for example "/afk back in an hour") still
+#     refresh away mode rather than ending it.
+#   - a whole-message plain-language instruction, such as "im back",
+#     "exit afk", "afk off", "stop afk", "end away mode", or "away mode off".
+#
+# Plain-language forms must match the WHOLE message, so an ordinary request that
+# merely contains one of those words (for example "back up the database")
+# keeps away mode alive.
+message_is_afk_exit() {  # <message-text>
+  local msg=$1 norm
+  [ -n "$msg" ] || return 1
+  norm=$(fm_afk_normalize_message "$msg")
+  case "$norm" in
+    /back|/back\ *|/unafk|/unafk\ *) return 0 ;;
+    /afk\ exit*|/afk\ off*|/afk\ stop*|/afk\ end*|/afk\ done*) return 0 ;;
   esac
-  return 0
+  case "$norm" in
+    back|"back now"|"im back"|"im back now"|"i am back"|"i am back now") return 0 ;;
+    "exit afk"|"afk exit"|"afk off"|"stop afk"|"end afk"|"afk done"|"done afk") return 0 ;;
+    "exit away mode"|"away mode off"|"end away mode"|"stop away mode") return 0 ;;
+  esac
+  return 1
 }
 
 # message_is_injection: 0 if the given message text starts with the sentinel
 # marker (a daemon escalation), 1 otherwise (a real user message). Firstmate's
-# afk-exit contract uses this: marker present -> stay afk; absent -> captain is
-# back. Bias ambiguous cases toward exit (a false exit is self-correcting).
+# afk-exit contract uses this: marker present -> internal escalation, stay afk.
+# An unmarked message is a real captain message, which by itself does NOT exit
+# away mode; only message_is_afk_exit's explicit grammar does.
 message_is_injection() {  # <message-text>
   local msg=$1
   [ -n "$msg" ] || return 1

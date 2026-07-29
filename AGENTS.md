@@ -108,7 +108,7 @@ state/               volatile runtime signals; gitignored
   x-outbox/          generated X-mode dry-run reply and dismiss previews; inspect it when FMX_DRY_RUN is set (section 14)
   x-poll.error x-poll.claim-error  generated X-mode relay and offer-claim diagnostic dedupe markers
   .wake-queue        durable queued wakes: epoch<TAB>seq<TAB>kind<TAB>key<TAB>payload
-  .afk               durable away-mode flag; present = the away posture, so a live sub-supervisor daemon may inject escalations, while supervision ownership follows an actually-live daemon rather than this flag (bin/fm-afk-daemon-lib.sh; set by /afk, cleared on user return)
+  .afk               durable away-mode flag; present = the away posture, so a live sub-supervisor daemon may inject escalations, while supervision ownership follows an actually-live daemon rather than this flag (bin/fm-afk-daemon-lib.sh; set by /afk, cleared on an explicit captain return)
   .afk-persist       durable away-mode PERSIST INTENT, distinct from operational .afk; present = the captain ordered away supervision to survive a session turnover, so session start re-enters away mode and revives the daemon (bin/fm-bootstrap.sh afk_daemon_revive_sweep); owned by bin/fm-afk-launch.sh, set by `persist`, cleared ONLY by the explicit `unpersist` exit (never by auto-return)
   .afk-delivery .afk-outbox* .afk-inbox.beat  away-mode delivery mode, the durable pull-delivery records used when no supervisor pane exists, and the reader's liveness beacon; acknowledged only by bin/fm-afk-inbox.sh (docs/configuration.md)
   .watch.lock .wake-queue.lock watcher singleton and queue serialization locks
@@ -395,9 +395,11 @@ The skill owns the daemon procedure; these safety facts remain inline:
 - A marked message while away mode is active is internal escalation and does not exit away mode.
 - A completed `bin/fm-afk-inbox.sh` background task is internal escalation too, never captain input; act on the digests it printed and obey its final line's re-arm verdict rather than re-deriving it.
 - A message beginning `/afk` refreshes away mode.
-- Any other unmarked message means the captain returned; load `/afk`, run the return owner, and do not process that message as ordinary work until its durable catch-up gate clears.
+- An ordinary captain message does NOT end away mode; the captain answers questions while still away, so keep supervising and answer in place.
+- Away mode ends only on an explicit exit instruction, such as `/back` or "exit away mode"; `bin/fm-supervise-daemon.sh`'s `message_is_afk_exit` owns that grammar and the `/afk` skill owns the return procedure.
+- On an explicit exit, load `/afk`, run the return owner, and do not process that message as ordinary work until its durable catch-up gate clears.
 - Away mode never expands approval authority for merges, ask-user findings, destructive actions, irreversible actions, or security-sensitive choices.
-- Bias ambiguous input toward exit because a present captain takes precedence.
+- Bias ambiguous input toward STAYING away, because a wrong exit tears down away supervision the captain never asked to end.
 
 ### Stuck-worker trigger
 

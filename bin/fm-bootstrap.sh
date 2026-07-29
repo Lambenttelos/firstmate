@@ -497,7 +497,7 @@ afk_daemon_revive_sweep() {
   # Idempotent away-mode daemon revive - SESSION START ONLY, and only while this
   # session holds the fleet lock. The away-mode daemon and the watcher it owns as
   # a child do not survive a firstmate session turnover (compaction, restart, or
-  # a return-on-unmarked-message flow that stopped away mode). Evidence 2026-07-26:
+  # an explicit-return flow that stopped away mode). Evidence 2026-07-26:
   # the daemon shut down cleanly at a session boundary, state/.afk was cleared, and
   # the captain's standing "keep away mode" order survived only as prose in
   # data/captain.md - nothing machine-readable re-entered away mode. Durable

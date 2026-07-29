@@ -128,7 +128,7 @@ The daemon owns `bin/fm-watch.sh` as its child, so hosting the daemon durably ma
 ## Away-mode persist intent (state/.afk-persist)
 
 `state/.afk-persist` is the durable, machine-readable record that the captain ordered away supervision to survive a session turnover, distinct from the session-operational `state/.afk` flag.
-[`bin/fm-afk-launch.sh`](../bin/fm-afk-launch.sh) owns it: `persist` sets it and enters durable paneless away mode, and `unpersist` is the only path that clears it - the auto-return-on-unmarked-message flow ([`bin/fm-afk-return.sh`](../bin/fm-afk-return.sh)) deliberately does not, so a turnover during a still-standing away order resumes supervision rather than dropping it.
+[`bin/fm-afk-launch.sh`](../bin/fm-afk-launch.sh) owns it: `persist` sets it and enters durable paneless away mode, and `unpersist` is the only path that clears it - the explicit-return flow ([`bin/fm-afk-return.sh`](../bin/fm-afk-return.sh)) deliberately does not, so a turnover during a still-standing away order resumes supervision rather than dropping it.
 It is not a session-scoped delivery artifact, so a fresh away entry never clears it.
 While it is set and no live daemon owns the home, the session-start revive sweep ([`bin/fm-bootstrap.sh`](../bin/fm-bootstrap.sh) `afk_daemon_revive_sweep`) re-enters durable paneless away mode automatically, reporting only a revive failure as an `AFK_DAEMON:` line.
 Plain `/afk` without `persist` keeps its single-session auto-exit behavior.
