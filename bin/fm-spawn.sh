@@ -62,7 +62,7 @@
 #   profile consultation. A --secondmate spawn is exempt and resolves the SECONDMATE
 #   harness (config/secondmate-harness -> config/crew-harness -> own), so the
 #   secondmate-vs-crewmate split is DURABLE across every respawn (recovery,
-#   /updatefirstmate, restart). A bare adapter name (claude|codex|opencode|pi|grok)
+#   /updatefirstmate, restart). A bare adapter name (claude|codex|opencode|pi|grok|jcode)
 #   overrides it for this spawn (either kind). A non-flag string containing
 #   whitespace is treated as a RAW launch command - the escape hatch for verifying
 #   new adapters.
@@ -114,9 +114,17 @@
 #     __PIWATCH__   absolute path to .pi/extensions/fm-primary-pi-watch.ts in a pi secondmate home
 #     __OPINPUT__   absolute path to the canonical operational-input encoder
 #     __PIBRIEFENV__ shell assignment identifying the unchanged Pi positional brief
+#   A harness with no positional prompt (jcode) carries no __BRIEF__ placeholder:
+#   its brief, model, and effort are delivered to the live session after launch by
+#   jcode_post_launch_delivery(), which waits FM_SPAWN_JCODE_READY_POLLS seconds
+#   for the composer, then submits /model, /effort, and a launch-brief pointer.
 # Per-harness turn-end hooks are installed automatically; some live outside the worktree.
 # grok uses a firstmate-owned global hook under ${GROK_HOME:-$HOME/.grok}/hooks
 # plus a gitignored .fm-grok-turnend worktree pointer and a state token.
+# jcode gets NO turn-end hook: its native turn_end lifecycle hook is read by the
+# shared background server rather than by the launched client, so this spawn
+# cannot arm one per task. Its crewmates are supervised through stale-pane
+# detection alone (harness-adapters owns the evidence and the consequence).
 # Before dispatching it prints the host-resource reading from bin/fm-resource-check.sh
 # to stderr as a `warning:` advisory when the host is degraded or critical; that
 # is a report, never a refusal, and nothing is stopped automatically.
@@ -160,6 +168,10 @@ SUB_HOME_MARKER=".fm-secondmate-home"
 # Fail closed before any fleet mutation: a no-mistakes gate agent must never spawn
 # a direct report (see bin/fm-gate-refuse-lib.sh).
 fm_refuse_if_gate_agent
+# Seconds jcode_post_launch_delivery waits for a just-launched jcode TUI to draw
+# its composer before giving up on delivering the launch profile and brief. It
+# connects to an already-running shared server, so this is client startup only.
+FM_SPAWN_JCODE_READY_POLLS=${FM_SPAWN_JCODE_READY_POLLS:-30}
 # Skip the watcher guard when re-exec'd for one pair of a batch (FM_SPAWN_NO_GUARD is
 # set by the batch loop below), so the guard runs once for the batch, not once per pair.
 [ -n "${FM_SPAWN_NO_GUARD:-}" ] || "$FM_ROOT/bin/fm-guard.sh" || true
@@ -450,7 +462,7 @@ FIRSTMATE_HOME=
 
 if [ "$KIND" = secondmate ]; then
   case "${POS[1]:-}" in
-    ''|claude|codex|opencode|pi|grok)
+    ''|claude|codex|opencode|pi|grok|jcode)
       ARG3=${POS[1]:-}
       ;;
     *' '*)
@@ -511,8 +523,86 @@ launch_template() {
     # launch command - it is a Stop-event hook installed below (global hook +
     # per-task pointer), so the template is identical for ship/scout/secondmate.
     grok) printf '%s' 'grok --always-approve __MODELFLAG____EFFORTFLAG__"$(__OPINPUT__ encode launch-brief < __BRIEF__)"' ;;
+    # jcode: the ONLY verified adapter with no positional prompt - `jcode 'text'`
+    # is rejected as an unrecognized subcommand - so the brief is delivered AFTER
+    # launch by jcode_post_launch_delivery below, and the launch command carries
+    # no brief, model, or effort placeholder at all. --no-update keeps the launcher
+    # from interrupting the spawn with an update check. Tools run with no
+    # permission prompt by default, so there is no autonomy flag to pass and no
+    # trust dialog to accept (verified 2026-07-30, jcode server 0.64.2: a spawned
+    # session ran a bash tool unattended in a fresh git worktree). Model and
+    # effort launch flags are deliberately omitted: jcode's agent runs in a
+    # shared background server, and when that server is already up - it always is
+    # in practice - the launcher prints "provider/model flags only apply when
+    # starting a new server" and ignores them, so both axes are applied
+    # per-session after launch instead. No turn-end hook is installed: jcode's
+    # native turn_end lifecycle hook is read by the shared server, not by the
+    # client this spawn launches, so a per-task hook cannot be armed from here
+    # (evidence and the supervision consequence: harness-adapters).
+    jcode) printf '%s' 'jcode --no-update' ;;
     *) return 1 ;;
   esac
+}
+
+# jcode_post_launch_delivery: apply the resolved launch profile and deliver the
+# brief to a just-launched jcode session, the work its launch command cannot do.
+#
+# Ordering matters: model and effort are applied BEFORE the brief so the first
+# real turn already runs on the intended route. Each message is one line typed
+# into the composer and submitted through the target backend's own verified
+# submit path, so a swallowed Enter is retried exactly as it is for a steer.
+# Each `/`-prefixed line gets the same popup settle bin/fm-send.sh uses, because
+# jcode opens a slash-autocomplete popup within ~0.1s of the first character
+# (verified: `/model claude-opus-4-8 high` typed and submitted correctly with a
+# 1.2s settle, while a too-fast Enter lands in the popup instead).
+#
+# The brief is delivered as a POINTER to data/<id>/brief.md rather than as the
+# brief text: the brief is many lines, and every backend's composer submit is
+# line-oriented, so a raw newline would submit a partial brief. That matches
+# AGENTS.md's standing rule that long instructions travel as a file. The pointer
+# still rides the canonical launch-brief operational input, so the crewmate
+# receives it as a structurally typed launch brief exactly like every other
+# harness.
+jcode_post_launch_delivery() {  # <target> <brief-path> <model> <effort>
+  local target=$1 brief=$2 model=$3 effort=$4 i=0 state=unknown verdict line settle
+  local lines=()
+  # Wait for the TUI: until its composer row exists there is nothing to type
+  # into, and a message typed into the still-starting client is lost.
+  while [ "$i" -lt "$FM_SPAWN_JCODE_READY_POLLS" ]; do
+    state=$(fm_backend_composer_state "$BACKEND" "$target" 2>/dev/null) || state=unknown
+    [ "$state" = unknown ] || break
+    sleep 1
+    i=$((i + 1))
+  done
+  if [ "$state" = unknown ]; then
+    echo "warning: jcode composer did not appear within ${FM_SPAWN_JCODE_READY_POLLS}s on $target; the launch profile and brief were not delivered" >&2
+    return 1
+  fi
+  if [ -n "$model" ] && [ "$model" != default ]; then
+    lines+=("/model $model")
+  fi
+  if [ -n "$effort" ] && [ "$effort" != default ]; then
+    lines+=("/effort $effort")
+  fi
+  line=$(printf 'Read %s and follow it as your task brief.' "$brief" \
+    | "$FM_ROOT/bin/fm-operational-input.sh" encode launch-brief) \
+    || { echo "warning: could not encode the jcode launch brief for $target" >&2; return 1; }
+  lines+=("$line")
+  for line in "${lines[@]}"; do
+    case "$line" in
+      /*) settle=1.2 ;;
+      *) settle=0.3 ;;
+    esac
+    verdict=$(fm_backend_send_text_submit "$BACKEND" "$target" "$line" 3 0.4 "$settle" 2>/dev/null) || verdict=send-failed
+    case "$verdict" in
+      pending|send-failed)
+        echo "warning: jcode did not accept '$line' on $target (verdict $verdict); inspect the pane before relying on the task" >&2
+        return 1
+        ;;
+    esac
+    sleep 1
+  done
+  return 0
 }
 
 case "$ARG3" in
@@ -601,6 +691,10 @@ model_flag_for_harness() {
     claude|codex|opencode|pi|grok)
       printf -- '--model %s ' "$(shell_quote "$model")"
       ;;
+    # jcode is deliberately absent: its launch model flag applies only when the
+    # launcher starts the shared background server, so jcode's model is applied
+    # per session after launch instead (see effort_flag_for_harness below and
+    # jcode_post_launch_delivery).
   esac
 }
 
@@ -640,6 +734,14 @@ effort_flag_for_harness() {
     # opencode's interactive `opencode --prompt` launch has a verified --model
     # flag but no verified effort flag. Its `opencode run --variant` flag belongs
     # to a different, non-interactive launch mode, so fm-spawn does not pass it.
+    #
+    # jcode has both -m/--model and provider flags, but they apply only when the
+    # launcher STARTS the shared background server, so on an already-running
+    # server they are silently ignored. Neither axis is a launch flag for it:
+    # jcode_post_launch_delivery applies both to the live session with /model and
+    # /effort, which do work per session (verified 2026-07-30). jcode's /effort
+    # accepts a superset of firstmate's vocabulary, so nothing is capped, but
+    # which levels a given model honors is jcode's own decision.
   esac
 }
 
@@ -1484,6 +1586,15 @@ if [ "${HERDR_PROJECTED:-0}" -eq 1 ]; then
   spawn_herdr_presentation_order_lock_release
 fi
 spawn_send_key "$T" Enter
+# jcode's launch command carries no brief, model, or effort (launch_template
+# above): they are applied to the live session once its composer exists. A
+# delivery failure is reported and does not abort the spawn - the endpoint,
+# worktree, and metadata are already recorded, so firstmate supervises and
+# recovers this pane through the ordinary stuck-worker path rather than being
+# left with a half-torn-down task.
+if [ "$HARNESS" = jcode ]; then
+  jcode_post_launch_delivery "$T" "$BRIEF" "${MODEL:-}" "${EFFORT:-}" || true
+fi
 if [ "$KIND" = secondmate ]; then
   if ! fm_config_reread_discard_pending "$PROJ_ABS" "$ID" "$FM_HOME"; then
     if fm_config_reread_quarantine_pending "$PROJ_ABS" "$ID" "$FM_HOME"; then

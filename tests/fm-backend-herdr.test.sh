@@ -1788,6 +1788,62 @@ test_composer_state_grok_bright_truecolor_real_text_is_pending() {
   pass "fm_backend_herdr_composer_state: grok's real bright typed input still reads pending"
 }
 
+# jcode (verified 2026-07-30, jcode server 0.64.2) has neither a composer box nor
+# a known agent prompt glyph: its composer row is a turn counter plus a state
+# glyph ("3>" idle, "4…" mid-turn), the typed text, then a right-aligned ⏳. The
+# structural scan has to recognize that shape or the row is not found at all and
+# an IDLE jcode pane reads `unknown` - herdr's refuse-to-inject verdict - which
+# would strand every away-mode escalation to a jcode crewmate. Fixtures below are
+# the real captured bytes with the padding shortened.
+test_composer_state_jcode_numbered_prompt_is_empty() {
+  local dir log resp fb out
+  dir="$TMP_ROOT/composer-jcode-idle"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
+  printf ' 1\xe2\x80\xba Reply with exactly OK and nothing else.\n OK\n\x1b[38;2;255;80;80m3\x1b[38;2;138;180;248m> \x1b[39m        \x1b[38;2;255;193;7m\xe2\x8f\xb3\n' > "$resp/1.out"
+  fb=$(make_herdr_fakebin "$dir")
+  out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_composer_state default:w1:p2' "$ROOT" )
+  [ "$out" = empty ] || fail "an idle jcode numbered prompt row must read empty, got '$out'"
+  pass "fm_backend_herdr_composer_state: jcode's idle numbered prompt row reads empty"
+}
+
+test_composer_state_jcode_busy_prompt_is_empty() {
+  local dir log resp fb out
+  dir="$TMP_ROOT/composer-jcode-busy"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
+  printf '\xe2\xa0\xb9 4s \xc2\xb7 714.3 tps \xc2\xb7 https\n\x1b[38;2;255;80;80m4\x1b[38;2;138;180;248m\xe2\x80\xa6 \x1b[39m        \x1b[38;2;255;193;7m\xe2\x8f\xb3\n' > "$resp/1.out"
+  fb=$(make_herdr_fakebin "$dir")
+  out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_composer_state default:w1:p2' "$ROOT" )
+  [ "$out" = empty ] || fail "a mid-turn jcode prompt row holds no pending input and must read empty, got '$out'"
+  pass "fm_backend_herdr_composer_state: jcode's mid-turn prompt row reads empty"
+}
+
+test_composer_state_jcode_typed_text_is_pending() {
+  local dir log resp fb out
+  dir="$TMP_ROOT/composer-jcode-pending"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
+  # The slash-popup case: typed, popup open, nothing submitted yet, so the submit
+  # retry must still be told to send the second Enter.
+  printf '\x1b[38;2;255;80;80m3\x1b[38;2;138;180;248m> \x1b[39m/model claude-opus-4-8        \x1b[38;2;255;193;7m\xe2\x8f\xb3\n' > "$resp/1.out"
+  fb=$(make_herdr_fakebin "$dir")
+  out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_composer_state default:w1:p2' "$ROOT" )
+  [ "$out" = pending ] || fail "an unsubmitted jcode slash command must read pending, got '$out'"
+  pass "fm_backend_herdr_composer_state: jcode's unsubmitted slash-command text reads pending"
+}
+
+test_composer_state_jcode_transcript_rows_are_not_a_composer() {
+  local dir log resp fb out
+  dir="$TMP_ROOT/composer-jcode-transcript"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
+  # jcode's transcript and footer rows also start with digits, but its user rows
+  # use '›' (U+203A) and the footers carry no prompt glyph, so a capture with no
+  # composer row must stay unknown rather than promoting one of them.
+  printf ' 1\xe2\x80\xba Reply with exactly OK and nothing else.\n   2.7s \xc2\xb7 32.6 tps \xc2\xb7 \xe2\x86\x91254 \xe2\x86\x934\n 27k/1.0M \xe2\x96\xb1\xe2\x96\xb1\xe2\x96\xb1 3%%\n' > "$resp/1.out"
+  fb=$(make_herdr_fakebin "$dir")
+  out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_composer_state default:w1:p2' "$ROOT" )
+  [ "$out" = unknown ] || fail "jcode transcript/footer rows must not be promoted to a composer row, got '$out'"
+  pass "fm_backend_herdr_composer_state: jcode transcript and footer rows are not a composer row"
+}
+
 test_composer_state_codex_bare_prompt_glyph_is_empty() {
   local dir log resp fb out
   dir="$TMP_ROOT/composer-codex-bare"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
@@ -2831,6 +2887,10 @@ test_composer_state_claude_dim_ghost_row_with_real_text_is_pending
 test_composer_state_grok_dark_truecolor_placeholder_is_empty
 test_composer_state_grok_bright_truecolor_real_text_is_pending
 test_composer_state_codex_bare_prompt_glyph_is_empty
+test_composer_state_jcode_numbered_prompt_is_empty
+test_composer_state_jcode_busy_prompt_is_empty
+test_composer_state_jcode_typed_text_is_pending
+test_composer_state_jcode_transcript_rows_are_not_a_composer
 test_composer_state_codex_faint_suggestion_is_empty
 test_composer_state_codex_non_faint_same_text_is_pending
 test_wait_for_working_returns_busy_on_first_poll

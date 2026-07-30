@@ -1413,6 +1413,12 @@ fm_backend_herdr_strip_ansi() {  # <text>
 #              deliberately narrower than the bordered content classifier so a
 #              no-agent shell fallback prompt (`>`, `$`, `%`, or `#`) falls
 #              through to `unknown` instead of being misread as delivered.
+#              jcode's composer row (verified jcode server 0.64.2) is accepted
+#              here too, through the shared fm_composer_jcode_prompt_text
+#              recognizer rather than a herdr-local pattern: it is a turn counter
+#              plus a state glyph ("3> " idle, "4… " mid-turn) with a
+#              right-aligned status glyph, and the leading digit run keeps it
+#              distinct from every shell fallback prompt.
 #   separated - Pi's composer is one or more content rows between two solid
 #              horizontal `─` separator rows, with no prompt glyph or side
 #              borders. This shape is accepted ONLY when Herdr's native
@@ -1553,6 +1559,17 @@ fm_backend_herdr_composer_state() {  # <target> -> empty|pending|unknown
           raw_match=$line
           generic_line=$row
           found=1
+        elif fm_composer_jcode_prompt_text "$trimmed" >/dev/null 2>&1; then
+          # jcode's numbered prompt row ("3> …" idle, "4… " mid-turn), recognized
+          # by the shared owner so herdr and tmux cannot drift on the shape. It
+          # is the `bare` shape for content purposes: the shared classifier
+          # re-recognizes the row and supplies the composer-container flag
+          # itself. jcode's own transcript rows use a digit plus `›` (U+203A),
+          # not `>`, so they never match here.
+          shape=bare
+          raw_match=$line
+          generic_line=$row
+          found=1
         fi
         ;;
     esac
@@ -1619,8 +1636,9 @@ EOF
   fi
   # Delegate the empty/pending/unknown decision to the shared owner. The bare
   # shape only ever starts with an AGENT glyph (FM_BACKEND_HERDR_BARE_PROMPT_RE
-  # is '^[❯›]'), so a bare shell prompt never reaches here - it stays 'unknown'
-  # via the no-composer-row path above, exactly as before.
+  # is '^[❯›]') or with jcode's digit-prefixed prompt, so a bare shell prompt
+  # never reaches here - it stays 'unknown' via the no-composer-row path above,
+  # exactly as before.
   fm_composer_classify_content "$bordered" "$stripped" "$FM_BACKEND_HERDR_IDLE_RE"
 }
 

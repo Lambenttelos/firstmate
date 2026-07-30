@@ -82,6 +82,63 @@ test_agent_glyphs_are_empty_bordered_and_bare() {
   pass "fm_composer_classify_content: agent prompt glyphs (❯ claude, › codex) read empty bordered or bare"
 }
 
+# --- jcode's numbered prompt row ---------------------------------------------
+# jcode (verified 2026-07-30, jcode server 0.64.2) draws neither a composer box
+# nor a known agent glyph: its composer row is a turn counter, a state glyph
+# ("3>" idle, "4…" mid-turn), the typed text, then a right-aligned status glyph
+# (⏳) padded out to the far edge of the pane. Every run is bright truecolor, so
+# the ghost stripper keeps the whole row and the classifier sees it verbatim.
+# Rows below are the real captures, with the padding shortened.
+
+test_jcode_idle_prompt_row_is_empty() {
+  local out
+  out=$(classify 0 '3>                    ⏳')
+  [ "$out" = empty ] \
+    || fail "an idle jcode composer row must read empty (it read '$out'; pending here is the false-pending wedge)"
+  out=$(classify 0 '12>                   ⏳')
+  [ "$out" = empty ] || fail "a multi-digit jcode turn counter must still read empty, got '$out'"
+  out=$(classify 0 '3>')
+  [ "$out" = empty ] || fail "a jcode prompt row with no status glyph must read empty, got '$out'"
+  pass "fm_composer_classify_content: an idle jcode numbered prompt row reads empty"
+}
+
+test_jcode_busy_prompt_row_is_empty() {
+  local out
+  # Mid-turn the counter's glyph flips to '…'. Nothing is typed, so there is no
+  # pending input to defer on.
+  out=$(classify 0 '4…                    ⏳')
+  [ "$out" = empty ] || fail "a mid-turn jcode composer row must read empty, got '$out'"
+  pass "fm_composer_classify_content: a mid-turn jcode prompt row reads empty"
+}
+
+test_jcode_typed_text_is_pending() {
+  local out
+  out=$(classify 0 '3> hello unsubmitted text          ⏳')
+  [ "$out" = pending ] || fail "real text in a jcode composer must read pending, got '$out'"
+  # The slash-command popup fill: typed but unsubmitted, so the submit retry
+  # must still be told to send the second Enter.
+  out=$(classify 0 '3> /model claude-opus-4-8          ⏳')
+  [ "$out" = pending ] || fail "an unsubmitted jcode slash command must read pending, got '$out'"
+  pass "fm_composer_classify_content: real and slash-popup text in a jcode composer reads pending"
+}
+
+test_jcode_recognizer_rejects_non_composer_rows() {
+  local row out
+  # jcode's own transcript rows use a digit plus '›' (U+203A), not '>', and its
+  # footer rows start with digits too. None of them is a composer row.
+  for row in '1› Reply with exactly OK and nothing else.' '2.7s · 32.6 tps · ↑254 ↓4' '27k/1.0M ▱▱▱▱▱▱ 3%'; do
+    if fm_composer_jcode_prompt_text "$row" >/dev/null 2>&1; then
+      fail "fm_composer_jcode_prompt_text must not claim the jcode row '$row' as a composer prompt"
+    fi
+  done
+  # And the safety rule is untouched: a bare shell prompt is still a dead shell.
+  out=$(classify 0 '>')
+  [ "$out" = unknown ] || fail "the bare shell glyph must stay unknown after the jcode case, got '$out'"
+  out=$(classify 0 '$ ls -la')
+  [ "$out" != empty ] || fail "a dead shell with a command must not read empty, got '$out'"
+  pass "fm_composer_jcode_prompt_text: only jcode's numbered prompt row matches, and the dead-shell rule is preserved"
+}
+
 # --- Empty content and idle placeholder -------------------------------------
 
 test_empty_content_is_empty() {
@@ -165,3 +222,7 @@ test_empty_content_is_empty
 test_idle_placeholder_is_empty
 test_idle_placeholder_case_mode_is_explicit
 test_real_text_is_pending
+test_jcode_idle_prompt_row_is_empty
+test_jcode_busy_prompt_row_is_empty
+test_jcode_typed_text_is_pending
+test_jcode_recognizer_rejects_non_composer_rows
