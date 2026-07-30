@@ -125,24 +125,21 @@ The daemon's own death is healed at session start by `afk_daemon_revive_sweep` u
 A dead reader is self-concealing, because reviving it requires the very firstmate turn its own delivery would have started, so the incident on 2026-07-30 left nine escalations unread for over eleven hours while the daemon kept working.
 Two independent paths close that loop.
 The daemon's undelivered-escalation alarm above wakes a human through the active-alert channel and the durable wedge marker.
-[`bin/fm-afk-reader-check.sh`](../bin/fm-afk-reader-check.sh) gives the next firstmate turn a machine-readable instruction instead: session start runs it as `afk_reader_revive_sweep` ([`bin/fm-bootstrap.sh`](../bin/fm-bootstrap.sh)) and prints one `AFK_READER:` line when away mode is active, delivery is paneless, the beacon is stale beyond the shared window, and records are genuinely waiting.
+[`bin/fm-afk-reader-check.sh`](../bin/fm-afk-reader-check.sh) gives the next firstmate turn a machine-readable instruction instead: session start runs it as `afk_reader_revive_sweep` ([`bin/fm-bootstrap.sh`](../bin/fm-bootstrap.sh)) and prints one `AFK_READER:` line when away mode is active, delivery is paneless, this home's daemon is confidently live, the beacon is stale beyond the shared window, and records are genuinely waiting; a home whose daemon is gone is left to the revive sweep instead, so the report never points a session at the wrong subsystem.
 That check is a detector and never starts a reader itself, because the reader acknowledges every record it prints, so a reader started outside the harness would consume the captain's escalations to a stdout nobody reads.
 The [`afk`](../.agents/skills/afk/SKILL.md) skill owns the operating procedure.
-
-### Away-mode autonomous queue advancement
-
-Escalation is a notification: the daemon's contract is to tell firstmate what to drive, and firstmate's own agent turn does the driving.
-While the captain is away there may be no firstmate turn for hours, and on 2026-07-30 the fleet coasted roughly 9.5 hours - finished lanes uncleaned, a lane stalled before its push unnudged, unblocked tickets unstarted - even though every escalation was correct.
-[`bin/fm-afk-driver.sh`](../bin/fm-afk-driver.sh) closes that gap by advancing the mechanical part of the queue itself, and its header is the single owner of what one tick does, the dispatch-recipe format it requires, and the safety boundaries it observes.
-The daemon's housekeeping runs one bounded tick per cadence while `state/.afk` is present, wrapped so a driver failure or overrun is logged and supervision continues.
-`FM_AFK_DRIVER_TICK_SECS` sets that cadence (default 600 seconds; `0` switches the hook off for a home without changing anything else about away mode), and `FM_AFK_DRIVER_TIMEOUT_SECS` bounds a single tick (default 300 seconds).
-`FM_AFK_DRIVER_MAX_WORKERS` lowers the worker cap below its hard maximum of 4, and `FM_AFK_DRIVER_DISABLE=1` refuses every tick for a home.
-The driver never widens away mode's approval authority: it never merges, never forces or discards, never dispatches work without both a complete brief and a recorded recipe, and leaves every money, destructive, irreversible, and security-sensitive decision escalating and waiting for the captain.
-Every action it takes is appended to the same outbox as one record per tick, so the captain's catch-up shows what moved while they were away.
 
 A paneless home hosts the daemon durably in a detached tmux session through `bin/fm-afk-launch.sh start-paneless`, which forces `FM_AFK_DELIVERY=paneless` so the daemon selects pull delivery unconditionally rather than discovering the tmux pane it is itself hosted in.
 tmux is present as the runtime backend even though a paneless firstmate runs outside it, so a detached tmux session is a session-independent host that outlives a firstmate session turnover; the older `start-native` path hosted the daemon as a harness-native background job that was a child of the firstmate session and was reaped on turnover, silently taking away supervision down (evidence 2026-07-26).
 The daemon owns `bin/fm-watch.sh` as its child, so hosting the daemon durably makes the watcher durable too.
+
+### Away-mode autonomous queue advancement
+
+Escalation is a notification: the daemon tells firstmate what to drive, and firstmate's own agent turn does the driving.
+While the captain is away there may be no firstmate turn for hours, and on 2026-07-30 the fleet coasted roughly 9.5 hours even though every escalation was correct.
+[`bin/fm-afk-driver.sh`](../bin/fm-afk-driver.sh) closes that gap, and its header is the single owner of what one tick does, the dispatch-recipe format it requires, and the safety boundaries it keeps.
+The daemon's housekeeping runs one bounded tick per cadence while `state/.afk` is present, wrapped so a driver failure or overrun is logged and supervision continues.
+The knobs this file owns are `FM_AFK_DRIVER_TICK_SECS` (cadence, default 600 seconds; `0` switches the hook off for a home without changing anything else about away mode), `FM_AFK_DRIVER_TIMEOUT_SECS` (maximum seconds for one tick, default 300), `FM_AFK_DRIVER_MAX_WORKERS` (worker cap below its hard maximum of 4), and `FM_AFK_DRIVER_DISABLE=1` (refuse every tick for this home).
 
 ## Away-mode persist intent (state/.afk-persist)
 

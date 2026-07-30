@@ -17,6 +17,7 @@
 #                 "NUDGE_SECONDMATES: secondmate <id>: send failed: <reason>",
 #                 "BOOTSTRAP_INFO: nudged fm-<id> with '<message>'",
 #                 "SECONDMATE_LIVENESS: secondmate <id>: skipped: <reason>|respawn failed: <reason>",
+#                 "AFK_READER: away-mode escalation reader is not running ...",
 #                 "FMX: X mode on ..." or "FMX: X mode off ...".
 #          When a RUNNING secondmate worktree is fast-forwarded to firstmate's
 #          own current default-branch commit (a purely LOCAL fast-forward, never
@@ -525,14 +526,12 @@ afk_reader_revive_sweep() {
   # (bin/fm-afk-inbox.sh) firstmate arms as a tracked background task to deliver
   # them. The revive sweep above covers a dead daemon; this covers a dead reader,
   # which is self-concealing because reviving it needs the very firstmate turn its
-  # own delivery would have started. Evidence 2026-07-30: the reader ended at
-  # 22:33 and nine escalations sat unread until 09:55.
+  # own delivery would have started.
   #
-  # bin/fm-afk-reader-check.sh owns the whole condition and stays silent for a
-  # healthy, pane-delivery, or away-inactive home. It is a DETECTOR: arming the
-  # reader is firstmate's own action, because a reader started outside the harness
-  # would acknowledge the captain's escalations to a stdout nobody reads. Its
-  # AFK_READER line therefore instructs this session to arm one.
+  # bin/fm-afk-reader-check.sh owns the whole condition, the incident evidence, and
+  # why it detects rather than arms; it stays silent for a healthy, pane-delivery,
+  # daemon-less, or away-inactive home. Its AFK_READER line instructs THIS session
+  # to arm the reader, because that has to remain firstmate's own action.
   local out
   out=$(FM_HOME="$FM_HOME" "$SCRIPT_DIR/fm-afk-reader-check.sh" 2>/dev/null || true)
   [ -n "$out" ] && printf '%s\n' "$out"

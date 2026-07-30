@@ -2349,7 +2349,7 @@ test_driver_failure_never_takes_supervision_down() {
 test_inbox_beacon_stale_window_is_derived_from_max_defer() {
   local secs
   secs=$(unset FM_AFK_INBOX_BEACON_STALE_SECS FM_MAX_DEFER_SECS; inbox_beacon_stale_secs)
-  [ "$secs" -eq $(( MAX_DEFER_SECS_DEFAULT * INBOX_BEACON_STALE_DEFER_MULTIPLE )) ] \
+  [ "$secs" -eq $(( FM_AFK_MAX_DEFER_SECS_DEFAULT * FM_AFK_INBOX_BEACON_STALE_DEFER_MULTIPLE )) ] \
     || fail "the default staleness window is $secs, not the derived default"
   [ "$secs" -gt "$MAX_DEFER_SECS_DEFAULT" ] \
     || fail "the default staleness window ($secs) does not outlast one max-defer window"

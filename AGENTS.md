@@ -400,8 +400,7 @@ The skill owns the daemon procedure; these safety facts remain inline:
 - An ordinary captain message does NOT end away mode; the captain answers questions while still away, so keep supervising and answer in place.
 - Away mode ends only on an explicit exit instruction, such as `/back` or "exit away mode"; `bin/fm-supervise-daemon.sh`'s `message_is_afk_exit` owns that grammar and the `/afk` skill owns the return procedure.
 - On an explicit exit, load `/afk`, run the return owner, and do not process that message as ordinary work until its durable catch-up gate clears.
-- While away mode is active, the daemon also runs one bounded `bin/fm-afk-driver.sh` tick per cadence, which advances only the mechanical part of the queue - cleaning up a finished lane whose work is durable, nudging one that finished without pushing, starting queued work that already has complete instructions and a recorded start recipe - and reports every action it takes on the captain's catch-up.
-  It carries exactly firstmate's own away-mode authority: it never merges, never forces or discards, and never starts work whose instructions are unwritten.
+- While away mode is active, the daemon also runs one bounded `bin/fm-afk-driver.sh` tick per cadence, which advances the mechanical part of the queue and reports every action on the captain's catch-up; that script's header owns the contract, and it carries exactly firstmate's own away-mode authority.
 - Away mode never expands approval authority for merges, ask-user findings, destructive actions, irreversible actions, or security-sensitive choices.
 - Bias ambiguous input toward STAYING away, because a wrong exit tears down away supervision the captain never asked to end.
 

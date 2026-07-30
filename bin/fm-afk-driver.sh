@@ -34,8 +34,17 @@
 #      (data/<id>/dispatch, see DISPATCH RECIPE below). Anything else is reported as
 #      a fact for firstmate and never auto-dispatched.
 #   4. Report what moved. Every action, refusal, and skipped-because reason is
-#      appended to the away-mode outbox as ONE record per tick, so the captain's
-#      catch-up shows what the driver did while they were away.
+#      written to a durable spool the moment it happens and drained into ONE
+#      away-mode outbox record, so the captain's catch-up shows what the driver did
+#      while they were away. The spool, not an in-memory list, is the source of that
+#      record: a tick the daemon's watchdog stops after acting leaves its facts
+#      there and the next tick reports them.
+#   5. Surface a dead escalation reader. bin/fm-afk-reader-check.sh's condition is
+#      re-checked each tick and printed, which reaches the daemon log rather than
+#      the outbox: when that condition holds, the outbox is precisely the channel
+#      nobody is reading. The driver never arms a reader itself - that script's
+#      header owns why arming must stay firstmate's own action - so session start
+#      remains the path that heals the channel.
 #
 # HARD BOUNDARIES. The driver has exactly firstmate's own away-mode authority and
 # not one step more:
@@ -69,9 +78,11 @@
 # decision - firstmate records the decision in advance, and the driver only fires
 # it once the dependency and host gates clear.
 #
-# ACTIVE WORKER. A task counts against the cap when its reconciled state is
-# working, parked, blocked, or paused - it holds a worker and a memory slot.
-# done, failed, and unknown do not.
+# ACTIVE WORKER. Every recorded ship or scout task counts against the cap unless
+# its reconciled state is done. failed and unknown count too, deliberately: a task
+# whose state cannot be reconciled may still hold a live endpoint and a memory
+# slot, and the safe direction for a cap is to OVERCOUNT. Dispatching one item late
+# costs a delay; undercounting starts a fifth worker on a machine sized for four.
 #
 # Usage: fm-afk-driver.sh tick [--dry-run]
 #        fm-afk-driver.sh --help
@@ -105,6 +116,9 @@ DATA="$FM_HOME/data"
 . "$SCRIPT_DIR/fm-afk-outbox-lib.sh"
 
 WORKER_CAP_HARD=4
+# Durable spool of this tick's facts, drained into one outbox record. It exists so
+# a tick stopped by the daemon's watchdog still reports what it already did.
+FACT_SPOOL_NAME=".afk-driver-facts"
 DRY_RUN=0
 ACTIONS=()
 
@@ -113,8 +127,15 @@ usage() {
     "${BASH_SOURCE[0]}"
 }
 
+# Every fact is written to the durable spool the MOMENT its action completed, not
+# only collected in memory for the end-of-tick report. A tick can be stopped by the
+# daemon's own timeout watchdog mid-pass, and an action that already happened - a
+# lane cleaned up, an agent nudged, work started - must still reach the captain's
+# catch-up. The spool is drained into one outbox record at the end of this tick, or
+# by the next tick when this one did not get that far.
 note() {  # <text> - one captain-facing fact about this tick
   ACTIONS+=("$1")
+  [ "$DRY_RUN" -eq 1 ] || printf '%s\n' "$1" >> "$STATE/$FACT_SPOOL_NAME" 2>/dev/null || true
   printf 'driver: %s\n' "$1"
 }
 
@@ -126,16 +147,29 @@ marker_key() {  # <task-id> - filesystem-safe marker suffix
   printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_'
 }
 
-# Record a one-time note under a marker. Returns 0 the first time this exact text
-# is recorded for this marker, 1 when the same text was already recorded - so a
-# repeated tick over unchanged state stays silent instead of re-reporting.
-note_once() {  # <marker-name> <text>
-  local marker="$STATE/$1" text=$2
-  if [ -r "$marker" ] && [ "$(cat "$marker" 2>/dev/null)" = "$text" ]; then
+# Report one condition once. <kind> is a STABLE condition name and <task-key> the
+# task it concerns, so a marker records the condition rather than the exact wording:
+# every one of these reports embeds a tool's own last output line as evidence, and
+# keying on that text would re-report the same unchanged condition on every tick as
+# soon as a path, a count, or a timestamp inside it moved. Returns 0 when the
+# condition is new for this task and the caller should report it, 1 when it was
+# already reported and this tick must stay silent about it.
+report_once() {  # <kind> <task-key> <text>
+  local kind=$1 key=$2 text=$3 marker="$STATE/.afk-driver-noted-$2-$1"
+  if [ -e "$marker" ]; then
     return 1
   fi
-  [ "$DRY_RUN" -eq 1 ] || printf '%s\n' "$text" > "$marker" 2>/dev/null || true
+  if [ "$DRY_RUN" -eq 0 ]; then
+    printf '%s\n' "$text" > "$marker" 2>/dev/null || true
+  fi
   return 0
+}
+
+# Forget every condition recorded for a task, so a lane that genuinely moved on
+# reports its next condition instead of staying silent behind a stale marker.
+forget_notes() {  # <task-key>
+  [ "$DRY_RUN" -eq 1 ] && return 0
+  rm -f "$STATE/.afk-driver-noted-$1"-* 2>/dev/null || true
 }
 
 worker_cap() {
@@ -156,13 +190,6 @@ crew_state() {  # <task-id>
   printf '%s' "$out" | awk '{ for (i = 1; i < NF; i++) if ($i == "state:") { print $(i + 1); exit } }'
 }
 
-state_is_active() {  # <state-word>
-  case "$1" in
-    working|parked|blocked|paused) return 0 ;;
-    *) return 1 ;;
-  esac
-}
-
 # --- step 1 and 2: finished lanes -------------------------------------------
 
 # Advance ONE done lane: clean it up when its branch is durable on origin, or
@@ -178,7 +205,7 @@ advance_done_lane() {  # <task-id> <worktree>
   if [ -z "$branch" ] || [ "$branch" = HEAD ]; then
     # A detached HEAD cannot be probed by branch name, and deciding what its
     # commit belongs to is a judgment call. Report it once and leave it alone.
-    note_once ".afk-driver-noted-$key" \
+    report_once detached-head "$key" \
       "$id finished on a detached HEAD; firstmate must decide where that commit belongs" \
       && note "$id finished on a detached HEAD; left alone for firstmate"
     return 0
@@ -193,10 +220,11 @@ advance_done_lane() {  # <task-id> <worktree>
       fi
       if out=$(FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" \
         "$SCRIPT_DIR/fm-teardown.sh" "$id" 2>&1); then
-        rm -f "$STATE/.afk-driver-noted-$key" "$STATE/.afk-driver-steered-$key"
+        forget_notes "$key"
+        rm -f "$STATE/.afk-driver-steered-$key"
         note "cleaned up $id (branch $branch durable on origin)"
       else
-        note_once ".afk-driver-noted-$key" \
+        report_once cleanup-refused "$key" \
           "cleanup refused for $id: $(printf '%s' "$out" | tail -n 1)" \
           && note "cleanup refused for $id, work left untouched: $(printf '%s' "$out" | tail -n 1)"
       fi
@@ -218,7 +246,7 @@ advance_done_lane() {  # <task-id> <worktree>
         date +%s > "$STATE/.afk-driver-steered-$key"
         note "steered $id to finish pushing $branch"
       else
-        note_once ".afk-driver-noted-$key" \
+        report_once steer-failed "$key" \
           "could not steer $id: $(printf '%s' "$out" | tail -n 1)" \
           && note "could not reach $id to ask it to push $branch: $(printf '%s' "$out" | tail -n 1)"
       fi
@@ -226,7 +254,7 @@ advance_done_lane() {  # <task-id> <worktree>
     *)
       # An ls-remote that failed for any other reason (no remote, offline, auth)
       # proves nothing about durability, so the lane is left exactly as it is.
-      note_once ".afk-driver-noted-$key" \
+      report_once origin-unreachable "$key" \
         "origin unreachable for $id ($branch); durability unknown" \
         && note "could not check whether $id's work reached origin; left untouched"
       ;;
@@ -303,7 +331,7 @@ dispatch_ready_work() {  # <active-worker-count>
     fi
     key=$(marker_key "$id")
     if ! brief_is_complete "$id"; then
-      note_once ".afk-driver-noted-$key" "$id is ready but has no complete brief" \
+      report_once brief-incomplete "$key" "$id is ready but has no complete brief" \
         && note "$id is ready to start but still needs instructions written; left for firstmate"
       continue
     fi
@@ -313,12 +341,12 @@ dispatch_ready_work() {  # <active-worker-count>
       args+=("$line")
     done < <(recipe_args "$id")
     if [ "${#args[@]}" -lt 2 ]; then
-      note_once ".afk-driver-noted-$key" "$id is ready but has no dispatch recipe" \
+      report_once recipe-missing "$key" "$id is ready but has no dispatch recipe" \
         && note "$id is ready to start but firstmate has not recorded how to start it; left for firstmate"
       continue
     fi
     if ! host_has_headroom; then
-      note_once ".afk-driver-noted-host" "host under pressure; dispatch held" \
+      report_once host-pressure fleet "host under pressure; dispatch held" \
         && note "the machine is under pressure, so queued work is waiting rather than starting"
       return 0
     fi
@@ -329,36 +357,59 @@ dispatch_ready_work() {  # <active-worker-count>
     fi
     if out=$(FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" \
       "$SCRIPT_DIR/fm-spawn.sh" "${args[@]}" 2>&1); then
-      rm -f "$STATE/.afk-driver-noted-$key"
+      forget_notes "$key"
       note "started $id"
       active=$((active + 1))
     else
-      note_once ".afk-driver-noted-$key" "could not start $id: $(printf '%s' "$out" | tail -n 1)" \
+      report_once spawn-failed "$key" "could not start $id: $(printf '%s' "$out" | tail -n 1)" \
         && note "could not start $id: $(printf '%s' "$out" | tail -n 1)"
     fi
   done < <(ready_ids)
   if [ "$held" -gt 0 ]; then
-    note_once ".afk-driver-noted-cap" "cap reached with $held item(s) waiting" \
+    report_once worker-cap fleet "cap reached with $held item(s) waiting" \
       && note "$held queued item(s) are waiting because the fleet is already at its worker limit"
   else
-    rm -f "$STATE/.afk-driver-noted-cap" 2>/dev/null || true
+    forget_notes fleet
   fi
+}
+
+# --- reader liveness ---------------------------------------------------------
+
+# Surface a dead escalation reader on the daemon's own log, where a human reading
+# an incident will find it, rather than as an outbox fact: the outbox is exactly
+# the channel nobody is reading when this condition holds, so reporting it there
+# would be a message to the failure itself. Arming a reader is deliberately NOT
+# done here - bin/fm-afk-reader-check.sh's header owns why that must stay
+# firstmate's own action - and session start acts on the same check.
+report_reader_liveness() {
+  local out
+  [ -x "$SCRIPT_DIR/fm-afk-reader-check.sh" ] || return 0
+  out=$(FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" \
+    "$SCRIPT_DIR/fm-afk-reader-check.sh" 2>/dev/null || true)
+  [ -n "$out" ] || return 0
+  printf '%s\n' "$out"
+  return 0
 }
 
 # --- one tick ----------------------------------------------------------------
 
+# Drain the durable fact spool into ONE outbox record. The spool, not the in-memory
+# list, is the source: a previous tick that the watchdog stopped after acting leaves
+# its facts there, and they must still reach the captain rather than be lost with
+# the process that performed them. The spool is cleared only after the record is
+# safely appended.
 report_actions() {
-  local digest
-  [ "${#ACTIONS[@]}" -gt 0 ] || return 0
+  local spool="$STATE/$FACT_SPOOL_NAME" digest
   [ "$DRY_RUN" -eq 1 ] && return 0
-  digest="away-mode driver: $(printf '%s; ' "${ACTIONS[@]}")"
-  digest=${digest%; }
+  [ -s "$spool" ] || return 0
+  digest="away-mode driver: $(tr '\n' ';' < "$spool" | sed 's/;$//; s/;/; /g')"
   fm_afk_outbox_append "$STATE" driver "$digest" || return 1
+  rm -f "$spool"
   return 0
 }
 
 run_tick() {
-  local meta id kind wt st active=0 rc=0
+  local meta lane id kind wt st active=0 rc=0
   local -a done_lanes=()
   for meta in "$STATE"/*.meta; do
     [ -e "$meta" ] || continue
@@ -368,39 +419,42 @@ run_tick() {
       secondmate) continue ;;
     esac
     st=$(crew_state "$id") || st=
-    if state_is_active "$st"; then
-      active=$((active + 1))
-      continue
-    fi
     if [ "$st" = "done" ]; then
       done_lanes+=("$id"$'\t'"$(meta_value "$meta" worktree)")
+      continue
     fi
+    # Everything else counts against the cap, including failed and unknown. A
+    # recorded task whose state cannot be reconciled may still be holding a live
+    # endpoint and a memory slot, and the safe direction for a cap is to
+    # OVERCOUNT: a tick that dispatches one item late costs a delay, while one
+    # that undercounts starts a fifth worker on a machine sized for four.
+    active=$((active + 1))
   done
 
-  for meta in "${done_lanes[@]:-}"; do
-    [ -n "$meta" ] || continue
-    id=${meta%%$'\t'*}
-    wt=${meta#*$'\t'}
+  for lane in "${done_lanes[@]:-}"; do
+    [ -n "$lane" ] || continue
+    id=${lane%%$'\t'*}
+    wt=${lane#*$'\t'}
     advance_done_lane "$id" "$wt"
   done
 
   dispatch_ready_work "$active"
+  report_reader_liveness
   report_actions || rc=1
   return "$rc"
 }
 
 main() {
-  local mode=tick lock rc=0
+  local lock rc=0
   while [ "$#" -gt 0 ]; do
     case "$1" in
-      tick) mode=tick ;;
+      tick) ;;
       --dry-run) DRY_RUN=1 ;;
       -h|--help) usage; return 0 ;;
       *) printf 'fm-afk-driver: unknown argument %s\n' "$1" >&2; usage >&2; return 1 ;;
     esac
     shift
   done
-  [ "$mode" = tick ] || return 1
 
   if [ "${FM_AFK_DRIVER_DISABLE:-0}" = 1 ]; then
     printf 'fm-afk-driver: disabled for this home (FM_AFK_DRIVER_DISABLE=1)\n' >&2

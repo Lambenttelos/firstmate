@@ -34,6 +34,10 @@
 #   - away mode is active (state/.afk present),
 #   - the daemon recorded PANELESS delivery for this away session (a pane home
 #     needs no reader at all),
+#   - this home's away-mode daemon is actually LIVE, because a home whose daemon
+#     is gone has a different and larger problem that the daemon revive sweep
+#     owns, and telling that session to arm a reader for a channel nothing is
+#     writing to would point it at the wrong subsystem,
 #   - the reader's liveness beacon is absent or staler than the shared window
 #     (bin/fm-afk-outbox-lib.sh's fm_afk_inbox_beacon_stale_secs), and
 #   - at least one unacknowledged record is actually waiting.
@@ -57,24 +61,20 @@ STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 
 # shellcheck source=bin/fm-afk-outbox-lib.sh
 . "$SCRIPT_DIR/fm-afk-outbox-lib.sh"
-
-# Seconds since <file> was last touched; a huge number when it does not exist, so
-# an absent beacon reads as the strongest form of "nothing is listening".
-file_age() {  # <file>
-  local f=$1 mtime now
-  [ -e "$f" ] || { printf '999999'; return; }
-  now=$(date +%s)
-  mtime=$(stat -f %m "$f" 2>/dev/null || stat -c %Y "$f" 2>/dev/null || echo "$now")
-  printf '%s' $(( now - mtime ))
-}
+# Away-mode daemon liveness, so this check can tell "the writer is working and
+# only the reader is gone" from "away supervision is down altogether".
+# shellcheck source=bin/fm-afk-daemon-lib.sh
+. "$SCRIPT_DIR/fm-afk-daemon-lib.sh"
 
 main() {
   local pending count age
 
   [ -e "$STATE/.afk" ] || return 0
   [ "$(fm_afk_delivery_mode_recorded "$STATE")" = paneless ] || return 0
+  fm_afk_daemon_alive "$STATE/.supervise-daemon.lock" \
+    "$SCRIPT_DIR/fm-supervise-daemon.sh" || return 0
 
-  age=$(file_age "$(fm_afk_inbox_beacon_file "$STATE")")
+  age=$(fm_afk_file_age "$(fm_afk_inbox_beacon_file "$STATE")")
   [ "$age" -ge "$(fm_afk_inbox_beacon_stale_secs)" ] || return 0
 
   count=0

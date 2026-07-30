@@ -134,7 +134,20 @@ fm_afk_inbox_beacon_touch() {  # <state>
 # staleness window from max-defer keeps the two windows comparable however
 # max-defer is configured, and docs/configuration.md owns the published defaults.
 FM_AFK_MAX_DEFER_SECS_DEFAULT=300
+
 FM_AFK_INBOX_BEACON_STALE_DEFER_MULTIPLE=2
+
+# Seconds since <file> was last touched, and a very large number when it does not
+# exist - so an absent beacon reads as the strongest possible form of "nothing is
+# listening" rather than as a fresh stamp. Same portable stat pair the watcher and
+# the daemon use, kept here so every beacon consumer measures age identically.
+fm_afk_file_age() {  # <file>
+  local f=$1 mtime now
+  [ -e "$f" ] || { printf '999999'; return 0; }
+  now=$(date +%s)
+  mtime=$(stat -f %m "$f" 2>/dev/null || stat -c %Y "$f" 2>/dev/null || printf '%s' "$now")
+  printf '%s' $(( now - mtime ))
+}
 
 # Seconds without a beacon stamp before firstmate's inbox reader counts as gone.
 # A non-numeric or zero FM_AFK_INBOX_BEACON_STALE_SECS override falls back to the

@@ -26,7 +26,7 @@ make_case() {  # <name> -> case dir
   cp "$ROOT/bin/fm-afk-driver.sh" "$ROOT/bin/fm-afk-reader-check.sh" \
     "$ROOT/bin/fm-afk-outbox-lib.sh" "$ROOT/bin/fm-wake-lib.sh" \
     "$ROOT/bin/fm-mutex-lib.sh" "$ROOT/bin/fm-pid-lib.sh" \
-    "$ROOT/bin/fm-classify-lib.sh" "$dir/bin/"
+    "$ROOT/bin/fm-classify-lib.sh" "$ROOT/bin/fm-afk-daemon-lib.sh" "$dir/bin/"
 
   # Reconciled current state comes from one file per task, so a test states the
   # crew state it means instead of simulating a no-mistakes run.
@@ -350,7 +350,66 @@ test_secondmate_home_is_never_advanced() {
   pass "a persistent secondmate is never cleaned up or steered by the driver"
 }
 
+test_facts_from_a_stopped_tick_are_reported_by_the_next_one() {
+  local dir out
+  dir=$(make_case spooled-facts)
+  # The shape a watchdog-stopped tick leaves behind: the actions happened, so their
+  # facts are already on the durable spool, but the process never got to report.
+  printf 'cleaned up omicron (branch fm/omicron durable on origin)\n' \
+    > "$dir/home/state/.afk-driver-facts"
+
+  out=$(run_driver "$dir") || fail "the tick failed: $out"
+  assert_contains "$(outbox_records "$dir")" "cleaned up omicron" \
+    "facts from a stopped tick never reached the captain's catch-up"
+  [ ! -e "$dir/home/state/.afk-driver-facts" ] \
+    || fail "the spool survived a successful report and will be reported twice"
+  pass "actions a stopped tick already performed are reported by the next tick"
+}
+
+test_unreadable_lanes_still_count_against_the_cap() {
+  local dir out i
+  dir=$(make_case cap-unknown-lanes)
+  # Three working lanes plus one whose state cannot be reconciled. The fourth may
+  # still be holding a live endpoint, so the cap must count it.
+  for i in 1 2 3; do
+    fm_write_meta "$dir/home/state/live$i.meta" "window=synthetic:fm-live$i" "kind=ship"
+    printf 'working\n' > "$dir/home/state/live$i.crewstate"
+  done
+  fm_write_meta "$dir/home/state/murky.meta" "window=synthetic:fm-murky" "kind=ship"
+  seed_ready_item "$dir" upsilon --brief-complete --recipe
+
+  out=$(run_driver "$dir") || fail "the tick failed: $out"
+  [ ! -e "$dir/home/spawn.log" ] \
+    || fail "a lane whose state could not be read was not counted against the cap"
+  assert_contains "$out" "already at its worker limit" "the held queue was not reported: $out"
+  pass "a lane whose state cannot be reconciled counts against the worker cap"
+}
+
 # --- reader liveness --------------------------------------------------------
+
+# A live away-mode daemon for this home: the reader check must be able to tell
+# "the writer is fine and only the reader died" from "away supervision is down",
+# so the lock is held by a real live process with a recorded identity, exactly as
+# the daemon lock records it.
+DAEMON_SLEEPERS=()
+seed_live_daemon() {  # <case-dir>
+  local dir=$1 lock="$1/home/state/.supervise-daemon.lock" pid
+  sleep 120 &
+  pid=$!
+  DAEMON_SLEEPERS+=("$pid")
+  mkdir -p "$lock"
+  printf '%s\n' "$pid" > "$lock/pid"
+  ( . "$ROOT/bin/fm-pid-lib.sh"; fm_pid_identity "$pid" > "$lock/pid-identity" ) 2>/dev/null || true
+}
+
+stop_daemon_sleepers() {
+  local pid
+  for pid in "${DAEMON_SLEEPERS[@]:-}"; do
+    [ -n "$pid" ] || continue
+    kill "$pid" 2>/dev/null || true
+  done
+}
+trap 'stop_daemon_sleepers; fm_test_cleanup' EXIT
 
 run_reader_check() {  # <case-dir>
   local dir=$1
@@ -364,9 +423,26 @@ seed_unread_record() {  # <case-dir> <age-seconds>
     "$(( $(date +%s) - age ))" > "$dir/home/state/.afk-outbox"
 }
 
+test_tick_surfaces_a_dead_reader_without_consuming_records() {
+  local dir out before
+  dir=$(make_case tick-reader-dead)
+  seed_live_daemon "$dir"
+  seed_unread_record "$dir" 4000
+  touch -t 197001020000 "$dir/home/state/.afk-inbox.beat"
+  before=$(outbox_records "$dir")
+
+  out=$(run_driver "$dir") || fail "the tick failed: $out"
+  assert_contains "$out" "AFK_READER:" \
+    "a tick found a dead escalation reader and said nothing where an operator would see it: $out"
+  assert_contains "$(outbox_records "$dir")" "$before" \
+    "the tick consumed or rewrote the records still waiting for the reader"
+  pass "a tick surfaces a dead escalation reader on the daemon log and consumes nothing"
+}
+
 test_reader_check_reports_a_dead_reader_with_records_waiting() {
   local dir out
   dir=$(make_case reader-dead)
+  seed_live_daemon "$dir"
   seed_unread_record "$dir" 4000
   # The incident's exact shape: a beacon that EXISTS but has not been stamped for
   # hours, which is a reader that died rather than one that was never armed.
@@ -384,6 +460,7 @@ test_reader_check_reports_a_dead_reader_with_records_waiting() {
 test_reader_check_is_silent_for_a_live_reader() {
   local dir out
   dir=$(make_case reader-live)
+  seed_live_daemon "$dir"
   seed_unread_record "$dir" 4000
   touch "$dir/home/state/.afk-inbox.beat"
 
@@ -395,6 +472,7 @@ test_reader_check_is_silent_for_a_live_reader() {
 test_reader_check_is_silent_with_nothing_waiting() {
   local dir out
   dir=$(make_case reader-nothing-pending)
+  seed_live_daemon "$dir"
   touch -t 197001020000 "$dir/home/state/.afk-inbox.beat"
 
   out=$(run_reader_check "$dir")
@@ -402,9 +480,21 @@ test_reader_check_is_silent_with_nothing_waiting() {
   pass "an unarmed reader with nothing waiting for it is not an incident"
 }
 
+test_reader_check_is_silent_when_the_daemon_itself_is_gone() {
+  local dir out
+  dir=$(make_case reader-daemon-gone)
+  seed_unread_record "$dir" 4000
+  touch -t 197001020000 "$dir/home/state/.afk-inbox.beat"
+
+  out=$(run_reader_check "$dir")
+  [ -z "$out" ] || fail "a home whose away-mode daemon is gone was told to arm a reader: $out"
+  pass "a home with no live away-mode daemon is left to the daemon revive sweep"
+}
+
 test_reader_check_is_silent_outside_paneless_away_mode() {
   local dir out
   dir=$(make_case reader-pane-mode)
+  seed_live_daemon "$dir"
   seed_unread_record "$dir" 4000
   touch -t 197001020000 "$dir/home/state/.afk-inbox.beat"
   printf 'pane\n' > "$dir/home/state/.afk-delivery"
@@ -433,7 +523,11 @@ test_second_tick_after_cleanup_is_a_no_op
 test_driver_refuses_when_away_mode_is_absent
 test_dry_run_reports_without_touching_the_fleet
 test_secondmate_home_is_never_advanced
+test_facts_from_a_stopped_tick_are_reported_by_the_next_one
+test_unreadable_lanes_still_count_against_the_cap
+test_tick_surfaces_a_dead_reader_without_consuming_records
 test_reader_check_reports_a_dead_reader_with_records_waiting
 test_reader_check_is_silent_for_a_live_reader
 test_reader_check_is_silent_with_nothing_waiting
+test_reader_check_is_silent_when_the_daemon_itself_is_gone
 test_reader_check_is_silent_outside_paneless_away_mode

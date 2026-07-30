@@ -214,9 +214,8 @@ Session start reports a reader that has stopped while records are waiting as one
 Never start the reader with a plain `&`: it acknowledges every record it prints, so a reader nobody is reading consumes the captain's escalations.
 
 Escalating is a notification, and while the captain is away there may be no firstmate turn for hours, so the daemon also runs one bounded `bin/fm-afk-driver.sh` tick per cadence while away mode is active.
-The driver advances only the mechanical part of the queue - cleaning up a finished lane whose work is durable on origin, nudging once a lane that finished without pushing, starting queued work that already has both complete instructions and a recorded start recipe - and appends every action it took to the same catch-up channel.
-Its header owns the full contract; the boundaries that matter here are that it carries exactly firstmate's own away-mode authority, never merges, never forces or discards, never starts work whose instructions are unwritten, and refuses to run at all unless away mode is active.
-`docs/configuration.md` owns its cadence and cap knobs.
+Those ticks appear on the captain's catch-up as `away-mode driver:` records, which is how a return report explains what moved with no firstmate turn behind it.
+`bin/fm-afk-driver.sh`'s header owns what a tick does and every boundary it keeps, and `docs/configuration.md` owns its cadence and cap knobs.
 
 ## Operational prefix contract
 

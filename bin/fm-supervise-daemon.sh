@@ -256,15 +256,9 @@ WEDGE_ALARM_NOTIFIER_PID=
 OUTBOX_UNREADABLE=0
 OUTBOX_PROBE_NOT_BEFORE=0
 # How stale bin/fm-afk-inbox.sh's liveness beacon must be before the paneless
-# undelivered alarm treats the reader as gone, expressed as a multiple of the
-# effective max-defer window rather than a fixed number of seconds.
-#
-# The window this has to survive is one firstmate TURN, not one poll interval,
-# and the reporting bound that follows from it, are owned by
-# docs/configuration.md ("Away-mode paneless delivery"); deriving the window from
-# max-defer here is what keeps the two comparable however max-defer is configured.
-# shellcheck disable=SC2034 # Read by tests that pin the derived staleness window.
-INBOX_BEACON_STALE_DEFER_MULTIPLE=$FM_AFK_INBOX_BEACON_STALE_DEFER_MULTIPLE
+# undelivered alarm treats the reader as gone is derived in
+# bin/fm-afk-outbox-lib.sh (fm_afk_inbox_beacon_stale_secs), with the beacon it
+# measures and the session-start reader-liveness check that needs the same answer.
 # The captain-relevant verb set and the status classifiers (last_status_line,
 # status_is_captain_relevant, window_to_task, scan_captain_relevant_statuses) now
 # live in bin/fm-classify-lib.sh, shared with the always-on watcher.
@@ -823,7 +817,7 @@ paneless_delivery() {
 }
 
 # Seconds without a reader beacon stamp before the paneless undelivered alarm
-# treats firstmate's inbox reader as gone: INBOX_BEACON_STALE_DEFER_MULTIPLE times
+# treats firstmate's inbox reader as gone: FM_AFK_INBOX_BEACON_STALE_DEFER_MULTIPLE times
 # the effective max-defer window (see docs/configuration.md for that default and
 # its reporting bound). A non-numeric or zero override falls back to the derived
 # default rather than disabling the staleness check, because a staleness window of
