@@ -1,0 +1,439 @@
+#!/usr/bin/env bash
+# Away-mode autonomous driver and reader-liveness regressions.
+#
+# Covers the 2026-07-30 overnight incident, where the away-mode daemon escalated
+# correctly for 9.5 hours while nothing advanced the fleet: no finished lane was
+# cleaned up, no lane stalled before its push was nudged, no unblocked ticket was
+# started, and the escalation reader had died at 22:33 with nobody able to re-arm
+# it. bin/fm-afk-driver.sh owns the queue advancement, bin/fm-afk-reader-check.sh
+# owns the reader-liveness report, and both must stay inside firstmate's own
+# away-mode authority: no merges, no forcing, no dispatch without complete
+# instructions, no work beyond the worker cap.
+set -u
+
+# shellcheck source=tests/lib.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+
+TMP_ROOT=$(fm_test_tmproot fm-afk-driver-tests)
+
+# --- fixtures ---------------------------------------------------------------
+
+# A driver case: a home with away mode active, the real driver plus the libraries
+# it sources, and recording stubs for every fleet command it may call.
+make_case() {  # <name> -> case dir
+  local dir="$TMP_ROOT/$1"
+  mkdir -p "$dir/bin" "$dir/home/state" "$dir/home/data" "$dir/home/config" "$dir/fakebin"
+  cp "$ROOT/bin/fm-afk-driver.sh" "$ROOT/bin/fm-afk-reader-check.sh" \
+    "$ROOT/bin/fm-afk-outbox-lib.sh" "$ROOT/bin/fm-wake-lib.sh" \
+    "$ROOT/bin/fm-mutex-lib.sh" "$ROOT/bin/fm-pid-lib.sh" \
+    "$ROOT/bin/fm-classify-lib.sh" "$dir/bin/"
+
+  # Reconciled current state comes from one file per task, so a test states the
+  # crew state it means instead of simulating a no-mistakes run.
+  cat > "$dir/bin/fm-crew-state.sh" <<'SH'
+#!/usr/bin/env bash
+id=$1
+file="$FM_STATE_OVERRIDE/$id.crewstate"
+[ -r "$file" ] || { printf 'state: unknown · source: none · no record\n'; exit 0; }
+printf 'state: %s · source: stub · fixture\n' "$(cat "$file")"
+SH
+
+  # Teardown records the call and behaves like the real one: it refuses when the
+  # case asked it to, and otherwise releases the lane's durable records.
+  cat > "$dir/bin/fm-teardown.sh" <<'SH'
+#!/usr/bin/env bash
+id=$1
+printf '%s\n' "$*" >> "$FM_HOME/teardown.log"
+if [ -e "$FM_STATE_OVERRIDE/.refuse-teardown-$id" ]; then
+  printf 'refusing to tear down %s: worktree holds unpushed work\n' "$id" >&2
+  exit 1
+fi
+rm -f "$FM_STATE_OVERRIDE/$id.meta" "$FM_STATE_OVERRIDE/$id.crewstate"
+printf 'released %s\n' "$id"
+SH
+
+  cat > "$dir/bin/fm-send.sh" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$FM_HOME/send.log"
+[ -e "$FM_STATE_OVERRIDE/.fail-send" ] && exit 1
+exit 0
+SH
+
+  cat > "$dir/bin/fm-spawn.sh" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$FM_HOME/spawn.log"
+if [ -e "$FM_STATE_OVERRIDE/.fail-spawn" ]; then
+  printf 'spawn refused: no worktree available\n' >&2
+  exit 1
+fi
+printf 'window=synthetic:fm-%s\nkind=ship\n' "$1" > "$FM_STATE_OVERRIDE/$1.meta"
+printf 'working\n' > "$FM_STATE_OVERRIDE/$1.crewstate"
+SH
+
+  # Host reading: exit status comes from the case, defaulting to healthy.
+  cat > "$dir/bin/fm-resource-check.sh" <<'SH'
+#!/usr/bin/env bash
+status=0
+[ -r "$FM_STATE_OVERRIDE/.resource-status" ] && status=$(cat "$FM_STATE_OVERRIDE/.resource-status")
+exit "$status"
+SH
+
+  # Backlog backend: the ready list is whatever the case wrote.
+  cat > "$dir/fakebin/tasks-axi" <<'SH'
+#!/usr/bin/env bash
+[ "${1:-}" = ready ] || exit 0
+file="$FM_STATE_OVERRIDE/.ready"
+[ -r "$file" ] || { printf 'count: 0\nready[0]{id,state,kind,repo,title}:\n'; exit 0; }
+printf 'count: 1\nready[1]{id,state,kind,repo,title}:\n'
+while IFS= read -r id; do
+  [ -n "$id" ] || continue
+  printf '  %s,queued,ship,alpha,Some title\n' "$id"
+done < "$file"
+SH
+
+  chmod +x "$dir/bin/"*.sh "$dir/fakebin/tasks-axi"
+  : > "$dir/home/state/.afk"
+  printf 'paneless\n' > "$dir/home/state/.afk-delivery"
+  printf '%s\n' "$dir"
+}
+
+run_driver() {  # <case-dir> [args...]
+  local dir=$1
+  shift
+  PATH="$dir/fakebin:$PATH" FM_HOME="$dir/home" FM_STATE_OVERRIDE="$dir/home/state" \
+    "$dir/bin/fm-afk-driver.sh" "${@:-tick}" 2>&1
+}
+
+# A finished lane: real git worktree on its own branch, meta pointing at it, and a
+# reconciled done state. Pushing to the fixture origin is the caller's choice, so
+# the durable and the never-pushed shapes differ only in that one fact.
+seed_done_lane() {  # <case-dir> <id> <push:0|1>
+  local dir=$1 id=$2 push=$3 repo="$TMP_ROOT/repos/$2" wt="$TMP_ROOT/worktrees/$2"
+  mkdir -p "$TMP_ROOT/repos" "$TMP_ROOT/worktrees"
+  # Origin is created BEFORE the task branch exists, so a branch reaches it only
+  # by being pushed - the exact distinction the driver's durability probe makes.
+  fm_git_init_commit "$repo"
+  fm_git_add_origin "$repo" "$TMP_ROOT/repos/$id.git"
+  git -C "$repo" worktree add --quiet -b "fm/$id" "$wt"
+  if [ "$push" = 1 ]; then
+    git -C "$wt" push --quiet origin "fm/$id" 2>/dev/null \
+      || fail "fixture could not push fm/$id to the fixture origin"
+  fi
+  fm_write_meta "$dir/home/state/$id.meta" \
+    "window=synthetic:fm-$id" "worktree=$wt" "project=$repo" "kind=ship" "mode=direct-push"
+  printf 'done\n' > "$dir/home/state/$id.crewstate"
+}
+
+outbox_records() {  # <case-dir>
+  cat "$1/home/state/.afk-outbox" 2>/dev/null || true
+}
+
+# --- driver: cleanup of finished lanes ---------------------------------------
+
+test_pushed_lane_is_cleaned_up_and_reported() {
+  local dir out
+  dir=$(make_case pushed-lane)
+  seed_done_lane "$dir" alpha 1
+
+  out=$(run_driver "$dir") || fail "the tick failed: $out"
+  assert_contains "$out" "cleaned up alpha" "a finished lane whose branch is on origin was not cleaned up: $out"
+  assert_grep 'alpha' "$dir/home/teardown.log" "cleanup never called the guarded teardown path"
+  assert_no_grep '--force' "$dir/home/teardown.log" "cleanup forced a teardown"
+  assert_contains "$(outbox_records "$dir")" "cleaned up alpha" \
+    "the cleanup was not reported to the captain's catch-up"
+  pass "a finished lane whose branch is durable on origin is cleaned up and reported"
+}
+
+test_unpushed_lane_is_not_torn_down_and_is_steered_once() {
+  local dir out second sends
+  dir=$(make_case unpushed-lane)
+  seed_done_lane "$dir" beta 0
+
+  out=$(run_driver "$dir") || fail "the tick failed: $out"
+  [ ! -e "$dir/home/teardown.log" ] \
+    || fail "a lane whose branch never reached origin was handed to cleanup: $(cat "$dir/home/teardown.log")"
+  assert_contains "$out" "steered beta" "an unpushed finished lane was not asked to finish its push: $out"
+  assert_grep 'push it and report' "$dir/home/send.log" "the steer did not ask the lane to push"
+  [ -e "$dir/home/state/beta.meta" ] || fail "the driver discarded the lane's durable record"
+
+  # Second tick over unchanged state: the steer must not be re-sent, and nothing
+  # new may be reported.
+  second=$(run_driver "$dir") || fail "the second tick failed: $second"
+  sends=$(wc -l < "$dir/home/send.log" | tr -d ' ')
+  [ "$sends" -eq 1 ] || fail "the lane was steered $sends times instead of once"
+  [ "$(outbox_records "$dir" | wc -l | tr -d ' ')" -eq 1 ] \
+    || fail "an unchanged second tick reported again: $(outbox_records "$dir")"
+  pass "a finished lane that never pushed is steered exactly once and never torn down"
+}
+
+test_teardown_refusal_is_reported_and_never_forced() {
+  local dir out
+  dir=$(make_case teardown-refusal)
+  seed_done_lane "$dir" gamma 1
+  : > "$dir/home/state/.refuse-teardown-gamma"
+
+  out=$(run_driver "$dir") || fail "the tick failed: $out"
+  assert_contains "$out" "cleanup refused for gamma" "a refused cleanup was not reported: $out"
+  assert_contains "$(outbox_records "$dir")" "cleanup refused for gamma" \
+    "a refused cleanup never reached the captain's catch-up"
+  assert_no_grep '--force' "$dir/home/teardown.log" "a refusal was worked around with --force"
+  [ -e "$dir/home/state/gamma.meta" ] || fail "a refused cleanup still released the lane's record"
+  pass "a teardown refusal is reported as a fact and never forced"
+}
+
+test_active_lane_is_left_alone() {
+  local dir out
+  dir=$(make_case active-lane)
+  seed_done_lane "$dir" delta 1
+  printf 'working\n' > "$dir/home/state/delta.crewstate"
+
+  out=$(run_driver "$dir") || fail "the tick failed: $out"
+  [ ! -e "$dir/home/teardown.log" ] || fail "a working lane was torn down"
+  [ ! -e "$dir/home/send.log" ] || fail "a working lane was steered"
+  pass "a lane still working is never cleaned up or steered"
+}
+
+# --- driver: dispatch --------------------------------------------------------
+
+seed_ready_item() {  # <case-dir> <id> [--brief-complete] [--recipe]
+  local dir=$1 id=$2
+  shift 2
+  printf '%s\n' "$id" >> "$dir/home/state/.ready"
+  mkdir -p "$dir/home/data/$id"
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --brief-complete)
+        printf '# Task\n\nFix the thing.\n' > "$dir/home/data/$id/brief.md" ;;
+      --brief-placeholder)
+        printf '# Task\n\n{TASK}\n' > "$dir/home/data/$id/brief.md" ;;
+      --recipe)
+        mkdir -p "$dir/home/projects/alpha"
+        printf 'project=projects/alpha\nharness=claude\neffort=low\n' \
+          > "$dir/home/data/$id/dispatch" ;;
+    esac
+    shift
+  done
+}
+
+test_ready_item_with_brief_and_recipe_is_started() {
+  local dir out
+  dir=$(make_case dispatch-ready)
+  seed_ready_item "$dir" epsilon --brief-complete --recipe
+
+  out=$(run_driver "$dir") || fail "the tick failed: $out"
+  assert_contains "$out" "started epsilon" "a fully prepared ready item was not started: $out"
+  assert_grep 'epsilon' "$dir/home/spawn.log" "the item was reported started without a spawn"
+  assert_grep '--harness claude' "$dir/home/spawn.log" "the recorded recipe's harness was not used"
+  assert_grep '--effort low' "$dir/home/spawn.log" "the recorded recipe's effort was not used"
+  assert_contains "$(outbox_records "$dir")" "started epsilon" \
+    "the dispatch was not reported to the captain's catch-up"
+  pass "a ready item with a complete brief and a recorded recipe is started and reported"
+}
+
+test_incomplete_brief_is_never_dispatched() {
+  local dir out
+  dir=$(make_case dispatch-placeholder-brief)
+  seed_ready_item "$dir" zeta --brief-placeholder --recipe
+
+  out=$(run_driver "$dir") || fail "the tick failed: $out"
+  [ ! -e "$dir/home/spawn.log" ] || fail "an item whose instructions were never written was started"
+  assert_contains "$out" "zeta is ready to start but still needs instructions" \
+    "the unwritten instructions were not reported: $out"
+  pass "a ready item whose brief still holds a placeholder is reported, never dispatched"
+}
+
+test_missing_recipe_is_never_dispatched() {
+  local dir out
+  dir=$(make_case dispatch-no-recipe)
+  seed_ready_item "$dir" eta --brief-complete
+
+  out=$(run_driver "$dir") || fail "the tick failed: $out"
+  [ ! -e "$dir/home/spawn.log" ] || fail "an item with no recorded dispatch recipe was started"
+  assert_contains "$out" "has not recorded how to start it" \
+    "the missing dispatch recipe was not reported: $out"
+  pass "a ready item with no recorded dispatch recipe is reported, never dispatched"
+}
+
+test_dispatch_respects_the_worker_cap() {
+  local dir out i
+  dir=$(make_case dispatch-cap)
+  for i in 1 2 3 4; do
+    fm_write_meta "$dir/home/state/live$i.meta" \
+      "window=synthetic:fm-live$i" "worktree=$dir/home/wt$i" "kind=ship"
+    printf 'working\n' > "$dir/home/state/live$i.crewstate"
+  done
+  seed_ready_item "$dir" theta --brief-complete --recipe
+
+  out=$(run_driver "$dir") || fail "the tick failed: $out"
+  [ ! -e "$dir/home/spawn.log" ] || fail "the driver started work past the four-worker cap"
+  assert_contains "$out" "already at its worker limit" "the held queue was not reported: $out"
+  pass "dispatch stops at the worker cap and reports what is waiting"
+}
+
+test_dispatch_holds_while_the_host_is_under_pressure() {
+  local dir out
+  dir=$(make_case dispatch-host-pressure)
+  seed_ready_item "$dir" iota --brief-complete --recipe
+  printf '2\n' > "$dir/home/state/.resource-status"
+
+  out=$(run_driver "$dir") || fail "the tick failed: $out"
+  [ ! -e "$dir/home/spawn.log" ] || fail "the driver started work while the host read critical"
+  assert_contains "$out" "machine is under pressure" "the host pressure was not reported: $out"
+  pass "dispatch waits while the host reads degraded or critical"
+}
+
+# --- driver: idempotence and refusal ----------------------------------------
+
+test_quiet_fleet_tick_is_a_silent_no_op() {
+  local dir out
+  dir=$(make_case quiet-fleet)
+
+  out=$(run_driver "$dir") || fail "the tick failed: $out"
+  [ -z "$out" ] || fail "a tick over an empty fleet reported something: $out"
+  [ ! -s "$dir/home/state/.afk-outbox" ] \
+    || fail "a tick over an empty fleet appended a record: $(outbox_records "$dir")"
+  pass "a tick over an unchanged quiet fleet takes no action and appends no record"
+}
+
+test_second_tick_after_cleanup_is_a_no_op() {
+  local dir first second
+  dir=$(make_case idempotent-cleanup)
+  seed_done_lane "$dir" kappa 1
+
+  first=$(run_driver "$dir") || fail "the first tick failed: $first"
+  assert_contains "$first" "cleaned up kappa" "the first tick did not clean the lane up: $first"
+  second=$(run_driver "$dir") || fail "the second tick failed: $second"
+  [ -z "$second" ] || fail "the second tick acted again on an already-clean fleet: $second"
+  [ "$(outbox_records "$dir" | wc -l | tr -d ' ')" -eq 1 ] \
+    || fail "the second tick appended another record: $(outbox_records "$dir")"
+  pass "a second tick over the state the first tick produced is a no-op"
+}
+
+test_driver_refuses_when_away_mode_is_absent() {
+  local dir out rc=0
+  dir=$(make_case no-afk)
+  seed_done_lane "$dir" lambda 1
+  rm -f "$dir/home/state/.afk"
+
+  out=$(run_driver "$dir") || rc=$?
+  expect_code 3 "$rc" "the driver ran outside away mode"
+  assert_contains "$out" "away mode is not active" "the refusal did not name away mode: $out"
+  [ ! -e "$dir/home/teardown.log" ] || fail "a refused tick still tore a lane down"
+  [ ! -s "$dir/home/state/.afk-outbox" ] || fail "a refused tick appended a record"
+  pass "the driver refuses to run when away mode is not active"
+}
+
+test_dry_run_reports_without_touching_the_fleet() {
+  local dir out
+  dir=$(make_case dry-run)
+  seed_done_lane "$dir" mu 1
+  seed_ready_item "$dir" nu --brief-complete --recipe
+
+  out=$(run_driver "$dir" tick --dry-run) || fail "the dry run failed: $out"
+  assert_contains "$out" "would clean up mu" "the dry run did not report the cleanup it would do: $out"
+  assert_contains "$out" "would start nu" "the dry run did not report the dispatch it would do: $out"
+  [ ! -e "$dir/home/teardown.log" ] || fail "a dry run tore a lane down"
+  [ ! -e "$dir/home/spawn.log" ] || fail "a dry run started work"
+  [ ! -s "$dir/home/state/.afk-outbox" ] || fail "a dry run appended a record"
+  pass "a dry run reports its intended actions and mutates nothing"
+}
+
+test_secondmate_home_is_never_advanced() {
+  local dir out
+  dir=$(make_case secondmate-untouched)
+  fm_write_secondmate_meta "$dir/home/state/domain.meta" "$dir/home/second"
+  printf 'done\n' > "$dir/home/state/domain.crewstate"
+
+  out=$(run_driver "$dir") || fail "the tick failed: $out"
+  [ ! -e "$dir/home/teardown.log" ] || fail "the driver retired a secondmate home"
+  [ -z "$out" ] || fail "the driver acted on a secondmate: $out"
+  pass "a persistent secondmate is never cleaned up or steered by the driver"
+}
+
+# --- reader liveness --------------------------------------------------------
+
+run_reader_check() {  # <case-dir>
+  local dir=$1
+  FM_HOME="$dir/home" FM_STATE_OVERRIDE="$dir/home/state" \
+    "$dir/bin/fm-afk-reader-check.sh" 2>&1
+}
+
+seed_unread_record() {  # <case-dir> <age-seconds>
+  local dir=$1 age=$2
+  printf '%s\t1\tescalation\tSupervisor escalate (1 event(s)): alpha.status: done: PR 7\n' \
+    "$(( $(date +%s) - age ))" > "$dir/home/state/.afk-outbox"
+}
+
+test_reader_check_reports_a_dead_reader_with_records_waiting() {
+  local dir out
+  dir=$(make_case reader-dead)
+  seed_unread_record "$dir" 4000
+  # The incident's exact shape: a beacon that EXISTS but has not been stamped for
+  # hours, which is a reader that died rather than one that was never armed.
+  touch -t 197001020000 "$dir/home/state/.afk-inbox.beat"
+
+  out=$(run_reader_check "$dir")
+  assert_contains "$out" "AFK_READER:" "a dead reader with records waiting was not reported: $out"
+  assert_contains "$out" "1 escalation record(s) are waiting" \
+    "the report does not say how many records are waiting: $out"
+  assert_contains "$out" "arm bin/fm-afk-inbox.sh" \
+    "the report does not instruct firstmate to arm the reader: $out"
+  pass "a stale reader beacon with unread records is reported with the re-arm instruction"
+}
+
+test_reader_check_is_silent_for_a_live_reader() {
+  local dir out
+  dir=$(make_case reader-live)
+  seed_unread_record "$dir" 4000
+  touch "$dir/home/state/.afk-inbox.beat"
+
+  out=$(run_reader_check "$dir")
+  [ -z "$out" ] || fail "a reader that is stamping its beacon was reported dead: $out"
+  pass "a live reader mid-turn is never reported, however old the pending record is"
+}
+
+test_reader_check_is_silent_with_nothing_waiting() {
+  local dir out
+  dir=$(make_case reader-nothing-pending)
+  touch -t 197001020000 "$dir/home/state/.afk-inbox.beat"
+
+  out=$(run_reader_check "$dir")
+  [ -z "$out" ] || fail "an unarmed reader with an empty outbox was reported: $out"
+  pass "an unarmed reader with nothing waiting for it is not an incident"
+}
+
+test_reader_check_is_silent_outside_paneless_away_mode() {
+  local dir out
+  dir=$(make_case reader-pane-mode)
+  seed_unread_record "$dir" 4000
+  touch -t 197001020000 "$dir/home/state/.afk-inbox.beat"
+  printf 'pane\n' > "$dir/home/state/.afk-delivery"
+
+  out=$(run_reader_check "$dir")
+  [ -z "$out" ] || fail "a pane-delivery home was told to arm a reader it does not use: $out"
+
+  printf 'paneless\n' > "$dir/home/state/.afk-delivery"
+  rm -f "$dir/home/state/.afk"
+  out=$(run_reader_check "$dir")
+  [ -z "$out" ] || fail "a home that is not in away mode was told to arm a reader: $out"
+  pass "the reader report is limited to a paneless home that is actually in away mode"
+}
+
+test_pushed_lane_is_cleaned_up_and_reported
+test_unpushed_lane_is_not_torn_down_and_is_steered_once
+test_teardown_refusal_is_reported_and_never_forced
+test_active_lane_is_left_alone
+test_ready_item_with_brief_and_recipe_is_started
+test_incomplete_brief_is_never_dispatched
+test_missing_recipe_is_never_dispatched
+test_dispatch_respects_the_worker_cap
+test_dispatch_holds_while_the_host_is_under_pressure
+test_quiet_fleet_tick_is_a_silent_no_op
+test_second_tick_after_cleanup_is_a_no_op
+test_driver_refuses_when_away_mode_is_absent
+test_dry_run_reports_without_touching_the_fleet
+test_secondmate_home_is_never_advanced
+test_reader_check_reports_a_dead_reader_with_records_waiting
+test_reader_check_is_silent_for_a_live_reader
+test_reader_check_is_silent_with_nothing_waiting
+test_reader_check_is_silent_outside_paneless_away_mode

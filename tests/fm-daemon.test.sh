@@ -2253,6 +2253,99 @@ test_paneless_alarm_fires_within_its_bound_for_a_dead_or_missing_reader() {
 # window it has to survive is one firstmate turn. A window shorter than max-defer
 # goes stale at almost the same moment the record becomes overdue, which is the
 # healthy path.
+# --- away-mode driver hook ---------------------------------------------------
+# Escalating tells firstmate what to drive, but while the captain is away there may
+# be no firstmate turn for hours (2026-07-30: 9.5 hours of a coasting fleet). One
+# bounded bin/fm-afk-driver.sh tick per cadence is housekeeping's answer. The three
+# facts the DAEMON owns, as opposed to the driver's own behavior, are asserted here:
+# it is gated on away mode, it is gated on its cadence, and a driver failure can
+# never take supervision down.
+install_driver_stub() {  # <case-dir> [exit-status]
+  local dir=$1 status=${2:-0}
+  mkdir -p "$dir/driverbin"
+  cat > "$dir/driverbin/fm-afk-driver.sh" <<SH
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$dir/driver.log"
+printf 'cleaned up alpha\n'
+exit $status
+SH
+  chmod +x "$dir/driverbin/fm-afk-driver.sh"
+}
+
+driver_ticks() {  # <case-dir>
+  [ -e "$1/driver.log" ] || { printf '0'; return; }
+  wc -l < "$1/driver.log" | tr -d ' '
+}
+
+test_driver_tick_runs_on_cadence_while_away_mode_is_active() {
+  local dir state log_file
+  dir=$(make_supercase driver-cadence)
+  state="$dir/state"
+  log_file="$dir/daemon.log"; : > "$log_file"
+  install_driver_stub "$dir"
+  afk_enter "$state"
+
+  FM_DAEMON_DIR="$dir/driverbin" LOG="$log_file" FM_SUPERVISOR_TARGET="" \
+    FM_AFK_DELIVERY_MODE=paneless FM_ESCALATE_BATCH_SECS=99999 \
+    FM_AFK_DRIVER_TICK_SECS=600 housekeeping "$state"
+  [ "$(driver_ticks "$dir")" -eq 1 ] || fail "housekeeping ran no away-mode driver tick"
+  grep -F 'driver: cleaned up alpha' "$log_file" >/dev/null \
+    || fail "the driver's own report was not logged by the daemon: $(cat "$log_file")"
+
+  # Immediately again: the cadence gate must hold, so a one-second housekeeping
+  # tick does not run fleet-scale work every second.
+  FM_DAEMON_DIR="$dir/driverbin" LOG="$log_file" FM_SUPERVISOR_TARGET="" \
+    FM_AFK_DELIVERY_MODE=paneless FM_ESCALATE_BATCH_SECS=99999 \
+    FM_AFK_DRIVER_TICK_SECS=600 housekeeping "$state"
+  [ "$(driver_ticks "$dir")" -eq 1 ] \
+    || fail "the driver ran again inside its own cadence window"
+
+  # Cadence elapsed: it runs again. The gate reads the marker's MTIME, so the
+  # marker is backdated rather than rewritten.
+  touch -t 200001010000 "$state/.subsuper-last-driver"
+  FM_DAEMON_DIR="$dir/driverbin" LOG="$log_file" FM_SUPERVISOR_TARGET="" \
+    FM_AFK_DELIVERY_MODE=paneless FM_ESCALATE_BATCH_SECS=99999 \
+    FM_AFK_DRIVER_TICK_SECS=600 housekeeping "$state"
+  [ "$(driver_ticks "$dir")" -eq 2 ] || fail "the driver did not run once its cadence elapsed"
+  pass "housekeeping runs one bounded away-mode driver tick per cadence"
+}
+
+test_driver_tick_is_presence_gated_and_switchable() {
+  local dir state
+  dir=$(make_supercase driver-gates)
+  state="$dir/state"
+  install_driver_stub "$dir"
+
+  # Away mode off: queue advancement is an away-mode behavior only.
+  FM_DAEMON_DIR="$dir/driverbin" FM_SUPERVISOR_TARGET="" FM_ESCALATE_BATCH_SECS=99999 \
+    FM_AFK_DRIVER_TICK_SECS=600 housekeeping "$state"
+  [ "$(driver_ticks "$dir")" -eq 0 ] || fail "the driver ran while away mode was off"
+
+  # Away mode on but the hook switched off for this home.
+  afk_enter "$state"
+  FM_DAEMON_DIR="$dir/driverbin" FM_SUPERVISOR_TARGET="" FM_ESCALATE_BATCH_SECS=99999 \
+    FM_AFK_DRIVER_TICK_SECS=0 housekeeping "$state"
+  [ "$(driver_ticks "$dir")" -eq 0 ] || fail "FM_AFK_DRIVER_TICK_SECS=0 did not switch the driver off"
+  pass "the driver tick runs only in away mode and only while its cadence is enabled"
+}
+
+test_driver_failure_never_takes_supervision_down() {
+  local dir state log_file rc=0
+  dir=$(make_supercase driver-failure)
+  state="$dir/state"
+  log_file="$dir/daemon.log"; : > "$log_file"
+  install_driver_stub "$dir" 1
+  afk_enter "$state"
+
+  FM_DAEMON_DIR="$dir/driverbin" LOG="$log_file" FM_SUPERVISOR_TARGET="" \
+    FM_AFK_DELIVERY_MODE=paneless FM_ESCALATE_BATCH_SECS=99999 \
+    FM_AFK_DRIVER_TICK_SECS=600 housekeeping "$state" || rc=$?
+  expect_code 0 "$rc" "a failed driver tick failed the whole housekeeping pass"
+  grep -F 'away-mode driver tick failed' "$log_file" >/dev/null \
+    || fail "a failed driver tick was not logged: $(cat "$log_file")"
+  pass "a failed away-mode driver tick is logged and supervision continues"
+}
+
 test_inbox_beacon_stale_window_is_derived_from_max_defer() {
   local secs
   secs=$(unset FM_AFK_INBOX_BEACON_STALE_SECS FM_MAX_DEFER_SECS; inbox_beacon_stale_secs)
@@ -2529,6 +2622,9 @@ test_paneless_undelivered_alarm_is_presence_gated_and_age_bounded
 test_paneless_alarm_survives_the_turn_that_processes_a_delivery
 test_paneless_alarm_fires_within_its_bound_for_a_dead_or_missing_reader
 test_inbox_beacon_stale_window_is_derived_from_max_defer
+test_driver_tick_runs_on_cadence_while_away_mode_is_active
+test_driver_tick_is_presence_gated_and_switchable
+test_driver_failure_never_takes_supervision_down
 test_paneless_marker_says_so_when_the_inbox_cannot_be_read
 test_paneless_marker_reports_records_picked_up_while_it_was_written
 test_paneless_pick_up_leaves_an_existing_marker_alone

@@ -2,7 +2,7 @@
 name: bootstrap-diagnostics
 description: >-
   Agent-only handling playbook for session-start bootstrap diagnostics.
-  Use whenever the session-start digest's bootstrap section prints an actionable diagnostic line - MISSING, MISSING_MANUAL, BACKEND_INVALID, NEEDS_GH_AUTH, TANGLE, CREW_DISPATCH invalid, FLEET_SYNC, PRESENT_DAEMON, PR_CHECK_MIGRATION, SECONDMATE_SYNC, SECONDMATE_LIVENESS, AFK_DAEMON, NUDGE_SECONDMATES, or FMX - or when a standalone bin/fm-bootstrap.sh run prints one of those lines.
+  Use whenever the session-start digest's bootstrap section prints an actionable diagnostic line - MISSING, MISSING_MANUAL, BACKEND_INVALID, NEEDS_GH_AUTH, TANGLE, CREW_DISPATCH invalid, FLEET_SYNC, PRESENT_DAEMON, PR_CHECK_MIGRATION, SECONDMATE_SYNC, SECONDMATE_LIVENESS, AFK_DAEMON, AFK_READER, NUDGE_SECONDMATES, or FMX - or when a standalone bin/fm-bootstrap.sh run prints one of those lines.
   A silent bootstrap section, or a BOOTSTRAP_INFO fact, means no skill load.
 user-invocable: false
 metadata:
@@ -60,6 +60,9 @@ When any diagnostic needs captain attention, report the plain consequence and re
   Investigate the reason because that secondmate is not guaranteed live.
 - `AFK_DAEMON: away-mode revive failed: <reason>` - the durable away-mode persist intent (`state/.afk-persist`) is set, so the captain ordered away supervision to survive a session turnover, but the session-start revive sweep could not bring the away daemon back up.
   Away supervision is NOT running for this home right now; read the reason (a missing tmux CLI, a pending return catch-up, or a hosting failure), check `state/.supervise-daemon.log`, and re-enter away mode through `bin/fm-afk-launch.sh persist` once the cause is fixed, or clear the standing order with `bin/fm-afk-launch.sh unpersist` if away mode is no longer wanted.
+- `AFK_READER: away-mode escalation reader is not running (no sign of life for <n>s) and <n> escalation record(s) are waiting; arm bin/fm-afk-inbox.sh as a tracked background task to deliver them` - this home is in paneless away mode and the away-mode daemon is still appending escalations, but the reader that turns them into a firstmate turn is gone, so those records have reached nobody.
+  Arm the reader now, exactly the way the emitted supervision protocol arms a tracked background task, and then handle every digest it delivers as ordinary away-mode escalation before taking new work: the waiting records may include a review-ready change, a blocker, or a decision that has been unanswered for hours.
+  Never start the reader as a plain background shell job or with `&`: it acknowledges every record it prints, so a reader whose output nobody reads silently consumes the captain's escalations.
 - `NUDGE_SECONDMATES: secondmate <id>: send failed: <reason>` - the secondmate sweep fast-forwarded a running secondmate home and its loaded instruction surface (`AGENTS.md`, `bin/`, or `.agents/skills/`) changed, but the deterministic `fm-send.sh fm-<id>` re-read nudge failed.
   Inspect the reason, keep the pending marker under `state/.secondmate-nudge-pending/` intact, and rerun session start after the endpoint or metadata issue is fixed so bootstrap can retry the exact same marked send.
 - `FMX: X mode on ...` / `FMX: X mode off ...` - bootstrap confirmed or removed the local X-mode poll artifacts (`docs/configuration.md` "X mode (.env)").
