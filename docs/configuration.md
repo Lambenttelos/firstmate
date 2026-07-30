@@ -119,11 +119,27 @@ Its default is twice `FM_MAX_DEFER_SECS` (600 seconds at defaults; an invalid or
 A reader that is never re-armed, or a firstmate that died, is therefore still reported within that window of its last sign of life rather than silently, and raising `FM_MAX_DEFER_SECS` instead is the wrong fix because that trades the false alarm for a silent gap.
 An alarm whose own inbox read then finds every record already acknowledged records that recovery in the daemon log only, raising no alert and writing no wedge marker, because that marker means wedged to every consumer that surfaces it; an inbox that could not be read still alarms.
 A read that cannot even look into `state/` is a failed read too, not an empty outbox, so an untraversable state directory blocks the reader and return catch-up rather than reading as nothing pending.
+A paneless away home therefore depends on TWO live processes, and both must self-heal.
+The daemon appends escalations, and the reader delivers them into a firstmate turn; either one dying alone leaves away supervision silent.
+The daemon's own death is healed at session start by `afk_daemon_revive_sweep` under the persist intent below.
+A dead reader is self-concealing, because reviving it requires the very firstmate turn its own delivery would have started, so the incident on 2026-07-30 left nine escalations unread for over eleven hours while the daemon kept working.
+Two independent paths close that loop.
+The daemon's undelivered-escalation alarm above wakes a human through the active-alert channel and the durable wedge marker.
+[`bin/fm-afk-reader-check.sh`](../bin/fm-afk-reader-check.sh) gives the next firstmate turn a machine-readable instruction instead: session start runs it as `afk_reader_revive_sweep` ([`bin/fm-bootstrap.sh`](../bin/fm-bootstrap.sh)) and prints one `AFK_READER:` line when away mode is active, delivery is paneless, this home's daemon is confidently live, the beacon is stale beyond the shared window, and records are genuinely waiting; a home whose daemon is gone is left to the revive sweep instead, so the report never points a session at the wrong subsystem.
+That check is a detector and never starts a reader itself, because the reader acknowledges every record it prints, so a reader started outside the harness would consume the captain's escalations to a stdout nobody reads.
 The [`afk`](../.agents/skills/afk/SKILL.md) skill owns the operating procedure.
 
 A paneless home hosts the daemon durably in a detached tmux session through `bin/fm-afk-launch.sh start-paneless`, which forces `FM_AFK_DELIVERY=paneless` so the daemon selects pull delivery unconditionally rather than discovering the tmux pane it is itself hosted in.
 tmux is present as the runtime backend even though a paneless firstmate runs outside it, so a detached tmux session is a session-independent host that outlives a firstmate session turnover; the older `start-native` path hosted the daemon as a harness-native background job that was a child of the firstmate session and was reaped on turnover, silently taking away supervision down (evidence 2026-07-26).
 The daemon owns `bin/fm-watch.sh` as its child, so hosting the daemon durably makes the watcher durable too.
+
+### Away-mode autonomous queue advancement
+
+Escalation is a notification: the daemon tells firstmate what to drive, and firstmate's own agent turn does the driving.
+While the captain is away there may be no firstmate turn for hours, and on 2026-07-30 the fleet coasted roughly 9.5 hours even though every escalation was correct.
+[`bin/fm-afk-driver.sh`](../bin/fm-afk-driver.sh) closes that gap, and its header is the single owner of what one tick does, the dispatch-recipe format it requires, and the safety boundaries it keeps.
+The daemon's housekeeping runs one bounded tick per cadence while `state/.afk` is present, wrapped so a driver failure or overrun is logged and supervision continues.
+The knobs this file owns are `FM_AFK_DRIVER_TICK_SECS` (cadence, default 600 seconds; `0` switches the hook off for a home without changing anything else about away mode), `FM_AFK_DRIVER_TIMEOUT_SECS` (maximum seconds for one tick, default 300), `FM_AFK_DRIVER_MAX_WORKERS` (worker cap below its hard maximum of 4), and `FM_AFK_DRIVER_DISABLE=1` (refuse every tick for this home).
 
 ## Away-mode persist intent (state/.afk-persist)
 
@@ -681,6 +697,10 @@ FM_INJECT_CONFIRM_RETRIES=3        # daemon Enter-retry attempts after typing a 
 FM_INJECT_CONFIRM_SLEEP=0.5        # seconds between daemon submit checks
 FM_HEARTBEAT_SCAN_SECS=300         # cadence of the catch-all status scan for missed captain verbs
 FM_HOUSEKEEPING_TICK=15            # seconds between batch-flush, stale/pause-recheck, and scan passes
+FM_AFK_DRIVER_TICK_SECS=600        # cadence of the bounded away-mode queue-advancing driver tick; 0 disables the hook
+FM_AFK_DRIVER_TIMEOUT_SECS=300     # maximum seconds for one driver tick before the daemon stops it and retries next cadence
+FM_AFK_DRIVER_MAX_WORKERS=4        # worker cap the driver dispatches under; values above 4 clamp to 4
+FM_AFK_DRIVER_DISABLE=             # set to 1 to refuse every away-mode driver tick for this home
 FM_CRASH_THRESHOLD=10              # watcher crashes allowed inside FM_CRASH_WINDOW before daemon backoff
 FM_CRASH_WINDOW=60                 # seconds in the crash-loop detection window
 FM_CRASH_BACKOFF=60                # seconds to wait after crossing the crash threshold

@@ -207,6 +207,16 @@ Nothing is lost in either mode.
 Records are acknowledged only after the reader has already printed them, so a reader killed mid-wait or mid-print simply delivers the same records on its next run, and anything still unacknowledged at return is reported by `bin/fm-afk-return.sh` as catch-up evidence.
 `docs/configuration.md` owns the state files and the `FM_AFK_DELIVERY` override, `bin/fm-afk-outbox-lib.sh` owns the record and acknowledgement contract, and `bin/fm-afk-inbox.sh --help` owns the reader's flags and exit lines.
 
+## Two live processes in paneless mode, and autonomous queue advancement
+
+A paneless away home depends on the daemon AND the reader, and both must be alive for away supervision to reach anyone.
+Session start reports a reader that has stopped while records are waiting as one `AFK_READER:` line (`bin/fm-afk-reader-check.sh`, handled by the `bootstrap-diagnostics` skill); the daemon separately raises its loud wedge alarm on the same condition.
+Never start the reader with a plain `&`: it acknowledges every record it prints, so a reader nobody is reading consumes the captain's escalations.
+
+Escalating is a notification, and while the captain is away there may be no firstmate turn for hours, so the daemon also runs one bounded `bin/fm-afk-driver.sh` tick per cadence while away mode is active.
+Those ticks appear on the captain's catch-up as `away-mode driver:` records, which is how a return report explains what moved with no firstmate turn behind it.
+`bin/fm-afk-driver.sh`'s header owns what a tick does and every boundary it keeps, and `docs/configuration.md` owns its cadence and cap knobs.
+
 ## Operational prefix contract
 
 The daemon constructs every current injection as the `away-supervisor` kind owned by `bin/fm-operational-input.sh`, beginning with `FM_OPERATIONAL_PREFIX`: `FM_INJECT_MARK` (U+2063 INVISIBLE SEPARATOR) followed by the stable `FIRSTMATE_OP: ` label.

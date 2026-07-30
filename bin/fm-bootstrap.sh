@@ -17,6 +17,7 @@
 #                 "NUDGE_SECONDMATES: secondmate <id>: send failed: <reason>",
 #                 "BOOTSTRAP_INFO: nudged fm-<id> with '<message>'",
 #                 "SECONDMATE_LIVENESS: secondmate <id>: skipped: <reason>|respawn failed: <reason>",
+#                 "AFK_READER: away-mode escalation reader is not running ...",
 #                 "FMX: X mode on ..." or "FMX: X mode off ...".
 #          When a RUNNING secondmate worktree is fast-forwarded to firstmate's
 #          own current default-branch commit (a purely LOCAL fast-forward, never
@@ -73,9 +74,9 @@
 #          refresh relays any completed fm-fleet-sync.sh output before the
 #          aggregate timeout skip line with timeout and elapsed seconds.
 #          Set FM_FLEET_PRUNE=0 to skip branch pruning during that refresh.
-#          Set FM_BOOTSTRAP_DETECT_ONLY=1 to skip the seven MUTATING sweeps
+#          Set FM_BOOTSTRAP_DETECT_ONLY=1 to skip the eight MUTATING sweeps
 #          (PR-check migration, present_daemon_sweep, afk_daemon_revive_sweep,
-#          secondmate_sync, secondmate_liveness_sweep,
+#          afk_reader_revive_sweep, secondmate_sync, secondmate_liveness_sweep,
 #          x_mode_setup, fleet_sync) while still printing every read-only detect line
 #          above; the TANGLE line switches to advisory-only wording with no
 #          checkout command. Used by
@@ -518,6 +519,25 @@ afk_daemon_revive_sweep() {
   return 0
 }
 
+afk_reader_revive_sweep() {
+  # Away-mode inbox reader liveness - SESSION START ONLY, and only while this
+  # session holds the fleet lock. A paneless away home needs TWO live processes:
+  # the sub-supervisor daemon that appends escalation digests, and the reader
+  # (bin/fm-afk-inbox.sh) firstmate arms as a tracked background task to deliver
+  # them. The revive sweep above covers a dead daemon; this covers a dead reader,
+  # which is self-concealing because reviving it needs the very firstmate turn its
+  # own delivery would have started.
+  #
+  # bin/fm-afk-reader-check.sh owns the whole condition, the incident evidence, and
+  # why it detects rather than arms; it stays silent for a healthy, pane-delivery,
+  # daemon-less, or away-inactive home. Its AFK_READER line instructs THIS session
+  # to arm the reader, because that has to remain firstmate's own action.
+  local out
+  out=$(FM_HOME="$FM_HOME" "$SCRIPT_DIR/fm-afk-reader-check.sh" 2>/dev/null || true)
+  [ -n "$out" ] && printf '%s\n' "$out"
+  return 0
+}
+
 present_daemon_sweep() {
   # Idempotent present-mode daemon liveness guarantee - SESSION START ONLY, and
   # only while this session actually holds the fleet lock. The daemon
@@ -928,6 +948,7 @@ fi
 if [ "${FM_BOOTSTRAP_DETECT_ONLY:-0}" != 1 ]; then
   present_daemon_sweep
   afk_daemon_revive_sweep
+  afk_reader_revive_sweep
   secondmate_liveness_sweep
   secondmate_sync
   x_mode_setup

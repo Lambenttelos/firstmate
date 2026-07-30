@@ -126,6 +126,47 @@ fm_afk_inbox_beacon_touch() {  # <state>
   touch "$file" 2>/dev/null || return 1
 }
 
+# The effective away-mode max-defer window and the multiple of it that a reader
+# beacon must go unstamped before the reader counts as gone. Both live here, with
+# the beacon they describe, because two consumers now need the same answer: the
+# daemon's paneless undelivered alarm (bin/fm-supervise-daemon.sh) and the
+# session-start reader-liveness check (bin/fm-afk-reader-check.sh). Deriving the
+# staleness window from max-defer keeps the two windows comparable however
+# max-defer is configured, and docs/configuration.md owns the published defaults.
+FM_AFK_MAX_DEFER_SECS_DEFAULT=300
+
+FM_AFK_INBOX_BEACON_STALE_DEFER_MULTIPLE=2
+
+# Seconds since <file> was last touched, and a very large number when it does not
+# exist - so an absent beacon reads as the strongest possible form of "nothing is
+# listening" rather than as a fresh stamp. Same portable stat pair the watcher and
+# the daemon use, kept here so every beacon consumer measures age identically.
+fm_afk_file_age() {  # <file>
+  local f=$1 mtime now
+  [ -e "$f" ] || { printf '999999'; return 0; }
+  now=$(date +%s)
+  mtime=$(stat -f %m "$f" 2>/dev/null || stat -c %Y "$f" 2>/dev/null || printf '%s' "$now")
+  printf '%s' $(( now - mtime ))
+}
+
+# Seconds without a beacon stamp before firstmate's inbox reader counts as gone.
+# A non-numeric or zero FM_AFK_INBOX_BEACON_STALE_SECS override falls back to the
+# derived default rather than disabling the check, because a window of zero would
+# make every armed reader look dead.
+fm_afk_inbox_beacon_stale_secs() {
+  local secs=${FM_AFK_INBOX_BEACON_STALE_SECS:-} max_defer
+  case "$secs" in
+    ''|*[!0-9]*|0)
+      max_defer=${FM_MAX_DEFER_SECS:-$FM_AFK_MAX_DEFER_SECS_DEFAULT}
+      case "$max_defer" in
+        ''|*[!0-9]*|0) max_defer=$FM_AFK_MAX_DEFER_SECS_DEFAULT ;;
+      esac
+      secs=$(( max_defer * FM_AFK_INBOX_BEACON_STALE_DEFER_MULTIPLE ))
+      ;;
+  esac
+  printf '%s' "$secs"
+}
+
 # Session-scoped away-mode delivery artifacts owned by this library, one name per
 # line. bin/fm-afk-start.sh folds them into the single session-artifact list that
 # fresh-entry clearing and the launcher's transactional rollback both iterate, so

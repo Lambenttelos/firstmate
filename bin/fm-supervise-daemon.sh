@@ -234,8 +234,19 @@ HOUSEKEEPING_TICK_DEFAULT=15
 # Max time a buffered escalation may sit undelivered before the daemon retries
 # the normal flush path and, if that cannot confirm a submit, raises a loud wedge
 # alarm. The escape hatch makes a guard false-positive visible instead of silent.
-MAX_DEFER_SECS_DEFAULT=300
+# The value itself lives with the beacon it is compared against
+# (bin/fm-afk-outbox-lib.sh's FM_AFK_MAX_DEFER_SECS_DEFAULT), because the
+# session-start reader-liveness check needs the same number.
+MAX_DEFER_SECS_DEFAULT=$FM_AFK_MAX_DEFER_SECS_DEFAULT
 WEDGE_ALARM_TIMEOUT_SECS_DEFAULT=10
+# How often housekeeping runs one bounded away-mode driver tick
+# (bin/fm-afk-driver.sh), and how long a single tick may take before it is
+# stopped. The cadence is minutes rather than seconds because the driver's work -
+# cleaning up finished lanes, nudging an unpushed one, starting queued work - is
+# fleet-scale and costs real commands; FM_AFK_DRIVER_TICK_SECS=0 switches the
+# hook off for a home without touching the rest of away mode.
+AFK_DRIVER_TICK_SECS_DEFAULT=600
+AFK_DRIVER_TIMEOUT_SECS_DEFAULT=300
 WEDGE_ALARM_LAST_EPOCH=0
 WEDGE_ALARM_NOTIFIER_PID=
 # Paneless undelivered-alarm probe state. A probe that cannot read the outbox
@@ -245,14 +256,9 @@ WEDGE_ALARM_NOTIFIER_PID=
 OUTBOX_UNREADABLE=0
 OUTBOX_PROBE_NOT_BEFORE=0
 # How stale bin/fm-afk-inbox.sh's liveness beacon must be before the paneless
-# undelivered alarm treats the reader as gone, expressed as a multiple of the
-# effective max-defer window rather than a fixed number of seconds.
-#
-# The window this has to survive is one firstmate TURN, not one poll interval,
-# and the reporting bound that follows from it, are owned by
-# docs/configuration.md ("Away-mode paneless delivery"); deriving the window from
-# max-defer here is what keeps the two comparable however max-defer is configured.
-INBOX_BEACON_STALE_DEFER_MULTIPLE=2
+# undelivered alarm treats the reader as gone is derived in
+# bin/fm-afk-outbox-lib.sh (fm_afk_inbox_beacon_stale_secs), with the beacon it
+# measures and the session-start reader-liveness check that needs the same answer.
 # The captain-relevant verb set and the status classifiers (last_status_line,
 # status_is_captain_relevant, window_to_task, scan_captain_relevant_statuses) now
 # live in bin/fm-classify-lib.sh, shared with the always-on watcher.
@@ -811,24 +817,14 @@ paneless_delivery() {
 }
 
 # Seconds without a reader beacon stamp before the paneless undelivered alarm
-# treats firstmate's inbox reader as gone: INBOX_BEACON_STALE_DEFER_MULTIPLE times
+# treats firstmate's inbox reader as gone: FM_AFK_INBOX_BEACON_STALE_DEFER_MULTIPLE times
 # the effective max-defer window (see docs/configuration.md for that default and
 # its reporting bound). A non-numeric or zero override falls back to the derived
 # default rather than disabling the staleness check, because a staleness window of
 # zero would make every armed reader look dead and restore the false alarm this
 # gate removes.
 inbox_beacon_stale_secs() {
-  local secs=${FM_AFK_INBOX_BEACON_STALE_SECS:-} max_defer
-  case "$secs" in
-    ''|*[!0-9]*|0)
-      max_defer=${FM_MAX_DEFER_SECS:-$MAX_DEFER_SECS_DEFAULT}
-      case "$max_defer" in
-        ''|*[!0-9]*|0) max_defer=$MAX_DEFER_SECS_DEFAULT ;;
-      esac
-      secs=$(( max_defer * INBOX_BEACON_STALE_DEFER_MULTIPLE ))
-      ;;
-  esac
-  printf '%s' "$secs"
+  fm_afk_inbox_beacon_stale_secs
 }
 
 # The supervisor pane target for THIS run, or the empty string when no pane is
@@ -1182,6 +1178,55 @@ inject_wedge_alarm() {  # <state> <age-seconds> [mode]
   fi
 }
 
+# --- autonomous queue advancement ------------------------------------------
+# One bounded away-mode driver tick (bin/fm-afk-driver.sh), which owns every
+# decision it makes and every safety boundary it observes. This wrapper owns only
+# the two things the DAEMON must guarantee: the tick can never take the daemon
+# down, and it can never run longer than its own window.
+#
+# The daemon's contract is to escalate so firstmate's agent drives; the driver's
+# is to advance the mechanical part of the queue when no firstmate turn is
+# happening at all. Keeping the call here rather than in the watcher is deliberate:
+# away mode is the only posture where nothing else is driving, and the driver
+# refuses to run unless state/.afk is present anyway.
+afk_driver_tick() {  # <state>
+  local state=$1 driver out rc=0 pid waited timeout line
+  driver="$FM_DAEMON_DIR/fm-afk-driver.sh"
+  [ -x "$driver" ] || return 0
+  timeout=${FM_AFK_DRIVER_TIMEOUT_SECS:-$AFK_DRIVER_TIMEOUT_SECS_DEFAULT}
+  case "$timeout" in
+    ''|*[!0-9]*|0) timeout=$AFK_DRIVER_TIMEOUT_SECS_DEFAULT ;;
+  esac
+  out=$(mktemp "${TMPDIR:-/tmp}/fm-afk-driver.XXXXXX") || return 0
+  FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$state" "$driver" tick >"$out" 2>&1 &
+  pid=$!
+  waited=0
+  while kill -0 "$pid" 2>/dev/null; do
+    if [ "$waited" -ge "$timeout" ]; then
+      kill "$pid" 2>/dev/null || true
+      log "away-mode driver tick exceeded ${timeout}s and was stopped; the fleet is unchanged and the next tick retries"
+      break
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  wait "$pid" 2>/dev/null || rc=$?
+  if [ -s "$out" ]; then
+    while IFS= read -r line; do
+      [ -n "$line" ] || continue
+      log "driver: $line"
+    done < "$out"
+  fi
+  # A driver failure is a logged fact, never a daemon crash: supervision must keep
+  # escalating even when queue advancement cannot run.
+  case "$rc" in
+    0|3|4) ;;
+    *) log "away-mode driver tick failed (exit $rc); supervision continues unaffected" ;;
+  esac
+  rm -f "$out"
+  return 0
+}
+
 _oldest_line_age() {  # <buf> -> seconds since the oldest buffered item first arrived (sidecar epoch)
   local f=$1 since
   [ -s "$f" ] || { echo 999999; return; }
@@ -1194,7 +1239,7 @@ _oldest_line_age() {  # <buf> -> seconds since the oldest buffered item first ar
 }
 
 # --- housekeeping (runs every tick while the watcher is mid-cycle) ----------
-# Four cheap jobs, each guarded so an empty/quiet fleet costs near zero:
+# Cheap jobs, each guarded so an empty/quiet fleet costs near zero:
 #  1) batch flush: if the escalation buffer's oldest content is older than
 #     ESCALATE_BATCH_SECS (or batching is disabled), inject one digest.
 #  1b) max-defer escape: if the buffer is STILL undelivered past MAX_DEFER_SECS,
@@ -1214,9 +1259,12 @@ _oldest_line_age() {  # <buf> -> seconds since the oldest buffered item first ar
 #     digest and reset the window (repeating bounded re-surface, never a wedge).
 #  3) heartbeat scan: every HEARTBEAT_SCAN_SECS, grep state/*.status for a
 #     captain-relevant line the per-wake classifier missed and escalate it.
+#  4) driver tick: every FM_AFK_DRIVER_TICK_SECS while away mode is active, run one
+#     bounded bin/fm-afk-driver.sh pass so the queue still advances when no
+#     firstmate turn is happening. Never able to crash the daemon.
 housekeeping() {  # <state>
   local state=$1 now due f key task win marker age last max_defer oldest pause_secs
-  local oldest_epoch outbox_rc
+  local oldest_epoch outbox_rc driver_secs
   now=$(_now)
   migrate_watcher_pause_markers "$state"
 
@@ -1396,6 +1444,23 @@ housekeeping() {  # <state>
       escalate_add "$state" "$(basename "$f"): $last (catch-all scan)"
       mark_status_seen "$state" "$task" "$last"
     done < <(scan_captain_relevant_statuses "$state")
+  fi
+
+  # (4) autonomous queue advancement. Escalating tells firstmate what to drive;
+  # while the captain is away there may be no firstmate turn for hours, so one
+  # bounded driver tick advances the mechanical part of the queue itself. Gated on
+  # away mode and on its own cadence, and wrapped so it can never take the daemon
+  # down (afk_driver_tick above).
+  if afk_active "$state"; then
+    driver_secs=${FM_AFK_DRIVER_TICK_SECS:-$AFK_DRIVER_TICK_SECS_DEFAULT}
+    case "$driver_secs" in
+      ''|*[!0-9]*) driver_secs=$AFK_DRIVER_TICK_SECS_DEFAULT ;;
+    esac
+    if [ "$driver_secs" -gt 0 ] \
+       && [ "$(_file_age "$state/.subsuper-last-driver")" -ge "$driver_secs" ]; then
+      _now > "$state/.subsuper-last-driver"
+      afk_driver_tick "$state"
+    fi
   fi
 }
 
