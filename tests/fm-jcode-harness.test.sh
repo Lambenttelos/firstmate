@@ -115,6 +115,7 @@ test_spawn_launch_template_has_no_positional_brief() {
   launch=$(launch_template jcode ship)
   [ "$launch" = 'jcode --no-update' ] \
     || fail "the jcode launch template must be exactly 'jcode --no-update', got '$launch'"
+  # shellcheck disable=SC2016  # single quotes are deliberate: a literal needle matched against fm-spawn.sh source text, not an expansion
   grep -q 'jcode_post_launch_delivery "\$T" "\$BRIEF"' "$ROOT/bin/fm-spawn.sh" \
     || fail "fm-spawn.sh must deliver the jcode brief after launch"
   grep -q 'FM_SPAWN_JCODE_READY_POLLS' "$ROOT/bin/fm-spawn.sh" \
@@ -127,6 +128,7 @@ test_spawn_installs_no_jcode_turnend_hook() {
   # the launched client, so no per-task hook can be armed and none may be
   # written. Supervision is stale-pane only (harness-adapters).
   local hook_block
+  # shellcheck disable=SC2016  # single quotes are deliberate: a literal sed range matched against fm-spawn.sh source text, not an expansion
   hook_block=$(sed -n '/^if \[ "\$KIND" != secondmate \]; then/,/^fi$/p' "$ROOT/bin/fm-spawn.sh")
   ! printf '%s\n' "$hook_block" | grep -q 'jcode' \
     || fail "fm-spawn.sh must not install a turn-end hook for jcode"

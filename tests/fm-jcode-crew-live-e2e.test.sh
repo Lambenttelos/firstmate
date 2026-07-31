@@ -118,6 +118,24 @@ wait_for_text() {  # <text> <seconds>
   done
   return 1
 }
+# Border/whitespace-stripped matcher for a value that jcode's bordered composer
+# may wrap across rows. A long brief pointer is broken mid-token by the composer
+# box (a row ends with the path fragment, a padding run, and a `│` border, then
+# the next row resumes the token), so a contiguous capture never holds the path.
+# Removing every space, newline, and box-border glyph from both the capture and
+# the needle rejoins the wrapped token; the needle here is an absolute path with
+# no interior whitespace, so stripping it is a no-op and the match stays exact.
+wait_for_wrapped_text() {  # <text> <seconds>
+  local text=$1 budget=$2 i=0 needle joined
+  needle=$(printf '%s' "$text" | tr -d '[:space:]' | sed 's/[│┃|]//g')
+  while [ "$i" -lt "$budget" ]; do
+    joined=$(capture | tr -d '[:space:]' | sed 's/[│┃|]//g')
+    case "$joined" in *"$needle"*) return 0 ;; esac
+    sleep 1
+    i=$((i + 1))
+  done
+  return 1
+}
 
 wait_for_text "Switched to model: $MODEL" 60 \
   || fail "the resolved model was never applied to the session: $(capture | tail -20)"
@@ -125,7 +143,7 @@ wait_for_text "Reasoning effort" 30 \
   || fail "the resolved effort was never applied to the session: $(capture | tail -20)"
 pass "jcode_post_launch_delivery: the resolved model and effort apply to the live session"
 
-wait_for_text "$HOME_DIR/data/$ID/brief.md" 60 \
+wait_for_wrapped_text "$HOME_DIR/data/$ID/brief.md" 60 \
   || fail "the launch-brief pointer never landed in the session: $(capture | tail -20)"
 pass "jcode_post_launch_delivery: the launch-brief pointer lands in the composer"
 
@@ -167,10 +185,21 @@ pass "fm_tmux_composer_state: an idle jcode composer reads empty on a real pane"
 
 # /quit exits cleanly and prints the resume command. The shared background server
 # keeps serving every other session; nothing here stops or reloads it.
+#
+# The submit verdict is NOT the success signal for /quit: a successful /quit tears
+# down the very composer that fm_tmux_submit_core polls to confirm delivery, so
+# the confirmation read catches the pane mid-shutdown and returns `pending` (a
+# false swallow) even though the command landed (verified 2026-07-31 on jcode
+# 0.64.2: one Enter on the /quit popup exits and prints the resume line). So the
+# verdict only has to prove the keystrokes were sent, not that the composer
+# cleared: `pending` is expected and accepted here, and `send-failed` is the one
+# real failure. The authoritative proof is the resume line the next step waits
+# for, which only a genuine clean exit prints. Real teardown never depends on
+# this verdict anyway - bin/fm-teardown.sh kills the recorded pane endpoint.
 verdict=$(fm_tmux_submit_core "$TARGET" '/quit' 3 0.4 1.2)
 case "$verdict" in
-  empty|unknown) : ;;
-  *) fail "/quit was not accepted (verdict $verdict)" ;;
+  empty|unknown|pending) : ;;
+  *) fail "/quit keystrokes were not sent (verdict $verdict)" ;;
 esac
 wait_for_text "jcode --resume" 30 \
   || fail "/quit did not print the resume command: $(capture | tail -20)"
