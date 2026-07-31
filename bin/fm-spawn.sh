@@ -499,7 +499,18 @@ launch_template() {
     # does NOT suppress the interactive ghost text (verified empirically), so the env
     # var is the correct control. The dim-aware composer reader in fm-tmux-lib.sh is
     # the defense-in-depth backstop for any pane this flag cannot reach.
-    claude) printf '%s' 'CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false claude --dangerously-skip-permissions __MODELFLAG____EFFORTFLAG__"$(__OPINPUT__ encode launch-brief < __BRIEF__)"' ;;
+    # IS_SANDBOX=1 is injected ONLY when firstmate runs as root (uid 0). claude
+    # refuses --dangerously-skip-permissions under root/sudo ("cannot be used with
+    # root/sudo privileges for security reasons"), which fails every claude crew
+    # spawn closed at launch on a root-run server (verified 2026-07-30 and
+    # 2026-07-31). IS_SANDBOX=1 clears that root refusal. It is gated on uid 0 so a
+    # normal non-root host keeps the byte-identical launch template and is never
+    # weakened by the sandbox hint.
+    claude)
+      local claude_sandbox=''
+      [ "$(id -u)" = 0 ] && claude_sandbox='IS_SANDBOX=1 '
+      printf '%s' "${claude_sandbox}"'CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false claude --dangerously-skip-permissions __MODELFLAG____EFFORTFLAG__"$(__OPINPUT__ encode launch-brief < __BRIEF__)"'
+      ;;
     codex)
       if [ "$kind" = secondmate ]; then
         printf '%s' 'codex __MODELFLAG____EFFORTFLAG__--dangerously-bypass-approvals-and-sandbox "$(__OPINPUT__ encode launch-brief < __BRIEF__)"'
