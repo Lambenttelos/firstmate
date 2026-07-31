@@ -20,7 +20,10 @@
 # glyph (e.g. claude's older `| > ... |`). On a bare, unstructured row it is a
 # dead-shell prompt and is NEVER "empty"; it classifies as `unknown` (not a safe
 # injection target). The AGENT prompt glyphs `❯` (claude) and `›` (codex) are a
-# genuine empty agent composer either way, bordered or bare.
+# genuine empty agent composer either way, bordered or bare, and so is jcode's
+# numbered prompt row (`3> `, `4… `), recognized by fm_composer_jcode_prompt_text
+# below: a leading digit run before the prompt glyph is not a shell-prompt shape,
+# so recognizing it does not weaken the rule.
 #
 # GHOST/PLACEHOLDER TEXT is the other half of this owner (task
 # afk-herdr-false-pending): a harness fills an otherwise-empty composer with
@@ -159,6 +162,56 @@ fm_composer_strip_ghost() {
   '
 }
 
+# fm_composer_jcode_prompt_text: recognize jcode's NUMBERED composer prompt row
+# and print the real typed text it holds.
+#
+# jcode (verified 2026-07-30, jcode server 0.64.2) draws neither a composer box
+# nor one of the agent prompt glyphs the cases below already know. Its composer
+# row is a turn counter followed by a state glyph, then the typed text, then a
+# right-aligned status glyph at the far edge of the pane:
+#
+#   idle, nothing typed:  "3>                                        ⏳"
+#   idle, text typed:     "3> hello world                            ⏳"
+#   mid-turn (busy):      "4…                                        ⏳"
+#
+# Every run is bright truecolor, so nothing is de-emphasised and the shared ghost
+# stripper keeps the whole row: without this recognizer an IDLE jcode pane reads
+# as `pending` (verified: fm_tmux_composer_state printed `pending` on an idle
+# probe pane), which is the false-pending shape that wedges away-mode injection
+# and turns every delivered submit into a false "Enter swallowed".
+#
+# The row is accepted as a genuine agent composer because a leading DIGIT run
+# before the prompt glyph is not a shell-prompt shape, so this cannot relax the
+# bare-shell-glyph safety rule above. The right-aligned status glyph is dropped
+# structurally rather than by matching ⏳ itself: the indicator is separated from
+# any typed text by the run of padding spaces that right-aligns it, so the text
+# is whatever precedes the first run of two or more spaces. That keeps the
+# recognizer working whatever indicator jcode right-aligns next, and it keeps
+# real typed text `pending` because typed text always starts immediately after
+# the prompt glyph.
+#
+# Returns 0 and prints the trimmed typed text (empty when nothing is typed) for
+# a jcode composer row; returns 1 for any other row, leaving the caller's
+# existing classification untouched. Bash 3.2 safe: literal prefix/suffix
+# substitution only, no multibyte character classes.
+fm_composer_jcode_prompt_text() {  # <trimmed-row-content> -> typed text on stdout
+  local s=$1 digits rest
+  digits=${s%%[!0-9]*}
+  [ -n "$digits" ] || return 1
+  rest=${s#"$digits"}
+  case "$rest" in
+    '>'*) rest=${rest#>} ;;
+    '…'*) rest=${rest#…} ;;
+    *) return 1 ;;
+  esac
+  # Drop the right-aligned status indicator: everything from the first run of
+  # two or more spaces onward.
+  rest=${rest%%"  "*}
+  rest="${rest#"${rest%%[![:space:]]*}"}"
+  rest="${rest%"${rest##*[![:space:]]}"}"
+  printf '%s' "$rest"
+}
+
 # fm_composer_classify_content: the single shared composer-content verdict.
 #   <bordered> 1 when <content> came from a genuine agent-composer container (a
 #              bordered composer box, or a structurally-identified bare AGENT
@@ -200,7 +253,7 @@ fm_composer_idle_matches() {
 }
 
 fm_composer_classify_content() {  # <bordered> <content> [idle_re] [idle_case] [plain_content]
-  local bordered=$1 content=$2 idle_re=${3:-} idle_case=${4:-sensitive} plain_content
+  local bordered=$1 content=$2 idle_re=${3:-} idle_case=${4:-sensitive} plain_content jcode_text
   plain_content=${5:-$content}
   # Fold the NBSP prompt-padding class the callers' ASCII [:space:] trim missed,
   # then re-trim, so a claude "❯ " empty composer reaches the bare-glyph
@@ -211,6 +264,14 @@ fm_composer_classify_content() {  # <bordered> <content> [idle_re] [idle_case] [
   plain_content=$(fm_composer_normalize_ws "$plain_content")
   plain_content="${plain_content#"${plain_content%%[![:space:]]*}"}"
   plain_content="${plain_content%"${plain_content##*[![:space:]]}"}"
+  # jcode's numbered prompt row is a genuine agent composer, so reduce it to the
+  # text actually typed into it and treat it as a composer container from here on
+  # (see fm_composer_jcode_prompt_text). An idle jcode row then reaches the
+  # nothing-on-the-row case as empty instead of reading as pending input.
+  if jcode_text=$(fm_composer_jcode_prompt_text "$content"); then
+    bordered=1
+    content=$jcode_text
+  fi
   if [ "$bordered" != 1 ] && [ -z "$content" ] && [ -n "$plain_content" ]; then
     case "$plain_content" in
       '❯'|'›') printf 'empty'; return 0 ;;

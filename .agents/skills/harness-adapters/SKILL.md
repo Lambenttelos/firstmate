@@ -1,6 +1,6 @@
 ---
 name: harness-adapters
-description: Agent-only reference for firstmate harness operations. Use before spawning or recovering a crewmate or secondmate, handling a trust dialog, sending a harness-specific skill invocation, interrupting or exiting an agent, resuming an exited agent, or verifying a new harness adapter. Contains verified facts for claude, codex, opencode, pi, and grok.
+description: Agent-only reference for firstmate harness operations. Use before spawning or recovering a crewmate or secondmate, handling a trust dialog, sending a harness-specific skill invocation, interrupting or exiting an agent, resuming an exited agent, or verifying a new harness adapter. Contains verified facts for claude, codex, opencode, pi, grok, and jcode.
 user-invocable: false
 metadata:
   internal: true
@@ -33,7 +33,9 @@ The supervision knowledge lives here: busy signature, exit command, interrupt, d
 Never dispatch a crewmate or secondmate on an unverified adapter.
 If `config/crew-harness` or `config/secondmate-harness` names an unverified adapter, tell the captain under `AGENTS.md` section 9 that the requested worker runtime is not verified yet, use firstmate's own verified runtime for current work, and ask only whether to verify the requested runtime before future use.
 Do not pause current work for that future-verification choice, and never launch an unverified adapter.
-If the captain asks for a new harness, propose verifying it first: spawn a trivial supervised task using `fm-spawn`'s raw-launch-command escape hatch, confirm every fact empirically, then record the mechanics in `fm-spawn`, the busy signature in `fm-watch.sh` and `fm-tmux-lib.sh` defaults, any needed `FM_COMPOSER_IDLE_RE` empty-composer override plus any novel bare agent prompt glyph in `bin/fm-composer-lib.sh`'s shared composer classifier (the one fleet-wide owner of the empty/dead-shell/pending decision, so a new harness's own idle composer is not misread as a dead shell), the tmux agent-process liveness classification in `bin/backends/tmux.sh` when the harness can launch a secondmate, and the verified knowledge here.
+If the captain asks for a new harness, propose verifying it first: spawn a trivial supervised task using `fm-spawn`'s raw-launch-command escape hatch, confirm every fact empirically, then record the mechanics in `fm-spawn`, the busy signature in `fm-watch.sh` and `fm-tmux-lib.sh` defaults, any needed `FM_COMPOSER_IDLE_RE` empty-composer override plus any novel bare agent prompt glyph or prompt-row shape in `bin/fm-composer-lib.sh`'s shared composer classifier (the one fleet-wide owner of the empty/dead-shell/pending decision, so a new harness's own idle composer is not misread as a dead shell), the tmux agent-process liveness classification in `bin/backends/tmux.sh` when the harness can launch a secondmate, and the verified knowledge here.
+A novel prompt-row shape also has to be taught to `bin/backends/herdr.sh`'s structural composer scan, which finds the composer row by shape rather than by a cursor position: recording the shape only in the shared classifier leaves herdr unable to find the row at all, so the same idle composer reads `pending` on tmux and `unknown` on herdr (both wrong, in opposite directions).
+Verify the composer read on both ANSI-capable backends before calling an adapter verified.
 
 ## Detection
 
@@ -119,6 +121,7 @@ The supported launch-profile flags below are verified locally; each row records 
 | grok | `--model <model>` | `--reasoning-effort <low\|medium\|high>` | Verified on grok 0.2.99 (2026-07-13). `--effort` is an alias, but firstmate's profile axis is reasoning effort. As of 0.2.99 the ceiling is `high`; both `xhigh` and `max` are rejected with `use one of: high, medium, low`, so firstmate omits them. |
 | pi | `--model <model>` | `--thinking <low\|medium\|high\|xhigh\|max>` | Verified 2026-07-13 on Pi 0.80.6. `pi --help` advertises `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`; `pi --print --model openai-codex/gpt-5.6-sol --thinking max 'Reply with exactly OK.'` completed successfully. |
 | opencode | `--model <provider/model>` | none for firstmate's interactive launch | Verified on opencode 1.17.6. `opencode run` has `--variant`, but firstmate launches the interactive `opencode --prompt` path, which has no verified effort flag. |
+| jcode | none at launch; `/model <name>` after launch | none at launch; `/effort <low\|medium\|high\|xhigh\|max>` after launch | Verified 2026-07-30 on jcode server 0.64.2. `-m/--model` and `--provider` apply only when the launcher starts the shared background server, so on an already-running server the launcher prints "provider/model flags only apply when starting a new server" and ignores them. `fm-spawn` therefore passes neither flag and applies both axes to the live session (`jcode_post_launch_delivery`). `/effort` accepts `none\|minimal\|low\|medium\|high\|xhigh\|max\|swarm\|swarm-deep`, a superset of firstmate's vocabulary, so nothing is capped; which levels a given model honors is jcode's own decision (Anthropic `xhigh` needs Opus 4.7+, Sonnet 5+, or Fable 5+, and an unsupported level is reported in-session while the previous effort stands). `jcode model list` prints the accepted model names. |
 
 When a requested effort value is outside the harness-specific accepted set, `fm-spawn` records the requested `effort=` in meta but emits no effort flag for that harness.
 This preserves launch success instead of passing a known-bad value.
@@ -132,6 +135,7 @@ Natural language is acceptable if uncertain.
 - codex: `$<skill>`, for example `$no-mistakes`; `/<skill>` is claude-only and codex rejects it as "Unrecognized command".
 - opencode: no separate verified skill invocation beyond normal slash-command behavior; use natural language if the exact skill command is uncertain.
 - pi: no separate verified skill invocation beyond normal command behavior; use natural language if the exact skill command is uncertain.
+- jcode: `/<skill>`, for example `/no-mistakes` (same form as claude); jcode loads the same user-level skill directory, and its startup banner lists the discovered skills as `/`-prefixed names. Typing `/` opens a slash-autocomplete popup, so the same submit hazard applies: give the popup a settle before Enter and rely on the target backend's submit retry, which `fm-send` already does for every `/`-prefixed message.
 - grok: `/<skill>`, for example `/no-mistakes` (same form as claude). Verified end to end: grok discovers the user-level `no-mistakes` skill, `/no-mistakes` invokes it, and grok drives a real `no-mistakes axi run`. Like codex's `$`/`/` popups, typing `/<skill>` opens grok's slash-autocomplete, so a too-fast Enter selects the popup entry instead of sending, and for an argument-taking command (like `/no-mistakes`'s optional task-first argument) that first Enter only expands the popup selection into an argument-hint placeholder rather than submitting - a genuine second Enter is required (see the grok section below for the 2026-07-03 incident and fix). `fm_tmux_submit_core`'s retried Enter (used by `fm-send` on the tmux backend) already handles this correctly by reading the cursor row; the herdr backend needed a dedicated fix (`fm_backend_herdr_composer_state`, docs/herdr-backend.md) because its prior delta-based verification false-positived on that same popup-close content change.
 
 ## claude (VERIFIED)
@@ -316,3 +320,52 @@ The adapter therefore runs the shared predicate and, when it returns 2, forces o
 It does not pass `--permission-mode`, so the passive hook cannot escalate the primary session's tool permissions.
 Project-local Grok hooks require folder trust, verified with launch-time `--trust`; if the primary firstmate checkout is not trusted for Grok hooks, this primary guard fails open and `fm-guard.sh` remains the next-command alarm.
 Grok's primary watcher protocol is Claude-shaped background-notify around `bin/fm-watch-arm.sh`; the passive Stop hook is only a backstop for blind turn ends.
+
+## jcode (VERIFIED 2026-07-30, jcode server 0.64.2, launcher 0.62.1)
+
+jcode (github.com/1jehuang/jcode), a coding agent that drives Claude Max or ChatGPT Pro subscriptions.
+Verified as a CREWMATE and SECONDMATE target only.
+It is not yet verified as firstmate's own primary harness: it has no usable turn-end hook for the primary guard (see below), so the primary turn-end guard, watcher-arm adapter, pre-arm seatbelt, and session-start nudge still need their own design.
+`bin/fm-supervision-instructions.sh` therefore falls back to its `unknown` protocol when firstmate itself is detected on jcode.
+
+| Fact | Value |
+|---|---|
+| Busy-pane signature | its numbered composer prompt row, anchored at column 0, flips from `3>` (idle) to `4…` (mid-turn) and back. Regex `^[0-9]+…` in `bin/fm-watch.sh` and `bin/fm-tmux-lib.sh`. jcode's spinner line is NOT usable: its text changes across the phases of one turn (`⠴ sending context… 1s · https`, then `⠹ 4s · 714.3 tps · https`, then a per-tool line such as `●·· bash ··● · $ sleep 12 · https · 6s · ⌥+B bg`), and the trailing `⏳` sits on the composer row when idle too, so neither is a busy signal. |
+| Exit command | `/quit`, which exits cleanly and prints `Session <name> - to resume:` followed by `jcode --resume <session-id>` |
+| Interrupt | single Escape (prints `Interrupted`, composer returns to `N>`) |
+| Skill invocation | `/<skill>`, for example `/no-mistakes` (same form as claude) |
+| Autonomy | none needed: tools run with no permission prompt by default, verified by a spawned session running a `bash` tool unattended in a fresh git worktree. No trust dialog appeared in a git repo worktree. |
+| Env marker | `JCODE_ACTIVE_PROVIDER` and `JCODE_RUNTIME_PROVIDER`, both set for tool processes (`bin/fm-harness.sh`). `JCODE_NON_INTERACTIVE`, `JCODE_SOCKET`, and `JCODE_SCRATCH_DIR` are also present. |
+| Resume | `jcode --resume <session-id>` (id printed on `/quit`), or `jcode --resume` with no id to list sessions |
+| Process name | `jcode`, so `bin/backends/tmux.sh`'s agent-liveness probe reads a live client as `alive`; it stays `jcode` for the whole turn because the agent runs in the shared server, not in the pane |
+
+**No positional prompt, so the brief is delivered after launch.**
+`jcode 'some text'` is rejected as an unrecognized subcommand, so `fm-spawn`'s launch command is a bare `jcode --no-update` and `jcode_post_launch_delivery` in `bin/fm-spawn.sh` then submits, in order, `/model <model>`, `/effort <effort>`, and the launch brief.
+The brief travels as a POINTER to `data/<id>/brief.md` inside the canonical launch-brief operational input, because every backend's composer submit is line-oriented and a raw newline would submit a partial brief.
+That matches the standing rule that long instructions travel as a file.
+
+**Per-session model and effort work; the launch flags do not.**
+`-m/--model` and `--provider` apply only when the launcher STARTS the shared background server, and it is already running in practice, so the launcher prints "provider/model flags only apply when starting a new server" and ignores them.
+`/model <name>` and `/effort <level>` do apply per session, verified with two concurrent sessions on one server: one switched route while the other kept its own model and effort, with no cross-contamination and no change to the server default.
+`/model <name> <effort>` also works and sets both in one message, but `fm-spawn` sends the two documented commands separately so effort still applies when no model was resolved.
+`/model` with NO argument opens an arrow-key picker instead, and that picker is MODAL: while it is open it swallows typed text, so a pane that ended up in it needs Escape before any steer will land.
+Never send a bare `/model`.
+
+**No usable turn-end hook, so crewmate supervision is stale-pane only.**
+jcode does have a native lifecycle hook set (`[hooks]` in its `config.toml`, with `turn_start`, `turn_end`, `session_start`, `session_end`, `pre_tool`, and `post_tool`, plus `JCODE_HOOK_*` env overrides).
+It is not reachable from a spawn: the hook is read by the shared background server, not by the client the spawn launches.
+Verified by launching a client with `JCODE_HOOK_TURN_END="touch <marker>"`, running a turn to completion, and finding no marker and no hook line in `~/.jcode/logs/`.
+Arming it would mean writing `[hooks] turn_end` into the captain's global jcode config, which every jcode session on the machine shares, so it is a captain decision rather than something a spawn may do.
+Consequence, accepted by the captain: a jcode crewmate produces NO per-turn wake, and `fm-spawn` deliberately installs no turn-end token or hook for it.
+Its supervision is the watcher's stale-pane detection alone, which is why the busy signature above has to be right.
+
+**Shared background server: never stop or restart it.**
+Every jcode session on the machine, including firstmate's own if it is running on jcode, is served by one daemon.
+`jcode server stop` and `jcode server reload` drop or interrupt every live session, so neither belongs in any spawn, steer, teardown, or recovery step.
+Teardown just exits the session with `/quit` and returns the worktree; the server keeps running for the other sessions.
+
+**Composer shape (why the shared classifier needed a jcode case).**
+The composer row is a turn counter, a state glyph, the typed text, then a right-aligned `⏳` (U+23F3) at the far edge: `3>` idle, `3> hello world` with text, `4…` mid-turn.
+Every run is bright truecolor, so nothing is de-emphasised and the shared ghost stripper keeps the whole row.
+Before the fix, `fm_tmux_composer_state` printed `pending` on an idle jcode pane and herdr's structural scan found no composer row at all, so away-mode injection would have deferred forever on tmux and refused on herdr, and every delivered submit would have read as a swallowed Enter.
+`fm_composer_jcode_prompt_text` in `bin/fm-composer-lib.sh` is the one fleet-wide owner of the shape; both ANSI-capable adapters route through it.

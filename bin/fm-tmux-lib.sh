@@ -62,8 +62,11 @@
 
 # Busy footers per harness (mirror fm-watch.sh). claude/codex: "esc to
 # interrupt"; opencode: "esc interrupt"; pi: "Working..."; grok: "Ctrl+c:cancel"
-# (grok's mid-turn cancel hint, shown iff a turn is running - verified grok 0.2.73).
-FM_TMUX_BUSY_REGEX_DEFAULT='esc (to )?interrupt|Working\.\.\.|Ctrl\+c:cancel'
+# (grok's mid-turn cancel hint, shown iff a turn is running - verified grok 0.2.73);
+# jcode: its numbered composer prompt row flips from "3>" to "4…" for exactly the
+# duration of a turn (verified jcode server 0.64.2 - see fm-watch.sh for why the
+# composer row, and not jcode's spinner line, is the signal).
+FM_TMUX_BUSY_REGEX_DEFAULT='esc (to )?interrupt|Working\.\.\.|Ctrl\+c:cancel|^[0-9]+…'
 
 # fm_tmux_strip_ghost: thin adapter over the shared, fleet-wide ghost extractor
 # fm_composer_strip_ghost (bin/fm-composer-lib.sh). It drops de-emphasised

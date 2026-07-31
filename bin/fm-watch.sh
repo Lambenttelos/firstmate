@@ -215,7 +215,14 @@ if [ "$POLL" -lt "$_beacon_half" ]; then BEACON_SLICE=$POLL; else BEACON_SLICE=$
 # grok: "Ctrl+c:cancel" (the mid-turn cancel hint in grok's keybind bar, shown iff a
 # turn is running; absent when idle - verified grok 0.2.73, ASCII to avoid the
 # locale fragility of matching grok's braille spinner glyph directly).
-BUSY_REGEX=${FM_BUSY_REGEX:-'esc (to )?interrupt|Working\.\.\.|Ctrl\+c:cancel'}
+# jcode: its numbered composer prompt row, anchored at column 0, flips from "3>"
+# (idle) to "4…" (mid-turn) and back - verified jcode server 0.64.2. jcode's
+# spinner line is NOT usable: its text changes across the phases of one turn
+# ("⠴ sending context… 1s · https", then "⠹ 4s · 714.3 tps · https", then a
+# per-tool line such as "●·· bash ··● · $ sleep 12 · https · 6s · ⌥+B bg"), and
+# the trailing ⏳ on the composer row is present when idle too, so neither is a
+# busy signal. The composer row is the one signal present in every busy phase.
+BUSY_REGEX=${FM_BUSY_REGEX:-'esc (to )?interrupt|Working\.\.\.|Ctrl\+c:cancel|^[0-9]+…'}
 # Always-on wake triage: most wakes during a long crew validation are benign (a
 # working: note or turn-end while a pipeline runs, a no-change heartbeat). Rather
 # than wake firstmate's LLM for each, this watcher classifies every wake in bash

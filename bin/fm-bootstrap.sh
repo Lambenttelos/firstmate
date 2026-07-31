@@ -470,8 +470,11 @@ secondmate_liveness_sweep() {
     target=$(fm_backend_target_of_meta "$meta")
     [ -n "$target" ] || target="$window"
     verdict=$(fm_backend_agent_alive "$backend" "$target" 2>/dev/null) || verdict="unknown"
+    # A confident `dead` reading may authorize a respawn only for a harness
+    # whose own process name the liveness probe can recognize (harness-adapters);
+    # jcode qualifies because it runs as comm "jcode" (verified 2026-07-30).
     case "$harness" in
-      claude|codex|opencode|pi|grok) ;;
+      claude|codex|opencode|pi|grok|jcode) ;;
       *) [ "$verdict" = dead ] && verdict=unknown ;;
     esac
     case "$verdict" in

@@ -16,7 +16,12 @@
 #   - Candidates map to the quota provider and product their model consumes:
 #     direct Claude -> Claude, direct Codex -> Codex, direct Grok -> Grok Build,
 #     and Pi/OpenCode models prefixed anthropic/, openai-codex/, or xai/ ->
-#     Claude, Codex, or the xAI API product respectively.
+#     Claude, Codex, or the xAI API product respectively. A jcode profile maps to
+#     Claude only for a claude-* model, because that route runs on the same
+#     Claude OAuth subscription (verified 2026-07-30: a jcode session on
+#     claude-opus-4-8 reports "Claude · OAuth" and draws down the same Anthropic
+#     five-hour window). jcode's other providers are unmapped, so such a profile
+#     is simply unscorable rather than charged to the wrong quota.
 #   - A candidate's score is the minimum percentRemaining among its relevant
 #     general and matching model windows, or its exact Grok product window.
 #     Grok's aggregate credits window is used only when product windows are not
@@ -114,12 +119,13 @@ profiles_json=$(printf '%s\n' "$SPEC_JSON" | jq -ec '
 ' 2>/dev/null) || { echo "error: dispatch input must be a rule, profile, or profile array" >&2; exit 2; }
 
 validation_error=$(printf '%s\n' "$profiles_json" | jq -r '
-  def verified($h): ["claude", "codex", "opencode", "pi", "grok"] | index($h);
+  def verified($h): ["claude", "codex", "opencode", "pi", "grok", "jcode"] | index($h);
   def effort_ok($h; $e):
     if $h == "claude" then ["low", "medium", "high", "xhigh", "max"] | index($e)
     elif $h == "codex" then ["low", "medium", "high", "xhigh"] | index($e)
     elif $h == "grok" then ["low", "medium", "high"] | index($e)
     elif $h == "pi" then ["low", "medium", "high", "xhigh", "max"] | index($e)
+    elif $h == "jcode" then ["low", "medium", "high", "xhigh", "max"] | index($e)
     elif $h == "opencode" then false
     else false
     end;
@@ -243,6 +249,8 @@ selection=$(printf '%s\n' "$quota_json" | jq -ec \
         {provider: "codex", model: (model_name($model))}
       elif (($h == "pi" or $h == "opencode") and ($model | startswith("xai/"))) then
         {provider: "grok", product: "api", model: (model_name($model))}
+      elif ($h == "jcode" and ($model | startswith("claude-"))) then
+        {provider: "claude", model: $model}
       else null
       end;
   def provider_for($id): [.providers[]? | select(.provider == $id)][0];

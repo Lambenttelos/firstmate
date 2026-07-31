@@ -143,8 +143,12 @@ fm_backend_tmux_current_command() {  # <target>
 # AGENTS.md's session-start guarantee closes). See docs/tmux-backend.md
 # "Agent liveness probe" for the empirical basis. Prints one of:
 #   alive   - the foreground command is one of the verified harness binaries
-#             (claude, codex, opencode, grok - each confirmed to run as its
-#             own process name, never wrapped by a generic interpreter).
+#             (claude, codex, opencode, grok, jcode - each confirmed to run as
+#             its own process name, never wrapped by a generic interpreter;
+#             jcode verified 2026-07-30 on jcode launcher 0.62.1: a live TUI
+#             client reports pane_current_command "jcode", and it stays "jcode"
+#             while the agent runs because the agent turn itself executes in the
+#             shared background server, not in the pane).
 #   dead    - the foreground command is a bare shell: nothing is running in
 #             the pane, so a prior agent process has exited.
 #   unknown - anything else, INCLUDING a bare "node"/"python" interpreter
