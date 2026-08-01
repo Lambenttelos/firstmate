@@ -94,19 +94,107 @@ fm_sm_claude_context_tokens() {  # <cwd>
 # directory, which for a secondmate is its home= (state/<id>.meta) and for
 # firstmate's own read is its operational home (FM_HOME).
 #
-# jcode (github.com/1jehuang/jcode) is a Claude-Agent-SDK runtime that persists
-# the SAME per-session JSONL transcript claude does, under
-# <config-dir>/projects/<munged-cwd>/<session-id>.jsonl with a message.usage
-# object per assistant turn (verified 2026-08-01; see
-# docs/secondmate-context-handoff.md). Its read is therefore byte-identical to
-# claude's, so it dispatches to the same reader rather than a duplicate one.
+# jcode (github.com/1jehuang/jcode) is a Claude-Agent-SDK runtime, but it does
+# NOT write to claude's projects dir - it persists its own journal at
+# <jcode-home>/sessions/session_<id>.journal.jsonl with a per-turn
+# append_messages[].token_usage object (verified 2026-08-01; see
+# docs/secondmate-context-handoff.md), so it dispatches to its own reader.
 fm_sm_context_tokens() {  # <cwd> <harness>
   local cwd=$1 harness=$2
   [ -n "$cwd" ] || return 0
   case "$harness" in
-    claude|jcode) fm_sm_claude_context_tokens "$cwd" ;;
+    claude) fm_sm_claude_context_tokens "$cwd" ;;
+    jcode)  fm_sm_jcode_context_tokens "$cwd" ;;
     *) return 0 ;;
   esac
+}
+
+# --- jcode reader ----------------------------------------------------------
+# jcode persists token usage in its own journal, NOT claude's projects dir. The
+# read: find the journal whose FIRST line .meta.working_dir equals <home> (exact
+# string equality - jcode stores the raw absolute path, no munging), preferring
+# the active-pid-confirmed live journal over a stale same-home leftover; the
+# context count is the last append_messages[].token_usage summed as
+# input_tokens + cache_creation_input_tokens + cache_read_input_tokens. Every
+# failure path (no jq, no sessions dir, no working_dir match, no usage line,
+# non-integer or <= 0 sum, or any jcode format shift that renames the field or
+# moves the dir) returns empty so the caller treats context as unknown and fails
+# closed - it never returns a wrong number. Verified 2026-08-01; see
+# docs/secondmate-context-handoff.md.
+
+# fm_sm_jcode_home: jcode's config root - $JCODE_HOME, else ~/.jcode.
+fm_sm_jcode_home() {
+  printf '%s' "${JCODE_HOME:-$HOME/.jcode}"
+}
+
+# fm_sm_jcode_journal: the journal file for the live jcode session launched in
+# <home>, or empty when none matches. Selection: among
+# <jcode-home>/sessions/session_*.journal.jsonl whose FIRST line
+# .meta.working_dir equals <home>, prefer the one whose session_<id> basename is
+# present in <jcode-home>/active_pids/ (the running session), falling back to the
+# newest-mtime working_dir match when no active-pid match exists (a resumed or
+# edge session). Only the first line of each file is parsed for working_dir, so
+# the scan stays cheap even with ~130 session files.
+fm_sm_jcode_journal() {  # <home>
+  local home=$1 jhome sessions pids f base first wd
+  local newest='' newest_active=''
+  command -v jq >/dev/null 2>&1 || return 0
+  [ -n "$home" ] || return 0
+  jhome=$(fm_sm_jcode_home)
+  sessions="$jhome/sessions"
+  pids="$jhome/active_pids"
+  [ -d "$sessions" ] || return 0
+  for f in "$sessions"/session_*.journal.jsonl; do
+    [ -f "$f" ] || continue
+    first=$(head -1 "$f" 2>/dev/null || true)
+    # Cheap pre-filter: skip a file whose first line has no working_dir at all.
+    case "$first" in *'"working_dir"'*) ;; *) continue ;; esac
+    wd=$(printf '%s' "$first" | jq -r '.meta.working_dir // empty' 2>/dev/null || true)
+    [ "$wd" = "$home" ] || continue
+    if [ -z "$newest" ] || [ "$f" -nt "$newest" ]; then
+      newest=$f
+    fi
+    # session_<id>.journal.jsonl -> session_<id> is the active_pids basename.
+    base=$(basename "$f")
+    base=${base%.journal.jsonl}
+    if [ -e "$pids/$base" ]; then
+      if [ -z "$newest_active" ] || [ "$f" -nt "$newest_active" ]; then
+        newest_active=$f
+      fi
+    fi
+  done
+  if [ -n "$newest_active" ]; then
+    printf '%s' "$newest_active"
+  elif [ -n "$newest" ]; then
+    printf '%s' "$newest"
+  fi
+}
+
+# fm_sm_jcode_context_tokens: the last turn's context-window occupancy
+# (input + cache_creation + cache_read input tokens) from <home>'s live jcode
+# journal. Empty when the journal, jq, or a usable token_usage line is missing,
+# or when the sum is not a positive integer - the caller then treats context as
+# unknown and fails closed.
+fm_sm_jcode_context_tokens() {  # <home>
+  local home=$1 f line tokens
+  command -v jq >/dev/null 2>&1 || return 0
+  f=$(fm_sm_jcode_journal "$home") || return 0
+  [ -n "$f" ] || return 0
+  # Last record carrying a token_usage; grep streams the file so a multi-MB
+  # journal stays cheap on the slow-poll cadence.
+  line=$(grep '"token_usage"' "$f" 2>/dev/null | tail -1 || true)
+  [ -n "$line" ] || return 0
+  # Take the last append_messages entry that has a token_usage (the most recent
+  # turn's cumulative context), summing its three input components. Guard every
+  # field with // 0 so a renamed field fails closed rather than misreporting.
+  tokens=$(printf '%s' "$line" | jq '
+      ([.append_messages[]?.token_usage // empty] | last) as $u
+    | (($u.input_tokens // 0)
+     + ($u.cache_creation_input_tokens // 0)
+     + ($u.cache_read_input_tokens // 0))' 2>/dev/null || true)
+  [[ "$tokens" =~ ^[0-9]+$ ]] || return 0
+  [ "$tokens" -gt 0 ] || return 0
+  printf '%s' "$tokens"
 }
 
 # --- firstmate's OWN context stow-nudge threshold ---------------------------
