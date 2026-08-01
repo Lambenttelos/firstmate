@@ -489,6 +489,41 @@ Unit coverage in `tests/fm-backend-herdr.test.sh` pins the exact idle and pendin
 The existing tmux injection E2E remains the transport-parity proof for type-once, verified-submit behavior.
 The wedge alarm remains defense in depth and is not the primary delivery path.
 
+## Incident (2026-08-01): a wrapped jcode composer read `unknown` and wedged the away daemon
+
+Verified 2026-08-01, jcode server 0.64.2, herdr 0.7.x on the linux/root fleet, against both the live away daemon and a scratch jcode session.
+
+Symptom.
+The firstmate primary ran on jcode inside a herdr pane with away mode active.
+The sub-supervisor daemon (`bin/fm-supervise-daemon.sh`) injected each batched escalation digest into the jcode composer and the captain DID receive it, but the daemon's submit-confirm read returned `unknown`, so it never cleared `state/.subsuper-escalations`, wrote `state/.subsuper-inject-wedged`, and re-fired the identical batch on every housekeeping tick (a `~5.8h undelivered` marker while the same 26-event batch arrived every ~40s - a large recurring token drain).
+The daemon log alternated `inject deferred: supervisor composer not confirmed-empty (state=pending...)`, `inject deferred: supervisor pane busy (agent mid-turn)`, and `inject failed: submit unconfirmed after 3 retries (verdict=unknown, text may be in composer)`.
+
+Root cause.
+The away daemon's batched digest is a single line of ~13k characters (verified: `state/.subsuper-escalations` joined with ` | ` measured 13457 bytes).
+jcode's composer is ~42 columns wide and jcode renders the composer INLINE, growing it downward one wrapped row at a time - it does NOT cap the composer height or scroll only the composer.
+So a 13k-character line wraps to roughly 330 rows and pushes the leading `NNN>` prompt row hundreds of rows above the visible pane.
+The tmux adapter reads the exact cursor row (`#{cursor_y}`) and is immune, but the herdr adapter has no cursor primitive and scans a bounded tail window (`FM_BACKEND_HERDR_COMPOSER_LINES`, default 20); when only wrapped continuation rows are in that window, `fm_composer_jcode_prompt_text` matches nothing and `fm_backend_herdr_composer_state` returns `unknown`.
+`fm_backend_herdr_send_text_submit` short-circuits and aborts the whole submit on the first `unknown` read (verdict=unknown), so the delivered batch was never confirmed and never cleared.
+`fm-send` short single-line steers do not wrap far enough to hit this, which is why the send path always worked and only the away daemon's long digest exposed it.
+
+Reproduction (scratch jcode, no firstmate lifecycle).
+```
+tmux new-session -d -s jcprobe -x 80 -y 24 'cd /tmp/jcode-probe && jcode --no-update'
+# type a ~1900-char single line into the composer (no Enter)
+tmux send-keys -t jcprobe -l "<long single line>"
+tmux capture-pane -p -t jcprobe          # composer starts at word023 - "1>" prompt scrolled off; last row ends in ⏳
+```
+The visible pane showed only wrapped continuation rows ending in the right-aligned `⏳`, with no `NNN>` prompt row anywhere.
+Fed the same shape through the fake-herdr harness: `fm_backend_herdr_composer_state` returned `unknown` (the bug); the tmux adapter on the identical scratch pane returned `pending` correctly (cursor-row read).
+
+Fix.
+Recognize jcode's wrapped-composer TAIL row by its right-aligned status indicator (`⏳`, U+23F3), which jcode draws only on the composer's last visible row (never on a transcript or footer row).
+The recognizer is the shared `fm_composer_jcode_wrapped_tail` in `bin/fm-composer-lib.sh` (one owner, reused - not a herdr-local copy of the jcode-row logic), wired as a third recognizer in `fm_backend_herdr_composer_state`'s structural scan.
+A wrapped tail carries real unsubmitted text, so it classifies as `pending`, which tells the daemon to retry Enter until the composer clears back to the idle `NNN>` row (already read as `empty`), confirming delivery and clearing the buffer.
+After the fix the same wrapped capture reads `pending` (fake harness and live scratch jcode), an idle jcode pane still reads `empty`, a mid-turn pane still reads `empty`, and a real-text pane still reads `pending`; the tmux path is unchanged.
+A future indicator-glyph change degrades to the pre-fix `unknown` (the safe direction: the daemon retries and never falsely confirms), never to a false injection target.
+Coverage: `tests/fm-composer-lib.test.sh` (`test_jcode_wrapped_tail_is_pending`, `test_jcode_wrapped_tail_recognizer_is_precise`) and `tests/fm-backend-herdr.test.sh` (`test_composer_state_jcode_wrapped_tail_is_pending`).
+
 ## Verified bug: `pane read --lines N` returns empty for small N
 
 This was the most significant finding of this verification pass.
@@ -546,6 +581,7 @@ For unbordered live composers, added after the 2026-07-07 incident below, the ro
 For jcode, added 2026-07-30 (jcode server 0.64.2), the composer is a third unbordered shape the structural scan finds by shape: a numbered prompt row that is a turn counter, a state glyph (`3> ` idle, `4… ` mid-turn), the typed text, then a right-aligned status glyph (`⏳`) padded to the far edge.
 It is recognized through the shared `fm_composer_jcode_prompt_text` owner (`bin/fm-composer-lib.sh`) rather than a herdr-local pattern, so herdr and tmux cannot drift on the shape, and the leading digit run keeps it distinct from every shell fallback prompt (jcode's own transcript rows use a digit plus `›`, not `>`, so they never match).
 Without teaching herdr's structural scan this shape, the row is not found at all and an idle jcode pane reads `unknown` - herdr's refuse-to-inject verdict - stranding every away-mode escalation to a jcode crewmate, the mirror of the tmux false-`pending` the shared classifier fixes.
+jcode also renders its composer INLINE and grows it downward one wrapped row at a time, so a long single-line message pushes the `NNN>` prompt row off the top of the visible pane, leaving only wrapped continuation rows in the bounded scan window; the WRAPPED tail is recognized through the shared `fm_composer_jcode_wrapped_tail` owner by jcode's right-aligned status indicator (`⏳`, U+23F3), which jcode draws only on the composer's last visible row, and always reads `pending` because it carries real unsubmitted text (see the 2026-08-01 incident below).
 For Pi, added after the 2026-07-14 incident above, the candidate is the content between the bottom-most complete separator pair, admitted only when native Herdr identity reports exactly `pi` with status `idle`, `done`, or `blocked` and the bounded structure is unambiguous.
 A popup-close-with-placeholder-fill still reads as real content on that row, so composer fallback correctly classifies it as pending; on the normal idle-baseline path, the same first Enter also fails to start a turn, so native agent-state confirmation likewise retries instead of stopping early.
 Known ghost/placeholder composer text (`Type a message...`, verified grok 0.2.82's empty-composer hint) is recognized and still reads as empty.
