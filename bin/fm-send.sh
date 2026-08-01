@@ -27,7 +27,10 @@
 # routes its reply via its status file or a status-pointed doc instead of
 # stranding it in chat the main firstmate never reads. A crewmate/scout target,
 # an explicit backend-target escape-hatch target, and the --key path are never
-# marked - their behavior is unchanged.
+# marked - their behavior is unchanged. A leading-slash CONTROL directive
+# ("/model ...", "/effort ...", "/no-mistakes") is also delivered unmarked, even
+# to a secondmate target, so the slash reaches column 0 and the harness runs it;
+# see the slash-command carve-out at the classification site below for the why.
 #
 # Parent-owned pending-reply expectation: every newly marked secondmate request
 # also receives a privacy-safe correlation id and a durable parent record under
@@ -198,11 +201,30 @@ fm_backend_validate "$TARGET_BACKEND" || exit 1
 # secondmate then routes its reply via the status path (see fm-marker-lib.sh).
 # An explicit backend target (the escape hatch for endpoints outside this home)
 # and any crewmate/scout target are left unmarked, and so is the --key path.
+#
+# Slash-command carve-out: a leading-slash message ("/model ...", "/effort ...",
+# "/no-mistakes") is a harness CONTROL directive, not an agent request. It must
+# reach the composer with the slash at column 0 or the target harness treats it
+# as plain text, and the from-firstmate carrier ("[fm-from-firstmate]<sep>corr=")
+# prepended ahead of the body would break that. The reply-routing contract does
+# not apply either: a control directive spins up no agent turn and produces no
+# correlated status reply, so a pending-reply expectation on it could never be
+# resolved and would falsely trip recovery/escalation. So a slash-command send is
+# delivered UNMARKED even to a secondmate target, with no pending-reply record.
+# This is a deliberate, documented resolution of a genuine conflict, not a silent
+# drop: ordinary (non-slash) secondmate messages keep the carrier and pending
+# expectation unchanged.
 MARK_FROM_FIRSTMATE=0
 PENDING_REPLY_CORR=
 PENDING_REPLY_CREATED=0
 TARGET_TASK_ID=
-if [ -n "$TARGET_SELECTOR" ] && [ -n "$TARGET_META" ] && [ "$(fm_meta_get "$TARGET_META" kind)" = secondmate ]; then
+MESSAGE_IS_SLASH_COMMAND=0
+case "$*" in
+  /*) MESSAGE_IS_SLASH_COMMAND=1 ;;
+esac
+if [ "$MESSAGE_IS_SLASH_COMMAND" = 0 ] \
+  && [ -n "$TARGET_SELECTOR" ] && [ -n "$TARGET_META" ] \
+  && [ "$(fm_meta_get "$TARGET_META" kind)" = secondmate ]; then
   MARK_FROM_FIRSTMATE=1
   TARGET_TASK_ID=$(fm_send_id_from_meta "$TARGET_META")
 fi
