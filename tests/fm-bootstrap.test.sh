@@ -775,6 +775,9 @@ unsupported codex max effort is flagged^{"rules":[{"when":"big feature","use":{"
 unsupported grok max effort is flagged^{"rules":[{"when":"deep current work","use":{"harness":"grok","model":"grok-4","effort":"max"}}]}^exact^CREW_DISPATCH: invalid config/crew-dispatch.json - invalid effort: grok:max
 unsupported grok xhigh effort is flagged^{"rules":[{"when":"deep current work","use":{"harness":"grok","model":"grok-4","effort":"xhigh"}}]}^exact^CREW_DISPATCH: invalid config/crew-dispatch.json - invalid effort: grok:xhigh
 pi max effort is accepted^{"rules":[{"when":"deep coding","use":{"harness":"pi","model":"openai-codex/gpt-5.6-sol","effort":"max"}}]}^empty^
+jcode default profile is accepted^{"default":{"harness":"jcode"}}^empty^
+jcode with effort is accepted^{"rules":[{"when":"jcode work","use":{"harness":"jcode","model":"gpt-5.5","effort":"xhigh"}}]}^empty^
+jcode unsupported effort is flagged^{"rules":[{"when":"jcode work","use":{"harness":"jcode","effort":"none"}}]}^exact^CREW_DISPATCH: invalid config/crew-dispatch.json - invalid effort: jcode:none
 unsupported opencode effort is flagged^{"rules":[{"when":"opencode work","use":{"harness":"opencode","model":"anthropic/claude-sonnet-4-5","effort":"high"}}]}^exact^CREW_DISPATCH: invalid config/crew-dispatch.json - invalid effort: opencode:high
 array use with quota-balanced is accepted^{"rules":[{"when":"big feature","use":[{"harness":"claude","model":"claude-sonnet-5","effort":"high"},{"harness":"codex","model":"gpt-5.5","effort":"high"}],"select":"quota-balanced"}]}^empty^
 array use without select is accepted^{"rules":[{"when":"big feature","use":[{"harness":"claude"},{"harness":"codex"}]}]}^empty^
