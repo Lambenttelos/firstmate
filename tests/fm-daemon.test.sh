@@ -1602,7 +1602,14 @@ test_wedge_alarm_shutdown_stops_active_notifier_group() {
     child=$(cat "$child_file")
     WEDGE_ALARM_NOTIFIER_PID=$pid
     wedge_alarm_stop_active_notifier
-    if kill -0 "$child" 2>/dev/null; then
+    # Liveness must be zombie-aware (is_live_non_zombie, tests/wake-helpers.sh).
+    # wedge_alarm_stop_active_notifier SIGKILLs the whole process group, but the
+    # killed grandchild (the backgrounded `sleep`) is reparented to init and only
+    # reaped when init harvests it. A minimal init - a sandbox/container PID 1 that
+    # is not a reaper - can leave it as a defunct zombie, and a bare `kill -0`
+    # reports a zombie as "alive" even though it holds no resources and can never
+    # run again. Only a genuinely runnable descendant is a leak.
+    if is_live_non_zombie "$child"; then
       fail "shutdown left a notifier descendant running (pid $child)"
     fi
   ) || fail "notifier shutdown cleanup helper failed"
@@ -1628,6 +1635,10 @@ test_inject_wedge_alarm_fires_active_alert_on_non_tmux_backend() {
 
 test_inject_wedge_alarm_throttles_when_marker_cannot_be_written() {
   local dir state log daemon_log alerts errors
+  if [ "$(id -u)" = 0 ]; then
+    pass "skipped: running as root, where chmod u-w does not deny the marker write"
+    return 0
+  fi
   dir=$(make_wedge_case wedge-unwritable-marker)
   state="$dir/state"; log="$dir/alert.log"; daemon_log="$dir/daemon.log"
   escalate_add "$state" "needs-decision: pick A"
@@ -2573,6 +2584,24 @@ _write_own_transcript() {  # <config> <home> <input> <cc> <cr>
     "$input" "$cc" "$cr" > "$dir/session.jsonl"
 }
 
+# Build a fake jcode journal under <jcode-home>/sessions so
+# firstmate_own_context_tokens reads a controllable count when the supervisor
+# harness is jcode. jcode stores the RAW absolute working_dir (no munging) on the
+# first line's .meta and per-turn usage under append_messages[].token_usage; the
+# session basename is placed in active_pids/ so the live-session selection wins.
+# Mirrors write_jcode_journal in tests/fm-secondmate-context.test.sh.
+_write_own_jcode_journal() {  # <jcode-home> <home> <input> <cc> <cr>
+  local jhome=$1 home=$2 input=$3 cc=$4 cr=$5
+  local sessions="$jhome/sessions" pids="$jhome/active_pids"
+  mkdir -p "$sessions" "$pids"
+  {
+    printf '{"type":"meta_init","meta":{"working_dir":"%s","status":"Active"}}\n' "$home"
+    printf '{"type":"record","append_messages":[{"token_usage":{"input_tokens":%s,"output_tokens":5,"cache_creation_input_tokens":%s,"cache_read_input_tokens":%s}}]}\n' \
+      "$input" "$cc" "$cr"
+  } > "$sessions/session_own.journal.jsonl"
+  : > "$pids/session_own"
+}
+
 test_context_stow_nudges_once_per_crossing_and_rearms() {
   local dir state config home
   dir=$(make_supercase context-stow-once)
@@ -2661,15 +2690,18 @@ test_context_stow_fails_closed_on_unreadable_count() {
 }
 
 test_context_stow_honors_configured_threshold() {
-  local dir state config home
+  local dir state config home jhome
   dir=$(make_supercase context-stow-configthreshold)
   state="$dir/state"
   config="$dir/config"; mkdir -p "$config"
   home="$dir/fmhome"
+  jhome="$dir/jcode"
   printf '90000\n' > "$config/context-stow-threshold"
-  # 100000 is under the default 200000 but over the configured 90000.
-  _write_own_transcript "$config" "$home" 0 0 100000
-  CLAUDE_CONFIG_DIR="$config" FM_HOME="$dir" FM_CONFIG_OVERRIDE="$config" \
+  # Exercise the jcode read path (the dependency this feature waited on): a jcode
+  # journal, NOT a claude transcript, so the harness and the fixture agree. 100000
+  # is under the default 200000 but over the configured 90000.
+  _write_own_jcode_journal "$jhome" "$home" 0 0 100000
+  JCODE_HOME="$jhome" FM_HOME="$dir" FM_CONFIG_OVERRIDE="$config" \
     FM_SUPERVISOR_HARNESS=jcode FM_CONTEXT_STOW_CWD="$home" context_stow_check "$state"
   grep -F 'stow threshold 90000' "$state/.subsuper-escalations" >/dev/null \
     || fail "the configured 90000 threshold should drive the nudge (and jcode should read)"
