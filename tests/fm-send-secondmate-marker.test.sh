@@ -253,6 +253,45 @@ test_marked_send_preserves_trailing_newlines() {
   pass "fm-send: marked secondmate payload preserves trailing newline bytes"
 }
 
+# A leading-slash CONTROL directive ("/model ...", "/effort ...", "/no-mistakes")
+# to a secondmate target is delivered with the slash at column 0 - UNMARKED, with
+# NO from-firstmate carrier and NO corr token ahead of it - or the target harness
+# treats it as plain text instead of running it. Verified live on jcode: with the
+# carrier prepended, `/model claude-opus-4-8` landed as chat ("I can't switch
+# models from here"); without it, the pane showed `Model -> claude-opus-4-8`.
+# The reply-routing contract does not apply to a control directive (no agent turn,
+# no correlated status reply), so no pending-reply record is created either.
+test_slash_command_to_secondmate_is_unmarked() {
+  local dir fb log home rc got cmd
+  # shellcheck source=bin/fm-pending-reply-lib.sh
+  . "$ROOT/bin/fm-pending-reply-lib.sh"
+  for cmd in "/model claude-opus-4-8" "/effort high" "/no-mistakes"; do
+    dir="$TMP_ROOT/slash-$RANDOM"; mkdir -p "$dir"
+    fb=$(make_stubs "$dir"); log="$dir/send.log"
+    home=$(setup_home slash)
+    fm_write_secondmate_meta "$home/state/domain.meta" "$home" "sess:fm-domain"
+    run_send "$fb" "$home" "$log" "domain" "$cmd"; rc=$?
+    expect_code 0 "$rc" "slash-command send to a secondmate should succeed ($cmd)"
+    got=$(cat "$log")
+    [ "$got" = "$cmd" ] \
+      || fail "slash command to secondmate must be the bare command with '/' first, got:"$'\n'"--- bytes ---"$'\n'"$(printf '%s' "$got" | od -An -c)"
+    case "$got" in
+      "$FM_FROMFIRST_MARK"*) fail "slash command carried the from-firstmate marker: $cmd" ;;
+      corr=*) fail "slash command carried a corr token ahead of the slash: $cmd" ;;
+      /*) : ;;
+      *) fail "slash command did not start with '/': $cmd" ;;
+    esac
+    # No pending-reply expectation may be created for a control directive.
+    if [ -d "$home/state/pending-replies" ]; then
+      case "$(ls -A "$home/state/pending-replies" 2>/dev/null)" in
+        '') : ;;
+        *) fail "slash command created a pending-reply record: $cmd" ;;
+      esac
+    fi
+  done
+  pass "fm-send: a leading-slash control directive to a secondmate lands unmarked with the slash first and no pending record"
+}
+
 test_secondmate_target_is_marked
 test_exact_secondmate_task_id_is_marked
 test_crewmate_target_is_not_marked
@@ -261,3 +300,4 @@ test_key_path_is_not_marked
 test_marker_is_label_plus_invisible_separator
 test_marker_transformation_is_idempotent
 test_marked_send_preserves_trailing_newlines
+test_slash_command_to_secondmate_is_unmarked
