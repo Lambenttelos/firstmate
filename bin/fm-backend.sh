@@ -725,6 +725,48 @@ fm_backend_agent_alive() {  # <backend> <target>
   esac
 }
 
+# fm_backend_endpoint_live: the CONFIDENT liveness verdict a live-lane COUNT
+# needs, distinct from fm_backend_agent_alive above. Prints alive|dead|unknown
+# with the same fail-safe-toward-alive contract (a confident `dead` is the ONLY
+# verdict that excludes a recorded lane from a count).
+#
+# Why this is not fm_backend_agent_alive: that probe asks the session provider
+# "is one of MY verified harness processes the foreground command", which is the
+# right question for the secondmate-liveness respawn sweep but the WRONG one for
+# counting live herdr lanes. A jcode-hosted lane runs its agent turn in jcode's
+# shared background server, not one process per pane, so herdr registers NO agent
+# for a working lane's pane (`agent get` -> agent_not_found) - identical to the
+# restored bare-shell husk fm_backend_herdr_agent_alive is built to call `dead`.
+# Using agent_alive to count therefore reports `dead` for every live herdr lane
+# and zeroes the count (observed: `live agents 0` with six live lanes running).
+# The reliable herdr liveness signal is pane PRESENCE, which is exactly what the
+# session-start endpoint sweep (bin/fm-session-start.sh) and bin/fm-wake-brief.sh
+# already trust via fm_backend_target_exists, so this reuses that signal:
+#   herdr -> pane present is alive, an unqueryable pane (server down, pane closed)
+#            is dead; an unparseable target is unknown.
+#   tmux  -> UNCHANGED from the agent-process check, so a bare-shell husk still
+#            excludes and the tmux count keeps its existing behaviour exactly.
+#   any other backend -> unknown (never a confident dead), so a recorded lane on
+#            an unverified backend always counts rather than silently vanishing.
+fm_backend_endpoint_live() {  # <backend> <target>
+  local backend=$1 target=$2
+  case "$backend" in
+    tmux) fm_backend_agent_alive tmux "$target" ;;
+    herdr)
+      case "$target" in
+        *:*) : ;;
+        *) printf 'unknown'; return 0 ;;
+      esac
+      if fm_backend_target_exists herdr "$target"; then
+        printf 'alive'
+      else
+        printf 'dead'
+      fi
+      ;;
+    *) printf 'unknown' ;;
+  esac
+}
+
 # --- native event push (backend-extensible) ---------------------------------
 #
 # The watcher's event-wait splice (bin/fm-watch.sh) is backend-agnostic: it asks

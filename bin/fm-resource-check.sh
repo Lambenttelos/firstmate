@@ -84,10 +84,15 @@
 # retained headroom is what covers that variation without over-charging.
 # Live agents are the RUNNING ones, and ONLY the watcher's slow sweep pays for
 # that answer. Under --sweep every state/*.meta is probed with bin/fm-backend.sh's
-# fm_backend_agent_alive, only a CONFIDENT `dead` verdict is excluded - so a meta
-# whose agent has exited but which has not been torn down yet stops inflating the
-# count and the shed advice - and the resulting count is cached in
-# state/.resource-live. An ambiguous or unreadable probe counts that one agent as
+# fm_backend_endpoint_live, only a CONFIDENT `dead` verdict is excluded - so a
+# meta whose endpoint is gone but which has not been torn down yet stops inflating
+# the count and the shed advice - and the resulting count is cached in
+# state/.resource-live. fm_backend_endpoint_live is deliberately NOT
+# fm_backend_agent_alive: the count asks "is this recorded lane still a live
+# endpoint", so on herdr it reads pane presence (a jcode lane's turn runs in
+# jcode's shared background server and registers no herdr agent, so the
+# agent-process probe would call every live herdr lane `dead`), while tmux keeps
+# its agent-process check unchanged. An ambiguous or unreadable probe counts that one agent as
 # live rather than discarding the whole reading; each probe is bounded by
 # FM_RESOURCE_PROBE_TIMEOUT seconds (default 5, malformed values falling back to
 # it) and is terminated as a process group, so a wedged backend leaks no stuck
@@ -288,12 +293,21 @@ read_swap_total_mb() {
   printf '%s' "$v"
 }
 
-# probe_verdict: fm_backend_agent_alive for one endpoint, bounded and tolerant.
+# probe_verdict: fm_backend_endpoint_live for one endpoint, bounded and tolerant.
 # The probe runs in its own PROCESS GROUP (job control, restored immediately) so
 # a timeout terminates the wedged backend command too, not just the shell waiting
 # on it. Anything that is not a confident alive/dead answer degrades to unknown
 # for that one crew rather than spoiling the whole reading. A malformed timeout
 # knob falls back to the default instead of aborting the reading.
+#
+# It asks fm_backend_endpoint_live, NOT fm_backend_agent_alive: the count needs
+# "is this recorded lane still a live endpoint", and on herdr a working
+# jcode-hosted lane registers no herdr agent (its turn runs in jcode's shared
+# background server), so agent_alive reads every live herdr lane as `dead` and
+# zeroes the count. fm_backend_endpoint_live keeps tmux's agent-process check
+# unchanged while reading herdr liveness from pane presence, the same signal
+# session-start and the wake-brief endpoint sweep already trust. See
+# bin/fm-backend.sh's fm_backend_endpoint_live header.
 # bin/fm-watch.sh's run_check_capture is the hardened implementation of this same
 # bounded process-group execution; consolidating the two into a shared helper is
 # intended follow-on work, kept out of this path's change for now.
@@ -322,7 +336,7 @@ probe_verdict() {  # <backend> <target> <seconds>
   trap 'rm -f "$PROBE_TMP" 2>/dev/null; exit 130' INT
   trap 'rm -f "$PROBE_TMP" 2>/dev/null; exit 143' TERM
   set -m
-  ( fm_backend_agent_alive "$1" "$2" 2>/dev/null || printf 'unknown' ) > "$out" 2>/dev/null &
+  ( fm_backend_endpoint_live "$1" "$2" 2>/dev/null || printf 'unknown' ) > "$out" 2>/dev/null &
   pid=$!
   set +m
   # Only signal the group once the child is confirmed to lead its own, the way
