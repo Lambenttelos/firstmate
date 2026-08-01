@@ -661,6 +661,21 @@ Rather than add a second herdr classifier, `fm_backend_herdr_agent_alive` (`bin/
 No new empirical verification was needed for the mapping itself - `fm_backend_herdr_pane_agent_state`'s four states are already verified above (both at the unit level and, for `no-agent`, against the real binary via the respawn-idempotency e2e test); this wrapper only renames them for the generic `fm_backend_agent_alive` dispatcher (`bin/fm-backend.sh`) that also serves the tmux adapter (`docs/tmux-backend.md` "Agent liveness probe").
 Unlike tmux's probe, herdr's has no equivalent "which harness is running under a generic interpreter name" ambiguity: the classification comes from herdr's own registered-agent state, not a process name, so herdr correctly resolves every verified harness including `pi` (the one tmux cannot confidently classify - see `docs/tmux-backend.md` "Known gap").
 
+### jcode corroboration for the `no-agent` verdict (2026-08-01)
+
+The blanket `no-agent -> dead` mapping above was correct for every hook-integrated harness (claude, codex, opencode, pi, grok), whose live agents register a real `agent_status` and only leave an agent-less pane once dead, but it was WRONG for jcode and made the session-start secondmate-liveness sweep kill and respawn every live jcode secondmate on every session start, destroying its accumulated context (verified live 2026-08-01).
+jcode is not in herdr's integration list, so herdr never registers an agent for a jcode pane at all: `herdr agent get <pane>` returns `agent_not_found` for EVERY live jcode pane, exactly like the agent-less bare-shell husk a dead secondmate leaves behind.
+`fm_backend_herdr_pane_agent_state` therefore maps a fully live, idle jcode secondmate to `no-agent`, indistinguishable from a dead husk by the native agent API alone.
+
+The fix keeps `dead` (`pane_not_found`) and `live` unchanged, but routes the `no-agent` verdict through `fm_backend_herdr_no_agent_liveness`, which corroborates the pane's CONTENT before collapsing to `dead`:
+
+- `alive` when the pane content shows a live jcode composer row - an idle `NNN>` prompt, a mid-turn `NNN…` prompt, or a wrapped-composer tail - recognized through the SAME shared `fm_composer_jcode_prompt_text` / `fm_composer_jcode_wrapped_tail` owners (`bin/fm-composer-lib.sh`) that `fm_backend_herdr_composer_state` already uses, so herdr and tmux cannot drift on the shape and no new regex is invented.
+- `dead` when the pane content is read but shows no jcode composer row (a bare shell / agent-less husk) - the sweep still self-heals a truly dead secondmate.
+- `unknown` when the pane content cannot be read at all - fail-safe toward refusal, because a false `dead` destroys a live secondmate's context while a false `unknown` costs only one stale sweep.
+
+A hook-integrated harness never reaches this arm: its live agent reports a real `agent_status` (`live -> alive`) and its dead pane's `pane_not_found` is `dead` outright, so no pane-content read is ever performed for it - the existing behavior for claude/codex/opencode/pi/grok is byte-for-byte unchanged.
+Coverage: `tests/fm-backend-herdr.test.sh` (`test_agent_alive_no_agent_but_live_jcode_composer_is_alive`, `test_agent_alive_no_agent_and_bare_shell_stays_dead`, `test_agent_alive_no_agent_unreadable_pane_is_unknown_never_dead`, `test_agent_alive_hook_integrated_harness_unaffected`) and `tests/fm-secondmate-liveness.test.sh` (`test_herdr_agent_alive_no_agent_delegates_to_content_corroboration`, plus the sweep-level `test_sweep_herdr_live_jcode_secondmate_is_not_respawned` and `test_sweep_herdr_dead_jcode_secondmate_still_self_heals`).
+
 ## End-to-end verification (spawn -> steer -> peek -> done -> merge -> teardown)
 
 Beyond the fake-CLI unit tests (`tests/fm-backend-herdr.test.sh`) and the real-CLI smoke tests (`tests/fm-backend-herdr-smoke.test.sh` and `tests/fm-backend-autodetect-smoke.test.sh`), the full firstmate lifecycle was driven end to end against a real `claude` crewmate through this branch's own scripts, in a scratch `FM_HOME`, a scratch `local-only` git project, and an isolated `HERDR_SESSION`:

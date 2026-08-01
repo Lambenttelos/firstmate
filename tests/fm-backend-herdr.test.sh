@@ -1877,6 +1877,87 @@ test_composer_state_jcode_wrapped_tail_is_pending() {
   pass "fm_backend_herdr_composer_state: jcode's wrapped composer tail (prompt scrolled off) reads pending"
 }
 
+# --- jcode agent-liveness corroboration (the false-`dead` respawn-loop fix) ---
+# herdr does NOT register jcode as an agent (jcode is not in herdr's integration
+# list), so `agent get` on EVERY live jcode pane returns agent_not_found ->
+# pane_agent_state=no-agent. The old unconditional no-agent->dead mapping made
+# the session-start secondmate-liveness sweep kill and respawn every live jcode
+# secondmate, destroying its context (verified 2026-08-01). The fix corroborates
+# a no-agent pane's content before collapsing to dead: a live jcode composer row
+# reads alive, a bare shell / agent-less husk stays dead, and an unreadable pane
+# reads unknown (never dead - the fail-safe direction). Fixtures are the same
+# real captured jcode composer bytes used by the composer-state tests above.
+test_agent_alive_no_agent_but_live_jcode_composer_is_alive() {
+  local dir log resp fb out
+  dir="$TMP_ROOT/alive-jcode-live"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
+  # 1: pane get -> the pane structurally exists.
+  printf '{"result":{"pane":{"pane_id":"w1:p2"}}}\n' > "$resp/1.out"
+  # 2: agent get -> agent_not_found: herdr never registered the jcode agent.
+  printf '{"error":{"code":"agent_not_found","message":"agent target w1:p2 not found"}}\n' > "$resp/2.out"
+  # 3: pane read -> a live idle jcode numbered prompt row ("3>" + right-aligned ⏳).
+  printf ' 1\xe2\x80\xba Reply with exactly OK and nothing else.\n OK\n\x1b[38;2;255;80;80m3\x1b[38;2;138;180;248m> \x1b[39m        \x1b[38;2;255;193;7m\xe2\x8f\xb3\n' > "$resp/3.out"
+  fb=$(make_herdr_fakebin "$dir")
+  out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_agent_alive default:w1:p2' "$ROOT" )
+  [ "$out" = alive ] || fail "a no-agent pane whose content is a live jcode composer row must read alive, got '$out' (a false dead would kill a live secondmate)"
+  pass "fm_backend_herdr_agent_alive: a no-agent pane with a live jcode composer row reads alive, not dead"
+}
+
+test_agent_alive_no_agent_and_bare_shell_stays_dead() {
+  local dir log resp fb out
+  dir="$TMP_ROOT/alive-jcode-husk"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
+  printf '{"result":{"pane":{"pane_id":"w1:p2"}}}\n' > "$resp/1.out"
+  printf '{"error":{"code":"agent_not_found","message":"agent target w1:p2 not found"}}\n' > "$resp/2.out"
+  # 3: pane read -> a bare login shell, exactly the husk a dead secondmate leaves
+  # behind. No jcode composer row anywhere, so it must still classify dead.
+  printf 'Last login: Fri Aug  1 07:00:00 on ttys001\nuser@host ~/project %% \n' > "$resp/3.out"
+  fb=$(make_herdr_fakebin "$dir")
+  out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_agent_alive default:w1:p2' "$ROOT" )
+  [ "$out" = dead ] || fail "a no-agent pane whose content is a bare shell (agent-less husk) must stay dead so the sweep still self-heals a truly dead secondmate, got '$out'"
+  pass "fm_backend_herdr_agent_alive: a no-agent pane with only a bare shell (no jcode composer) stays dead"
+}
+
+test_agent_alive_no_agent_unreadable_pane_is_unknown_never_dead() {
+  local dir log resp fb out
+  dir="$TMP_ROOT/alive-jcode-unreadable"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
+  printf '{"result":{"pane":{"pane_id":"w1:p2"}}}\n' > "$resp/1.out"
+  printf '{"error":{"code":"agent_not_found","message":"agent target w1:p2 not found"}}\n' > "$resp/2.out"
+  # 3: pane read fails (unreadable pane). The content read cannot decide, so the
+  # verdict must be unknown, never dead - a false dead destroys a live secondmate.
+  printf '3\n' > "$resp/3.exit"
+  fb=$(make_herdr_fakebin "$dir")
+  out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_agent_alive default:w1:p2' "$ROOT" )
+  [ "$out" = unknown ] || fail "a no-agent pane whose content cannot be read must read unknown (fail-safe), never dead, got '$out'"
+  pass "fm_backend_herdr_agent_alive: a no-agent pane with an unreadable content capture reads unknown, never dead"
+}
+
+test_agent_alive_hook_integrated_harness_unaffected() {
+  local dir log resp fb out
+  # A hook-integrated harness (claude/codex/...) NEVER reaches the no-agent
+  # corroboration path: a live agent reports a real agent_status (live->alive)
+  # and a dead one's pane_not_found is dead outright. Prove both arms are
+  # unchanged and that a live agent's pane content is never even read.
+  dir="$TMP_ROOT/alive-hook-live"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
+  printf '{"result":{"pane":{"pane_id":"w1:p2"}}}\n' > "$resp/1.out"
+  printf '{"result":{"agent":{"agent_status":"idle"}}}\n' > "$resp/2.out"
+  fb=$(make_herdr_fakebin "$dir")
+  out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_agent_alive default:w1:p2' "$ROOT" )
+  [ "$out" = alive ] || fail "a registered idle agent must read alive, got '$out'"
+  assert_not_contains "$(cat "$log")" $'\x1f''pane'$'\x1f''read' "a live registered agent must never trigger a corroborating pane-content read"
+
+  dir="$TMP_ROOT/alive-hook-dead"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
+  printf '{"error":{"code":"pane_not_found","message":"pane w1:p2 not found"}}\n' > "$resp/1.out"
+  fb=$(make_herdr_fakebin "$dir")
+  out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_agent_alive default:w1:p2' "$ROOT" )
+  [ "$out" = dead ] || fail "a structurally-gone pane (pane_not_found) must read dead outright, got '$out'"
+  assert_not_contains "$(cat "$log")" $'\x1f''pane'$'\x1f''read' "a structurally-gone pane must never trigger a corroborating pane-content read"
+  pass "fm_backend_herdr_agent_alive: hook-integrated harness liveness (live->alive, gone->dead) is unchanged and reads no pane content"
+}
+
 test_composer_state_codex_bare_prompt_glyph_is_empty() {
   local dir log resp fb out
   dir="$TMP_ROOT/composer-codex-bare"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
@@ -2925,6 +3006,10 @@ test_composer_state_jcode_busy_prompt_is_empty
 test_composer_state_jcode_typed_text_is_pending
 test_composer_state_jcode_transcript_rows_are_not_a_composer
 test_composer_state_jcode_wrapped_tail_is_pending
+test_agent_alive_no_agent_but_live_jcode_composer_is_alive
+test_agent_alive_no_agent_and_bare_shell_stays_dead
+test_agent_alive_no_agent_unreadable_pane_is_unknown_never_dead
+test_agent_alive_hook_integrated_harness_unaffected
 test_composer_state_codex_faint_suggestion_is_empty
 test_composer_state_codex_non_faint_same_text_is_pending
 test_wait_for_working_returns_busy_on_first_poll

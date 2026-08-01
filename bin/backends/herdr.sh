@@ -944,10 +944,77 @@ fm_backend_herdr_agent_alive() {  # <target>
   local target=$1
   fm_backend_herdr_parse_target "$target" || { printf 'unknown'; return 0; }
   case "$(fm_backend_herdr_pane_agent_state "$FM_BACKEND_HERDR_SESSION" "$FM_BACKEND_HERDR_PANE")" in
-    dead|no-agent) printf 'dead' ;;
-    live) printf 'alive' ;;
-    *) printf 'unknown' ;;
+    dead)
+      # pane_not_found: the pane itself is structurally gone. Nothing to
+      # corroborate - confidently dead for every harness, jcode included.
+      printf 'dead'
+      ;;
+    live)
+      printf 'alive'
+      ;;
+    no-agent)
+      # herdr never registers an agent for a jcode pane at all - jcode is not
+      # in herdr's integration list, so `agent get` on EVERY live jcode pane
+      # returns agent_not_found, which pane_agent_state maps to no-agent. A
+      # fully live, idle jcode secondmate is therefore indistinguishable from a
+      # dead agent-less bare-shell husk by the native agent API alone, and the
+      # old unconditional no-agent->dead mapping made the session-start
+      # secondmate-liveness sweep kill and respawn every live jcode secondmate,
+      # destroying its accumulated context (verified 2026-08-01; see
+      # docs/herdr-backend.md "Agent liveness probe reuses the husk classifier").
+      # Corroborate with a pane-content read before collapsing to dead. This
+      # keeps every hook-integrated harness (claude/codex/opencode/pi/grok)
+      # EXACTLY as before: their live agents report a real agent_status so they
+      # never reach this arm, and their dead husks show a bare shell with no
+      # jcode composer row and stay dead.
+      fm_backend_herdr_no_agent_liveness "$FM_BACKEND_HERDR_SESSION" "$FM_BACKEND_HERDR_PANE"
+      ;;
+    *)
+      printf 'unknown'
+      ;;
   esac
+}
+
+# fm_backend_herdr_no_agent_liveness: corroborate a no-agent pane's liveness
+# from its content, for the jcode false-dead fix above. Prints one of:
+#   alive   - the pane content shows a live jcode composer row (an idle "NNN>"
+#             prompt, a mid-turn "NNN…" prompt, or a wrapped-composer tail),
+#             recognized through the SHARED fm_composer_jcode_* owners
+#             (bin/fm-composer-lib.sh) that fm_backend_herdr_composer_state
+#             already uses, so herdr and tmux cannot drift on the shape. A live,
+#             idle jcode secondmate always draws its numbered prompt row, so this
+#             is the positive signal the native agent API cannot give.
+#   dead    - the pane content was read but shows NO jcode composer row: a bare
+#             shell / agent-less husk, exactly the shape a dead secondmate leaves
+#             behind for jcode AND for every hook-integrated harness. The sweep
+#             still self-heals a truly dead secondmate.
+#   unknown - the pane content could not be read at all. Fail-safe toward
+#             refusal: an unreadable pane must NEVER read dead, because the cost
+#             of a false dead is destroying a live secondmate's context while the
+#             cost of a false unknown is one stale sweep.
+# jcode's own transcript rows use a digit plus '›' (U+203A), and its footer rows
+# carry no prompt glyph, so neither is misread as a composer row (the shared
+# recognizers reject both) - the same precision fm_backend_herdr_composer_state
+# already relies on.
+fm_backend_herdr_no_agent_liveness() {  # <session> <pane_id> -> alive|dead|unknown
+  local session=$1 pane_id=$2 cap line trimmed
+  cap=$(fm_backend_herdr_capture "$session:$pane_id" "${FM_BACKEND_HERDR_COMPOSER_LINES:-20}" 2>/dev/null) \
+    || { printf 'unknown'; return 0; }
+  [ -n "$cap" ] || { printf 'unknown'; return 0; }
+  while IFS= read -r line; do
+    trimmed=$(fm_backend_herdr_strip_ansi "$line")
+    trimmed="${trimmed#"${trimmed%%[![:space:]]*}"}"
+    trimmed="${trimmed%"${trimmed##*[![:space:]]}"}"
+    [ -n "$trimmed" ] || continue
+    if fm_composer_jcode_prompt_text "$trimmed" >/dev/null 2>&1 \
+       || fm_composer_jcode_wrapped_tail "$trimmed" >/dev/null 2>&1; then
+      printf 'alive'
+      return 0
+    fi
+  done <<EOF
+$cap
+EOF
+  printf 'dead'
 }
 
 # fm_backend_herdr_create_task: create the task's tab (one pane) in

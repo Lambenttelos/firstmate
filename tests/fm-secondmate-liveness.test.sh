@@ -128,9 +128,6 @@ test_herdr_agent_alive_maps_pane_agent_state() {
   out=$(bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_pane_agent_state() { printf "dead"; }; fm_backend_herdr_agent_alive "sess:p1"' "$ROOT")
   [ "$out" = dead ] || fail "herdr pane_agent_state=dead should map to dead, got '$out'"
 
-  out=$(bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_pane_agent_state() { printf "no-agent"; }; fm_backend_herdr_agent_alive "sess:p1"' "$ROOT")
-  [ "$out" = dead ] || fail "herdr pane_agent_state=no-agent (restored bare shell) should map to dead, got '$out'"
-
   out=$(bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_pane_agent_state() { printf "live"; }; fm_backend_herdr_agent_alive "sess:p1"' "$ROOT")
   [ "$out" = alive ] || fail "herdr pane_agent_state=live should map to alive, got '$out'"
 
@@ -140,7 +137,28 @@ test_herdr_agent_alive_maps_pane_agent_state() {
   out=$(bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_agent_alive "no-colon-target"' "$ROOT")
   [ "$out" = unknown ] || fail "an unparseable target should classify as unknown, got '$out'"
 
-  pass "fm_backend_herdr_agent_alive: dead/no-agent->dead, live->alive, unknown->unknown"
+  pass "fm_backend_herdr_agent_alive: dead->dead, live->alive, unknown->unknown"
+}
+
+# no-agent is NO LONGER an unconditional dead: herdr never registers a jcode
+# agent, so a live jcode secondmate reads no-agent exactly like a dead bare-shell
+# husk. The wrapper now corroborates a no-agent pane's content before collapsing
+# it to dead (fm_backend_herdr_no_agent_liveness). Test that delegation in
+# isolation by overriding the corroboration helper; the content-based classifier
+# itself is exercised with real jcode fixtures in tests/fm-backend-herdr.test.sh.
+test_herdr_agent_alive_no_agent_delegates_to_content_corroboration() {
+  local out
+
+  out=$(bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_pane_agent_state() { printf "no-agent"; }; fm_backend_herdr_no_agent_liveness() { printf "alive"; }; fm_backend_herdr_agent_alive "sess:p1"' "$ROOT")
+  [ "$out" = alive ] || fail "no-agent with a live-jcode-content corroboration must read alive, got '$out'"
+
+  out=$(bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_pane_agent_state() { printf "no-agent"; }; fm_backend_herdr_no_agent_liveness() { printf "dead"; }; fm_backend_herdr_agent_alive "sess:p1"' "$ROOT")
+  [ "$out" = dead ] || fail "no-agent with a bare-shell-content corroboration must stay dead, got '$out'"
+
+  out=$(bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_pane_agent_state() { printf "no-agent"; }; fm_backend_herdr_no_agent_liveness() { printf "unknown"; }; fm_backend_herdr_agent_alive "sess:p1"' "$ROOT")
+  [ "$out" = unknown ] || fail "no-agent with an unreadable-content corroboration must read unknown (never dead), got '$out'"
+
+  pass "fm_backend_herdr_agent_alive: no-agent delegates to content corroboration (jcode live->alive, husk->dead, unreadable->unknown)"
 }
 
 # --- unit level: the generic fm_backend_agent_alive dispatcher --------------
@@ -235,6 +253,47 @@ SH
   printf '%s\n' "$fakebin"
 }
 
+# make_liveness_herdr <dir>: a herdr stub for the sweep's herdr agent-liveness
+# path. It answers `status --json` (server running, protocol 14), reports the
+# task pane as structurally present (`pane get`), reports agent_not_found for
+# `agent get` (herdr NEVER registers a jcode agent - the whole reason a live
+# jcode secondmate reads no-agent), and answers `pane read` from a controllable
+# $FM_TEST_HERDR_PANE_READ file so a test can make the corroborating content read
+# a live jcode composer row or a bare shell. It logs any pane close (a respawn's
+# kill step) to $FM_HERDR_CALL_LOG so a test can assert a live secondmate is
+# never touched.
+make_liveness_herdr() {
+  local dir=$1 fakebin
+  fakebin=$(fm_fakebin "$dir")
+  cat > "$fakebin/herdr" <<'SH'
+#!/usr/bin/env bash
+set -u
+# Positional subcommand is "$1 $2" (the trailing "--session <name>" the adapter
+# appends does not change the leading two args).
+case "${1:-} ${2:-}" in
+  "status --json")
+    printf '{"client":{"version":"0.7.1","protocol":14},"server":{"running":true}}\n'
+    exit 0 ;;
+  "pane get")
+    printf '{"result":{"pane":{"pane_id":"%s"}}}\n' "${3:-}"
+    exit 0 ;;
+  "agent get")
+    # agent_not_found: exactly what herdr returns for every live jcode pane.
+    printf '{"error":{"code":"agent_not_found","message":"agent target %s not found"}}\n' "${3:-}"
+    exit 0 ;;
+  "pane read")
+    [ -f "${FM_TEST_HERDR_PANE_READ:-}" ] && cat "$FM_TEST_HERDR_PANE_READ"
+    exit 0 ;;
+  "pane close")
+    printf '%s\n' "$*" >> "${FM_HERDR_CALL_LOG:?}"
+    exit 0 ;;
+esac
+exit 0
+SH
+  chmod +x "$fakebin/herdr"
+  printf '%s\n' "$fakebin"
+}
+
 # new_world <name>: a scratch firstmate HOME (state/, watcher beacon, pinned
 # harness) with no kind=secondmate meta yet. FM_ROOT is left to resolve
 # naturally to the real checkout under test ($ROOT), exactly as production
@@ -258,7 +317,7 @@ new_world() {
 # worktree; a non-git home just makes the unrelated fast-forward sweep log a
 # harmless "not a git repo" skip.
 add_sm_home() {
-  local w=$1 id=$2 window=$3 harness=${4:-claude}
+  local w=$1 id=$2 window=$3 harness=${4:-claude} backend=${5:-}
   local home="$w/$id"
   mkdir -p "$home/bin" "$home/data" "$home/state" "$home/config" "$home/projects"
   printf '%s\n' "$id" > "$home/.fm-secondmate-home"
@@ -268,6 +327,7 @@ add_sm_home() {
     printf 'window=%s\n' "$window"
     printf 'kind=secondmate\n'
     printf 'harness=%s\n' "$harness"
+    [ -n "$backend" ] && printf 'backend=%s\n' "$backend"
     printf 'home=%s\n' "$home"
   } > "$w/home/state/$id.meta"
 }
@@ -276,6 +336,13 @@ run_bootstrap() {  # <fakebin> <home> <pane-cmd> <call-log> [extra env...] -> st
   local fb=$1 home=$2 cmd=$3 log=$4; shift 4
   PATH="$fb:$BASE_PATH" TMUX='' FM_BACKEND=tmux FM_HOME="$home" \
     FM_TEST_PANE_CMD="$cmd" FM_TMUX_CALL_LOG="$log" \
+    env "$@" "$ROOT/bin/fm-bootstrap.sh" 2>&1
+}
+
+run_bootstrap_herdr() {  # <fakebin> <home> <pane-read-file> <herdr-call-log> [extra env...] -> stdout
+  local fb=$1 home=$2 pane_read=$3 log=$4; shift 4
+  PATH="$fb:$BASE_PATH" TMUX='' FM_BACKEND=herdr FM_HOME="$home" \
+    FM_TEST_HERDR_PANE_READ="$pane_read" FM_HERDR_CALL_LOG="$log" \
     env "$@" "$ROOT/bin/fm-bootstrap.sh" 2>&1
 }
 
@@ -401,8 +468,58 @@ test_sweep_noop_with_no_secondmate_meta() {
   pass "sweep: a silent no-op with no kind=secondmate meta present (a secondmate home's own natural scoping)"
 }
 
+# --- sweep level, herdr backend: the jcode false-`dead` respawn-loop fix ------
+# The exact fleet bug (verified 2026-08-01): herdr never registers a jcode agent,
+# so a live idle jcode secondmate's `agent get` returns agent_not_found ->
+# no-agent, and the old sweep killed and respawned it every session start,
+# destroying its context. These two tests pin BOTH directions on the sweep it
+# actually runs: a live-jcode-content endpoint is left untouched, while a
+# genuinely dead (bare-shell) endpoint is still respawned.
+test_sweep_herdr_live_jcode_secondmate_is_not_respawned() {
+  local w fb herdrfb log pane_read out
+  w=$(new_world sweep-herdr-jcode-live)
+  add_sm_home "$w" sm1 "default:w1:p2" jcode herdr
+  fb=$(make_toolchain "$w"); herdrfb=$(make_liveness_herdr "$w")
+  log="$w/herdr-calls.log"; : > "$log"
+  # A live idle jcode composer row ("3>" numbered prompt + right-aligned ⏳).
+  pane_read="$w/pane-read"
+  printf ' 1\xe2\x80\xba Reply with exactly OK and nothing else.\n OK\n\x1b[38;2;255;80;80m3\x1b[38;2;138;180;248m> \x1b[39m        \x1b[38;2;255;193;7m\xe2\x8f\xb3\n' > "$pane_read"
+
+  out=$(run_bootstrap_herdr "$herdrfb:$fb" "$w/home" "$pane_read" "$log")
+
+  assert_not_contains "$out" "SECONDMATE_LIVENESS: secondmate sm1: respawn failed" \
+    "a live jcode secondmate must not even attempt a respawn"
+  [ ! -s "$log" ] || fail "a live jcode secondmate endpoint must NEVER be closed/respawned (the false-dead context-destroying bug): $(cat "$log")"
+  pass "sweep (herdr): a live jcode secondmate (agent_not_found but a live jcode composer row) is left untouched, never respawned"
+}
+
+test_sweep_herdr_dead_jcode_secondmate_still_self_heals() {
+  local w fb herdrfb log pane_read out
+  w=$(new_world sweep-herdr-jcode-dead)
+  add_sm_home "$w" sm1 "default:w1:p2" jcode herdr
+  fb=$(make_toolchain "$w"); herdrfb=$(make_liveness_herdr "$w")
+  log="$w/herdr-calls.log"; : > "$log"
+  # A bare login shell: the same agent_not_found as a live jcode pane, but the
+  # content shows no jcode composer row, so the sweep must still self-heal it.
+  pane_read="$w/pane-read"
+  printf 'Last login: Fri Aug  1 07:00:00 on ttys001\nuser@host ~/project %% \n' > "$pane_read"
+
+  out=$(run_bootstrap_herdr "$herdrfb:$fb" "$w/home" "$pane_read" "$log")
+
+  # The respawn kills the stale endpoint first (pane close). Its own fm-spawn.sh
+  # relaunch may fail in this stubbed environment, which is reported - what
+  # matters here is that a genuinely dead endpoint is ACTED ON, not skipped as
+  # inconclusive or left alone like a live one.
+  assert_contains "$(cat "$log")" "pane close" \
+    "a genuinely dead jcode secondmate endpoint must still be killed before respawn (self-heal)"
+  assert_not_contains "$out" "SECONDMATE_LIVENESS: secondmate sm1: skipped: liveness probe inconclusive" \
+    "a bare-shell jcode endpoint is a CONFIDENT dead, never an inconclusive skip"
+  pass "sweep (herdr): a genuinely dead jcode secondmate (agent_not_found + bare shell) is still killed and respawned"
+}
+
 test_tmux_agent_alive_classifies
 test_herdr_agent_alive_maps_pane_agent_state
+test_herdr_agent_alive_no_agent_delegates_to_content_corroboration
 test_agent_alive_dispatcher_routes_and_falls_back
 test_sweep_respawns_confirmed_dead_secondmate
 test_sweep_leaves_alive_secondmate_untouched
@@ -411,5 +528,7 @@ test_sweep_never_acts_on_unverified_harness_dead_reading
 test_sweep_converges_no_retouch_once_alive
 test_sweep_skipped_under_detect_only
 test_sweep_noop_with_no_secondmate_meta
+test_sweep_herdr_live_jcode_secondmate_is_not_respawned
+test_sweep_herdr_dead_jcode_secondmate_still_self_heals
 
 echo "# all fm-secondmate-liveness tests passed"
