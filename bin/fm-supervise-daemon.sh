@@ -120,6 +120,21 @@
 #                                   (default 300)
 #          FM_HOUSEKEEPING_TICK     seconds between housekeeping passes while
 #                                   the watcher is mid-cycle (default 15)
+#          FM_CONTEXT_STOW_CHECK_SECS cadence for reading firstmate's OWN context
+#                                   and nudging it to /stow when it crosses the
+#                                   stow threshold (default 120; 0 disables). The
+#                                   threshold itself is config/context-stow-threshold
+#                                   (default 200000; docs/configuration.md). The
+#                                   read is claude/jcode-capable and fails closed:
+#                                   an unreadable/unsupported harness never nudges.
+#          FM_CONTEXT_STOW_HYSTERESIS tokens the count must drop BELOW the
+#                                   threshold by before the once-per-crossing stow
+#                                   nudge re-arms (default 20000). Prevents a count
+#                                   hovering at the line from re-nudging every tick.
+#          FM_SUPERVISOR_HARNESS    firstmate's own harness for the context-stow
+#                                   read (override; otherwise bin/fm-harness.sh).
+#          FM_CONTEXT_STOW_CWD      transcript launch dir for the context read
+#                                   (override; otherwise FM_HOME). Testing seam.
 #          FM_BUSY_REGEX            OR-ed busy signatures (mirrors fm-watch.sh)
 #          FM_COMPOSER_IDLE_RE      empty-composer regex applied after dim-ghost
 #                                   and structural border stripping (default:
@@ -217,6 +232,14 @@ FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 # shellcheck source=bin/fm-afk-outbox-lib.sh
 . "$FM_DAEMON_DIR/fm-afk-outbox-lib.sh"
 
+# firstmate's own live context read (fm_sm_context_tokens, claude/jcode-capable)
+# and the stow-nudge threshold (fm_context_stow_threshold). The SAME read the
+# secondmate context monitor uses, pointed at firstmate's own home so the daemon
+# can nudge firstmate to /stow before a context reset loses knowledge. Fails
+# closed: an unreadable or unsupported harness yields no tokens and never nudges.
+# shellcheck source=bin/fm-secondmate-context-lib.sh
+. "$FM_DAEMON_DIR/fm-secondmate-context-lib.sh"
+
 # --- tunables ---------------------------------------------------------------
 # Supervisor backends this daemon knows how to inject into today. zellij, orca,
 # and cmux are real backends elsewhere in firstmate (bin/fm-backend.sh) but this
@@ -247,6 +270,16 @@ WEDGE_ALARM_TIMEOUT_SECS_DEFAULT=10
 # hook off for a home without touching the rest of away mode.
 AFK_DRIVER_TICK_SECS_DEFAULT=600
 AFK_DRIVER_TIMEOUT_SECS_DEFAULT=300
+# firstmate own-context stow-nudge cadence and hysteresis. The daemon reads
+# firstmate's OWN live context on this cadence (minutes, not seconds - the read
+# streams a transcript and the nudge is a slow-moving condition) and, when the
+# count first crosses fm_context_stow_threshold, injects ONE operational nudge to
+# /stow. A durable marker rate-limits it to once per crossing; the marker clears
+# only after the count drops back below (threshold - hysteresis), so a count
+# hovering at the line cannot re-nudge every tick. FM_CONTEXT_STOW_CHECK_SECS=0
+# switches the check off for a home without touching the rest of the daemon.
+CONTEXT_STOW_CHECK_SECS_DEFAULT=120
+CONTEXT_STOW_HYSTERESIS_DEFAULT=20000
 WEDGE_ALARM_LAST_EPOCH=0
 WEDGE_ALARM_NOTIFIER_PID=
 # Paneless undelivered-alarm probe state. A probe that cannot read the outbox
@@ -1227,6 +1260,70 @@ afk_driver_tick() {  # <state>
   return 0
 }
 
+# --- firstmate own-context stow nudge ---------------------------------------
+# Read firstmate's OWN live context occupancy and, when it first crosses the stow
+# threshold, buffer ONE operational nudge telling firstmate to /stow now (and
+# /compact if the session cannot auto-compact). Stow+compact is firstmate's own
+# responsibility but depends on the agent remembering mid-flurry, and a long-lived
+# session cannot auto-compact, so knowledge can be lost to a context reset with no
+# enforcement. This is the structural, daemon-side half of that enforcement; the
+# turn-end-hook half is separate (enforce-stow-at-turnend-guard).
+#
+# The read is claude/jcode-capable (fm_sm_context_tokens) and fails CLOSED: any
+# unreadable or unsupported harness, or a non-numeric count, yields no nudge -
+# the check never nudges on a bad read. The nudge reuses the same operational
+# escalation path (escalate_add -> escalate_flush -> inject_msg's
+# fm_operational_input_encode away-supervisor) as every other daemon escalation,
+# so firstmate recognizes it as an operational nudge rather than captain input.
+
+# firstmate_own_context_tokens: firstmate's OWN context occupancy in tokens, or
+# empty when unreadable. Harness comes from FM_SUPERVISOR_HARNESS (resolved once
+# at startup in fm_super_main); the transcript cwd is firstmate's launch home,
+# FM_CONTEXT_STOW_CWD when set (testing) else FM_HOME. Fails closed to empty on a
+# missing harness/cwd or an unsupported harness, exactly like the secondmate
+# monitor.
+firstmate_own_context_tokens() {
+  local harness=${FM_SUPERVISOR_HARNESS:-} cwd
+  cwd=${FM_CONTEXT_STOW_CWD:-${FM_HOME:-}}
+  [ -n "$harness" ] || return 0
+  [ -n "$cwd" ] || return 0
+  fm_sm_context_tokens "$cwd" "$harness"
+}
+
+# context_stow_check: buffer a single stow nudge when firstmate's own context
+# first crosses the stow threshold. Rate-limited to ONCE per crossing by a
+# durable marker (state/.context-stow-nudged); the marker clears only after the
+# count drops back below (threshold - hysteresis), so a count hovering at the
+# line cannot re-nudge every tick. Fails closed: a non-numeric/empty read leaves
+# the marker untouched and buffers nothing. Deliberately NOT gated on afk_active:
+# the gate is the daemon running (context fills in normal mode too), and delivery
+# itself stays afk-gated in inject_msg.
+context_stow_check() {  # <state>
+  local state=$1 config threshold hysteresis tokens marker rearm
+  config="${FM_CONFIG_OVERRIDE:-$FM_HOME/config}"
+  tokens=$(firstmate_own_context_tokens 2>/dev/null || true)
+  # Fail closed: never nudge on an unreadable or non-numeric count.
+  case "$tokens" in ''|*[!0-9]*) return 0 ;; esac
+  threshold=$(fm_context_stow_threshold "$config")
+  hysteresis=${FM_CONTEXT_STOW_HYSTERESIS:-$CONTEXT_STOW_HYSTERESIS_DEFAULT}
+  case "$hysteresis" in ''|*[!0-9]*) hysteresis=$CONTEXT_STOW_HYSTERESIS_DEFAULT ;; esac
+  marker="$state/.context-stow-nudged"
+  if [ "$tokens" -ge "$threshold" ]; then
+    # Already nudged for this crossing: stay silent until the count re-arms.
+    [ -e "$marker" ] && return 0
+    _now > "$marker"
+    escalate_add "$state" "firstmate context ${tokens} tokens >= stow threshold ${threshold}: /stow now to persist knowledge before a context reset, and /compact if this session cannot auto-compact"
+    log "context-stow nudge buffered: ${tokens} tokens >= threshold ${threshold}"
+    return 0
+  fi
+  rearm=$(( threshold - hysteresis ))
+  [ "$rearm" -ge 0 ] || rearm=0
+  # Dropped back below the hysteresis band (a fresh/compacted session): re-arm so
+  # the next crossing nudges again.
+  [ "$tokens" -lt "$rearm" ] && rm -f "$marker"
+  return 0
+}
+
 _oldest_line_age() {  # <buf> -> seconds since the oldest buffered item first arrived (sidecar epoch)
   local f=$1 since
   [ -s "$f" ] || { echo 999999; return; }
@@ -1262,9 +1359,13 @@ _oldest_line_age() {  # <buf> -> seconds since the oldest buffered item first ar
 #  4) driver tick: every FM_AFK_DRIVER_TICK_SECS while away mode is active, run one
 #     bounded bin/fm-afk-driver.sh pass so the queue still advances when no
 #     firstmate turn is happening. Never able to crash the daemon.
+#  5) context-stow nudge: every FM_CONTEXT_STOW_CHECK_SECS, read firstmate's OWN
+#     context and buffer one /stow nudge on the first crossing of the stow
+#     threshold (context_stow_check). Gated on the daemon running, NOT on away
+#     mode, because context fills in normal mode too; fails closed on a bad read.
 housekeeping() {  # <state>
   local state=$1 now due f key task win marker age last max_defer oldest pause_secs
-  local oldest_epoch outbox_rc driver_secs
+  local oldest_epoch outbox_rc driver_secs context_secs
   now=$(_now)
   migrate_watcher_pause_markers "$state"
 
@@ -1461,6 +1562,21 @@ housekeeping() {  # <state>
       _now > "$state/.subsuper-last-driver"
       afk_driver_tick "$state"
     fi
+  fi
+
+  # (5) firstmate own-context stow nudge. On its own cadence, read firstmate's OWN
+  # context and buffer one /stow nudge on the first crossing of the stow
+  # threshold. NOT gated on away mode - a filling context loses knowledge in
+  # normal mode too, and the daemon runs in both - and fails closed on a bad read
+  # (context_stow_check above). FM_CONTEXT_STOW_CHECK_SECS=0 disables it.
+  context_secs=${FM_CONTEXT_STOW_CHECK_SECS:-$CONTEXT_STOW_CHECK_SECS_DEFAULT}
+  case "$context_secs" in
+    ''|*[!0-9]*) context_secs=$CONTEXT_STOW_CHECK_SECS_DEFAULT ;;
+  esac
+  if [ "$context_secs" -gt 0 ] \
+     && [ "$(_file_age "$state/.subsuper-last-context-stow")" -ge "$context_secs" ]; then
+    _now > "$state/.subsuper-last-context-stow"
+    context_stow_check "$state"
   fi
 }
 
@@ -1762,6 +1878,20 @@ fm_super_main() {
   discovered_backend=$(discover_supervisor_backend) || true
   FM_SUPERVISOR_BACKEND="$discovered_backend"
   local BACKEND="$FM_SUPERVISOR_BACKEND"
+
+  # --- resolve firstmate's OWN harness once, for the context-stow nudge --------
+  # The context read (fm_sm_context_tokens) needs firstmate's harness to know
+  # which transcript format to parse. The daemon is exec'd from firstmate's pane
+  # via its harness's background tool, so it inherits the same env markers
+  # bin/fm-harness.sh detect_own reads (CLAUDECODE, JCODE_ACTIVE_PROVIDER, etc.).
+  # An explicit FM_SUPERVISOR_HARNESS override wins (testing). Only claude and
+  # jcode have a verified read; every other harness reads unknown and the nudge
+  # simply never fires (fail closed). Resolved once here rather than per tick so
+  # the read stays cheap.
+  if [ -z "${FM_SUPERVISOR_HARNESS:-}" ]; then
+    FM_SUPERVISOR_HARNESS=$("$FM_DAEMON_DIR/fm-harness.sh" 2>/dev/null || printf 'unknown')
+  fi
+  export FM_SUPERVISOR_HARNESS
 
   # --- refuse an unsupported supervisor backend loudly, before ever trying a
   # tmux/herdr-specific call against it (zellij, orca, and cmux have no verified

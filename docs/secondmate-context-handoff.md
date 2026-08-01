@@ -83,6 +83,32 @@ Read rules that keep this robust:
 Known staleness edge: between a `/compact` (or resume) and the first assistant turn afterward, the last recorded usage still reflects the pre-compact turn, so the read is briefly stale-high.
 This is safe for a threshold monitor - it can only over-report, never silently miss - and the handoff orchestrator re-checks safety (idle, not mid-turn) before acting, and this feature exists precisely to make that `/compact` unnecessary.
 
+### jcode (VERIFIED 2026-08-01)
+
+jcode (github.com/1jehuang/jcode) is a Claude-Agent-SDK runtime that persists the SAME per-session JSONL transcript claude does, in the SAME `<config-dir>/projects/<munged-cwd>/<session-id>.jsonl` location, with a `message.usage` object carrying `input_tokens`, `cache_creation_input_tokens`, and `cache_read_input_tokens` per assistant turn.
+The read is therefore byte-identical to claude's, so `fm_sm_context_tokens` dispatches jcode to the exact same `fm_sm_claude_context_tokens` reader rather than a duplicate one.
+
+Exact commands and output that established this (this machine, 2026-08-01, firstmate running natively on jcode):
+
+```
+$ bin/fm-harness.sh
+jcode
+
+$ cd ~/.claude/projects/-work-firstmate-work && ls -t *.jsonl | head -1
+2d7a971f-556b-4a45-a0d0-b59178870c49.jsonl
+
+$ F=2d7a971f-556b-4a45-a0d0-b59178870c49.jsonl
+$ grep '"usage"' "$F" | grep -v '"isSidechain":true' | tail -1 \
+    | jq '(.message.usage.input_tokens // 0)+(.message.usage.cache_creation_input_tokens // 0)+(.message.usage.cache_read_input_tokens // 0)'
+51046
+
+$ grep '"usage"' "$F" | tail -1 | jq '.message.usage | keys'
+["cache_creation","cache_creation_input_tokens","cache_read_input_tokens", ...]
+```
+
+The transcript carries the same `cwd`, `isSidechain`, and `message.usage` fields claude writes, so every read rule above applies unchanged.
+This same read is what the supervision daemon uses for firstmate's OWN context-stow nudge (`config/context-stow-threshold`, docs/configuration.md), pointed at firstmate's home instead of a secondmate's.
+
 ### codex, opencode, pi, grok (NOT APPLICABLE - no verified read)
 
 Each of these harnesses persists session state in its own place and format, none of which has been reverse-engineered and verified for a token-occupancy read:
