@@ -6,6 +6,16 @@
 # A GitHub pull request URL and a GitLab merge request URL are both accepted,
 # including a merge request on a self-hosted GitLab instance.
 # Usage: fm-pr-check.sh <task-id> <pr-url>
+#
+# Orphan mode (fm-pr-check.sh --orphan <pr-url>) exists so an orphan merge - a
+# PR whose task metadata state/<id>.meta is already gone - shares the same
+# invocation shape as the task path. Arming a watcher merge poll genuinely
+# requires a task: the poll's data sidecar, registration, and check are all
+# keyed by task id and validated against the task's own meta, and there is no
+# meta for an orphan PR. So orphan mode records no pr=/pr_head= evidence and
+# arms no poll; it cleanly no-ops with a message and exits 0. The merge itself
+# (bin/fm-pr-merge.sh --orphan) is the must-have path and records its own
+# durable evidence to data/orphan-merges.log.
 set -eu
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -15,6 +25,19 @@ STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 
 # shellcheck source=bin/fm-pr-lib.sh
 . "$SCRIPT_DIR/fm-pr-lib.sh"
+
+if [ "${1:-}" = "--orphan" ]; then
+  if [ "$#" -ne 2 ]; then
+    echo "error: invalid PR check request" >&2
+    exit 2
+  fi
+  if ! fm_pr_url_parse "$2"; then
+    echo "error: invalid PR check request" >&2
+    exit 2
+  fi
+  echo "orphan: no task metadata to record and no poll to arm; skipping" >&2
+  exit 0
+fi
 
 if [ "$#" -ne 2 ]; then
   echo "error: invalid PR check request" >&2

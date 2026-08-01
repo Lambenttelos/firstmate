@@ -8,36 +8,29 @@
 # --merge, --rebase, or --method after the optional -- separator. Extra args
 # must not include --repo or -R because the repository comes only from the URL.
 # Usage: fm-pr-merge.sh <task-id> <pr-url> [-- <extra gh-axi pr merge args>]
+#
+# Orphan mode merges a PR whose task metadata state/<id>.meta is already gone
+# (the worker was torn down), for example a branch drained from the durable
+# merge queue by the merge-desk secondmate. It runs the same guarded machinery -
+# the URL is parsed and validated by bin/fm-pr-lib.sh, the merge method still
+# defaults to --squash, --repo/-R overrides are still refused, and any conflict
+# or red required check still makes gh-axi refuse loudly - but it takes no task
+# id, requires no meta, and records merge evidence to the append-only log
+# data/orphan-merges.log instead of a task's pr= line. The explicit repository
+# argument must equal the owner/repository the URL already carries; it exists so
+# the caller states the repository it believes it is merging and the merge
+# refuses on any mismatch.
+# Usage: fm-pr-merge.sh --orphan <owner/repository> <pr-url> [-- <extra gh-axi pr merge args>]
 set -eu
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
+DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 
 # shellcheck source=bin/fm-pr-lib.sh
 . "$SCRIPT_DIR/fm-pr-lib.sh"
-
-if [ "$#" -lt 2 ]; then
-  echo "error: invalid PR merge request" >&2
-  exit 2
-fi
-ID=$1
-RAW_URL=$2
-# bin/fm-pr-lib.sh parses GitLab merge request URLs so the watcher can follow
-# them, but this path still addresses only GitHub by owner/repository. The
-# provider check holds that refusal exactly as it was until merge parity lands.
-if ! fm_pr_task_id_valid "$ID" || ! fm_pr_url_parse "$RAW_URL" \
-  || [ "$FM_PR_PROVIDER" != github ]; then
-  echo "error: invalid PR merge request" >&2
-  exit 2
-fi
-URL=$FM_PR_URL
-PR_OWNER=$FM_PR_OWNER
-PR_REPO=$FM_PR_REPO
-PR_NUMBER=$FM_PR_NUMBER
-shift 2
-[ "${1:-}" = "--" ] && shift
 
 caller_has_merge_method() {
   local arg
@@ -60,6 +53,71 @@ reject_repo_overrides() {
     esac
   done
 }
+
+# Orphan mode: merge a PR with no task meta, recording evidence to the durable
+# orphan-merge log rather than a task's pr= line. Gated strictly behind the
+# explicit --orphan flag; the task-based path below is unchanged.
+if [ "${1:-}" = "--orphan" ]; then
+  if [ "$#" -lt 3 ]; then
+    echo "error: invalid PR merge request" >&2
+    exit 2
+  fi
+  REPO_ARG=$2
+  RAW_URL=$3
+  if ! fm_pr_url_parse "$RAW_URL" || [ "$FM_PR_PROVIDER" != github ]; then
+    echo "error: invalid PR merge request" >&2
+    exit 2
+  fi
+  # The explicit repository argument must equal the URL's own owner/repository.
+  if [ "$REPO_ARG" != "$FM_PR_OWNER/$FM_PR_REPO" ]; then
+    echo "error: repository argument does not match the PR URL" >&2
+    exit 1
+  fi
+  URL=$FM_PR_URL
+  PR_OWNER=$FM_PR_OWNER
+  PR_REPO=$FM_PR_REPO
+  PR_NUMBER=$FM_PR_NUMBER
+  shift 3
+  [ "${1:-}" = "--" ] && shift
+  reject_repo_overrides "$@" || exit 1
+
+  merge_args=()
+  if ! caller_has_merge_method "$@"; then
+    merge_args=(--squash)
+  fi
+
+  gh-axi pr merge "$PR_NUMBER" --repo "$PR_OWNER/$PR_REPO" "${merge_args[@]+"${merge_args[@]}"}" "$@"
+
+  # Record merge evidence only after gh-axi confirms the merge. There is no task
+  # meta to write pr= into, so the append-only log is the durable evidence sink.
+  mkdir -p "$DATA" || { echo "error: could not record orphan-merge evidence" >&2; exit 1; }
+  printf '%s\torphan-merge\t%s\t%s\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$PR_OWNER/$PR_REPO" "$URL" \
+    >> "$DATA/orphan-merges.log" \
+    || { echo "error: could not record orphan-merge evidence" >&2; exit 1; }
+  exit 0
+fi
+
+if [ "$#" -lt 2 ]; then
+  echo "error: invalid PR merge request" >&2
+  exit 2
+fi
+ID=$1
+RAW_URL=$2
+# bin/fm-pr-lib.sh parses GitLab merge request URLs so the watcher can follow
+# them, but this path still addresses only GitHub by owner/repository. The
+# provider check holds that refusal exactly as it was until merge parity lands.
+if ! fm_pr_task_id_valid "$ID" || ! fm_pr_url_parse "$RAW_URL" \
+  || [ "$FM_PR_PROVIDER" != github ]; then
+  echo "error: invalid PR merge request" >&2
+  exit 2
+fi
+URL=$FM_PR_URL
+PR_OWNER=$FM_PR_OWNER
+PR_REPO=$FM_PR_REPO
+PR_NUMBER=$FM_PR_NUMBER
+shift 2
+[ "${1:-}" = "--" ] && shift
 
 reject_repo_overrides "$@" || exit 1
 
