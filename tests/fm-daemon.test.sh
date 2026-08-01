@@ -1275,7 +1275,7 @@ test_max_defer_afk_inactive_does_not_flush_or_alarm() {
 # log, so they verify channel SELECTION and summary propagation; the real
 # osascript/herdr argv is verified once by the bounded manual evidence in
 # docs/wedge-alarm.md, never from a suite.
-make_wedge_case() {  # <name> -> echoes dir; creates state/, fakebin/{uname,osascript,herdr}, alert.log
+make_wedge_case() {  # <name> -> echoes dir; creates state/, fakebin/{uname,osascript,herdr,notify-send}, alert.log
   local name=$1 dir fakebin
   dir="$TMP_ROOT/$name"; fakebin="$dir/fakebin"
   mkdir -p "$dir/state" "$fakebin"
@@ -1295,7 +1295,15 @@ SH
 printf '%s\n' herdr >> "${FM_WEDGE_ALARM_REAL_LOG:-/dev/null}"
 exit 0
 SH
-  chmod +x "$fakebin/uname" "$fakebin/osascript" "$fakebin/herdr"
+  # notify-send is the Linux `auto` default. It is created here so command
+  # discovery is deterministic, and a test that wants a host WITHOUT it (a
+  # headless server) removes it from this fakebin before invoking the daemon.
+  cat > "$fakebin/notify-send" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' notify-send >> "${FM_WEDGE_ALARM_REAL_LOG:-/dev/null}"
+exit 0
+SH
+  chmod +x "$fakebin/uname" "$fakebin/osascript" "$fakebin/herdr" "$fakebin/notify-send"
   : > "$dir/alert.log"
   printf '%s\n' "$dir"
 }
@@ -1373,6 +1381,46 @@ test_wedge_alarm_osascript_channel_selected() {
   pass "osascript channel routes through the notifier seam with the summary (never a real notification)"
 }
 
+test_wedge_alarm_auto_linux_selects_notify_send() {
+  local dir log
+  dir=$(make_wedge_case wedge-auto-linux); log="$dir/alert.log"
+  # notify-send present on this fake Linux host: `auto` must resolve to it, so a
+  # paneless away captain on Linux gets a real OS push, not only the marker.
+  PATH="$dir/fakebin:$PATH" FM_WEDGE_ALARM_LOG="$log" FM_FAKE_UNAME=Linux FM_WEDGE_ALARM_CHANNEL=auto \
+    wedge_alarm_notify "away-mode WEDGED 900s" "/s/.marker"
+  grep -F 'notify-send' "$log" >/dev/null || fail "auto did not resolve to notify-send on Linux: $(cat "$log")"
+  grep -F 'osascript' "$log" >/dev/null && fail "Linux auto selected the macOS osascript channel"
+  pass "auto resolves to the Linux notify-send notifier when present (default-on desktop push)"
+}
+
+test_wedge_alarm_auto_linux_headless_has_no_os_channel() {
+  local dir log daemon_log
+  dir=$(make_wedge_case wedge-auto-linux-headless); log="$dir/alert.log"
+  daemon_log="$dir/daemon.log"; : > "$daemon_log"
+  # A headless Linux server has no notify-send: `auto` must resolve to nothing
+  # and log that the durable marker is the only signal, never silently claim a
+  # channel it cannot fire. The marker still carries the outage.
+  rm -f "$dir/fakebin/notify-send"
+  PATH="$dir/fakebin:$PATH" LOG="$daemon_log" FM_WEDGE_ALARM_LOG="$log" \
+    FM_FAKE_UNAME=Linux FM_WEDGE_ALARM_CHANNEL=auto \
+    wedge_alarm_notify "away-mode WEDGED 900s" "/s/.marker"
+  [ ! -s "$log" ] || fail "auto fired an OS channel on a headless Linux host with no notify-send: $(cat "$log")"
+  grep -F 'no OS-level alert channel' "$daemon_log" >/dev/null \
+    || fail "a headless Linux host did not log that the marker is the only signal: $(cat "$daemon_log")"
+  pass "auto on a headless Linux host (no notify-send) fires nothing and logs the marker as the only signal"
+}
+
+test_wedge_alarm_notify_send_channel_selected() {
+  local dir log
+  dir=$(make_wedge_case wedge-notify-send); log="$dir/alert.log"
+  FM_WEDGE_ALARM_LOG="$log" FM_WEDGE_ALARM_CHANNEL=notify-send \
+    wedge_alarm_notify "away-mode escalations WEDGED 700s undelivered - see /s/.marker" "/s/.marker"
+  grep -F 'notify-send' "$log" >/dev/null || fail "notify-send channel not routed through the notifier seam: $(cat "$log")"
+  grep -F 'WEDGED 700s undelivered' "$log" >/dev/null || fail "notify-send channel did not carry the summary"
+  grep -F 'osascript' "$log" >/dev/null && fail "notify-send-only config also selected osascript"
+  pass "notify-send channel routes through the notifier seam with the summary (never a real notification)"
+}
+
 test_wedge_alarm_herdr_channel_selected() {
   local dir log
   dir=$(make_wedge_case wedge-herdr); log="$dir/alert.log"
@@ -1447,13 +1495,16 @@ test_wedge_alarm_auto_darwin_selects_osascript() {
   pass "auto resolves to the macOS osascript notifier on Darwin (default-on)"
 }
 
-test_wedge_alarm_auto_non_darwin_has_no_os_channel() {
+test_wedge_alarm_auto_unknown_platform_has_no_os_channel() {
   local dir log
-  dir=$(make_wedge_case wedge-auto-linux); log="$dir/alert.log"
-  PATH="$dir/fakebin:$PATH" FM_WEDGE_ALARM_LOG="$log" FM_FAKE_UNAME=Linux FM_WEDGE_ALARM_CHANNEL=auto \
+  dir=$(make_wedge_case wedge-auto-unknown); log="$dir/alert.log"
+  # A platform that is neither macOS nor Linux has no built-in OS channel, even
+  # with notify-send on PATH: `auto` must fire nothing and leave the marker as
+  # the only signal (the captain wires a command: directive).
+  PATH="$dir/fakebin:$PATH" FM_WEDGE_ALARM_LOG="$log" FM_FAKE_UNAME=FreeBSD FM_WEDGE_ALARM_CHANNEL=auto \
     wedge_alarm_notify "away-mode WEDGED 900s" "/s/.marker"
-  [ ! -s "$log" ] || fail "auto selected a built-in OS channel on a non-macOS platform: $(cat "$log")"
-  pass "auto on a non-macOS platform selects no built-in OS channel (the marker or a configured command carries it)"
+  [ ! -s "$log" ] || fail "auto selected a built-in OS channel on an unsupported platform: $(cat "$log")"
+  pass "auto on an unsupported platform selects no built-in OS channel (the marker or a configured command carries it)"
 }
 
 test_wedge_alarm_config_file_multi_channel() {
@@ -2582,13 +2633,16 @@ test_wake_helpers_replace_inherited_notifier_override
 test_wedge_alarm_discard_seam_fires_nothing
 test_wedge_alarm_direct_notifiers_honor_discard_seam
 test_wedge_alarm_osascript_channel_selected
+test_wedge_alarm_notify_send_channel_selected
 test_wedge_alarm_herdr_channel_selected
 test_wedge_alarm_command_channel_receives_summary
 test_wedge_alarm_command_failure_hides_configured_command
 test_wedge_alarm_unknown_channel_hides_configured_directive
 test_wedge_alarm_off_disables_active_alert_regardless_of_position
 test_wedge_alarm_auto_darwin_selects_osascript
-test_wedge_alarm_auto_non_darwin_has_no_os_channel
+test_wedge_alarm_auto_linux_selects_notify_send
+test_wedge_alarm_auto_linux_headless_has_no_os_channel
+test_wedge_alarm_auto_unknown_platform_has_no_os_channel
 test_wedge_alarm_config_file_multi_channel
 test_wedge_alarm_failing_channel_degrades_gracefully
 test_wedge_alarm_hung_channel_times_out_and_falls_through
