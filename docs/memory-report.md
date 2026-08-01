@@ -132,6 +132,42 @@ Note that the server's binary lives under a different task's worktree while its 
 Rollup is by ownership, not ancestry, so a language server whose parent editor was killed still rolls up to the task whose worktree it is indexing.
 That is not hypothetical - during the incident two such servers survived their editor being killed, because they were never the editor's.
 
+## A listening server is never a leftover, 2026-08-01
+
+The reclaim list billed the fleet's shared dev backend as free memory and firstmate acted on it, killing the shared stack and costing a lane its test gate.
+It is recorded here because the failure is the incident's exact shape one layer further out: a perfectly correct reading, a process the records genuinely did not claim, and a dangerous conclusion drawn from that absence.
+
+The shared backend is a deliberately-started long-running server that serves the whole fleet.
+One lane starts it, and that lane tears down while the server keeps running, so by design no task record claims it.
+On the pre-fix code every reclaim-list criterion matched it at once: it ran as `node`, so its kind was `tooling`; it sat in a git checkout no record claimed, so it carried `unclaimed-checkout`; and its starting lane had exited, so it was reparented to `ppid 1` and flagged `no-live-parent`.
+All three facts were true, and all three were irrelevant.
+
+A shared stack has no owning task by design, so "unowned" is its natural state, not evidence it is disposable.
+The missing signal was that the process holds a listening socket.
+A process serving a port is serving something, which is positive evidence it is live work, not an abandoned leftover.
+
+Three changes followed, mirroring the record-set fix that preceded them.
+
+A new `server` class: a process with a `LISTEN` socket that no record claims is surfaced in its own class with its ports, never in the reclaim list.
+The listen socket is read from `lsof -a -iTCP -sTCP:LISTEN` into the `FM_MEMREPORT_LISTEN` seam, so it is a fact about the kernel's socket table rather than a guess from the process's path or name.
+This branch is checked before the unclaimed-checkout and tooling-leftover branches, so a `node` or `python` server in an unclaimed checkout can never fall through to a leftover class.
+
+A `listening:<ports>` flag on every row, owned or not, so a server's ports always travel with it and a reader can see what it is serving.
+The reclaim renderer carries a second, independent guard that excludes any row bearing that flag, so the exclusion does not depend on the classification order alone.
+
+The reclaim context names the excluded servers and their total, the same way it already named excluded agents and applications, so nothing is silently dropped from the accounting.
+
+Note what is deliberately not used: the absence of a local `mongod` is never a liveness test.
+A shared stack's database is remote, so it needs no local `mongod`, and treating a missing local database as "the stack is dead" would resurrect exactly this bug.
+
+### Why the tests did not catch it
+
+Every reclaim-list fixture process was either a genuine leftover, an agent, an editor, or an application.
+None held a listening socket, so the suite never exercised a server at all, and a class that is never constructed cannot be tested.
+
+The suite now carries a shared-backend fixture (`pid 1010`) that reproduces every pre-fix trigger at once - `node` kind, unclaimed git checkout, reparented to `ppid 1` - and is kept out of the reclaim list solely by its listen socket.
+Four tests pin the fix: the server is never reclaimable, it is surfaced in its own class with its ports, multiple ports read as one sorted deduplicated list, and a genuine leftover with no listen socket still reclaims, so the fix cannot have disarmed the class the script exists to make.
+
 ## The self-check thresholds
 
 The summed footprint normally sits above used memory, because footprint counts compressed pages and charges shared regions to each process.

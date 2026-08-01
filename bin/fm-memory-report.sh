@@ -52,10 +52,24 @@
 # the language-server rollup, the self-check thresholds, and the attribution
 # defect of 2026-07-24. Read it before changing any threshold or bucket rule.
 #
+# A LISTENING SERVER IS NEVER A LEFTOVER. A process holding a LISTEN socket is
+# serving something - a shared dev backend, a database proxy, a web server. On
+# this fleet a shared stack is started deliberately by one lane to serve the
+# WHOLE fleet, so it has NO owning task by design: once its starting lane tore
+# down, "unowned" is its natural state, not evidence it is disposable. Billing
+# such a server as reclaimable once cost a lane its test gate (docs/memory-report.md,
+# 2026-08-01). So a process with a listening socket is surfaced in its own
+# `server` class WITH its ports and is excluded from the reclaim list entirely.
+# The listen socket is positive evidence the process is serving something, never
+# a guess from the path shape - and note absence of a local mongod is NOT used as
+# a liveness test, because a shared stack's database is remote and it needs no
+# local mongod.
+#
 # Test seams: FM_MEMREPORT_TOP and FM_MEMREPORT_PS read a captured listing from a
 # file instead of running the tool, FM_MEMREPORT_LSOF likewise for working
-# directories, and FM_MEMREPORT_SELF_PID overrides which pid the self-check
-# requires to be present.
+# directories, FM_MEMREPORT_LISTEN likewise for listening-socket ports (a
+# pid<TAB>port listing), and FM_MEMREPORT_SELF_PID overrides which pid the
+# self-check requires to be present.
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -222,6 +236,40 @@ collect_cwd() {
         /^p/ { pid = substr($0, 2); next }
         /^n/ { if (pid != "") { printf "%s\t%s\n", pid, substr($0, 2); pid = "" } }
       ' > "$TMP/cwd.tsv" || true
+}
+
+# Listening TCP sockets for every enumerated pid, as pid<TAB>port. A process
+# holding a LISTEN socket is serving something and is never an abandoned
+# leftover (see the header). Read from lsof, so it is a fact about the kernel's
+# socket table, not a guess about the process's path or name. A pid absent from
+# the result simply holds no listening socket. Multiple ports per pid produce
+# multiple rows; downstream collapses them into a sorted port list.
+collect_listen() {
+  : > "$TMP/listen.tsv"
+  if [ -n "${FM_MEMREPORT_LISTEN:-}" ]; then
+    [ -r "$FM_MEMREPORT_LISTEN" ] || die "FM_MEMREPORT_LISTEN is not readable: $FM_MEMREPORT_LISTEN"
+    cat "$FM_MEMREPORT_LISTEN" > "$TMP/listen.tsv"
+    return 0
+  fi
+  command -v lsof >/dev/null 2>&1 || return 0
+  local pidlist
+  pidlist=$(cut -f1 "$TMP/top.tsv" | paste -sd, -)
+  [ -n "$pidlist" ] || return 0
+  # -iTCP -sTCP:LISTEN restricts to listening TCP sockets; -P and -n keep ports
+  # numeric and skip DNS. The name field looks like "*:4500" or "127.0.0.1:4500";
+  # the port is whatever follows the last colon.
+  lsof -a -iTCP -sTCP:LISTEN -P -n -Fpn -p "$pidlist" 2>/dev/null \
+    | awk '
+        /^p/ { pid = substr($0, 2); next }
+        /^n/ {
+          if (pid != "") {
+            name = substr($0, 2)
+            n = split(name, a, ":")
+            port = a[n]
+            if (port ~ /^[0-9]+$/) printf "%s\t%s\n", pid, port
+          }
+        }
+      ' > "$TMP/listen.tsv" || true
 }
 
 # Parse top's per-process rows into pid<TAB>footprint_kb, and its header counters
@@ -536,6 +584,21 @@ classify_rows() {
     FILENAME == CWDF { cwd[$1] = $2; next }
     FILENAME == GITF { gitcwd[$0] = 1; next }
     FILENAME == TOPF { fp[$1] = $2; next }
+    # Listening ports, one pid<TAB>port row each. Collapsed into a sorted,
+    # comma-separated list per pid so a server on several ports reads cleanly.
+    # Merely HOLDING a listen socket is what matters here - it is positive
+    # evidence the process is serving something, so it is never a leftover.
+    FILENAME == LISTENF {
+      if ($2 !~ /^[0-9]+$/) next
+      if (($1 SUBSEP $2) in seenport) next
+      seenport[$1 SUBSEP $2] = 1
+      # Guard the concatenation with a separate flag: writing listen[$1] on the
+      # left of the assignment creates the element before the right side runs, so
+      # "$1 in listen" would already be true and prepend a stray leading comma.
+      if ($1 in haveport) listen[$1] = listen[$1] "," $2
+      else { listen[$1] = $2; haveport[$1] = 1 }
+      next
+    }
 
     # ps rows arrive last: everything needed to classify is already loaded.
     FILENAME == PSF {
@@ -565,6 +628,21 @@ classify_rows() {
         }
       }
       return best
+    }
+
+    # Numerically-sorted, deduplicated port list for one pid, e.g. "80,443,4500".
+    # Deterministic so the same server reads the same way every run.
+    function ports_of(p,   s, n, a, i, j, t) {
+      if (!(p in listen)) return ""
+      n = split(listen[p], a, ",")
+      for (i = 1; i <= n; i++) {
+        for (j = i + 1; j <= n; j++) {
+          if (a[j] + 0 < a[i] + 0) { t = a[i]; a[i] = a[j]; a[j] = t }
+        }
+      }
+      s = a[1]
+      for (i = 2; i <= n; i++) s = s "," a[i]
+      return s
     }
 
     END {
@@ -612,11 +690,17 @@ classify_rows() {
         p = pids[i]
         c = (p in cwd) ? cwd[p] : ""
         fl = ""
+        # A listening socket travels as a flag on EVERY row, owned or not, so
+        # the listening ports are always visible next to a server. It is also the
+        # decisive signal below: a process serving a port is never a leftover.
+        # NOTE: no apostrophes in this awk block - it is single-quoted.
+        srvports = ports_of(p)
+        if (srvports != "") fl = "listening:" srvports
         # ppid 1 is only evidence of a LOST parent for things that are always
         # spawned by something else. launchd legitimately starts apps and system
         # daemons with ppid 1, so flagging those would manufacture 98 fake
         # findings - ancestry lying again, in the other direction.
-        if (ppid[p] == "1" && (k[p] == "lsp" || k[p] == "tooling" || k[p] == "agent")) fl = "no-live-parent"
+        if (ppid[p] == "1" && (k[p] == "lsp" || k[p] == "tooling" || k[p] == "agent")) fl = fl (fl == "" ? "" : ",") "no-live-parent"
         unclaimed = (okindof[p] == "" && c != "" && (c in gitcwd))
         if (unclaimed) fl = fl (fl == "" ? "" : ",") "unclaimed-checkout"
 
@@ -629,6 +713,19 @@ classify_rows() {
             # is the same incident one layer further out.
             # NOTE: no apostrophes in this awk block - it is single-quoted.
             okindof[p] = "foreign-agent"; olabelof[p] = "live agent, not this fleet"
+          } else if (srvports != "") {
+            # A LISTENING SERVER no record claims. On this fleet a shared dev
+            # stack is started by one lane to serve the WHOLE fleet, so it has no
+            # owning task by design and "unowned" is its NATURAL state, not
+            # evidence it is disposable. Holding a listen socket is positive
+            # evidence it is serving something, so it gets its own `server`
+            # bucket WITH its ports and is excluded from the reclaim list
+            # entirely. Billing such a server as reclaimable once killed a shared
+            # stack and cost a lane its test gate (docs/memory-report.md).
+            # Checked BEFORE the unclaimed-checkout and tooling leftover branches
+            # so a node/python server sitting in an unclaimed checkout can never
+            # fall through to the reclaim list.
+            okindof[p] = "server"; olabelof[p] = "listening server, ports " srvports; via[p] = "listen"
           } else if (unclaimed && shares_agent_dir(c)) {
             # Tooling sitting in the same directory as a live agent: its work,
             # not an abandoned leftover.
@@ -655,8 +752,8 @@ classify_rows() {
           p, ppid[p], f, rss[p], user[p], okindof[p], olabelof[p], via[p], k[p], fl, (c == "" ? "-" : c), cmd[p]
       }
     }
-  ' OWN="$TMP/owners.tsv" CWDF="$TMP/cwd.tsv" GITF="$TMP/gitcwd.tsv" TOPF="$TMP/top.tsv" PSF="$TMP/ps.tsv" \
-    "$TMP/owners.tsv" "$TMP/cwd.tsv" "$TMP/gitcwd.tsv" "$TMP/top.tsv" "$TMP/ps.tsv" \
+  ' OWN="$TMP/owners.tsv" CWDF="$TMP/cwd.tsv" GITF="$TMP/gitcwd.tsv" TOPF="$TMP/top.tsv" PSF="$TMP/ps.tsv" LISTENF="$TMP/listen.tsv" \
+    "$TMP/owners.tsv" "$TMP/cwd.tsv" "$TMP/gitcwd.tsv" "$TMP/top.tsv" "$TMP/listen.tsv" "$TMP/ps.tsv" \
     | sort -t$'\t' -k3,3nr > "$TMP/rows.tsv"
 }
 
@@ -727,6 +824,12 @@ render_reclaim() {
   # or monitor is not a leftover, and neither is another tool's live agent.
   awk -F'\t' '
     $9 == "agent" { next }
+    # A LISTENING SERVER is never a leftover, whatever else it looks like. It is
+    # serving something, so even a node/python server sitting in an unclaimed
+    # checkout must never be billed as free. Its own `server` owner_kind already
+    # keeps it out of the branches below, but this guard makes the exclusion
+    # independent of that classification order - a listening flag alone is enough.
+    $10 ~ /listening:/ { next }
     # Only language/build tooling qualifies as a leftover. A shell is a terminal
     # someone is sitting in, and a service is a service: neither is abandoned
     # just because no fleet record names its directory. The checkout test alone
@@ -756,9 +859,14 @@ render_reclaim() {
   # excluded and why, rather than wondering where the rest of the machine went.
   awk -F'\t' '
     $9 == "agent" && ($6 == "foreign-agent" || $6 == "unowned") { a += $3; an++; next }
+    # A listening server is surfaced as context WITH its ports, never billed as
+    # free. An unclaimed shared stack is exactly what a fleet server looks like
+    # once its starting lane tore down, so "no record claims it" is expected here.
+    $6 == "server" || ($10 ~ /listening:/ && $9 != "agent") { s += $3; sn++; next }
     $6 == "unowned" || $6 == "app" { o += $3; on++; next }
     END {
       if (an) printf "  NOT listed: %d live agent process(es), %s - another tool or home owns them\n", an, sz(a)
+      if (sn) printf "  NOT listed: %d listening server(s), %s - serving the fleet, not leftovers\n", sn, sz(s)
       if (on) printf "  NOT listed: %d application/other process(es), %s - in use, not leftovers\n", on, sz(o)
     }
     function sz(kb) {
@@ -903,6 +1011,7 @@ collect_ps
 parse_top
 parse_ps
 collect_cwd
+collect_listen
 run_self_check
 build_owners
 # One owner for the count every later caller reports; recomputing it per call

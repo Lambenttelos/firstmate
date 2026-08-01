@@ -46,11 +46,19 @@ mkdir -p "$HOME_DIR/state" "$HOME_DIR/data" "$HOME_DIR/projects/alpha"
 WT_TASK="$TMPROOT/wt/task-one"
 WT_SECOND="$TMPROOT/wt/second-home"
 WT_STALE="$TMPROOT/wt/stale-copy"
-mkdir -p "$WT_TASK" "$WT_SECOND" "$WT_STALE"
+# The shared dev backend: a long-running server serving the whole fleet, started
+# by a lane that has since torn down, so NO record claims it - which is exactly
+# what a shared stack looks like, not evidence it is disposable. It sits in a git
+# checkout (the incident's "unclaimed checkout") AND reports ppid 1 (reparented
+# when its starting lane exited), so on the pre-fix code it landed squarely in
+# RECLAIMABLE. It must never be reclaimable, because it holds a LISTEN socket.
+WT_BACKEND="$TMPROOT/wt/shared-backend"
+mkdir -p "$WT_TASK" "$WT_SECOND" "$WT_STALE" "$WT_BACKEND"
 # A checkout marker so the "leftover in a checkout no record claims" class can be
 # exercised: that class is a filesystem fact, not a guess about the path shape.
 : > "$WT_STALE/.git"
 : > "$WT_TASK/.git"
+: > "$WT_BACKEND/.git"
 
 fm_write_meta "$HOME_DIR/state/task-one.meta" \
   "window=firstmate:fm-task-one" \
@@ -73,6 +81,7 @@ EOF
 TOP="$TMPROOT/top.raw"
 PS="$TMPROOT/ps.raw"
 LSOF="$TMPROOT/lsof.tsv"
+LISTEN="$TMPROOT/listen.tsv"
 
 build_listings() {
   local n
@@ -99,6 +108,11 @@ build_listings() {
     printf '1006   50M   self\n'
     printf '1007   40M   mystery\n'
     printf '1008   60M   foreign\n'
+    # The shared dev backend, 800M - substantial, but deliberately below the
+    # language server (1200M) so the footprint-vs-rss ranking test keeps its clean
+    # two-way comparison. Its rss (below) is kept below the editor's so the
+    # editor stays the rss-heaviest process the ranking test relies on.
+    printf '1010   800M  backend\n'
     for n in $(seq 1 210); do printf '2%03d   30M   filler\n' "$n"; done
   } > "$TOP"
 
@@ -116,6 +130,11 @@ build_listings() {
     # (another tool's, or the captain's own). One unowned agent out of three is
     # normal and must stay quiet; three out of three is the wrong-home signature.
     printf '1008 900 40000 cyuan /usr/local/bin/opencode serve --port 1234\n'
+    # The shared dev backend: node in an unclaimed checkout, reparented to ppid 1.
+    # Its kind is `tooling` (node) and it is in a git checkout no record claims,
+    # so before the fix every reclaim-list criterion matched it. The LISTEN socket
+    # below is what keeps it out.
+    printf '1010 1 300000 cyuan node %s/server.js --port 4500\n' "$WT_BACKEND"
     for n in $(seq 1 210); do printf '2%03d 1 8000 root /usr/libexec/filler%s\n' "$n" "$n"; done
   } > "$PS"
 
@@ -126,9 +145,22 @@ build_listings() {
     printf '1005\t%s\n' "$WT_STALE"
     printf '1008\t/tmp\n'
     printf '1006\t%s\n' "$HOME_DIR"
+    printf '1010\t%s\n' "$WT_BACKEND"
   } > "$LSOF"
+
+  # Listening TCP sockets, as pid<TAB>port. Only the shared backend holds one:
+  # that single fact is what moves it out of RECLAIMABLE and into `server`.
+  {
+    printf '1010\t4500\n'
+  } > "$LISTEN"
 }
 build_listings
+
+# An empty listening-socket listing, for the custom invocations below that build
+# their own environment. Injected so no assertion ever falls through to the real
+# lsof of whatever host runs the suite - the same hermeticity the other seams get.
+EMPTY_LISTEN="$TMPROOT/empty.listen"
+: > "$EMPTY_LISTEN"
 
 # run_report <args...>: run against the injected listings with pid 1006 (the
 # script's stand-in) as the pid the self-check requires to be present.
@@ -137,6 +169,7 @@ run_report() {
   FM_MEMREPORT_TOP="$TOP" \
   FM_MEMREPORT_PS="$PS" \
   FM_MEMREPORT_LSOF="$LSOF" \
+  FM_MEMREPORT_LISTEN="$LISTEN" \
   FM_MEMREPORT_SELF_PID=1006 \
     "$REPORT" "$@" 2>&1
 }
@@ -147,6 +180,7 @@ run_broken() {
   FM_MEMREPORT_TOP="$1" \
   FM_MEMREPORT_PS="$2" \
   FM_MEMREPORT_LSOF="$LSOF" \
+  FM_MEMREPORT_LISTEN="$LISTEN" \
   FM_MEMREPORT_SELF_PID="${3:-1006}" \
     "$REPORT" 2>&1
 }
@@ -347,7 +381,7 @@ test_unreadable_facts_never_become_findings() {
   empty="$TMPROOT/empty.lsof"
   : > "$empty"
   out=$(FM_HOME="$HOME_DIR" FM_MEMREPORT_TOP="$TOP" FM_MEMREPORT_PS="$PS" \
-        FM_MEMREPORT_LSOF="$empty" FM_MEMREPORT_SELF_PID=1006 "$REPORT" 2>&1)
+        FM_MEMREPORT_LSOF="$empty" FM_MEMREPORT_LISTEN="$EMPTY_LISTEN" FM_MEMREPORT_SELF_PID=1006 "$REPORT" 2>&1)
   assert_contains "$out" "unclassified" "a missing cwd source must produce unclassified"
   owned_line=$(printf '%s\n' "$out" | awk '/^ +unowned /')
   [ -z "$owned_line" ] \
@@ -382,7 +416,7 @@ test_refuses_when_records_cannot_be_read() {
   nostate="$TMPROOT/nostatehome"
   mkdir -p "$nostate/data"
   out=$(FM_HOME="$nostate" FM_MEMREPORT_TOP="$TOP" FM_MEMREPORT_PS="$PS" \
-        FM_MEMREPORT_LSOF="$LSOF" FM_MEMREPORT_SELF_PID=1006 "$REPORT" 2>&1); rc=$?
+        FM_MEMREPORT_LSOF="$LSOF" FM_MEMREPORT_LISTEN="$LISTEN" FM_MEMREPORT_SELF_PID=1006 "$REPORT" 2>&1); rc=$?
   expect_code 3 "$rc" "an unreadable record store must refuse, not label live work unowned"
   assert_contains "$out" "could not be read" "the refusal must name the unreadable store"
   assert_not_contains "$out" "TOP PROCESSES" "a refusal must print NO ranking"
@@ -400,7 +434,7 @@ test_idle_fleet_is_not_a_broken_instrument() {
   empty="$TMPROOT/idlehome"
   mkdir -p "$empty/state" "$empty/data"
   out=$(FM_HOME="$empty" FM_MEMREPORT_TOP="$TOP" FM_MEMREPORT_PS="$PS" \
-        FM_MEMREPORT_LSOF="$LSOF" FM_MEMREPORT_SELF_PID=1006 "$REPORT" 2>&1); rc=$?
+        FM_MEMREPORT_LSOF="$LSOF" FM_MEMREPORT_LISTEN="$LISTEN" FM_MEMREPORT_SELF_PID=1006 "$REPORT" 2>&1); rc=$?
   expect_code 0 "$rc" "an idle fleet must still report; it is not a broken instrument"
   assert_contains "$out" "TOP PROCESSES" "an idle fleet must still get its ranking"
   pass "an idle but readable record store reports normally"
@@ -444,6 +478,104 @@ test_editor_is_surfaced_but_not_billed_as_free() {
   pass "the editor is surfaced as a decision, not billed as reclaimable"
 }
 
+# --- a listening server is never a leftover ----------------------------------
+#
+# The incident of 2026-08-01: `--tree` listed the fleet's SHARED dev backend - a
+# deliberately-started long-running server serving the whole fleet - under
+# RECLAIMABLE, because it was "unowned / a leftover in a checkout no record
+# claims" with "no-live-parent". All three were true and all three were
+# irrelevant: a shared stack has NO owning task BY DESIGN, so "unowned" is its
+# natural state, not evidence it is disposable. Firstmate acted on that list and
+# killed the shared stack, costing a lane its test gate. The fixture backend
+# (pid 1010) reproduces every pre-fix trigger - node kind, unclaimed git
+# checkout, ppid 1 - and is kept out of the reclaim list solely by its LISTEN
+# socket.
+
+test_listening_server_is_never_reclaimable() {
+  local out reclaim
+  # THE regression. A process holding a listening socket in an unclaimed checkout
+  # must NEVER appear in the reclaimable list, even though every other criterion
+  # (node tooling, git checkout, reparented) matches the leftover shape.
+  out=$(run_report)
+  reclaim=$(printf '%s\n' "$out" | awk '/RECLAIMABLE/, /never kills/')
+  # The backend's 800 MB must not be inside the freed-if-reclaimed total.
+  printf '%s\n' "$reclaim" | awk '/total, if all of the above were freed/' | grep -Fq "800 MB" \
+    && fail "the listening server must not be inside the reclaimable total"
+  # Nor may it be named as a leftover in any reclaim-candidate line. The only
+  # genuine leftover in the fixture is the language server in the stale checkout.
+  printf '%s\n' "$reclaim" | grep -F "shared-backend" \
+    && fail "the listening server must not appear as a reclaim candidate"
+  printf '%s\n' "$reclaim" | grep -F "4500" | grep -Fq "no record claims" \
+    && fail "the server's port must not be presented as a leftover"
+  pass "a listening server in an unclaimed checkout is never offered as reclaimable"
+}
+
+test_listening_server_gets_its_own_class_with_ports() {
+  local out line json
+  # A listening server is surfaced in its own labelled `server` class WITH its
+  # ports, so a human can see what it is serving rather than wondering where the
+  # memory went.
+  out=$(run_report --all)
+  # The owner group must show a server class.
+  printf '%s\n' "$out" | awk '/^BY OWNER/,/^RECLAIMABLE/' | grep -Fq "server" \
+    || fail "a listening server must appear in its own owner class"
+  # The port must travel with it, in both the group label and the process row.
+  printf '%s\n' "$out" | grep -F "listening server" | grep -Fq "4500" \
+    || fail "the server class must name the port it is listening on"
+  line=$(printf '%s\n' "$out" | awk '$1 == 1010')
+  [ -n "$line" ] || fail "the backend process must appear in the ranking"
+  case "$line" in
+    *"listen"*) : ;;
+    *) fail "the backend row must record it was attributed via its listen socket, got: $line" ;;
+  esac
+  # And the reclaim context must name it as excluded, so nothing is silently lost.
+  printf '%s\n' "$out" | awk '/RECLAIMABLE/, /never kills/' \
+    | grep -Fq "listening server" \
+    || fail "the reclaim context must name the listening server it excluded"
+  # --json carries the class and ports as structured fields.
+  json=$(run_report --json)
+  printf '%s\n' "$json" | grep -F '"pid":1010' | grep -Fq '"owner_kind":"server"' \
+    || fail "--json must classify the server with owner_kind server"
+  printf '%s\n' "$json" | grep -F '"pid":1010' | grep -Fq 'listening:4500' \
+    || fail "--json must carry the listening flag with the port"
+  pass "a listening server is surfaced in its own class with its ports"
+}
+
+test_listening_server_ports_are_sorted_and_deduplicated() {
+  local multi out
+  # A server on several ports must read as one deterministic, numerically-sorted,
+  # deduplicated list, so the same server looks the same every run and cannot be
+  # confused for several findings.
+  multi="$TMPROOT/multi.listen"
+  {
+    printf '1010\t4500\n'
+    printf '1010\t443\n'
+    printf '1010\t80\n'
+    printf '1010\t4500\n'
+  } > "$multi"
+  out=$(FM_HOME="$HOME_DIR" FM_MEMREPORT_TOP="$TOP" FM_MEMREPORT_PS="$PS" \
+        FM_MEMREPORT_LSOF="$LSOF" FM_MEMREPORT_LISTEN="$multi" \
+        FM_MEMREPORT_SELF_PID=1006 "$REPORT" --json 2>&1)
+  printf '%s\n' "$out" | grep -F '"pid":1010' | grep -Fq 'listening:80,443,4500' \
+    || fail "multiple ports must be numerically sorted and deduplicated"
+  pass "a multi-port server reports one sorted, deduplicated port list"
+}
+
+test_a_leftover_without_a_listen_socket_still_reclaims() {
+  local out reclaim
+  # The fix must NOT disarm the genuine leftover class. The stale-checkout
+  # language server (pid 1005) holds no listening socket, so it must still be
+  # offered as reclaimable exactly as before - otherwise the fix would have
+  # thrown away the very finding the script exists to make.
+  out=$(run_report)
+  reclaim=$(printf '%s\n' "$out" | awk '/RECLAIMABLE/, /never kills/')
+  case "$reclaim" in
+    *"leftovers in a checkout no record claims"*) : ;;
+    *) fail "a genuine leftover with no listen socket must still be reclaimable" ;;
+  esac
+  pass "a leftover without a listening socket is still offered as reclaimable"
+}
+
 test_warns_when_agents_match_no_record() {
   local out rc wrong f
   # Records exist, but they describe worktrees nothing is running in - the shape
@@ -457,7 +589,7 @@ test_warns_when_agents_match_no_record() {
         > "$wrong/state/$(basename "$f")"
   done
   out=$(FM_HOME="$wrong" FM_MEMREPORT_TOP="$TOP" FM_MEMREPORT_PS="$PS" \
-        FM_MEMREPORT_LSOF="$LSOF" FM_MEMREPORT_SELF_PID=1006 "$REPORT" 2>&1); rc=$?
+        FM_MEMREPORT_LSOF="$LSOF" FM_MEMREPORT_LISTEN="$LISTEN" FM_MEMREPORT_SELF_PID=1006 "$REPORT" 2>&1); rc=$?
   expect_code 0 "$rc" "a valid reading of the wrong home must still report"
   assert_contains "$out" "ATTRIBUTION LOOKS WRONG" "the mismatch must be called out loudly"
   assert_contains "$out" "do not act on the reclaim list" \
@@ -478,12 +610,12 @@ test_attribution_warning_survives_a_pipe() {
         > "$wrong/state/$(basename "$f")"
   done
   out=$(FM_HOME="$wrong" FM_MEMREPORT_TOP="$TOP" FM_MEMREPORT_PS="$PS" \
-        FM_MEMREPORT_LSOF="$LSOF" FM_MEMREPORT_SELF_PID=1006 "$REPORT" 2>/dev/null)
+        FM_MEMREPORT_LSOF="$LSOF" FM_MEMREPORT_LISTEN="$LISTEN" FM_MEMREPORT_SELF_PID=1006 "$REPORT" 2>/dev/null)
   assert_contains "$out" "ATTRIBUTION LOOKS WRONG" \
     "the warning must be on stdout so it survives a pipe"
   # And a machine consumer must see the same doubt.
   out=$(FM_HOME="$wrong" FM_MEMREPORT_TOP="$TOP" FM_MEMREPORT_PS="$PS" \
-        FM_MEMREPORT_LSOF="$LSOF" FM_MEMREPORT_SELF_PID=1006 "$REPORT" --json 2>/dev/null)
+        FM_MEMREPORT_LSOF="$LSOF" FM_MEMREPORT_LISTEN="$LISTEN" FM_MEMREPORT_SELF_PID=1006 "$REPORT" --json 2>/dev/null)
   assert_contains "$out" '"attribution_warning": "' \
     "--json must carry the attribution warning as a field"
   pass "the attribution warning survives a pipe and reaches machine consumers"
@@ -562,7 +694,7 @@ test_attributes_against_real_meta_records() {
   printf '1006 900 20000 cyuan /bin/bash %s\n' "$REPORT" >> "$ps"
 
   out=$(FM_HOME="$home" FM_MEMREPORT_TOP="$top" FM_MEMREPORT_PS="$ps" \
-        FM_MEMREPORT_LSOF="$lsof" FM_MEMREPORT_SELF_PID=1006 "$REPORT" --all 2>&1)
+        FM_MEMREPORT_LSOF="$lsof" FM_MEMREPORT_LISTEN="$EMPTY_LISTEN" FM_MEMREPORT_SELF_PID=1006 "$REPORT" --all 2>&1)
   [ "${out#*REFUSING}" = "$out" ] || fail "real-record run refused: $out"
   assert_not_contains "$out" "ATTRIBUTION LOOKS WRONG" \
     "agents sitting in real recorded worktrees must attribute cleanly"
@@ -578,7 +710,7 @@ test_attributes_against_real_meta_records() {
   }
   local json bad
   json=$(FM_HOME="$home" FM_MEMREPORT_TOP="$top" FM_MEMREPORT_PS="$ps" \
-         FM_MEMREPORT_LSOF="$lsof" FM_MEMREPORT_SELF_PID=1006 "$REPORT" --json 2>/dev/null)
+         FM_MEMREPORT_LSOF="$lsof" FM_MEMREPORT_LISTEN="$EMPTY_LISTEN" FM_MEMREPORT_SELF_PID=1006 "$REPORT" --json 2>/dev/null)
   bad=$(printf '%s' "$json" | REAL_HOME="$home" REAL_LSOF="$lsof" python3 -c '
 import json, sys, os
 d = json.load(sys.stdin)
@@ -637,7 +769,7 @@ test_real_secondmate_home_attributes() {
   printf '1003\t%s\n' "$path" > "$lsof"
   printf '1006\t%s\n' "$home" >> "$lsof"
   out=$(FM_HOME="$home" FM_MEMREPORT_TOP="$top" FM_MEMREPORT_PS="$ps" \
-        FM_MEMREPORT_LSOF="$lsof" FM_MEMREPORT_SELF_PID=1006 "$REPORT" --all 2>&1)
+        FM_MEMREPORT_LSOF="$lsof" FM_MEMREPORT_LISTEN="$EMPTY_LISTEN" FM_MEMREPORT_SELF_PID=1006 "$REPORT" --all 2>&1)
   printf '%s\n' "$out" | awk '$1 == 1003' | grep -Fq "$id" \
     || fail "a real secondmate home= record must attribute (expected $id)"
   pass "a real secondmate home= record attributes its agent"
@@ -683,7 +815,7 @@ test_json_refusal_is_not_a_document() {
   trunc="$TMPROOT/trunc2.top"
   head -20 "$TOP" > "$trunc"
   out=$(FM_HOME="$HOME_DIR" FM_MEMREPORT_TOP="$trunc" FM_MEMREPORT_PS="$PS" \
-        FM_MEMREPORT_LSOF="$LSOF" FM_MEMREPORT_SELF_PID=1006 "$REPORT" --json 2>&1); rc=$?
+        FM_MEMREPORT_LSOF="$LSOF" FM_MEMREPORT_LISTEN="$LISTEN" FM_MEMREPORT_SELF_PID=1006 "$REPORT" --json 2>&1); rc=$?
   expect_code 3 "$rc" "--json must refuse too, not emit a broken document"
   assert_not_contains "$out" '"processes"' "a refused --json must not emit a process array"
   pass "--json refuses rather than emitting a document built on a broken reading"
@@ -767,6 +899,10 @@ test_reclaim_classes_do_not_overlap
 test_refuses_when_records_cannot_be_read
 test_idle_fleet_is_not_a_broken_instrument
 test_live_agents_are_never_reclaimable
+test_listening_server_is_never_reclaimable
+test_listening_server_gets_its_own_class_with_ports
+test_listening_server_ports_are_sorted_and_deduplicated
+test_a_leftover_without_a_listen_socket_still_reclaims
 test_editor_is_surfaced_but_not_billed_as_free
 test_warns_when_agents_match_no_record
 test_attribution_warning_survives_a_pipe
