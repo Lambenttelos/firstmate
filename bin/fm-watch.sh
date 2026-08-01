@@ -52,6 +52,13 @@
 #                          unlanded work. Report-only; nothing is discarded here.
 #                          Both are armed by bin/fm-session-start.sh and run on
 #                          this watcher's slow poll (bin/fm-hourly-lib.sh).
+#   check: context-stow-nudge <detail>
+#                          firstmate's OWN context crossed the stow threshold
+#                          (config/context-stow-threshold) during NORMAL
+#                          supervision: /stow now and /compact when the session
+#                          cannot auto-compact. Nudge only - nothing is stowed or
+#                          compacted here. Fires once per crossing and stays out
+#                          while a live away-mode daemon owns the nudge.
 #   tick: <note>           env-gated proof-of-life close (FM_WATCH_ABSORB_TICK=1,
 #                          default off) for a benign-ABSORBED wake while work is
 #                          under way. Not an actionable wake: nothing is queued,
@@ -490,6 +497,72 @@ secondmate_context_sweep() {
 $(recorded_windows)
 EOF
 }
+
+# firstmate's OWN context stow-nudge sweep - the always-on twin of the away-mode
+# daemon's context_stow_check (bin/fm-supervise-daemon.sh). Context fills during
+# NORMAL supervision too, not just away mode, and the away-mode daemon owns the
+# nudge only while it is running; without this the nudge never fires in the
+# ordinary case. This is the interim enforcement while the structural turn-end
+# backstop (enforce-stow-at-turnend-guard) stays blocked on an unbuilt jcode
+# turn-end hook. It only NUDGES - it never runs /stow or /compact itself, because
+# a stow needs firstmate's judgment about where each durable fact belongs and an
+# auto-fired bare compact would summarize away un-stowed knowledge.
+#
+# When firstmate's own live context first crosses the stow threshold, wake once
+# with a firstmate-facing "check: context-stow-nudge" telling it to /stow now
+# (and /compact when the session cannot auto-compact). Idempotent via the SAME
+# durable marker the daemon check uses (state/.context-stow-nudged), so the two
+# supervision paths never double-nudge across a mode switch: the wake fires once
+# per crossing and re-arms only after the count drops back below
+# (threshold - hysteresis), which a fresh or compacted session does. Fails CLOSED:
+# an unreadable, non-numeric, or unsupported-harness count leaves the marker
+# untouched and wakes nobody, exactly like secondmate_context_sweep. Runs only on
+# the CHECK_INTERVAL cadence, and never while a live away-mode daemon owns triage
+# (the daemon's own check owns the nudge then, through its injection path). The
+# harness is FM_SUPERVISOR_HARNESS when set (testing) else this process's own
+# detected harness; the transcript cwd is FM_CONTEXT_STOW_CWD when set (testing)
+# else FM_HOME - identical resolution to the daemon so both read the same count.
+_own_stow_harness_memo=""
+own_stow_harness() {
+  if [ -z "$_own_stow_harness_memo" ]; then
+    _own_stow_harness_memo=${FM_SUPERVISOR_HARNESS:-$("$SCRIPT_DIR/fm-harness.sh" 2>/dev/null || printf unknown)}
+    [ -n "$_own_stow_harness_memo" ] || _own_stow_harness_memo=unknown
+  fi
+  printf '%s' "$_own_stow_harness_memo"
+}
+context_stow_sweep() {
+  local harness cwd threshold hysteresis tokens marker rearm reason
+  afk_daemon_owns_triage && return 0
+  harness=$(own_stow_harness)
+  cwd=${FM_CONTEXT_STOW_CWD:-${FM_HOME:-}}
+  [ -n "$harness" ] && [ "$harness" != unknown ] || return 0
+  [ -n "$cwd" ] || return 0
+  tokens=$(fm_sm_context_tokens "$cwd" "$harness" 2>/dev/null || true)
+  # Fail closed: never nudge on an unreadable or non-numeric count.
+  case "$tokens" in ''|*[!0-9]*) return 0 ;; esac
+  threshold=$(fm_context_stow_threshold "$CONFIG")
+  hysteresis=${FM_CONTEXT_STOW_HYSTERESIS:-$FM_CONTEXT_STOW_HYSTERESIS_DEFAULT}
+  case "$hysteresis" in ''|*[!0-9]*) hysteresis=$FM_CONTEXT_STOW_HYSTERESIS_DEFAULT ;; esac
+  marker="$STATE/.context-stow-nudged"
+  if [ "$tokens" -ge "$threshold" ]; then
+    # Already nudged for this crossing: stay silent until the count re-arms.
+    [ -e "$marker" ] && return 0
+    _now_stamp > "$marker"
+    reason="check: context-stow-nudge firstmate context ${tokens} tokens >= stow threshold ${threshold}: /stow now to persist knowledge before a context reset, and /compact if this session cannot auto-compact"
+    fm_wake_append check context-stow-nudge "$reason" || exit 1
+    touch "$STATE/.last-check"
+    wake "$reason"
+  fi
+  rearm=$(( threshold - hysteresis ))
+  [ "$rearm" -ge 0 ] || rearm=0
+  # Dropped back below the hysteresis band (a fresh/compacted session): re-arm so
+  # the next crossing nudges again.
+  [ "$tokens" -lt "$rearm" ] && rm -f "$marker"
+  return 0
+}
+
+# Epoch seconds, for the stow-nudge marker; matches the daemon's _now helper.
+_now_stamp() { date +%s; }
 
 # The slow-poll HOST monitor, split into a probe CYCLE and a surface DECISION so
 # the crew-liveness probe never runs on this loop. The probe (kernel-wide CPU,
@@ -1260,6 +1333,11 @@ while :; do
     # Slow-poll context monitor: wake once when a secondmate crosses the handoff
     # threshold. wake() exits the cycle when it fires (marker prevents re-fire).
     secondmate_context_sweep
+    # Slow-poll OWN-context stow nudge: wake once when firstmate's own context
+    # crosses the stow threshold in NORMAL supervision (the away-mode daemon owns
+    # it while it runs). wake() exits the cycle when it fires; the shared marker
+    # prevents re-fire. Nudge only - never runs /stow or /compact.
+    context_stow_sweep
     touch "$STATE/.last-check"
   fi
 

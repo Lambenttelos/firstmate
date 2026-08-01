@@ -280,7 +280,11 @@ AFK_DRIVER_TIMEOUT_SECS_DEFAULT=300
 # hovering at the line cannot re-nudge every tick. FM_CONTEXT_STOW_CHECK_SECS=0
 # switches the check off for a home without touching the rest of the daemon.
 CONTEXT_STOW_CHECK_SECS_DEFAULT=120
-CONTEXT_STOW_HYSTERESIS_DEFAULT=20000
+# The hysteresis band is owned by bin/fm-secondmate-context-lib.sh
+# (FM_CONTEXT_STOW_HYSTERESIS_DEFAULT), shared with the always-on watcher sweep,
+# so the daemon and the watcher cannot disagree about the re-arm point. Aliased
+# here only to keep the existing local name this file already reads.
+CONTEXT_STOW_HYSTERESIS_DEFAULT=$FM_CONTEXT_STOW_HYSTERESIS_DEFAULT
 WEDGE_ALARM_LAST_EPOCH=0
 WEDGE_ALARM_NOTIFIER_PID=
 # Paneless undelivered-alarm probe state. A probe that cannot read the outbox
