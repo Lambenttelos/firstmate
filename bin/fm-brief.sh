@@ -453,6 +453,8 @@ Before you invoke /no-mistakes, run \`$FM_ROOT/bin/fm-nm-preflight.sh\` from thi
 If it refuses, do NOT invoke /no-mistakes: append \`blocked: {the refusal it printed}\` and stop.
 It refuses when the pipeline already has a run in flight on a different branch, because a run started here would silently attach to that one and validate that branch instead of yours - never respond to or abort that run, because its findings belong to the lane that started it.
 
+ALWAYS pass \`--intent "{one-line description of what this change does}"\` when you invoke \`no-mistakes axi run\`, on EVERY run. It is required, never optional: without it the pipeline spends an extra model call deriving the intent itself, wasting tokens and latency on every run. Write the intent yourself from the Task above.
+
 You drive no-mistakes by responding to its gates, not by implementing fixes.
 Follow the guidance no-mistakes itself provides for the mechanics: it loads when you invoke /no-mistakes, and \`no-mistakes axi run --help\` plus the \`help\` lines in each \`axi\` response are authoritative and version-matched to the installed binary.
 Do not hand-edit, commit, or fix findings yourself while a run is active - the pipeline applies every fix.
@@ -538,6 +540,8 @@ A run in flight on a DIFFERENT branch is not a refusal: no-mistakes serializes p
 
 Drive YOUR run by its id. \`no-mistakes axi run\` reports the run it started; from then on read it with \`no-mistakes axi status --run <id>\` and \`no-mistakes axi logs --run <id> --step <step>\`.
 A bare \`axi status\` resolves repo-wide whenever your branch has no run of its own, so it can hand you a concurrent lane run as if it were yours.
+
+ALWAYS pass \`--intent "{one-line description of what this change does}"\` when you invoke \`no-mistakes axi run\`, on EVERY run. It is required, never optional: without it the pipeline spends an extra model call deriving the intent itself, wasting tokens and latency on every run. Write the intent yourself from the Task above.
 
 You drive no-mistakes by responding to its gates, not by implementing fixes.
 Follow the guidance no-mistakes itself provides for the mechanics: it loads when you invoke /no-mistakes, and \`no-mistakes axi run --help\` plus the \`help\` lines in each \`axi\` response are authoritative and version-matched to the installed binary.

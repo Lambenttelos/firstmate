@@ -71,6 +71,17 @@ test_ship_modes_generate_clean_briefs() {
     assert_grep "mid-task \`working:\` line (including setup complete) is nonterminal" "$brief" \
       "$id: brief missing nonterminal working:/setup-complete gate protection"
     assert_no_grep "EOF" "$brief" "$id: brief leaked a heredoc EOF marker (unterminated heredoc)"
+    # Pipeline-driving modes must force --intent on every no-mistakes run so the
+    # pipeline never spends an extra model call deriving intent. direct-PR and
+    # local-only do not drive the pipeline, so they carry no such line.
+    case $id in
+      brief-nomistakes-*|brief-directpush-*|brief-autoland-*)
+        assert_grep 'ALWAYS pass `--intent' "$brief" \
+          "$id: brief must require --intent on every no-mistakes axi run" ;;
+      *)
+        assert_no_grep 'ALWAYS pass `--intent' "$brief" \
+          "$id: non-pipeline brief should not mention --intent" ;;
+    esac
   done
   pass "fm-brief.sh: no-mistakes/direct-PR/direct-push/local-only briefs generate cleanly"
 }
