@@ -1570,6 +1570,27 @@ fm_backend_herdr_composer_state() {  # <target> -> empty|pending|unknown
           raw_match=$line
           generic_line=$row
           found=1
+        elif fm_composer_jcode_wrapped_tail "$trimmed" >/dev/null 2>&1; then
+          # jcode's WRAPPED composer tail row: the leading "NNN>"/"NNN…" prompt
+          # row has scrolled off the top because a long unsubmitted message (the
+          # away-daemon's ~13k-char single-line digest) grew the inline composer
+          # past the scan window, leaving only wrapped continuation rows visible
+          # here. Without this the row reads `unknown` and the daemon aborts its
+          # submit-confirm and re-fires the same batch forever (task
+          # fix-afk-daemon-jcode-submit-verification, verified 2026-08-01). The
+          # tmux adapter is immune (it reads the exact cursor row); herdr has no
+          # cursor primitive, so it recognizes the tail by jcode's right-aligned
+          # status indicator through the shared owner (fm_composer_jcode_wrapped_tail)
+          # rather than a herdr-local pattern. It reaches this arm only when the
+          # prompt-row arm above did NOT already claim this row, so it catches
+          # exactly the wrapped continuation tail. It always carries real text, so
+          # the content extracted from the plain row below classifies as pending -
+          # exactly the signal that tells the daemon to retry Enter until the
+          # composer clears back to the idle "NNN>" row (which reads empty).
+          shape=jcode-wrapped
+          raw_match=$line
+          generic_line=$row
+          found=1
         fi
         ;;
     esac
@@ -1632,6 +1653,19 @@ EOF
     # The native Pi identity plus the complete separator pair is the genuine
     # composer container, equivalent to a bordered box for shared content
     # classification. ANSI stripping keeps real text and drops only styling.
+    bordered=1
+  elif [ "$shape" = jcode-wrapped ]; then
+    # jcode's wrapped-composer tail row (prompt row scrolled off): the genuine
+    # composer content is whatever the shared owner extracts from the plain row
+    # in front of the right-aligned status indicator. Recompute it from the plain
+    # row so the trailing indicator glyph is dropped, and treat it as a genuine
+    # composer container (bordered=1) - it always carries real text, so the
+    # shared classifier returns pending, the correct "text still queued, retry
+    # Enter" signal.
+    stripped=$(fm_backend_herdr_strip_ansi "$raw_match")
+    stripped="${stripped#"${stripped%%[![:space:]]*}"}"
+    stripped="${stripped%"${stripped##*[![:space:]]}"}"
+    stripped=$(fm_composer_jcode_wrapped_tail "$stripped") || stripped=""
     bordered=1
   fi
   # Delegate the empty/pending/unknown decision to the shared owner. The bare

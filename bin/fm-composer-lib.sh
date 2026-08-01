@@ -212,6 +212,77 @@ fm_composer_jcode_prompt_text() {  # <trimmed-row-content> -> typed text on stdo
   printf '%s' "$rest"
 }
 
+# fm_composer_jcode_wrapped_tail: recognize the BOTTOM row of a jcode composer
+# whose typed text has grown tall enough that the leading "NNN>"/"NNN…" prompt
+# row has scrolled OFF the top of the visible pane, and print the real typed
+# text that bottom row still carries.
+#
+# WHY THIS EXISTS (task fix-afk-daemon-jcode-submit-verification, verified
+# 2026-08-01, jcode server 0.64.2): jcode renders its composer INLINE and grows
+# it downward one wrapped row at a time - it does not cap the composer height or
+# scroll only the composer. So a long single-line message (the away-mode
+# daemon's batched escalation digest is ~13k characters on one line, ~330
+# wrapped rows in jcode's ~40-column composer) pushes the "NNN>" prompt row far
+# above the visible viewport. The tmux adapter reads the exact cursor row
+# (#{cursor_y}) so it is immune, but the herdr adapter has no cursor primitive
+# and scans a bounded tail window (FM_BACKEND_HERDR_COMPOSER_LINES): when only
+# wrapped CONTINUATION rows are in that window, fm_composer_jcode_prompt_text
+# matches nothing and the composer reads `unknown`. The away daemon then aborts
+# its submit-confirm on that `unknown` (verdict=unknown, "submit unconfirmed"),
+# never clears state/.subsuper-escalations, writes .subsuper-inject-wedged, and
+# re-fires the identical batch every tick even though the captain DID receive it
+# - a large recurring token drain.
+#
+# The reliable structural anchor is jcode's right-aligned STATUS INDICATOR
+# (U+23F3 ⏳): jcode draws it at the far edge of the composer's LAST visible row
+# ONLY (idle "NNN>  ⏳", busy "NNN…  ⏳", and the wrapped tail "<text tail>  ⏳"),
+# never on a transcript or footer row (those end in "•", a rate string, "https",
+# a percent, etc.). A wrapped tail is therefore a row that (a) ends with that
+# indicator, right-aligned behind at least one padding space, (b) is NOT itself a
+# "NNN>"/"NNN…" prompt row (those are the idle/empty case, owned by
+# fm_composer_jcode_prompt_text), and (c) carries real content before the
+# padding. Such a row can only exist when unsubmitted text has wrapped, so it is
+# genuine pending input - reading it as pending (not unknown) lets the daemon's
+# submit-confirm retry its Enter until the composer clears back to the idle
+# "NNN>" row, which fm_composer_jcode_prompt_text already reads as empty. It
+# never reads as empty here (the recognizer requires content), so a wrapped
+# composer with real text can never be mistaken for a delivered/cleared submit.
+#
+# The indicator is matched by its exact bytes here (unlike
+# fm_composer_jcode_prompt_text, which drops it structurally by the padding run):
+# the byte match is what makes a wrapped continuation row distinguishable from an
+# arbitrary transcript row at all. A future indicator-glyph change degrades this
+# to the pre-fix behaviour (unknown, the safe direction: the daemon retries and
+# never falsely confirms), never to a false injection target.
+#
+# Returns 0 and prints the trimmed typed text for a jcode wrapped-composer tail
+# row; returns 1 for any other row (including a bare "NNN>"/"NNN…" prompt row and
+# an indicator-only row with no content). Bash 3.2 safe: literal byte
+# prefix/suffix substitution only, no multibyte character classes.
+fm_composer_jcode_wrapped_tail() {  # <trimmed-row-content> -> typed text on stdout
+  local s=$1 ind
+  # A bare "NNN>"/"NNN…" prompt row is the idle/empty case owned above, never a
+  # wrapped tail, so reject it here even though it also ends with the indicator.
+  fm_composer_jcode_prompt_text "$s" >/dev/null 2>&1 && return 1
+  ind=$(printf '\342\217\263')  # U+23F3 HOURGLASS WITH FLOWING SAND
+  s="${s%"${s##*[![:space:]]}"}"   # trim trailing whitespace
+  case "$s" in
+    *"$ind") ;;
+    *) return 1 ;;
+  esac
+  s=${s%"$ind"}                    # drop the trailing indicator glyph
+  # The indicator is RIGHT-ALIGNED: it must sit behind padding, not glued to the
+  # text, so a transcript row that merely happens to end in the glyph is rejected.
+  case "$s" in
+    *' ') ;;
+    *) return 1 ;;
+  esac
+  s="${s%"${s##*[![:space:]]}"}"   # trim the right-align padding
+  s="${s#"${s%%[![:space:]]*}"}"   # trim leading whitespace
+  [ -n "$s" ] || return 1
+  printf '%s' "$s"
+}
+
 # fm_composer_classify_content: the single shared composer-content verdict.
 #   <bordered> 1 when <content> came from a genuine agent-composer container (a
 #              bordered composer box, or a structurally-identified bare AGENT

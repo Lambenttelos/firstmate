@@ -1844,6 +1844,39 @@ test_composer_state_jcode_transcript_rows_are_not_a_composer() {
   pass "fm_backend_herdr_composer_state: jcode transcript and footer rows are not a composer row"
 }
 
+# jcode's WRAPPED composer: a long single-line message (the away daemon's
+# ~13k-char escalation digest) grows jcode's inline composer downward one wrapped
+# row at a time until the leading "NNN>" prompt row scrolls off the top of the
+# visible pane, leaving only wrapped continuation rows in the bounded scan window.
+# tmux reads the exact cursor row and is immune; herdr has no cursor primitive, so
+# without recognizing the wrapped tail the row read `unknown` and the away daemon
+# aborted its submit-confirm and re-fired the same batch every tick (task
+# fix-afk-daemon-jcode-submit-verification, verified 2026-08-01, jcode 0.64.2 +
+# live away daemon). The tail always carries real text, so it must read pending -
+# the "text still queued, retry Enter" signal, never a false unknown. The fixture
+# is the shape of a real wrapped composer: a prompt-less continuation tail row
+# ending in jcode's right-aligned status indicator ⏳ (U+23F3), preceded by
+# transcript rows and NO "NNN>" prompt row anywhere in the window.
+test_composer_state_jcode_wrapped_tail_is_pending() {
+  local dir log resp fb out
+  dir="$TMP_ROOT/composer-jcode-wrapped"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
+  {
+    printf ' transcript row one that scrolled up\n'
+    printf ' transcript row two that scrolled up\n'
+    # Wrapped continuation rows: real text, no "NNN>" prompt marker. Only the
+    # LAST row carries the right-aligned status indicator, exactly as jcode draws
+    # the bottom of a tall wrapped composer.
+    printf '    wrapped digest continuation row one more text\n'
+    printf '    wrapped digest continuation row two more text\n'
+    printf '\x1b[38;2;200;200;195m    final wrapped row of the digest        \x1b[0m\x1b[38;2;255;193;7m\xe2\x8f\xb3\n'
+  } > "$resp/1.out"
+  fb=$(make_herdr_fakebin "$dir")
+  out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_composer_state default:w1:p2' "$ROOT" )
+  [ "$out" = pending ] || fail "a jcode wrapped composer (prompt row scrolled off) must read pending, not '$out' (unknown is the away-daemon wedge)"
+  pass "fm_backend_herdr_composer_state: jcode's wrapped composer tail (prompt scrolled off) reads pending"
+}
+
 test_composer_state_codex_bare_prompt_glyph_is_empty() {
   local dir log resp fb out
   dir="$TMP_ROOT/composer-codex-bare"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
@@ -2891,6 +2924,7 @@ test_composer_state_jcode_numbered_prompt_is_empty
 test_composer_state_jcode_busy_prompt_is_empty
 test_composer_state_jcode_typed_text_is_pending
 test_composer_state_jcode_transcript_rows_are_not_a_composer
+test_composer_state_jcode_wrapped_tail_is_pending
 test_composer_state_codex_faint_suggestion_is_empty
 test_composer_state_codex_non_faint_same_text_is_pending
 test_wait_for_working_returns_busy_on_first_poll

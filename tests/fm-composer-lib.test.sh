@@ -139,6 +139,60 @@ test_jcode_recognizer_rejects_non_composer_rows() {
   pass "fm_composer_jcode_prompt_text: only jcode's numbered prompt row matches, and the dead-shell rule is preserved"
 }
 
+# --- jcode's WRAPPED composer tail row (prompt row scrolled off) --------------
+# Task fix-afk-daemon-jcode-submit-verification (verified 2026-08-01, jcode
+# server 0.64.2, scratch jcode + live away daemon): jcode renders its composer
+# inline and grows it downward one wrapped row at a time, so a long single-line
+# message (the away daemon's ~13k-char digest) pushes the "NNN>" prompt row far
+# above the visible pane, leaving only wrapped continuation rows - each ending in
+# jcode's right-aligned status indicator ⏳ (U+23F3). The herdr adapter has no
+# cursor primitive (tmux reads #{cursor_y} and is immune) and scans a bounded
+# window, so without recognizing the wrapped tail the row reads `unknown` and the
+# daemon aborts its submit-confirm and re-fires the same batch forever. The tail
+# always carries real text, so it must read pending.
+# INDICATOR is U+23F3 (\xe2\x8f\xb3); padding right-aligns it, as on the prompt row.
+JCODE_IND=$'\xe2\x8f\xb3'
+
+test_jcode_wrapped_tail_is_pending() {
+  local out
+  # A wrapped continuation row: real text, then right-align padding, then ⏳.
+  out=$(classify 0 "le                                        ${JCODE_IND}")
+  [ "$out" = pending ] \
+    || fail "a jcode wrapped-composer tail row (prompt scrolled off) must read pending, got '$out'"
+  out=$(classify 0 "s in the eighty column jcode composer to show structure   ${JCODE_IND}")
+  [ "$out" = pending ] || fail "a longer jcode wrapped tail must read pending, got '$out'"
+  pass "fm_composer_classify_content: a jcode wrapped-composer tail row reads pending"
+}
+
+test_jcode_wrapped_tail_recognizer_is_precise() {
+  local out
+  # It recognizes only a genuine right-aligned indicator tail with real content.
+  fm_composer_jcode_wrapped_tail "le                 ${JCODE_IND}" >/dev/null 2>&1 \
+    || fail "the recognizer must accept a wrapped tail with content + padded indicator"
+  out=$(fm_composer_jcode_wrapped_tail "le                 ${JCODE_IND}")
+  [ "$out" = le ] || fail "the recognizer must extract the tail content 'le', got '$out'"
+  # A bare "NNN>"/"NNN…" prompt row is the idle/empty case, NOT a wrapped tail.
+  if fm_composer_jcode_wrapped_tail "3>                 ${JCODE_IND}" >/dev/null 2>&1; then
+    fail "the recognizer must reject an idle 'NNN>' prompt row (that is the empty case)"
+  fi
+  if fm_composer_jcode_wrapped_tail "4…                 ${JCODE_IND}" >/dev/null 2>&1; then
+    fail "the recognizer must reject a mid-turn 'NNN…' prompt row"
+  fi
+  # An indicator with no content before it is not a wrapped tail.
+  if fm_composer_jcode_wrapped_tail "${JCODE_IND}" >/dev/null 2>&1; then
+    fail "the recognizer must reject a bare indicator with no content"
+  fi
+  # A row that merely ENDS in the glyph with no right-align padding is not a tail.
+  if fm_composer_jcode_wrapped_tail "text${JCODE_IND}" >/dev/null 2>&1; then
+    fail "the recognizer must reject a glyph glued to text (no right-align padding)"
+  fi
+  # A transcript/footer row without the indicator is never a wrapped tail.
+  if fm_composer_jcode_wrapped_tail '2.7s · 32.6 tps · ↑254 ↓4' >/dev/null 2>&1; then
+    fail "the recognizer must reject a jcode footer row (no indicator)"
+  fi
+  pass "fm_composer_jcode_wrapped_tail: only a right-aligned indicator tail with real content matches"
+}
+
 # --- Empty content and idle placeholder -------------------------------------
 
 test_empty_content_is_empty() {
@@ -226,3 +280,5 @@ test_jcode_idle_prompt_row_is_empty
 test_jcode_busy_prompt_row_is_empty
 test_jcode_typed_text_is_pending
 test_jcode_recognizer_rejects_non_composer_rows
+test_jcode_wrapped_tail_is_pending
+test_jcode_wrapped_tail_recognizer_is_precise
