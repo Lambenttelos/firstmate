@@ -208,6 +208,17 @@ fm_sm_jcode_context_tokens() {  # <home>
 # the harness dispatch it shares with the secondmate monitor.
 FM_CONTEXT_STOW_THRESHOLD_DEFAULT=200000
 
+# Hysteresis band (in tokens) below the stow threshold at which a fired nudge
+# re-arms. The single owner of this number: both the away-mode daemon check
+# (bin/fm-supervise-daemon.sh's context_stow_check) and the always-on watcher
+# sweep (bin/fm-watch.sh's context_stow_sweep) read it, so a nudge that fired
+# once re-arms only after the count drops back below (threshold - hysteresis) -
+# a fresh or compacted session - and a count hovering at the line cannot re-fire
+# every poll. 20000 is a full compaction's worth of headroom below the 200000
+# default threshold.
+# shellcheck disable=SC2034 # Read by callers (fm-watch.sh, fm-supervise-daemon.sh), not this lib.
+FM_CONTEXT_STOW_HYSTERESIS_DEFAULT=20000
+
 # fm_context_stow_threshold: the configured own-context stow threshold, or the
 # default. Reads config/context-stow-threshold (a single integer, first
 # non-empty non-comment line). Absent, non-integer, or non-positive falls back
