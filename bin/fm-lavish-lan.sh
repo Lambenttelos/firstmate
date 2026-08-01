@@ -197,11 +197,10 @@ cmd_start() {
   rm -f "$PIDFILE" 2>/dev/null || true
   mkdir -p "$STATE" 2>/dev/null || true
 
-  FM_LL_BIND="$BIND" FM_LL_PORT="$PORT" \
-    FM_LL_TARGET_HOST="127.0.0.1" FM_LL_TARGET_PORT="$TARGET" \
-    FM_LL_PIDFILE="$PIDFILE" \
-    node "$RELAY" >> "$LOG" 2>&1 &
-  local child=$!
+  local child=""
+  if ! launch_relay; then
+    die "cannot detach relay (need setsid or perl)" 1
+  fi
 
   # The relay writes the pidfile only once it is actually listening, so the
   # pidfile's appearance is the readiness signal. If the child dies first
@@ -215,7 +214,7 @@ cmd_start() {
       print_url "$(discover_lan_ip)"
       return 0
     fi
-    if ! kill -0 "$child" 2>/dev/null; then
+    if [ -n "$child" ] && ! kill -0 "$child" 2>/dev/null; then
       # Child exited before listening. Its exit code distinguishes port-in-use.
       wait "$child" 2>/dev/null
       local rc=$?
@@ -227,9 +226,44 @@ cmd_start() {
     sleep 0.1
     i=$((i + 1))
   done
-  # Timed out waiting; do not leave a rival running.
-  kill "$child" 2>/dev/null || true
+  # Timed out waiting; do not leave a rival running. The detached relay may be a
+  # grandchild whose pid we never captured, so fall back to the pidfile.
+  if [ -n "$child" ]; then
+    kill "$child" 2>/dev/null || true
+  elif [ -f "$PIDFILE" ]; then
+    local stray
+    stray=$(head -n1 "$PIDFILE" 2>/dev/null || true)
+    case "$stray" in ''|*[!0-9]*) ;; *) kill "$stray" 2>/dev/null || true ;; esac
+  fi
   die "relay did not become ready within 5s; see $LOG" 1
+}
+
+# Launch the relay detached so a closing terminal (SIGHUP) or a completed harness
+# background task cannot reap it. Prefer setsid; fall back to a perl fork+setsid
+# where setsid(1) is absent (e.g. macOS), matching bin/fm-present-daemon.sh. On the
+# setsid path $! is the relay pid (captured in child); the perl fallback exits its
+# parent immediately, so child stays empty and readiness relies on the pidfile.
+launch_relay() {
+  export FM_LL_BIND="$BIND" FM_LL_PORT="$PORT" \
+    FM_LL_TARGET_HOST="127.0.0.1" FM_LL_TARGET_PORT="$TARGET" \
+    FM_LL_PIDFILE="$PIDFILE"
+  if command -v setsid >/dev/null 2>&1; then
+    setsid node "$RELAY" >> "$LOG" 2>&1 < /dev/null &
+    child=$!
+    return 0
+  fi
+  command -v perl >/dev/null 2>&1 || return 1
+  # shellcheck disable=SC2016 # $pid/@ARGV are perl, not shell, expansions.
+  perl -e '
+    use POSIX qw(setsid);
+    my $pid = fork();
+    die "fork failed" unless defined $pid;
+    exit 0 if $pid;
+    setsid();
+    exec @ARGV or die "exec failed";
+  ' node "$RELAY" >> "$LOG" 2>&1 < /dev/null
+  child=""
+  return 0
 }
 
 print_reachability_notice() {

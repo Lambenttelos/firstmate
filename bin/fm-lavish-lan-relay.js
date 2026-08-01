@@ -81,3 +81,6 @@ function shutdown() {
 
 process.on('SIGTERM', shutdown);
 process.on('SIGINT', shutdown);
+// The manager detaches this relay so it outlives the launching terminal. Ignore
+// SIGHUP as a belt-and-suspenders so a closing SSH/VPN session cannot kill it.
+process.on('SIGHUP', () => {});
