@@ -73,6 +73,7 @@ config/cmux-socket-password  optional cmux control-socket password; LOCAL, gitig
 config/present-daemon  optional presence flag for the present-mode supervision daemon; LOCAL, gitignored; absent means the session arms the watcher itself per turn, as before. Not inherited by secondmate homes; see docs/configuration.md and bin/fm-present-daemon.sh
 config/wedge-alarm  optional away-mode wedge-alarm active-alert directives; LOCAL, gitignored; absent means auto (macOS Notification Center when available); see docs/wedge-alarm.md
 config/heavy-run-slots  how many heavy runs (suites, lint, builds) may execute at once in this home; LOCAL, gitignored; absent or malformed = 1; not inherited into secondmate homes, whose queues are their own (docs/configuration.md "Heavy-run serialization")
+config/watcher-cadence  optional supervision-watcher cadence knobs (signal_grace, poll, heartbeat) as key=value seconds; LOCAL, gitignored; present overrides, absent uses built-in defaults (signal_grace 240, poll 300, heartbeat 600), malformed value or unknown key falls back to the default and is reported loudly; read by bin/fm-watch.sh so no env prefix is needed at arm time (docs/configuration.md "Watcher cadence")
 config/x-mode.env    generated X-mode watcher cadence; LOCAL, gitignored; source before arming watcher when present
 data/                personal fleet records; LOCAL, gitignored as a whole
   backlog.md         task queue, dependencies, history

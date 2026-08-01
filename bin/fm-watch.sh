@@ -157,7 +157,73 @@ else
   stat_sig()   { stat -c '%s:%Y' "$1" 2>/dev/null; }
 fi
 
-POLL=${FM_POLL:-300}                  # seconds between cycles (captain default: 5 min).
+# Watcher cadence config file. docs/configuration.md owns the knob; this is its
+# reader. The file is optional, local, and gitignored, and follows the same
+# present/absent/malformed contract as config/heavy-run-slots: present means
+# override, absent means the built-in default below, a malformed value falls
+# back LOUDLY to the default (never silently). Format is one key=value per line,
+# with keys signal_grace, poll, heartbeat; blank lines and #-comments ignored;
+# an unknown key is itself a malformed condition reported loudly. A key present
+# in the file but with an empty value is treated as absent (falls to default).
+#
+# This reader lives in the watcher, NOT at the arm command, on purpose: the
+# arm-command seatbelt (bin/fm-arm-pretool-check.sh) refuses an env-prefixed
+# invocation like `FM_SIGNAL_GRACE=240 bin/fm-watch-arm.sh` as a compound
+# wrapper, so the env knobs were unreachable in normal operation. The watcher
+# reading a file sidesteps that: firstmate edits config/watcher-cadence and
+# arms with no env prefix, so bin/fm-watch-arm.sh stays a clean single command.
+#
+# Env var still WINS over the file (operator override and test seam), matching
+# every other knob here; the file only supplies a value when the env var is
+# unset. Warnings are collected here and emitted in the runtime section (near
+# the host-resource fallback log), because the log helper is defined later.
+CADENCE_FILE="$CONFIG/watcher-cadence"
+CADENCE_WARNINGS=""
+CADENCE_RESULT=""
+# Resolve one cadence key into the global CADENCE_RESULT: env override wins, then
+# the file's key=value, then the default. A malformed value records a warning and
+# yields the default. The result is a GLOBAL rather than stdout on purpose: a
+# command substitution ($(...)) runs in a subshell, so warnings appended to
+# CADENCE_WARNINGS there would be lost. The caller reads CADENCE_RESULT right after.
+# Usage: cadence_knob <env-var-name> <file-key> <default>
+cadence_knob() {  # <env-var-name> <file-key> <default>
+  local env_name=$1 key=$2 default=$3 env_val file_val
+  eval "env_val=\${$env_name:-}"
+  if [ -n "$env_val" ]; then
+    case "$env_val" in
+      ''|*[!0-9]*)
+        CADENCE_WARNINGS="$CADENCE_WARNINGS${CADENCE_WARNINGS:+; }malformed \$$env_name '$env_val', using default ${default}s"
+        CADENCE_RESULT=$default; return 0 ;;
+    esac
+    CADENCE_RESULT=$env_val; return 0
+  fi
+  if [ ! -f "$CADENCE_FILE" ]; then CADENCE_RESULT=$default; return 0; fi
+  file_val=$(sed -n "s/^[[:space:]]*${key}[[:space:]]*=[[:space:]]*//p" "$CADENCE_FILE" 2>/dev/null \
+    | grep -v '^[[:space:]]*#' | tail -n 1 | tr -d '[:space:]')
+  if [ -z "$file_val" ]; then CADENCE_RESULT=$default; return 0; fi
+  case "$file_val" in
+    ''|*[!0-9]*)
+      CADENCE_WARNINGS="$CADENCE_WARNINGS${CADENCE_WARNINGS:+; }malformed $key '$file_val' in $CADENCE_FILE, using default ${default}s"
+      CADENCE_RESULT=$default; return 0 ;;
+  esac
+  CADENCE_RESULT=$file_val
+}
+# Detect keys in the file the reader does not recognize, so a typo'd knob is
+# surfaced loudly instead of silently ignored (the file said something, and the
+# watcher must not pretend it was heard).
+if [ -f "$CADENCE_FILE" ]; then
+  while IFS= read -r _line || [ -n "$_line" ]; do
+    _stripped=$(printf '%s' "$_line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    case "$_stripped" in ''|'#'*) continue ;; esac
+    _k=${_stripped%%=*}; _k=$(printf '%s' "$_k" | tr -d '[:space:]')
+    case "$_k" in
+      signal_grace|poll|heartbeat) ;;
+      *) CADENCE_WARNINGS="$CADENCE_WARNINGS${CADENCE_WARNINGS:+; }unknown cadence key '$_k' in $CADENCE_FILE, ignored" ;;
+    esac
+  done < "$CADENCE_FILE"
+  unset _line _stripped _k
+fi
+cadence_knob FM_POLL poll 300; POLL=$CADENCE_RESULT  # seconds between cycles (captain default: 5 min).
                                       # INVARIANT: POLL < grace (WATCHER_STALE_GRACE,
                                       # set above from FM_WATCHER_STALE_GRACE, then
                                       # FM_GUARD_GRACE) so a full cycle's wait never
@@ -168,7 +234,7 @@ POLL=${FM_POLL:-300}                  # seconds between cycles (captain default:
                                       # grace default of 900, which is the captain's
                                       # operating pair. If either value is changed,
                                       # keep POLL below the grace.
-HEARTBEAT=${FM_HEARTBEAT:-600}        # base seconds between heartbeat scans
+cadence_knob FM_HEARTBEAT heartbeat 600; HEARTBEAT=$CADENCE_RESULT  # base seconds between heartbeat scans
 HEARTBEAT_MAX=${FM_HEARTBEAT_MAX:-7200}  # heartbeat backoff cap
 CHECK_INTERVAL=${FM_CHECK_INTERVAL:-600}  # seconds between *.check.sh sweeps (captain default: 10 min)
 CHECK_TIMEOUT=${FM_CHECK_TIMEOUT:-30}     # seconds allowed per *.check.sh
@@ -196,9 +262,23 @@ case "$RESOURCE_INTERVAL" in
     RESOURCE_INTERVAL=$RESOURCE_INTERVAL_DEFAULT
     ;;
 esac
-SIGNAL_GRACE=${FM_SIGNAL_GRACE:-30}   # seconds to linger after a signal so trailing
-                                      # signals (a status write, then the same turn's
-                                      # turn-end hook) coalesce into one wake
+cadence_knob FM_SIGNAL_GRACE signal_grace 240; SIGNAL_GRACE=$CADENCE_RESULT  # seconds to linger after a
+                                      # signal so trailing signals coalesce into one wake.
+                                      # Raised from 30 to 240 on 2026-07-24 evidence: one lane
+                                      # produced four wakes in minutes (status append, turn-end,
+                                      # another status append, then a stale reading while its
+                                      # suite ran), and each wake forces firstmate through a
+                                      # drain + re-arm before any other fleet command, costing
+                                      # the captain a full round trip per wake for no decision.
+                                      # 240s spans that burst so ordinary worker chatter batches
+                                      # into ONE wake, honoring the standing priority that
+                                      # firstmate's responsiveness to the captain outranks
+                                      # instant reaction to worker notifications. This does NOT
+                                      # delay a real terminal event: the linger below is skipped
+                                      # when the first scan already carries a captain-relevant
+                                      # verb (done:/failed:/needs-decision:/blocked:), so a
+                                      # genuine terminal wake still surfaces promptly - only
+                                      # no-verb chatter pays the coalescing wait.
 # Longest blind-sleep slice. A single `sleep POLL` refreshes the beacon only at
 # the loop top, so once POLL approaches the grace a healthy sleeping watcher
 # reads as dead for the back of every cycle (the wedge). beacon_sleep splits the
@@ -1091,6 +1171,15 @@ fm_pid_identity "$WATCHER_PID" > "$WATCH_LOCK/pid-identity" 2>/dev/null || true
 [ "$RESOURCE_INTERVAL_FELL_BACK" = 0 ] || triage_log \
   "host-resource cadence unresolved ('$RESOURCE_INTERVAL_RAW'), using default ${RESOURCE_INTERVAL}s"
 
+# Cadence-config problems are reported LOUDLY, never silently: a malformed value
+# or an unknown key already fell back to its safe default above, but the operator
+# who wrote the file must see why it was not honored. Both to stderr (visible when
+# the watcher is armed in the foreground) and the triage log (durable).
+if [ -n "$CADENCE_WARNINGS" ]; then
+  echo "watcher: cadence config: $CADENCE_WARNINGS" >&2
+  triage_log "cadence config: $CADENCE_WARNINGS"
+fi
+
 while :; do
   POLL_CYCLE=$(( POLL_CYCLE + 1 ))
   # Self-eviction: if the singleton lock no longer names this process, a second
@@ -1196,8 +1285,27 @@ while :; do
   # signature for an already-pending file (last write wins below).
   pending=$(scan_signals)
   if [ -n "$pending" ]; then
-    beacon_sleep "$SIGNAL_GRACE"
-    pending=$(printf '%s\n%s' "$pending" "$(scan_signals)")
+    # Terminal-latency guard: the coalescing linger exists only to batch benign
+    # chatter (a status write plus its turn-end hook, a working: note). A signal
+    # whose FIRST scan already carries a captain-relevant verb
+    # (done:/failed:/needs-decision:/blocked:) is a real terminal event, so it
+    # must NOT pay the linger - raising SIGNAL_GRACE to batch chatter would
+    # otherwise delay it by the whole grace. Compute the first-scan file list and
+    # skip the linger when it is actionable by verb; a no-verb burst still lingers.
+    first_files=""
+    while IFS=$(printf '\t') read -r sf sig f; do
+      [ -n "$sf" ] || continue
+      case " $first_files " in *" $f "*) ;; *) first_files="$first_files $f" ;; esac
+    done <<EOF
+$pending
+EOF
+    # shellcheck disable=SC2086  # $first_files is a space-separated status-path list (ids carry no spaces)
+    if signal_reason_is_actionable $first_files; then
+      : # terminal verb present: surface now, no coalescing delay
+    else
+      beacon_sleep "$SIGNAL_GRACE"
+      pending=$(printf '%s\n%s' "$pending" "$(scan_signals)")
+    fi
     files=""
     while IFS=$(printf '\t') read -r sf sig f; do
       [ -n "$sf" ] || continue

@@ -465,6 +465,35 @@ The queue is per operational home, because it lives under that home's `state/`.
 A fleet whose secondmate homes share one physical host therefore gets one queue per home, not one for the machine.
 Set the same ceiling in each home, or point every home at one queue by exporting `FM_HEAVY_RUN_DIR` to a shared directory, when the machine rather than the home is the thing being protected.
 
+## Watcher cadence (config/watcher-cadence)
+
+`config/watcher-cadence` is an optional local, gitignored file that tunes the supervision watcher's cadence knobs, read by [`bin/fm-watch.sh`](../bin/fm-watch.sh).
+This section is the single owner of the knob; the script's header owns the resolver and the runtime loop it feeds.
+The file follows the same present/absent/malformed contract as `config/heavy-run-slots`: present means override, absent means the built-in default, and a malformed value falls back to the default loudly, never silently.
+
+The format is one `key = value` line per knob, where the value is a non-negative integer number of seconds.
+Blank lines and `#` comment lines are ignored, whitespace around the key and value is tolerated, and the last occurrence of a key wins.
+Three keys are recognized:
+
+- `signal_grace` - seconds the watcher lingers after the first changed signal before it classifies, so trailing signals from one worker (a status write, then the same turn's turn-end hook, then another status note) coalesce into a single wake. Default `240`.
+- `poll` - seconds between watcher cycles. Default `300`. It must stay below the beacon grace (`900` by default), or a cycle's blind wait could outlive the liveness beacon; the watcher warns at startup when this invariant is violated.
+- `heartbeat` - base seconds between heartbeat scans. Default `600`.
+
+An unknown key is itself a loud condition: the file said something the reader could not honor, so it is reported and ignored rather than silently dropped.
+A malformed value for a recognized key falls back to that key's default and is reported, so the operator sees why the value they wrote was not applied.
+Both classes of warning go to the watcher's stderr and its durable triage log at startup.
+
+The equivalent environment variables (`FM_SIGNAL_GRACE`, `FM_POLL`, `FM_HEARTBEAT`) still win over the file, as the operator override and test seam.
+The file exists because those env variables are unreachable in normal operation: the arm-command seatbelt ([`bin/fm-arm-pretool-check.sh`](../bin/fm-arm-pretool-check.sh)) refuses an env-prefixed invocation such as `FM_SIGNAL_GRACE=240 bin/fm-watch-arm.sh` as a compound wrapper, so firstmate cannot set them at arm time.
+The watcher reading a file sidesteps that entirely: firstmate edits `config/watcher-cadence` and arms with a clean, unprefixed `bin/fm-watch-arm.sh`.
+
+The raised `signal_grace` default of `240` is deliberate and evidence-based.
+Before it, a single worker lane produced four separate wakes in minutes (a status append, a turn-end, another status append, then a stale reading while its suite ran), and each wake forces firstmate through a drain and re-arm before any other fleet command, costing the captain a full round trip per wake for no decision.
+A 240s window spans that burst so ordinary worker chatter batches into one wake, honoring the standing priority that firstmate's responsiveness to the captain outranks instant reaction to worker notifications.
+
+This does not delay a genuine terminal event.
+The coalescing linger is skipped when the first scan already carries a captain-relevant verb (`done:`, `failed:`, `needs-decision:`, `blocked:`), so a real terminal wake still surfaces promptly and only no-verb chatter pays the wait.
+
 ## Toolchain
 
 On session start the first mate detects what its required toolchain is missing or too old and lists each problem with either an exact install command or manual instructions.
