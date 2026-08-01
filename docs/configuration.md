@@ -292,6 +292,17 @@ This is the primary's monitoring knob and is not inherited into secondmate homes
 The primary's watcher reads each live secondmate's usage on its slow-poll cadence (claude only; every other harness reads unknown and is skipped) and wakes firstmate once when the count first crosses the threshold.
 The read mechanism and the evidence behind the claude-only support live in [`docs/secondmate-context-handoff.md`](secondmate-context-handoff.md); the handoff procedure lives in the `secondmate-provisioning` skill; exact flags and paths live in the headers and `--help` of [`bin/fm-secondmate-context.sh`](../bin/fm-secondmate-context.sh) and [`bin/fm-secondmate-handoff.sh`](../bin/fm-secondmate-handoff.sh).
 
+## Firstmate own-context stow threshold (config/context-stow-threshold)
+
+`config/context-stow-threshold` is an optional local, gitignored file holding a single positive integer: the context-window token count at which the supervision daemon nudges firstmate to `/stow` now, and to `/compact` when the session cannot auto-compact, so knowledge is persisted before a context reset can lose it.
+The first non-empty, non-comment line is parsed; an absent file, a non-integer, or a non-positive value falls back to the default `200000`, exactly like the secondmate threshold above, so a typo never silently disables the nudge.
+This is a distinct knob from `config/secondmate-context-threshold`: that one decides when to hand a secondmate off to a fresh agent, this one decides when to tell firstmate to save its own knowledge.
+The daemon reads firstmate's own live context on the `FM_CONTEXT_STOW_CHECK_SECS` cadence (default `120`; `0` disables the check) and, when the count first crosses the threshold, injects one operational nudge through the same away-supervisor path as every other daemon escalation, so firstmate recognizes it as an operational nudge rather than captain input.
+The nudge fires once per crossing and re-arms only after the count drops back below `threshold - FM_CONTEXT_STOW_HYSTERESIS` (default hysteresis `20000`), which a fresh or compacted session does, so a count hovering at the line cannot re-nudge every tick.
+The read is claude/jcode-capable and shares the exact reader the secondmate monitor uses; it fails closed, so on any other harness or any unreadable count the check simply never nudges.
+The check is gated on the daemon running, not on away mode, because context fills in normal mode too; delivery of the buffered nudge still follows the daemon's normal away-gated injection path.
+The read mechanism and the jcode evidence live in [`docs/secondmate-context-handoff.md`](secondmate-context-handoff.md); the crossing logic, the cadence, and the `FM_CONTEXT_STOW_*` knobs live in the header of [`bin/fm-supervise-daemon.sh`](../bin/fm-supervise-daemon.sh); the `/afk` skill's "Classification policy" points here for the contract.
+
 ## Host resource monitoring (FM_RESOURCE_INTERVAL)
 
 `FM_RESOURCE_INTERVAL` is the number of seconds between host CPU, memory, and swap sweeps, defaulting to `900`.

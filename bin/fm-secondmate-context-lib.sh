@@ -88,15 +88,58 @@ fm_sm_claude_context_tokens() {  # <cwd>
   printf '%s' "$tokens"
 }
 
-# fm_sm_context_tokens: dispatch the context read by harness. Only claude has a
-# verified read (docs/secondmate-context-handoff.md); every other harness yields
-# empty so the monitor fails closed. <cwd> is the agent's launch directory,
-# which for a secondmate is its home= (state/<id>.meta).
+# fm_sm_context_tokens: dispatch the context read by harness. claude and jcode
+# have a verified read (docs/secondmate-context-handoff.md); every other harness
+# yields empty so the monitor fails closed. <cwd> is the agent's launch
+# directory, which for a secondmate is its home= (state/<id>.meta) and for
+# firstmate's own read is its operational home (FM_HOME).
+#
+# jcode (github.com/1jehuang/jcode) is a Claude-Agent-SDK runtime that persists
+# the SAME per-session JSONL transcript claude does, under
+# <config-dir>/projects/<munged-cwd>/<session-id>.jsonl with a message.usage
+# object per assistant turn (verified 2026-08-01; see
+# docs/secondmate-context-handoff.md). Its read is therefore byte-identical to
+# claude's, so it dispatches to the same reader rather than a duplicate one.
 fm_sm_context_tokens() {  # <cwd> <harness>
   local cwd=$1 harness=$2
   [ -n "$cwd" ] || return 0
   case "$harness" in
-    claude) fm_sm_claude_context_tokens "$cwd" ;;
+    claude|jcode) fm_sm_claude_context_tokens "$cwd" ;;
     *) return 0 ;;
   esac
+}
+
+# --- firstmate's OWN context stow-nudge threshold ---------------------------
+# The point firstmate's OWN context is considered full enough that the away-mode
+# daemon should nudge it to /stow (and /compact when the session cannot
+# auto-compact). This is a SEPARATE knob from the secondmate handoff threshold
+# above: that one decides when to hand a secondmate off to a fresh agent, this
+# one decides when to tell firstmate to persist its own knowledge before a
+# context reset can lose it. The daemon owns the crossing logic and the nudge
+# (bin/fm-supervise-daemon.sh); this library owns only the threshold read and
+# the harness dispatch it shares with the secondmate monitor.
+FM_CONTEXT_STOW_THRESHOLD_DEFAULT=200000
+
+# fm_context_stow_threshold: the configured own-context stow threshold, or the
+# default. Reads config/context-stow-threshold (a single integer, first
+# non-empty non-comment line). Absent, non-integer, or non-positive falls back
+# to the default rather than failing, so a typo never disables the nudge
+# silently - identical robustness to fm_sm_context_threshold above.
+fm_context_stow_threshold() {  # <config-dir>
+  local config=$1 file line
+  file="$config/context-stow-threshold"
+  [ -f "$file" ] || { printf '%s' "$FM_CONTEXT_STOW_THRESHOLD_DEFAULT"; return 0; }
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    [ -n "$line" ] || continue
+    case "$line" in '#'*) continue ;; esac
+    if [[ "$line" =~ ^[1-9][0-9]*$ ]]; then
+      printf '%s' "$line"
+    else
+      printf '%s' "$FM_CONTEXT_STOW_THRESHOLD_DEFAULT"
+    fi
+    return 0
+  done < "$file"
+  printf '%s' "$FM_CONTEXT_STOW_THRESHOLD_DEFAULT"
 }

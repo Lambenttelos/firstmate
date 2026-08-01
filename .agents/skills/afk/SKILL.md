@@ -316,6 +316,16 @@ operational prefix, carrying pre-read status summaries and a recommended action.
 The single-line format makes the submission unambiguous across harnesses, and
 the operational prefix lets firstmate distinguish it from a real captain message.
 
+The daemon's housekeeping also runs a firstmate own-context stow nudge: on the
+`FM_CONTEXT_STOW_CHECK_SECS` cadence it reads firstmate's OWN live context and, on
+the first crossing of the stow threshold, buffers one operational nudge to `/stow`
+now (and `/compact` when the session cannot auto-compact) so knowledge is saved
+before a context reset can lose it. It is gated on the daemon running, not on away
+mode, because context fills in normal mode too, and it fails closed on any
+unreadable or unsupported-harness count. `docs/configuration.md`'s
+"Firstmate own-context stow threshold" section owns that contract in full,
+including `config/context-stow-threshold` and the `FM_CONTEXT_STOW_*` knobs.
+
 ## Injection hardening
 
 - **Single-line digest** - embedded newlines are collapsed to a literal

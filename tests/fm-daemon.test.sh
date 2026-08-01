@@ -2562,6 +2562,120 @@ test_pane_delivery_never_writes_the_inbox() {
   pass "an identified supervisor pane still delivers by typing and writes nothing to the inbox"
 }
 
+# --- firstmate own-context stow nudge (context_stow_check) -------------------
+# Build a fake claude/jcode transcript under <config>/projects/<munged-home> so
+# firstmate_own_context_tokens reads a controllable count for FM_CONTEXT_STOW_CWD.
+_write_own_transcript() {  # <config> <home> <input> <cc> <cr>
+  local config=$1 home=$2 input=$3 cc=$4 cr=$5 dir
+  dir="$config/projects/$(printf '%s' "$home" | tr '/.' '--')"
+  mkdir -p "$dir"
+  printf '{"type":"assistant","message":{"role":"assistant","usage":{"input_tokens":%s,"cache_creation_input_tokens":%s,"cache_read_input_tokens":%s}}}\n' \
+    "$input" "$cc" "$cr" > "$dir/session.jsonl"
+}
+
+test_context_stow_nudges_once_per_crossing_and_rearms() {
+  local dir state config home
+  dir=$(make_supercase context-stow-once)
+  state="$dir/state"
+  config="$dir/config"; mkdir -p "$config"
+  home="$dir/fmhome"
+  # Over the default 200000 threshold.
+  _write_own_transcript "$config" "$home" 10 20 250000
+
+  CLAUDE_CONFIG_DIR="$config" FM_HOME="$dir" FM_CONFIG_OVERRIDE="$config" \
+    FM_SUPERVISOR_HARNESS=claude FM_CONTEXT_STOW_CWD="$home" \
+    context_stow_check "$state"
+  [ -e "$state/.context-stow-nudged" ] || fail "crossing the threshold should record the nudge marker"
+  grep -F '/stow now' "$state/.subsuper-escalations" >/dev/null \
+    || fail "crossing the threshold should buffer a /stow nudge"
+  [ "$(grep -c '/stow now' "$state/.subsuper-escalations")" -eq 1 ] \
+    || fail "the first crossing should buffer exactly one nudge"
+
+  # Second tick still over threshold: must NOT buffer a second nudge.
+  CLAUDE_CONFIG_DIR="$config" FM_HOME="$dir" FM_CONFIG_OVERRIDE="$config" \
+    FM_SUPERVISOR_HARNESS=claude FM_CONTEXT_STOW_CWD="$home" \
+    context_stow_check "$state"
+  [ "$(grep -c '/stow now' "$state/.subsuper-escalations")" -eq 1 ] \
+    || fail "a still-over-threshold tick must not re-nudge (once per crossing)"
+
+  # Drop below (threshold - hysteresis) = 180000: the marker must re-arm.
+  _write_own_transcript "$config" "$home" 10 20 100000
+  CLAUDE_CONFIG_DIR="$config" FM_HOME="$dir" FM_CONFIG_OVERRIDE="$config" \
+    FM_SUPERVISOR_HARNESS=claude FM_CONTEXT_STOW_CWD="$home" \
+    context_stow_check "$state"
+  [ -e "$state/.context-stow-nudged" ] && fail "dropping below the hysteresis band should clear the marker"
+
+  # Re-cross: a second nudge is buffered.
+  _write_own_transcript "$config" "$home" 10 20 250000
+  CLAUDE_CONFIG_DIR="$config" FM_HOME="$dir" FM_CONFIG_OVERRIDE="$config" \
+    FM_SUPERVISOR_HARNESS=claude FM_CONTEXT_STOW_CWD="$home" \
+    context_stow_check "$state"
+  [ "$(grep -c '/stow now' "$state/.subsuper-escalations")" -eq 2 ] \
+    || fail "re-crossing after re-arm should buffer a second nudge"
+  pass "context stow nudge fires once per crossing and re-arms after dropping below the hysteresis band"
+}
+
+test_context_stow_stays_armed_within_hysteresis_band() {
+  local dir state config home
+  dir=$(make_supercase context-stow-hysteresis)
+  state="$dir/state"
+  config="$dir/config"; mkdir -p "$config"
+  home="$dir/fmhome"
+  _write_own_transcript "$config" "$home" 10 20 250000
+  CLAUDE_CONFIG_DIR="$config" FM_HOME="$dir" FM_CONFIG_OVERRIDE="$config" \
+    FM_SUPERVISOR_HARNESS=claude FM_CONTEXT_STOW_CWD="$home" context_stow_check "$state"
+  [ -e "$state/.context-stow-nudged" ] || fail "should nudge on first crossing"
+  # Drop below threshold (200000) but still ABOVE (threshold - hysteresis)=180000.
+  _write_own_transcript "$config" "$home" 10 20 190000
+  CLAUDE_CONFIG_DIR="$config" FM_HOME="$dir" FM_CONFIG_OVERRIDE="$config" \
+    FM_SUPERVISOR_HARNESS=claude FM_CONTEXT_STOW_CWD="$home" context_stow_check "$state"
+  [ -e "$state/.context-stow-nudged" ] \
+    || fail "a count still inside the hysteresis band must NOT re-arm the marker"
+  pass "the nudge stays armed while the count only dips into the hysteresis band"
+}
+
+test_context_stow_fails_closed_on_unreadable_count() {
+  local dir state config home
+  dir=$(make_supercase context-stow-failclosed)
+  state="$dir/state"
+  config="$dir/config"; mkdir -p "$config"
+  home="$dir/fmhome"
+  # No transcript at all -> empty read.
+  CLAUDE_CONFIG_DIR="$config" FM_HOME="$dir" FM_CONFIG_OVERRIDE="$config" \
+    FM_SUPERVISOR_HARNESS=claude FM_CONTEXT_STOW_CWD="$home" context_stow_check "$state"
+  [ -e "$state/.context-stow-nudged" ] && fail "an unreadable count must never record a nudge marker"
+  [ -e "$state/.subsuper-escalations" ] && fail "an unreadable count must buffer no nudge (fail closed)"
+
+  # An unsupported harness reads unknown even with a transcript present.
+  _write_own_transcript "$config" "$home" 10 20 250000
+  CLAUDE_CONFIG_DIR="$config" FM_HOME="$dir" FM_CONFIG_OVERRIDE="$config" \
+    FM_SUPERVISOR_HARNESS=codex FM_CONTEXT_STOW_CWD="$home" context_stow_check "$state"
+  [ -e "$state/.context-stow-nudged" ] && fail "an unsupported harness must never nudge"
+  [ -e "$state/.subsuper-escalations" ] && fail "an unsupported harness must buffer nothing (fail closed)"
+
+  # A missing harness (unknown) also fails closed.
+  CLAUDE_CONFIG_DIR="$config" FM_HOME="$dir" FM_CONFIG_OVERRIDE="$config" \
+    FM_SUPERVISOR_HARNESS='' FM_CONTEXT_STOW_CWD="$home" context_stow_check "$state"
+  [ -e "$state/.context-stow-nudged" ] && fail "an empty harness must never nudge"
+  pass "an unreadable, unsupported, or unknown-harness context count produces no nudge"
+}
+
+test_context_stow_honors_configured_threshold() {
+  local dir state config home
+  dir=$(make_supercase context-stow-configthreshold)
+  state="$dir/state"
+  config="$dir/config"; mkdir -p "$config"
+  home="$dir/fmhome"
+  printf '90000\n' > "$config/context-stow-threshold"
+  # 100000 is under the default 200000 but over the configured 90000.
+  _write_own_transcript "$config" "$home" 0 0 100000
+  CLAUDE_CONFIG_DIR="$config" FM_HOME="$dir" FM_CONFIG_OVERRIDE="$config" \
+    FM_SUPERVISOR_HARNESS=jcode FM_CONTEXT_STOW_CWD="$home" context_stow_check "$state"
+  grep -F 'stow threshold 90000' "$state/.subsuper-escalations" >/dev/null \
+    || fail "the configured 90000 threshold should drive the nudge (and jcode should read)"
+  pass "context stow nudge honors config/context-stow-threshold and reads a jcode transcript"
+}
+
 test_afk_start_refuses_when_flag_cannot_be_written
 test_afk_start_ignores_stale_pidfile_without_lock
 test_afk_start_reports_unclearable_artifacts_and_still_starts
@@ -2684,3 +2798,7 @@ test_paneless_marker_reports_records_picked_up_while_it_was_written
 test_paneless_pick_up_leaves_an_existing_marker_alone
 test_paneless_delivery_stays_presence_gated
 test_pane_delivery_never_writes_the_inbox
+test_context_stow_nudges_once_per_crossing_and_rearms
+test_context_stow_stays_armed_within_hysteresis_band
+test_context_stow_fails_closed_on_unreadable_count
+test_context_stow_honors_configured_threshold
