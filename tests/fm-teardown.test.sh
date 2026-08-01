@@ -57,6 +57,10 @@
 #   (hh) local default of a STANDALONE clone contains HEAD        -> REFUSE (ref dies with it)
 #   (ii) contained in the default branch but dirty                -> REFUSE (dirty wins)
 #   (jj) detached HEAD absent from every default branch           -> REFUSE (safety)
+#   (kk) HEAD pushed to origin under a DIFFERENT branch name        -> ALLOW  (any origin ref)
+#   (ll) direct-push + HEAD on origin under a different branch name -> ALLOW  (any origin ref)
+#   (mm) HEAD reachable from origin's default branch via any ref    -> ALLOW  (any origin ref)
+#   (nn) recorded branch absent + no origin ref contains HEAD       -> REFUSE (safety)
 #
 # Also covers backlog teardown-lock-race: a git index.lock left in the worktree by a
 # killed crew process (bin/fm-teardown.sh's teardown_treehouse_return).
@@ -526,6 +530,24 @@ push_branch_then_forget_local_ref() {
   git -C "$case_dir/wt" push -q origin fm/task-x1
   # refs/remotes are shared across worktrees via the common dir; delete once.
   git -C "$case_dir/project" update-ref -d refs/remotes/origin/fm/task-x1 2>/dev/null || true
+}
+
+# Push the worktree's HEAD to origin under a DIFFERENT branch name than the recorded
+# fm/task-x1, leaving the recorded branch absent from origin. This reproduces a lane
+# whose exact work is durable on origin under an alternate ref (a rebase that renamed
+# and pushed the branch). The local remote-tracking refs are pruned so the release
+# proof must come from a fresh fetch, not a stale local ref. Args: case_dir alt_branch
+push_head_to_alternate_origin_branch() {
+  local case_dir=$1 alt=$2
+  git -C "$case_dir/wt" push -q origin "HEAD:refs/heads/$alt"
+  # Drop the local remote-tracking refs so only a fresh fetch can prove durability.
+  # The for-each-ref prefix is refs/remotes/origin with NO trailing /*: a /* glob
+  # matches only one path component and would leave a slashed ref like
+  # refs/remotes/origin/fm/task-x1-renamed behind.
+  git -C "$case_dir/project" for-each-ref --format='%(refname)' refs/remotes/origin \
+    | while IFS= read -r ref; do
+        git -C "$case_dir/project" update-ref -d "$ref" 2>/dev/null || true
+      done
 }
 
 test_local_only_fork_remote_allows() {
@@ -1419,11 +1441,18 @@ add_git_ls_remote_failure() {
   cat > "$case_dir/fakebin/git" <<'SH'
 #!/usr/bin/env bash
 real=${REAL_GIT_FOR_TEST:?}
+# Simulate an unreachable origin: every network op against it fails. A real
+# offline/unreachable origin breaks fetch as well as ls-remote, so failing only
+# ls-remote would let the fresh-fetch durability check (head_on_any_origin_ref /
+# branch_fully_pushed_to_origin) still prove the work is on origin and release it.
+# The point of this case is that origin CANNOT be queried, so both must fail.
 for arg in "$@"; do
-  if [ "$arg" = ls-remote ]; then
-    echo "fatal: simulated origin failure" >&2
-    exit 128
-  fi
+  case "$arg" in
+    ls-remote|fetch)
+      echo "fatal: simulated origin failure" >&2
+      exit 128
+      ;;
+  esac
 done
 exec "$real" "$@"
 SH
@@ -1841,6 +1870,100 @@ test_pushed_but_origin_unreachable_refuses() {
   pass "pushed branch with an unreachable origin is refused (no release on unverifiable claim)"
 }
 
+# (kk) no-mistakes + HEAD pushed to origin under a DIFFERENT branch name than the
+#      recorded fm/task-x1 (rebase renamed and pushed the branch) -> ALLOW. The exact
+#      work is durable on origin under an alternate ref, so the local copy is
+#      disposable even though the recorded branch name is absent from origin.
+test_head_on_alternate_origin_branch_allows() {
+  local case_dir rc
+  case_dir=$(make_case alt-origin-branch)
+  write_meta "$case_dir" no-mistakes ship
+  wt_commit_file "$case_dir" feature.txt hello "work landed under a renamed branch"
+  push_head_to_alternate_origin_branch "$case_dir" fm/task-x1-renamed
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 0 "$rc" "alt-origin-branch: teardown should release work pushed to origin under a different branch name"
+  ! grep -q REFUSED "$case_dir/stderr" \
+    || fail "alt-origin-branch: teardown printed a REFUSED line for work durable on origin"
+  pass "worktree whose head is on origin under an alternate branch name is torn down"
+}
+
+# (ll) direct-push + HEAD pushed to origin under a DIFFERENT branch name than the
+#      recorded one -> ALLOW. The any-origin-ref proof satisfies the direct-push
+#      positive-proof requirement, so the branch-name probe is correctly skipped.
+test_direct_push_head_on_alternate_origin_branch_allows() {
+  local case_dir rc
+  case_dir=$(make_case dp-alt-origin-branch)
+  write_meta "$case_dir" direct-push ship
+  wt_commit_file "$case_dir" feature.txt hello "validated work landed under a renamed branch"
+  push_head_to_alternate_origin_branch "$case_dir" fm/task-x1-renamed
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 0 "$rc" "dp-alt-origin-branch: teardown should release direct-push work pushed to origin under a different branch name"
+  ! grep -q REFUSED "$case_dir/stderr" \
+    || fail "dp-alt-origin-branch: teardown printed a REFUSED line for work durable on origin"
+  pass "direct-push worktree whose head is on origin under an alternate branch name is torn down"
+}
+
+# (mm) HEAD reachable from origin's DEFAULT branch under no branch name (merged/rebased
+#      in on origin) -> ALLOW. head_on_any_origin_ref sees the origin default ref.
+test_head_on_origin_default_via_any_ref_allows() {
+  local case_dir rc
+  case_dir=$(make_case any-ref-origin-default)
+  write_meta "$case_dir" no-mistakes ship
+  detach_worktree_at_origin_default "$case_dir" feature.txt hello
+  # Drop the local remote-tracking refs so only a fresh fetch can prove durability.
+  git -C "$case_dir/project" for-each-ref --format='%(refname)' refs/remotes/origin \
+    | while IFS= read -r ref; do
+        git -C "$case_dir/project" update-ref -d "$ref" 2>/dev/null || true
+      done
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 0 "$rc" "any-ref-origin-default: teardown should release a head already on origin's default branch"
+  ! grep -q REFUSED "$case_dir/stderr" \
+    || fail "any-ref-origin-default: teardown printed a REFUSED line for merged-in work"
+  pass "worktree whose head is reachable from origin's default branch is torn down"
+}
+
+# (nn) the alternate-branch broadening must NOT release genuinely unpushed work: the
+#      recorded branch is absent from origin AND no other origin ref contains HEAD.
+test_alternate_branch_broadening_still_refuses_unpushed() {
+  local case_dir rc
+  case_dir=$(make_case alt-branch-still-unpushed)
+  write_meta "$case_dir" no-mistakes ship
+  wt_commit_file "$case_dir" feature.txt hello "genuinely unpushed work"
+  # An unrelated branch exists on origin but does NOT contain HEAD.
+  git -C "$case_dir/wt" push -q origin "HEAD~0:refs/heads/unrelated" 2>/dev/null || true
+  git -C "$case_dir/project" for-each-ref --format='%(refname)' refs/remotes/origin \
+    | while IFS= read -r ref; do
+        git -C "$case_dir/project" update-ref -d "$ref" 2>/dev/null || true
+      done
+  # Now advance HEAD past what any origin ref holds so nothing on origin contains it.
+  wt_commit_file "$case_dir" feature.txt more "further unpushed work never on origin"
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 1 "$rc" "alt-branch-still-unpushed: teardown should refuse work no origin ref contains"
+  grep -q REFUSED "$case_dir/stderr" \
+    || fail "alt-branch-still-unpushed: no REFUSED line in stderr"
+  pass "alternate-branch broadening still refuses work absent from every origin ref (safety preserved)"
+}
+
 test_local_only_fork_remote_allows
 test_pushed_unmerged_releases_and_records_merge_queue
 test_forced_pushed_unmerged_still_records_merge_queue
@@ -1891,3 +2014,7 @@ test_merged_into_shared_local_default_allows
 test_standalone_clone_local_default_does_not_count_as_landed
 test_contained_in_default_but_dirty_refuses
 test_detached_head_absent_from_every_default_refuses
+test_head_on_alternate_origin_branch_allows
+test_direct_push_head_on_alternate_origin_branch_allows
+test_head_on_origin_default_via_any_ref_allows
+test_alternate_branch_broadening_still_refuses_unpushed

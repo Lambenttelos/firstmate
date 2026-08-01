@@ -509,6 +509,36 @@ branch_fully_pushed_to_origin() {
   git -C "$WT" merge-base --is-ancestor "$current" "$head" 2>/dev/null
 }
 
+# Is HEAD's exact commit reachable from ANY branch on origin, verified by a FRESH
+# pruning fetch of every origin head (never a possibly-stale local ref)? This is the
+# broadening of branch_fully_pushed_to_origin from the RECORDED branch name to any
+# origin ref: it releases a lane whose exact work is already durable on origin under a
+# DIFFERENT ref than the recorded branch - a rebase that renamed and pushed the branch,
+# or a commit that landed on origin under some other name. The pruning fetch keeps a
+# deleted origin branch from counting through a stale local remote-tracking ref. Only
+# refs under refs/remotes/origin/ count, so an internal validation remote (e.g. the
+# no-mistakes pipeline remote) never satisfies this. The for-each-ref prefix is
+# refs/remotes/origin with no trailing /* on purpose: /* matches only one path
+# component and would miss a slashed branch name like fm/task-x1, while the bare
+# prefix matches every descendant ref. Returns non-zero - so the caller still refuses
+# - when there is no origin, the fetch fails (e.g. offline), or no origin ref contains
+# HEAD. This never releases on an unverifiable claim.
+head_on_any_origin_ref() {
+  local head ref refs
+  head=$(git -C "$WT" rev-parse --verify HEAD 2>/dev/null) || return 1
+  git -C "$WT" remote get-url origin >/dev/null 2>&1 || return 1
+  git -C "$WT" fetch --quiet --prune origin "+refs/heads/*:refs/remotes/origin/*" >/dev/null 2>&1 || return 1
+  refs=$(git -C "$WT" for-each-ref --format='%(refname)' refs/remotes/origin 2>/dev/null) || return 1
+  [ -n "$refs" ] || return 1
+  while IFS= read -r ref; do
+    [ -n "$ref" ] || continue
+    git -C "$WT" merge-base --is-ancestor "$head" "$ref" 2>/dev/null && return 0
+  done <<EOF
+$refs
+EOF
+  return 1
+}
+
 # Record a released-but-unmerged ship branch in the durable merge queue. Called once
 # from the main flow (never from the idempotent safety check) after safety passes and
 # while the worktree still exists. Skips work that is not on origin or already merged,
@@ -844,14 +874,17 @@ validate_worktree_teardown_safety() {
     worktree_safety_branch "$WT"
     branch=$TEARDOWN_WORKTREE_BRANCH_FOR_SAFETY
     # Release when the work has LANDED (merged), OR the branch is fully pushed to its
-    # own origin ref, OR HEAD's exact commit is already contained in a default branch
-    # that outlives this worktree. A pushed branch is durable on the remote, so the
-    # local copy is disposable even before it merges; the merge queue (recorded from
-    # the main flow) keeps the released-but-unmerged branch visible. The containment
-    # test adds the locally-landed case, where the approved landing target is the
-    # clone's own default branch. Work absent from all three still refuses.
+    # own origin ref, OR HEAD's exact commit is reachable from ANY branch on origin
+    # (a rebase renamed and pushed it, or it landed on origin under another name), OR
+    # HEAD's exact commit is already contained in a default branch that outlives this
+    # worktree. A pushed branch is durable on the remote, so the local copy is
+    # disposable even before it merges; the merge queue (recorded from the main flow)
+    # keeps the released-but-unmerged branch visible. The any-origin-ref test adds the
+    # alternate-branch-name case; the containment test adds the locally-landed case,
+    # where the approved landing target is the clone's own default branch. Work absent
+    # from all of these still refuses.
     if ! work_is_landed "$branch" && ! branch_fully_pushed_to_origin "$branch" \
-      && ! head_contained_in_default_branch; then
+      && ! head_on_any_origin_ref && ! head_contained_in_default_branch; then
       echo "REFUSED: worktree $WT has work not on any remote and not landed." >&2
       printf 'unpushed commits:\n%s\n' "$unpushed" >&2
       echo "Push the branch, land its PR, or get the captain's explicit OK to discard, then --force." >&2
@@ -862,12 +895,15 @@ validate_worktree_teardown_safety() {
   # direct-push has no PR or merge confirmation to catch a skipped push, and the
   # no-mistakes pipeline's internal validation remote never counts as landed, so
   # require positive proof that the branch reached origin.
-  # The branch-name probe below is skipped only when HEAD's exact commit is already
-  # contained in a default branch that survives teardown: the work has demonstrably
-  # landed, so looking its branch name up on origin can prove nothing further. That
-  # is the case for a lane that finished on a detached HEAD or a scratch branch, and
-  # for one that landed by merging rather than by pushing this branch name.
-  if [ "$MODE" = direct-push ] && ! head_contained_in_default_branch; then
+  # The branch-name probe below is skipped when HEAD's exact commit is already proven
+  # durable on origin by a means the recorded branch name cannot improve on: it is
+  # reachable from ANY branch on origin (rebase renamed and pushed it, or it landed
+  # under another name), or it is contained in a default branch that survives teardown
+  # (a lane that finished on a detached HEAD or a scratch branch, or landed by merging
+  # rather than by pushing this branch name). In every such case looking the recorded
+  # branch name up on origin can prove nothing further.
+  if [ "$MODE" = direct-push ] && ! head_on_any_origin_ref \
+    && ! head_contained_in_default_branch; then
     local origin_sha head_sha
     worktree_safety_branch "$WT"
     branch=$TEARDOWN_WORKTREE_BRANCH_FOR_SAFETY
