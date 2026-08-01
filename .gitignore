@@ -20,5 +20,6 @@ config/wedge-alarm
 config/secondmate-context-threshold
 config/herdr-presentation-spaces
 config/heavy-run-slots
+config/watcher-cadence
 config/present-daemon
 .codex/skills
