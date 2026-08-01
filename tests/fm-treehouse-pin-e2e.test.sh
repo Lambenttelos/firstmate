@@ -45,6 +45,14 @@ fm_git_init_commit "$FLEET"
 git -C "$FLEET" remote add origin "$ORIGIN"
 git -C "$FLEET" branch -M main
 git -C "$FLEET" push --quiet origin main
+# The bare origin's HEAD defaults to whatever git's init.defaultBranch is on
+# this box (often "master"), but the fixture only ever creates "main". treehouse
+# resolves a lease's base ref from the remote's default branch, so an origin
+# HEAD pointing at a nonexistent "master" makes every `treehouse get` fail with
+# "invalid reference: refs/remotes/origin/master" - green only on a box whose
+# default branch is already "main". Pin the origin HEAD to the branch that
+# actually exists so lease acquisition is deterministic across environments.
+git -C "$ORIGIN" symbolic-ref HEAD refs/heads/main
 git clone --quiet "$ORIGIN" "$CAPTAIN"
 
 # th <clone> <treehouse args...> - run treehouse from <clone> with HOME pointed

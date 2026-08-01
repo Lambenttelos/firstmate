@@ -19,13 +19,50 @@ make_spawn_fakebin() {
   cat > "$fakebin/tmux" <<'SH'
 #!/usr/bin/env bash
 set -u
+# The worktree-discovery poll asks a specific window for its cwd with
+# `display-message -p -t <window-id> '#{pane_current_path}'`. A single shared
+# FM_FAKE_PANE_PATH would hand every task the SAME worktree, which is exactly
+# the aliasing fm-spawn.sh refuses - fatal for a batch spawn that launches two
+# tasks in one run. When FM_FAKE_WT_MAP is set, resolve the reply PER TARGET
+# window instead: new-window prints a stable per-name window id ("@<name>"),
+# and the pane_current_path reply for that window is read from
+# "$FM_FAKE_WT_MAP/<name>". This gives every task its own isolated worktree
+# with no collision. FM_FAKE_PANE_PATH remains the single-worktree fallback for
+# the callers that do not need per-task isolation.
 case "$*" in
-  *"#{pane_current_path}"*) printf '%s\n' "${FM_FAKE_PANE_PATH:-}"; exit 0 ;;
+  *"#{pane_current_path}"*)
+    if [ -n "${FM_FAKE_WT_MAP:-}" ]; then
+      target=''
+      prev=''
+      for a in "$@"; do
+        [ "$prev" = "-t" ] && target=$a
+        prev=$a
+      done
+      name=${target#@}
+      if [ -n "$name" ] && [ -f "$FM_FAKE_WT_MAP/$name" ]; then
+        cat "$FM_FAKE_WT_MAP/$name"
+        exit 0
+      fi
+    fi
+    printf '%s\n' "${FM_FAKE_PANE_PATH:-}"
+    exit 0
+    ;;
 esac
 case "${1:-}" in
+  new-window)
+    # Print a per-name stable window id so the poll above can key on it.
+    name=''
+    prev=''
+    for a in "$@"; do
+      [ "$prev" = "-n" ] && name=$a
+      prev=$a
+    done
+    [ -n "$name" ] && printf '@%s\n' "$name"
+    exit 0
+    ;;
   display-message) printf 'firstmate\n'; exit 0 ;;
   list-windows) exit 0 ;;
-  has-session|new-session|new-window|kill-window) exit 0 ;;
+  has-session|new-session|kill-window) exit 0 ;;
   send-keys)
     if [ -n "${FM_FAKE_LAUNCH_LOG:-}" ]; then
       prev=
@@ -47,7 +84,7 @@ SH
 }
 
 make_spawn_case() {
-  local name=$1 harness=$2 case_dir home proj wt fakebin launchlog id
+  local name=$1 harness=$2 case_dir home proj wt fakebin launchlog id wtmap
   shift 2
   case_dir="$TMP_ROOT/$name"
   home="$case_dir/home"
@@ -56,16 +93,23 @@ make_spawn_case() {
   proj="$case_dir/home/projects/project"
   wt="$case_dir/wt"
   launchlog="$case_dir/launch.log"
+  wtmap="$case_dir/wt-map"
   fakebin=$(make_spawn_fakebin "$case_dir/fake")
-  mkdir -p "$home/data" "$home/projects" "$home/state" "$home/config"
+  mkdir -p "$home/data" "$home/projects" "$home/state" "$home/config" "$wtmap"
   printf '%s\n' "$harness" > "$home/config/crew-harness"
   fm_git_worktree "$proj" "$wt" "wt-$name"
   touch "$home/state/.last-watcher-beat"
   for id in "$@"; do
     mkdir -p "$home/data/$id"
     printf 'brief for %s\n' "$id" > "$home/data/$id/brief.md"
+    # A DISTINCT real worktree per task, keyed by the window name fm-spawn
+    # creates (fm-<id>), so a batch spawn of several tasks in one run does not
+    # alias one worktree across them (which fm-spawn correctly refuses). The
+    # single-worktree callers ignore this map and use FM_FAKE_PANE_PATH.
+    fm_git_worktree "$proj" "$case_dir/wt-$id" "wt-$name-$id" >/dev/null 2>&1
+    printf '%s\n' "$case_dir/wt-$id" > "$wtmap/fm-$id"
   done
-  printf '%s\n' "$case_dir|$home|$proj|$wt|$fakebin|$launchlog"
+  printf '%s\n' "$case_dir|$home|$proj|$wt|$fakebin|$launchlog|$wtmap"
 }
 
 enable_dispatch_profile() {
@@ -86,16 +130,20 @@ run_spawn() {
   local home=$1 wt=$2 fakebin=$3 launchlog=$4
   shift 4
   : > "$launchlog"
+  # FM_FAKE_WT_MAP is opt-in: only the batch case exports it (naming a directory
+  # of per-task worktree paths) so each task in a multi-task run gets its own
+  # isolated worktree. Every other caller leaves it empty and the fake tmux uses
+  # the single FM_FAKE_PANE_PATH worktree.
   FM_ROOT_OVERRIDE='' FM_HOME="$home" \
     FM_STATE_OVERRIDE="$home/state" FM_DATA_OVERRIDE="$home/data" \
     FM_PROJECTS_OVERRIDE="$home/projects" FM_CONFIG_OVERRIDE="$home/config" \
-    FM_SPAWN_NO_GUARD=1 FM_FAKE_PANE_PATH="$wt" TMUX="fake,1,0" \
+    FM_SPAWN_NO_GUARD=1 FM_FAKE_PANE_PATH="$wt" FM_FAKE_WT_MAP="${FM_FAKE_WT_MAP:-}" TMUX="fake,1,0" \
     FM_FAKE_LAUNCH_LOG="$launchlog" GROK_HOME="$home/grok-home" PATH="$fakebin:$PATH" \
     "$SPAWN" "$@" 2>&1
 }
 
 read_case_record() {
-  IFS='|' read -r CASE_DIR HOME_DIR PROJ_DIR WT_DIR FAKEBIN_DIR LAUNCH_LOG <<EOF
+  IFS='|' read -r CASE_DIR HOME_DIR PROJ_DIR WT_DIR FAKEBIN_DIR LAUNCH_LOG WT_MAP <<EOF
 $1
 EOF
 }
@@ -108,7 +156,7 @@ assert_meta_profile() {
 }
 
 test_no_profile_keeps_claude_profile_defaults() {
-  local rec id out status expected launch
+  local rec id out status expected launch sandbox
   id=profile-off-z1
   rec=$(make_spawn_case profile-off claude "$id")
   read_case_record "$rec"
@@ -120,7 +168,13 @@ test_no_profile_keeps_claude_profile_defaults() {
   assert_meta_profile "$HOME_DIR/state/$id.meta" claude default default
 
   launch=$(cat "$LAUNCH_LOG")
-  expected="CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false claude --dangerously-skip-permissions \"\$('${ROOT}/bin/fm-operational-input.sh' encode launch-brief < '$HOME_DIR/data/$id/brief.md')\""
+  # fm-spawn.sh injects IS_SANDBOX=1 ONLY under root (uid 0), to clear claude's
+  # root refusal of --dangerously-skip-permissions; a non-root host keeps the
+  # byte-identical template. Mirror that uid gate here so the expected launch
+  # matches on both a root-run server and an ordinary host.
+  sandbox=''
+  [ "$(id -u)" = 0 ] && sandbox='IS_SANDBOX=1 '
+  expected="${sandbox}CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false claude --dangerously-skip-permissions \"\$('${ROOT}/bin/fm-operational-input.sh' encode launch-brief < '$HOME_DIR/data/$id/brief.md')\""
   [ "$launch" = "$expected" ] || fail "no-profile claude launch did not use the canonical launch kind"$'\n'"expected: $expected"$'\n'"actual:   $launch"
   pass "no --model/--effort records defaults and types the claude launch instructions"
 }
@@ -393,7 +447,10 @@ test_batch_forwards_shared_profile_flags() {
   read_case_record "$rec"
   enable_dispatch_profile "$HOME_DIR"
 
-  out=$(run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" \
+  # A batch launches both tasks in one run, so each must draw its OWN worktree;
+  # a shared one trips fm-spawn's duplicate-worktree refusal. WT_MAP names the
+  # per-task worktree directory the case builder created.
+  out=$(FM_FAKE_WT_MAP="$WT_MAP" run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" \
     "$id1=$PROJ_DIR" "$id2=$PROJ_DIR" --harness codex --model gpt-5 --effort high)
   status=$?
   expect_code 0 "$status" "batch spawn with shared profile flags should succeed"
