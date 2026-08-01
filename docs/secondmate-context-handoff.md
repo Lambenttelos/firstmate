@@ -85,29 +85,45 @@ This is safe for a threshold monitor - it can only over-report, never silently m
 
 ### jcode (VERIFIED 2026-08-01)
 
-jcode (github.com/1jehuang/jcode) is a Claude-Agent-SDK runtime that persists the SAME per-session JSONL transcript claude does, in the SAME `<config-dir>/projects/<munged-cwd>/<session-id>.jsonl` location, with a `message.usage` object carrying `input_tokens`, `cache_creation_input_tokens`, and `cache_read_input_tokens` per assistant turn.
-The read is therefore byte-identical to claude's, so `fm_sm_context_tokens` dispatches jcode to the exact same `fm_sm_claude_context_tokens` reader rather than a duplicate one.
+jcode (github.com/1jehuang/jcode) is a Claude-Agent-SDK runtime, but it does NOT write to claude's `~/.claude/projects/` transcript directory.
+It persists its own per-session journal at `<jcode-home>/sessions/session_<id>.journal.jsonl`, where `<jcode-home>` is `$JCODE_HOME`, else `~/.jcode`.
+The context count is the LAST record's `append_messages[].token_usage` object, summed as `input_tokens + cache_creation_input_tokens + cache_read_input_tokens` - the same three-component formula as claude, but a different object (`append_messages[].token_usage`, not claude's `message.usage`) in a different, record-append journal.
+jcode has its own reader, `fm_sm_jcode_context_tokens`, and `fm_sm_context_tokens` dispatches jcode to it rather than to the claude reader.
 
-Exact commands and output that established this (this machine, 2026-08-01, firstmate running natively on jcode):
+A session is keyed to its home by its FIRST journal line's `.meta.working_dir`, compared for EXACT string equality against the home path (jcode stores the raw absolute path, so there is no path-munging step).
+Multiple stale same-home journals can exist, so selection prefers the journal whose `session_<id>` basename is present in `<jcode-home>/active_pids/` (the running session), falling back to the newest-mtime `working_dir` match when no active-pid match exists (a resumed or edge session).
+This prevents a stale `.json`-only same-home leftover from shadowing the live session.
+
+Earlier a false verification recorded jcode as "byte-identical to claude" returning `51046` from `~/.claude/projects/-work-firstmate-work/`.
+That number came from a stale, frozen claude-directory mirror (last updated 2026-07-31T21:50) while the live jcode journal for the same home had climbed past 180000, so the byte-identical claim and the claude dispatch were both wrong.
+
+Exact commands and output that established the corrected read (this machine, 2026-08-01, firstmate running natively on jcode):
 
 ```
 $ bin/fm-harness.sh
 jcode
 
-$ cd ~/.claude/projects/-work-firstmate-work && ls -t *.jsonl | head -1
-2d7a971f-556b-4a45-a0d0-b59178870c49.jsonl
+$ F=~/.jcode/sessions/session_hare_1785566988431_25ee34e0e322bffd.journal.jsonl
+$ head -1 "$F" | jq '.meta.working_dir,.meta.status'
+"/root/.treehouse/firstmate-work-468eb4/2/firstmate-work"
+"Active"
 
-$ F=2d7a971f-556b-4a45-a0d0-b59178870c49.jsonl
-$ grep '"usage"' "$F" | grep -v '"isSidechain":true' | tail -1 \
-    | jq '(.message.usage.input_tokens // 0)+(.message.usage.cache_creation_input_tokens // 0)+(.message.usage.cache_read_input_tokens // 0)'
-51046
+$ grep '"token_usage"' "$F" | tail -1 \
+    | jq '(.append_messages[].token_usage) as $u
+          | ($u.input_tokens//0)+($u.cache_creation_input_tokens//0)+($u.cache_read_input_tokens//0)'
+86866
 
-$ grep '"usage"' "$F" | tail -1 | jq '.message.usage | keys'
-["cache_creation","cache_creation_input_tokens","cache_read_input_tokens", ...]
+$ grep '"token_usage"' "$F" | tail -1 | jq '.append_messages[].token_usage | keys'
+["cache_creation_input_tokens","cache_read_input_tokens","input_tokens","output_tokens"]
 ```
 
-The transcript carries the same `cwd`, `isSidechain`, and `message.usage` fields claude writes, so every read rule above applies unchanged.
-This same read is what the supervision daemon uses for firstmate's OWN context-stow nudge (`config/context-stow-threshold`, docs/configuration.md), pointed at firstmate's home instead of a secondmate's.
+The reader mirrors the claude reader's fail-closed discipline: an absent `jq`, an absent sessions directory, no `working_dir` match, no `token_usage` line, or a sum that is not a positive integer all return `unknown` rather than a wrong number.
+Every field is guarded with jq `// 0` and the final sum is validated with `[[ =~ ^[0-9]+$ ]] && > 0`, so any jcode format shift (a renamed field or a moved directory) makes all matches fail and the reader returns `unknown`.
+Only each file's first line is scanned for `working_dir` before parsing usage, which is sub-second even across ~130 session files on the slow-poll cadence.
+This same read is what the supervision daemon uses for firstmate's OWN context-stow nudge (`config/context-stow-threshold`, docs/configuration.md), pointed at firstmate's home instead of a secondmate's - which is why this correction also restores that nudge, which the stale-mirror read had silently under-reported.
+
+Known staleness edge (same as claude): between a `/compact` (or resume) and the first turn afterward, the last `token_usage` still reflects the pre-compact turn, so the read is briefly stale-high.
+This is acceptable for a threshold monitor because it can only over-report, never silently miss, and the handoff orchestrator re-checks idle before acting.
 
 ### codex, opencode, pi, grok (NOT APPLICABLE - no verified read)
 

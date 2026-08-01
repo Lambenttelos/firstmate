@@ -141,18 +141,73 @@ test_reporter_refuses_non_secondmate() {
   pass "reporter refuses non-secondmate and unknown ids"
 }
 
-test_jcode_reads_same_transcript_as_claude() {
-  # jcode is a Claude-Agent-SDK runtime writing the SAME projects/<munged>/*.jsonl
-  # transcript with message.usage (verified 2026-08-01, docs/secondmate-context-handoff.md),
-  # so its context read must be byte-identical to claude's.
-  local config="$TMP_ROOT/cfg-jcode" home="$TMP_ROOT/home-jcode" out
-  write_transcript "$config" "$home" session 10 20 170000 >/dev/null
-  out=$(CLAUDE_CONFIG_DIR="$config" fm_sm_context_tokens "$home" jcode)
-  [ "$out" = 170030 ] || fail "jcode must read the same transcript sum as claude, got: $out"
-  # And still fails closed on a missing transcript.
-  [ -z "$(CLAUDE_CONFIG_DIR="$config" fm_sm_context_tokens "/no/such/home" jcode)" ] \
-    || fail "jcode with a missing transcript must read empty (fail closed)"
-  pass "jcode dispatches to the same verified read as claude and fails closed when absent"
+# Build a fake jcode home with a journal for <home>. jcode stores the RAW
+# absolute working_dir (no munging) on the first line's .meta, and per-turn
+# usage under append_messages[].token_usage. When <active> is "active" the
+# session basename is also placed in active_pids/. Extra args are appended
+# verbatim as additional JSONL records.
+write_jcode_journal() {  # <jcode-home> <home> <session-id> <input> <cc> <cr> <active> [extra-record...]
+  local jhome=$1 home=$2 sid=$3 input=$4 cc=$5 cr=$6 active=$7; shift 7
+  local sessions="$jhome/sessions" pids="$jhome/active_pids" f extra
+  mkdir -p "$sessions"
+  f="$sessions/$sid.journal.jsonl"
+  {
+    printf '{"type":"meta_init","meta":{"working_dir":"%s","status":"Active"}}\n' "$home"
+    printf '{"type":"record","append_messages":[{"token_usage":{"input_tokens":%s,"output_tokens":5,"cache_creation_input_tokens":%s,"cache_read_input_tokens":%s}}]}\n' "$input" "$cc" "$cr"
+    for extra in "$@"; do printf '%s\n' "$extra"; done
+  } > "$f"
+  if [ "$active" = active ]; then
+    mkdir -p "$pids"
+    : > "$pids/$sid"
+  fi
+  printf '%s' "$f"
+}
+
+test_jcode_reads_journal_token_usage() {
+  # jcode persists usage in its OWN journal (NOT claude's projects dir), summing
+  # the last append_messages[].token_usage input components (verified 2026-08-01,
+  # docs/secondmate-context-handoff.md).
+  local jhome="$TMP_ROOT/jcode-read" home="/root/some/live/home" out
+  # An earlier low-usage record written first, the most recent high-usage turn
+  # last: the reader must take the LAST token_usage line, not the first.
+  local latest='{"type":"record","append_messages":[{"token_usage":{"input_tokens":10,"cache_creation_input_tokens":20,"cache_read_input_tokens":170000}}]}'
+  write_jcode_journal "$jhome" "$home" session_live_1 1 1 1 active "$latest" >/dev/null
+  out=$(JCODE_HOME="$jhome" fm_sm_context_tokens "$home" jcode)
+  [ "$out" = 170030 ] || fail "jcode must sum the LAST token_usage input components, got: $out"
+  pass "jcode read sums the last journal token_usage and prefers the latest turn"
+}
+
+test_jcode_ignores_stale_same_home_session() {
+  # A stale same-home leftover with no active_pid and zero usage must never
+  # shadow the live active-pid-confirmed session, even if it is newer on disk.
+  local jhome="$TMP_ROOT/jcode-stale" home="/root/stale/home" live stale out
+  live=$(write_jcode_journal "$jhome" "$home" session_live_2 10 20 170000 active)
+  stale=$(write_jcode_journal "$jhome" "$home" session_stale_2 0 0 0 inactive)
+  # Make the stale one NEWER on disk to prove active-pid selection wins over mtime.
+  touch -t 202601010000 "$live"
+  touch -t 202607200000 "$stale"
+  out=$(JCODE_HOME="$jhome" fm_sm_context_tokens "$home" jcode)
+  [ "$out" = 170030 ] || fail "active-pid session must win over a newer stale same-home leftover, got: $out"
+  pass "the live active-pid journal wins over a newer stale same-home session"
+}
+
+test_jcode_fails_closed() {
+  local jhome="$TMP_ROOT/jcode-fc" home="/root/fc/home" nojqbin tool out
+  write_jcode_journal "$jhome" "$home" session_fc 10 20 170000 active >/dev/null
+  # working_dir mismatch -> unknown, never a wrong number.
+  [ -z "$(JCODE_HOME="$jhome" fm_sm_context_tokens "/root/other/home" jcode)" ] \
+    || fail "a working_dir mismatch must read empty (fail closed)"
+  # absent sessions dir -> unknown.
+  [ -z "$(JCODE_HOME="$TMP_ROOT/jcode-absent" fm_sm_context_tokens "$home" jcode)" ] \
+    || fail "an absent jcode sessions dir must read empty"
+  # absent jq -> unknown (never guesses).
+  nojqbin="$TMP_ROOT/nojqbin-jcode"
+  mkdir -p "$nojqbin"
+  for tool in bash grep tr head basename; do ln -sf "$(command -v "$tool")" "$nojqbin/$tool"; done
+  PATH="$nojqbin" command -v jq >/dev/null 2>&1 && fail "test PATH must not resolve jq"
+  out=$(PATH="$nojqbin" JCODE_HOME="$jhome" bash -c '. "'"$ROOT"'/bin/fm-secondmate-context-lib.sh"; fm_sm_context_tokens "'"$home"'" jcode')
+  [ -z "$out" ] || fail "without jq the jcode read must fail closed (empty), got: $out"
+  pass "jcode fails closed on working_dir mismatch, absent dir, and absent jq"
 }
 
 test_context_stow_threshold_default_and_config() {
@@ -183,7 +238,9 @@ test_non_claude_and_missing_fail_closed
 test_no_jq_fails_closed
 test_reporter_over_under_unknown
 test_reporter_refuses_non_secondmate
-test_jcode_reads_same_transcript_as_claude
+test_jcode_reads_journal_token_usage
+test_jcode_ignores_stale_same_home_session
+test_jcode_fails_closed
 test_context_stow_threshold_default_and_config
 
 echo "# all fm-secondmate-context tests passed"
