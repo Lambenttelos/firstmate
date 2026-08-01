@@ -121,6 +121,21 @@ make_supercase() {
   dir="$TMP_ROOT/$name"
   fakebin="$dir/fakebin"
   mkdir -p "$dir/state" "$fakebin"
+  # Fake wedge-alarm notifier binaries so the daemon's active-alert channel
+  # resolution is deterministic on ANY host. Without them, a Linux host that
+  # lacks notify-send resolves `auto` to no channel, so a wedge-alarm test that
+  # asserts the alarm reached a channel fails only on such a host (CI's
+  # ubuntu-latest ships libnotify, so it passed there). The daemon's recorder seam
+  # (FM_WEDGE_ALARM_EXEC, installed by this harness) still intercepts before these
+  # ever execute, so their bodies only need to exist on PATH for `command -v`.
+  # Mirrors make_wedge_case in tests/fm-daemon.test.sh. No uname fake here, so
+  # platform resolution stays on the real host for the many other make_supercase
+  # tests that do not touch the alarm.
+  local _n
+  for _n in osascript herdr notify-send; do
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$fakebin/$_n"
+    chmod +x "$fakebin/$_n"
+  done
   cat > "$fakebin/tmux" <<'SH'
 #!/usr/bin/env bash
 set -u
