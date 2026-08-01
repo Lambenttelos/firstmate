@@ -21,12 +21,13 @@ The durable marker and the tmux flash are unchanged; the active alert is added a
 `FM_WEDGE_ALARM_CHANNEL` overrides the file with a single directive (used by the tests).
 
 - `off` - position-independent kill switch that disables every active alert; the marker and tmux flash remain.
-- `auto` / `default` - platform default. macOS resolves to `osascript`; other platforms have no built-in OS channel, so `auto` there fires nothing and logs that the durable marker is the only signal (configure a `command:` directive instead).
+- `auto` / `default` - platform default. macOS resolves to `osascript`; Linux resolves to `notify-send` when that binary is present; a platform with no built-in channel (a headless Linux server, an unsupported OS) fires nothing and logs that the durable marker is the only signal (configure a `command:` directive instead).
 - `osascript` - a macOS Notification Center banner via `osascript`. OS-level, so it reaches the captain even when every pane and its status-line is unreadable.
+- `notify-send` - a Linux desktop banner via libnotify's `notify-send` (posted `--urgency=critical`). OS-level, independent of any pane or its status-line, so it reaches a desktop captain the same way `osascript` does on macOS.
 - `herdr` - a herdr UI notification via `herdr notification show`. herdr's own surface, separate from the pane and its status-line.
 - `command:<cmd>` - run `<cmd>` via `sh -c`, with the alarm summary passed as `$1` and on stdin. Lets the alert reach a phone or pager (ntfy, Slack, SMS) even when the captain is away from the machine entirely.
 
-An absent `config/wedge-alarm` behaves as `auto`, i.e. default-on on macOS.
+An absent `config/wedge-alarm` behaves as `auto`, i.e. default-on on a desktop macOS or Linux host.
 Default-on is deliberate: the alarm's entire purpose is that a wedged away-mode primary is never silent, so the reachable OS channel fires unless the captain explicitly disables it.
 The alarm is rate-limited to at most once per max-defer window, and fires only after a genuine wedge past max-defer, so the default-on banner is rare and never chatty.
 
@@ -82,7 +83,39 @@ $ echo $?
 Exit 0; herdr reported `"shown":true`.
 The daemon redirects this stdout to `/dev/null` and treats a zero exit as success.
 
-### command channel dispatch (summary on $1 and stdin)
+## Verification (Linux)
+
+Recorded 2026-08-01 on Linux (x86_64, Intel Core i7-8700K), sourcing `bin/fm-supervise-daemon.sh`.
+This host has no real libnotify `notify-send` binary, so the empirical check verifies the two things that were the actual gap: `auto` resolving to `notify-send` on Linux, and the alarm routing the summary through the real emitter to that binary.
+The real libnotify banner form the daemon runs is recorded below for reference; it is not fired here because no `notify-send` exists on this host.
+
+### auto resolves to notify-send on Linux, and routes the summary to it
+
+A fake `notify-send` on `PATH` records its argv; the daemon's `FM_WEDGE_ALARM_EXEC` seam is left unset so the real `wedge_alarm_via_notify_send` emitter runs and dispatches to that binary.
+
+```
+$ wedge_alarm_platform_default    # Linux, notify-send on PATH
+notify-send
+$ FM_WEDGE_ALARM_CHANNEL=auto wedge_alarm_notify \
+    "away-mode escalations WEDGED 600s undelivered - see /s/.marker" "/s/.marker"
+$ cat notify.log
+notify-send CALLED: --urgency=critical firstmate: away-mode escalations WEDGED away-mode escalations WEDGED 600s undelivered - see /s/.marker
+```
+
+`auto` selected `notify-send`, and the real emitter passed the title and the summary as argv items (never interpolated into a shell string).
+Reproduced end to end through the daemon's paneless undelivered-escalation path (housekeeping section 1c): with a 600s-old unacknowledged outbox record and no reader beacon, the daemon wrote `state/.subsuper-inject-wedged` and fired `notify-send`.
+Before this change the same path on Linux logged `no OS-level alert channel on Linux; durable marker ... is the only signal` and fired nothing, so an away captain got only the passive marker until the next session start.
+
+### the exact libnotify form the daemon runs (reference)
+
+```
+notify-send --urgency=critical "firstmate: away-mode escalations WEDGED" "<summary>"
+```
+
+The summary is passed as an argv item so its text can never break the call.
+`auto` resolves to `notify-send` only when `command -v notify-send` succeeds, so a headless Linux server with no libnotify falls through to the durable marker and logs it as the only signal, exactly like an unsupported platform.
+
+## command channel dispatch (summary on $1 and stdin)
 
 The `command:` channel runs `sh -c "<cmd>" fm-wedge-alarm "<summary>"` with the summary also piped on stdin.
 `test_wedge_alarm_command_channel_receives_summary` deliberately unsets the seam for a safe file-writing command to verify this dispatch contract without a notification.

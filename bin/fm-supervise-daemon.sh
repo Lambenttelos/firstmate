@@ -137,10 +137,11 @@
 #                                   derived from FM_MAX_DEFER_SECS.
 #          FM_WEDGE_ALARM_CHANNEL   override config/wedge-alarm with a single
 #                                   active-alert directive for that wedge alarm
-#                                   (off|auto|osascript|herdr|command:<cmd>). An
-#                                   absent file/var means auto: on macOS that is
-#                                   an OS-level notification, so the alarm is
-#                                   never silent. See wedge_alarm_notify below
+#                                   (off|auto|osascript|notify-send|herdr|command:<cmd>). An
+#                                   absent file/var means auto: on macOS an
+#                                   osascript banner, on Linux a notify-send
+#                                   banner when present, so the alarm is
+#                                   never silent on a desktop. See wedge_alarm_notify below
 #                                   and docs/configuration.md.
 #          FM_WEDGE_ALARM_EXEC      notifier seam: when set, every notifier
 #                                   channel routes through this command as
@@ -859,13 +860,15 @@ supervisor_pane_target() {
 # single directive. Directives:
 #   off              disable the active alert entirely, regardless of position
 #                    (marker + flash remain)
-#   auto | default   platform default: macOS -> osascript; otherwise none
+#   auto | default   platform default: macOS -> osascript; Linux -> notify-send
+#                    when present; otherwise none
 #   osascript        macOS Notification Center banner (backend-independent)
+#   notify-send      Linux libnotify desktop banner (backend-independent)
 #   herdr            herdr UI notification (herdr notification show)
 #   command:<cmd>    run <cmd> via `sh -c`, summary on $1 and on stdin
-# An absent config means auto, i.e. default-ON on macOS: the alarm's whole
-# purpose is to never be silent, so the reachable OS channel fires unless the
-# captain explicitly disables it.
+# An absent config means auto, i.e. default-ON on a desktop macOS or Linux host:
+# the alarm's whole purpose is to never be silent, so the reachable OS channel
+# fires unless the captain explicitly disables it.
 
 # Print the configured channel directives, one per line. FM_WEDGE_ALARM_CHANNEL
 # wins (a single directive); else each non-empty, non-comment line of
@@ -891,12 +894,17 @@ wedge_alarm_configured_channels() {
 }
 
 # Resolve the platform's default OS-level channel for `auto`. macOS reaches the
-# captain via an osascript Notification Center banner; other platforms have no
-# built-in OS channel (the captain wires a command: directive), so this prints
-# nothing and wedge_alarm_notify logs that the marker is the only signal.
+# captain via an osascript Notification Center banner; Linux reaches a desktop
+# captain via a libnotify notify-send banner when that binary is present. A
+# platform with no built-in channel, or a Linux host with no notify-send (a
+# headless server), prints nothing and wedge_alarm_notify logs that the marker
+# is the only signal, so the captain wires a command: directive (ntfy, Slack,
+# SMS) instead. Both desktop defaults are gated on the binary actually existing,
+# so a paneless away home never counts a channel it cannot fire.
 wedge_alarm_platform_default() {
   case "$(uname)" in
     Darwin) command -v osascript >/dev/null 2>&1 && printf 'osascript' ;;
+    Linux) command -v notify-send >/dev/null 2>&1 && printf 'notify-send' ;;
     *) : ;;
   esac
 }
@@ -1007,6 +1015,30 @@ wedge_alarm_via_herdr() {  # <summary>
   return 1
 }
 
+# Post a Linux desktop notification via libnotify's notify-send. Like osascript
+# on macOS, this is an OS-level banner independent of any terminal pane or
+# multiplexer status-line, so it reaches a desktop captain even when every pane
+# is unreadable. The summary is passed as an argv item (never interpolated into
+# a shell string) so its text can never break the call. Best-effort: logs and
+# returns 1 on failure. A headless server without notify-send never reaches
+# here, because wedge_alarm_platform_default only resolves to notify-send when
+# the binary exists.
+wedge_alarm_via_notify_send() {  # <summary>
+  local summary=$1 rc
+  wedge_alarm_os_notifier_override notify-send "$summary"
+  rc=$?
+  case "$rc" in
+    0) return 0 ;;
+    1) return 1 ;;
+  esac
+  command -v notify-send >/dev/null 2>&1 || {
+    log "wedge alarm: notify-send not found; cannot post a Linux notification"; return 1; }
+  wedge_alarm_run_bounded notify-send notify-send --urgency=critical \
+    "firstmate: away-mode escalations WEDGED" "$summary" >/dev/null 2>&1 && return 0
+  log "wedge alarm: notify-send notification failed"
+  return 1
+}
+
 # Run a captain-supplied command with the summary on $1 and on stdin, so an
 # alert can reach a phone/pager (ntfy, Slack, SMS) even when the captain is away
 # from the machine entirely. Best-effort: logs and returns 1 on failure.
@@ -1039,6 +1071,7 @@ wedge_alarm_emit() {  # <channel> <summary>
   esac
   case "$channel" in
     osascript) wedge_alarm_via_osascript "$summary" ;;
+    notify-send) wedge_alarm_via_notify_send "$summary" ;;
     herdr) wedge_alarm_via_herdr "$summary" ;;
     command) wedge_alarm_via_command "$cmd" "$summary" ;;
   esac
@@ -1063,7 +1096,7 @@ wedge_alarm_notify() {  # <summary> <marker>
     case "$ch" in auto|default) ch=$(wedge_alarm_platform_default) ;; esac
     case "$ch" in
       '') log "wedge alarm: no OS-level alert channel on $(uname); durable marker $marker is the only signal - set config/wedge-alarm (e.g. a command: directive)" ;;
-      osascript|herdr) wedge_alarm_emit "$ch" "$summary" || true ;;
+      osascript|notify-send|herdr) wedge_alarm_emit "$ch" "$summary" || true ;;
       command:*) wedge_alarm_emit command "$summary" "${ch#command:}" || true ;;
       *) log "wedge alarm: unrecognized active-alert channel directive (redacted); marker still written" ;;
     esac
