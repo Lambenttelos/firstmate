@@ -676,6 +676,104 @@ test_injected_live_count_still_wins() {
   pass "the FM_RESOURCE_LIVE injection seam still overrides both crew-count paths"
 }
 
+# --- herdr backend live-agent count ----------------------------------------
+# The regression under test (2026-08-01): the sweep excluded a lane the moment
+# its backend probe read `dead`, and it probed with fm_backend_agent_alive. On
+# herdr a working jcode-hosted lane runs its agent turn in jcode's shared
+# background server, so herdr registers NO agent for the pane (`agent get` ->
+# agent_not_found), and agent_alive read every live herdr lane as `dead` -
+# reporting `live agents 0` with lanes actually running. The fix probes with
+# fm_backend_endpoint_live, which on herdr reads pane PRESENCE (the same signal
+# session-start and the wake-brief endpoint sweep trust), so a present pane
+# counts even with no registered herdr agent, while a truly-gone pane still
+# excludes.
+
+# fake_herdr <dir> <gone-pane-id...>: a `herdr` stub for the resource sweep's
+# endpoint probe. `pane get <pane_id>` responds pane_not_found (the confident
+# dead verdict) for every pane_id named in <gone-pane-id...> and succeeds (a
+# live pane, no registered agent - exactly a jcode-hosted lane) for any other;
+# `agent get` always answers agent_not_found, mirroring a jcode lane. Every
+# other subcommand is a silent success so fm_backend_herdr_server_ensure and
+# friends stay quiet. The gone list is the bare pane_id (e.g. "w2:p0"), because
+# fm_backend_target_exists passes only the pane portion of the
+# "<session>:<pane_id>" target to `pane get`.
+fake_herdr() {
+  local dir=$1 fakebin
+  shift
+  fakebin=$(fm_fakebin "$dir")
+  {
+    printf '#!/usr/bin/env bash\nset -u\n'
+    printf 'gone="%s"\n' "$*"
+    cat <<'SH'
+cmd=${1:-}; sub=${2:-}; pane=${3:-}
+case "$cmd $sub" in
+  "status --json")
+    printf '{"client":{"version":"0.7.1","protocol":14},"server":{"running":true}}\n' ;;
+  "pane get")
+    for g in $gone; do
+      if [ "$pane" = "$g" ]; then
+        printf '{"error":{"code":"pane_not_found","message":"pane %s not found"}}\n' "$pane" >&2
+        exit 1
+      fi
+    done
+    printf '{"result":{"pane":{"pane_id":"%s","agent_status":"unknown"}}}\n' "$pane" ;;
+  "agent get")
+    printf '{"error":{"code":"agent_not_found","message":"agent %s not found"}}\n' "$pane" >&2
+    exit 1 ;;
+  *) : ;;
+esac
+exit 0
+SH
+  } > "$fakebin/herdr"
+  chmod +x "$fakebin/herdr"
+  printf '%s\n' "$fakebin"
+}
+
+# fm_write_herdr_meta <file> <pane-target> [extra-kv...]: a herdr-backend task
+# meta whose window= is the "<session>:<pane_id>" target the sweep probes.
+fm_write_herdr_meta() {
+  local file=$1 target=$2
+  shift 2
+  fm_write_meta "$file" "window=$target" "harness=jcode" "backend=herdr" "$@"
+}
+
+test_herdr_live_lanes_are_counted_from_pane_presence() {
+  command -v jq >/dev/null 2>&1 || { pass "herdr live-count (skipped: jq not found)"; return 0; }
+  local home fakebin
+  home=$(make_home herdr-live-count)
+  fakebin=$(fake_herdr "$TMP_ROOT/herdr-live-count-bin")
+  fm_write_herdr_meta "$home/state/alpha.meta" "default:w1:p0"
+  fm_write_herdr_meta "$home/state/beta.meta" "default:w2:p0"
+  fm_write_herdr_meta "$home/state/gamma.meta" "default:w3:p0"
+  run_in_home "$home" "$fakebin" --sweep
+  expect_code 0 "$RC" "herdr live-count sweep exit"
+  assert_contains "$OUT" "live agents 3 = 3 active (3 crew(s))" \
+    "every live herdr lane's pane is present, so all three must count (not zero)"
+  assert_not_contains "$OUT" "liveness unverified" \
+    "a probed herdr sweep reports a verified count"
+  [ "$(cat "$home/state/.resource-live")" = "3 0 0 0" ] \
+    || fail "the sweep must cache its verified herdr count for the synchronous callers"
+  pass "a herdr lane with a present pane counts even though it registers no herdr agent"
+}
+
+test_herdr_gone_pane_is_excluded_from_the_count() {
+  command -v jq >/dev/null 2>&1 || { pass "herdr gone-pane (skipped: jq not found)"; return 0; }
+  local home fakebin
+  home=$(make_home herdr-gone-pane)
+  # beta's pane is gone (torn down but its meta lingers); alpha and gamma live.
+  fakebin=$(fake_herdr "$TMP_ROOT/herdr-gone-pane-bin" "w2:p0")
+  fm_write_herdr_meta "$home/state/alpha.meta" "default:w1:p0"
+  fm_write_herdr_meta "$home/state/beta.meta" "default:w2:p0"
+  fm_write_herdr_meta "$home/state/gamma.meta" "default:w3:p0"
+  run_in_home "$home" "$fakebin" --sweep
+  expect_code 0 "$RC" "herdr gone-pane sweep exit"
+  assert_contains "$OUT" "live agents 2 = 2 active (2 crew(s))" \
+    "a herdr lane whose pane is gone must not count, but the present ones still must"
+  [ "$(cat "$home/state/.resource-live")" = "2 0 0 0" ] \
+    || fail "the cached verdict must exclude the gone herdr pane"
+  pass "a confidently-gone herdr pane is excluded while present lanes still count"
+}
+
 test_unreadable_host_is_unknown_and_never_alarms() {
   local fakebin dir
   dir="$TMP_ROOT/unreadable"
@@ -1039,6 +1137,8 @@ rc=0
 ( test_malformed_sweep_budget_never_disables_the_budget ) || rc=1
 ( test_malformed_probe_timeout_never_takes_monitoring_dark ) || rc=1
 ( test_injected_live_count_still_wins ) || rc=1
+( test_herdr_live_lanes_are_counted_from_pane_presence ) || rc=1
+( test_herdr_gone_pane_is_excluded_from_the_count ) || rc=1
 ( test_unreadable_host_is_unknown_and_never_alarms ) || rc=1
 ( test_partial_reading_never_passes_as_healthy ) || rc=1
 ( test_interval_knob_is_resolved_in_one_place ) || rc=1
