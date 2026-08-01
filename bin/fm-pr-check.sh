@@ -48,6 +48,21 @@ if [ "$PROVIDER" = gitlab ] && ! command -v glab >/dev/null 2>&1; then
   exit 1
 fi
 
+# Fork-target guard: a GitHub PR must target the task clone's OWN repository, not
+# a fork parent. `gh`/`glab` default a PR base to the fork parent on a fork
+# clone, so without this a worker (even with a correct brief) could arm a merge
+# poll for, and firstmate could then merge, a PR against a repo we do not own.
+# The check runs before any state mutation and fails closed on a resolved
+# mismatch. It is silent and permissive when origin does not resolve to a
+# github.com owner/repository (local-only clone, self-hosted forge), so those
+# clones are unchanged. GitLab targets are addressed by full path, not
+# owner/repository, and this GitHub-owner check does not apply to them.
+if [ "$PROVIDER" = github ]; then
+  GUARD_WT=$(grep '^worktree=' "$META" | tail -1 | cut -d= -f2- || true)
+  GUARD_PROJ=$(grep '^project=' "$META" | tail -1 | cut -d= -f2- || true)
+  fm_pr_refuse_unowned_github_target "$FM_PR_OWNER" "$FM_PR_REPO" "$GUARD_WT" "$GUARD_PROJ" || exit 1
+fi
+
 # Neutralize any pre-fix poll before recording or arming this task. The
 # migration never executes legacy artifacts and holds watcher exclusion while
 # it quarantines or rebuilds them.

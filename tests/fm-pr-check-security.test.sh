@@ -2868,3 +2868,117 @@ test_bootstrap_isolates_incomplete_poll_migration
 test_custom_snapshot_cleanup_on_signal
 test_returned_custom_check_descendants_are_drained
 test_teardown_removes_poll_artifacts
+
+# The fork-target guard binds mechanically in fm-pr-check.sh (and through it
+# fm-pr-merge.sh): a GitHub PR whose owner/repository is not the task clone's own
+# origin owner/repository is refused before any state mutation, so a fork clone
+# cannot arm a merge poll for, or merge, a PR against its fork PARENT. When
+# origin does not resolve to a github.com owner/repository the guard is silent
+# and permissive, so a local-only clone or a fixture without an origin is
+# unchanged.
+set_origin_github() {
+  local dir=$1 slug=$2
+  git -C "$dir" init -q
+  git -C "$dir" remote add origin "https://github.com/$slug.git"
+}
+
+test_fork_parent_pr_target_is_refused() {
+  local dir out rc
+
+  # Own-repo target on a real github.com origin: accepted, poll armed.
+  dir=$(make_case fork-own-repo)
+  rm -rf "$dir/project"
+  mkdir -p "$dir/project"
+  set_origin_github "$dir/project" our-org/our-repo
+  fm_write_meta "$dir/home/state/task-a.meta" \
+    "window=fm-task-a" \
+    "worktree=$dir/wt" \
+    "project=$dir/project" \
+    "kind=ship" \
+    "mode=direct-PR"
+  run_check_entry "$dir" task-a https://github.com/our-org/our-repo/pull/5 \
+    > "$dir/own.out" 2> "$dir/own.err" \
+    || fail "own-repo PR target was refused on a github.com origin"
+  fm_pr_poll_artifacts_valid "$dir/home/state" task-a "$POLL" \
+    || fail "own-repo PR target did not arm an authenticated poll"
+
+  # Case-insensitive owner/repository match is still our own repository.
+  dir=$(make_case fork-own-repo-case)
+  rm -rf "$dir/project"
+  mkdir -p "$dir/project"
+  set_origin_github "$dir/project" Our-Org/Our-Repo
+  fm_write_meta "$dir/home/state/task-a.meta" \
+    "window=fm-task-a" \
+    "worktree=$dir/wt" \
+    "project=$dir/project" \
+    "kind=ship" \
+    "mode=direct-PR"
+  run_check_entry "$dir" task-a https://github.com/our-org/our-repo/pull/6 \
+    > "$dir/case.out" 2> "$dir/case.err" \
+    || fail "case-different own-repo PR target was refused"
+
+  # Fork-parent target: origin is our fork, the PR bases on the parent. Refused
+  # before any state mutation, and the merge path refuses it too.
+  dir=$(make_case fork-parent-target)
+  rm -rf "$dir/project"
+  mkdir -p "$dir/project"
+  set_origin_github "$dir/project" our-fork/the-repo
+  fm_write_meta "$dir/home/state/task-a.meta" \
+    "window=fm-task-a" \
+    "worktree=$dir/wt" \
+    "project=$dir/project" \
+    "kind=ship" \
+    "mode=direct-PR"
+  set +e
+  out=$(run_check_entry "$dir" task-a https://github.com/upstream-parent/the-repo/pull/7 2>&1)
+  rc=$?
+  set -e
+  [ "$rc" -ne 0 ] || fail "fork-parent PR target was accepted"
+  case "$out" in
+    *"we do not own"*) ;;
+    *) fail "fork-parent refusal did not name the ownership problem" ;;
+  esac
+  [ ! -e "$dir/home/state/task-a.check.sh" ] || fail "refused fork-parent target left a poll armed"
+  [ ! -e "$dir/home/state/task-a.pr-poll" ] || fail "refused fork-parent target left a sidecar"
+  assert_no_grep 'pr=' "$dir/home/state/task-a.meta" "refused fork-parent target still recorded pr= metadata"
+
+  set +e
+  run_merge_entry "$dir" task-a https://github.com/upstream-parent/the-repo/pull/7 >/dev/null 2>&1
+  rc=$?
+  set -e
+  [ "$rc" -ne 0 ] || fail "merge path accepted a fork-parent PR target"
+  [ ! -s "$dir/gh-axi.log" ] || fail "merge path reached the GitHub CLI for a fork-parent target"
+
+  # A live worktree origin is authoritative over the persistent clone; when the
+  # worktree resolves the guard does not fall through to project.
+  dir=$(make_case fork-worktree-authoritative)
+  rm -rf "$dir/wt" "$dir/project"
+  mkdir -p "$dir/wt" "$dir/project"
+  set_origin_github "$dir/wt" our-fork/the-repo
+  set_origin_github "$dir/project" upstream-parent/the-repo
+  fm_write_meta "$dir/home/state/task-a.meta" \
+    "window=fm-task-a" \
+    "worktree=$dir/wt" \
+    "project=$dir/project" \
+    "kind=ship" \
+    "mode=direct-PR"
+  set +e
+  run_check_entry "$dir" task-a https://github.com/upstream-parent/the-repo/pull/8 >/dev/null 2>&1
+  rc=$?
+  set -e
+  [ "$rc" -ne 0 ] || fail "worktree origin was not authoritative over the persistent clone"
+
+  # No origin anywhere: nothing to verify against, so behavior is unchanged and
+  # the poll arms exactly as before.
+  dir=$(make_case fork-no-origin)
+  write_task_meta "$dir"
+  run_check_entry "$dir" task-a https://github.com/anything/at-all/pull/9 \
+    > "$dir/noorigin.out" 2> "$dir/noorigin.err" \
+    || fail "no-origin clone was refused when there was nothing to verify"
+  fm_pr_poll_artifacts_valid "$dir/home/state" task-a "$POLL" \
+    || fail "no-origin clone did not arm an authenticated poll"
+
+  pass "fork-parent GitHub PR targets are refused and own-repo targets accepted"
+}
+
+test_fork_parent_pr_target_is_refused

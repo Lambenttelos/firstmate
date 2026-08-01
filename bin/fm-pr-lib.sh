@@ -181,6 +181,102 @@ fm_pr_head_valid() {
   [[ "$head" =~ ^[0-9a-f]{40}$|^[0-9a-f]{64}$ ]]
 }
 
+# GitHub owner and repository validators, matching the exact rules
+# fm_pr_url_parse enforces on a canonical PR URL. They are factored out so the
+# fork-target guard below validates an origin-derived owner/repo by the same
+# discipline as a URL-derived one.
+fm_pr_github_owner_valid() {
+  local owner=${1-}
+  local LC_ALL=C
+  [[ "$owner" =~ ^([A-Za-z0-9]|[A-Za-z0-9][A-Za-z0-9-]{0,37}[A-Za-z0-9])$ ]] || return 1
+  [[ "$owner" != *--* ]]
+}
+
+fm_pr_github_repo_valid() {
+  local repo=${1-}
+  local LC_ALL=C
+  [[ "$repo" =~ ^[A-Za-z0-9._-]{1,100}$ ]] || return 1
+  [ "$repo" != . ] && [ "$repo" != .. ]
+}
+
+# Resolve the GitHub owner/repository ("owner/repo") of <dir>'s origin remote.
+# Prints the slug and returns 0 only when origin is an origin remote on the
+# github.com host in a recognized URL form; returns 1 otherwise (no git dir, no
+# origin, a non-github.com host, or an unparseable/invalid slug). The non-zero
+# return is deliberately "cannot verify here", distinct from a verified
+# mismatch, so a caller enforcing a GitHub PR target neither refuses a
+# local-only clone with no origin nor a self-hosted forge it cannot address by
+# owner/repository. Reading a remote URL is a config read; it never touches the
+# network.
+fm_pr_github_origin_slug() {
+  local dir=${1-} url host rest owner repo
+  local LC_ALL=C
+  [ -n "$dir" ] && [ -d "$dir" ] || return 1
+  url=$(git -C "$dir" remote get-url origin 2>/dev/null) || return 1
+  [ -n "$url" ] || return 1
+  case "$url" in
+    *://*)
+      rest=${url#*://}
+      rest=${rest#*@}          # strip any userinfo
+      host=${rest%%/*}
+      host=${host%%:*}         # strip any port
+      rest=${rest#*/}
+      ;;
+    *:*)                       # scp-like syntax, e.g. git@github.com:owner/repo
+      host=${url%%:*}
+      host=${host##*@}         # strip any userinfo
+      rest=${url#*:}
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+  [ "$host" = github.com ] || return 1
+  rest=${rest%.git}
+  rest=${rest%/}
+  owner=${rest%%/*}
+  repo=${rest#*/}
+  case "$owner" in ''|*/*) return 1 ;; esac
+  case "$repo" in ''|*/*) return 1 ;; esac
+  fm_pr_github_owner_valid "$owner" || return 1
+  fm_pr_github_repo_valid "$repo" || return 1
+  printf '%s/%s\n' "$owner" "$repo"
+}
+
+# Refuse a GitHub PR/merge whose target owner/repository is not the task clone's
+# own origin. The candidate directories are tried in order (the live task
+# worktree first, then the persistent clone that outlives it); the first one
+# whose origin resolves to a github.com owner/repository is authoritative. On a
+# case-insensitive match the target is our own repository and this returns 0. On
+# a resolved mismatch it prints a loud message naming the refused cross-repo
+# target and returns 1, so the caller can fail closed. When no candidate resolves
+# to a github.com origin (a local-only clone, a fixture with no origin, a
+# self-hosted forge) it returns 0 so behavior on those clones is unchanged; there
+# is nothing to verify against.
+#
+# This binds the fork-target hazard mechanically. On a fork clone `gh`/`glab`
+# default a PR base to the fork PARENT, not our own fork, so a PR opened that way
+# carries the parent's owner/repository. That target does not match origin's
+# owner/repository (a fork lives under a different owner), so this refuses it
+# rather than arming a merge poll for, or merging, a PR against a repo we do not
+# own - independent of what any brief told the worker.
+fm_pr_refuse_unowned_github_target() {
+  local pr_owner=${1-} pr_repo=${2-} dir slug
+  local LC_ALL=C
+  shift 2 || return 0
+  for dir in "$@"; do
+    [ -n "$dir" ] || continue
+    slug=$(fm_pr_github_origin_slug "$dir") || continue
+    if [ "${slug,,}" = "${pr_owner,,}/${pr_repo,,}" ]; then
+      return 0
+    fi
+    printf 'error: refusing PR target %s/%s: task clone origin is %s, a repository we do not own (a fork parent defaults in here); open the PR against our own repository\n' \
+      "$pr_owner" "$pr_repo" "$slug" >&2
+    return 1
+  done
+  return 0
+}
+
 fm_pr_file_mode() {
   if [ "$(uname)" = Darwin ]; then
     stat -f %Lp "$1" 2>/dev/null
