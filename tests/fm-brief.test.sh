@@ -46,6 +46,8 @@ write_registry() {
 - push-proj [direct-push] - fixture for direct-push mode (added 2026-07-24)
 - push-autoland-proj [direct-push +autoland] - fixture for direct-push self-land (added 2026-07-26)
 - local-proj [local-only] - fixture for local-only mode (added 2026-07-01)
+- hyfin [no-mistakes] - fixture for hyfin live-stack repro block (added 2026-08-02)
+- hyfin-server [direct-push] - fixture for hyfin-server live-stack repro block (added 2026-08-02)
 EOF
 }
 
@@ -119,6 +121,13 @@ test_direct_push_dod_semantics() {
     "direct-push brief did not forbid waiting on a PR url or CI"
   assert_grep "The configured merge authority lands the branch on the forge" "$brief" \
     "direct-push brief lost configured merge authority"
+  # The worker owns the whole finish itself; committing or pushing is never "done".
+  assert_grep "Committing locally is NEVER done" "$brief" \
+    "direct-push brief did not state committing locally is never done"
+  assert_grep "run the FULL /no-mistakes pipeline yourself" "$brief" \
+    "direct-push brief did not tell the worker to run the pipeline itself"
+  assert_no_grep "Firstmate will then instruct you to run /no-mistakes" "$brief" \
+    "direct-push brief must not defer pipeline start to a firstmate steer"
   assert_no_grep "open a PR" "$brief" \
     "direct-push brief must not tell the worker to open a PR"
   pass "fm-brief.sh: direct-push DOD runs the full pipeline then pushes to origin without a PR wait"
@@ -165,12 +174,63 @@ test_direct_push_autoland_dod_semantics() {
     "autoland brief did not forbid deleting a branch"
   assert_grep "done: landed fm/$id" "$brief" \
     "autoland brief did not require the merge-evidence done line"
+  # The worker owns the whole finish itself; committing or pushing is never "done".
+  assert_grep "Committing locally is NEVER done" "$brief" \
+    "autoland brief did not state committing locally is never done"
+  assert_no_grep "Firstmate will then instruct you to run /no-mistakes" "$brief" \
+    "autoland brief must not defer pipeline start to a firstmate steer"
   # It self-lands, so it must NOT keep the push-and-stop tail or open a PR.
   assert_no_grep "git push origin HEAD:fm/$id" "$brief" \
     "autoland brief must not keep the plain push-and-stop tail"
   assert_no_grep "open a PR" "$brief" \
     "autoland brief must not tell the worker to open a PR"
   pass "fm-brief.sh: direct-push +autoland DOD self-lands the green branch with the baked-in guardrails"
+}
+
+# hyfin and hyfin-server ship briefs carry a "Live stack repro" block with the
+# exact own-local-stack commands so a live merchant repro is never falsely declared
+# impossible. Any other repo, and the scout variant, must NOT carry it. The block
+# still defers to the fleet-wide two-at-once live-browser cap.
+test_hyfin_live_stack_repro_block() {
+  local home id brief
+  home="$TMP_ROOT/hyfin-repro-home"
+  write_registry "$home"
+  # hyfin ship brief carries the block.
+  id="brief-hyfin-c1"
+  FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" hyfin >/dev/null 2>&1
+  brief="$home/data/$id/brief.md"
+  assert_present "$brief" "hyfin ship brief was not scaffolded"
+  assert_grep "Live stack repro (hyfin / hyfin-server only)" "$brief" \
+    "hyfin ship brief lost the live-stack repro heading"
+  assert_grep "stand up your OWN local stack" "$brief" \
+    "hyfin ship brief did not tell the worker to stand up its own stack"
+  assert_grep "Recaptcha auto-bypasses locally" "$brief" \
+    "hyfin ship brief did not state recaptcha auto-bypasses locally"
+  assert_grep "HYFIN_LANE=<N>" "$brief" \
+    "hyfin ship brief lost the Playwright lane pointer"
+  assert_grep "docs/e2e-lanes.md" "$brief" \
+    "hyfin ship brief lost the e2e-lanes doc reference"
+  assert_grep "at most TWO live browser reproductions run fleet-wide at once" "$brief" \
+    "hyfin ship brief dropped the fleet-wide live-browser cap deference"
+  # hyfin-server ship brief carries it too.
+  id="brief-hyfinserver-c2"
+  FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" hyfin-server >/dev/null 2>&1
+  brief="$home/data/$id/brief.md"
+  assert_grep "Live stack repro (hyfin / hyfin-server only)" "$brief" \
+    "hyfin-server ship brief lost the live-stack repro block"
+  # A non-hyfin repo must NOT carry it.
+  id="brief-nonhyfin-c3"
+  FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" push-proj >/dev/null 2>&1
+  brief="$home/data/$id/brief.md"
+  assert_no_grep "Live stack repro" "$brief" \
+    "a non-hyfin ship brief wrongly carried the live-stack repro block"
+  # The scout variant of hyfin must NOT carry it (repro block is ship-only).
+  id="brief-hyfin-scout-c4"
+  FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" hyfin --scout >/dev/null 2>&1
+  brief="$home/data/$id/brief.md"
+  assert_no_grep "Live stack repro" "$brief" \
+    "the hyfin scout brief wrongly carried the ship-only live-stack repro block"
+  pass "fm-brief.sh: hyfin/hyfin-server ship briefs carry the live-stack repro block, others and scouts do not"
 }
 
 test_faster_paths_use_configured_authority_without_stacked_review() {
@@ -713,6 +773,7 @@ test_captain_rules_preserve_existing_brief_contracts
 test_ship_modes_generate_clean_briefs
 test_direct_push_dod_semantics
 test_direct_push_autoland_dod_semantics
+test_hyfin_live_stack_repro_block
 test_faster_paths_use_configured_authority_without_stacked_review
 test_no_mistakes_dod_wording
 test_no_mistakes_dod_requires_preflight

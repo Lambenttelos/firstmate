@@ -46,6 +46,10 @@
 # green (bin/fm-merge-local.sh). Guardrails baked into the generated contract: green
 # only, own branch only, --no-ff only, conflict escalates, never delete a branch.
 # Ship briefs begin with a worktree-isolation assertion before the branch step.
+# hyfin and hyfin-server ship briefs additionally carry a "Live stack repro" block
+# with the exact commands to stand up an own local stack (recaptcha auto-bypasses
+# locally, no AWS creds needed), so a live merchant repro is never falsely declared
+# impossible; it still defers to the fleet-wide two-at-once live-browser cap.
 # Scout tasks ignore mode - their deliverable is a report, not a merge.
 # Every scaffold's status protocol distinguishes the configured
 # declared-external-wait verb (FM_CLASSIFY_PAUSED_VERB, default "paused") from
@@ -320,6 +324,33 @@ fi
 
 REPO=${POS[1]}
 
+# Project-conditional live-stack repro block. hyfin and hyfin-server workers kept
+# declaring a live merchant repro impossible because nothing told them they can stand
+# up their OWN local stack, where recaptcha auto-bypasses and no AWS creds are needed.
+# This block gives them the exact commands so "live stack unavailable" stops being an
+# accepted ceiling for a payment or receipt bug, while still honoring the fleet-wide
+# two-at-once live-browser cap in Rule 10.
+case "$REPO" in
+  hyfin|hyfin-server)
+    HYFIN_REPRO=$(cat <<'EOF'
+# Live stack repro (hyfin / hyfin-server only)
+You CAN and SHOULD stand up your OWN local stack for a live merchant repro. "Live stack unavailable" is no longer an acceptable ceiling for a payment or receipt bug.
+Recaptcha auto-bypasses locally, so you need no AWS credentials: `hyfin-server services/access/RecaptchaService.js` skips validation when `global.isLocal && !ENABLE_RECAPTCHA`, and `config/localTestDb.js` sets the recaptcha threshold to 0, turns rate limiting off, and uses a test-only `tokenSecret`.
+
+- Backend: run `hyfin-server` `./start.sh` -> `api.local.hyfin.app:3000` (shared, first-come).
+- Frontend lane: run `hyfin` `./start.sh lane <your-lane-index>` -> `https://lane<N>.local.hyfin.app`, and point Playwright at it with `HYFIN_LANE=<N>`.
+- Seed throwaway sites ONLY via `tests/v8/e2e/7. pricing/lib/seed.js`, NEVER a real site.
+- Reference: `hyfin/docs/e2e-lanes.md`.
+
+Still honor Rule 10: at most TWO live browser reproductions run fleet-wide at once, so append the `working: BROWSER WAIT` line and wait for firstmate's go-ahead before you drive a browser.
+EOF
+)
+    ;;
+  *)
+    HYFIN_REPRO=""
+    ;;
+esac
+
 if [ "$HERDR_LAB" -eq 1 ]; then
 HERDR_LAB_HELPER=$(shell_quote "$FM_ROOT/bin/fm-herdr-lab.sh")
 # shellcheck disable=SC2016  # single quotes are deliberate: these lines are literal brief text whose backtick-wrapped $(...) and "$HERDR_LAB_SESSION" snippets must reach the reading agent verbatim, not expand at scaffold time; only the '"$VAR"' break-outs interpolate.
@@ -442,12 +473,10 @@ EOF
 2. Run \`no-mistakes doctor\`; if it reports the repo is not initialized here, run \`no-mistakes init\`."
     # Shared direct-push pipeline body: identical whether or not the lane self-lands.
     DP_BODY=$(cat <<EOF
-You still run the FULL /no-mistakes pipeline; its \`pr\` and \`ci\` steps not applying is expected, and a run ending \`passed\` with those steps skipped is COMPLETE - do not treat skipped PR/CI as a failure or a wait.
-A run reporting \`missing NO_MISTAKES_BITBUCKET_EMAIL\` is expected and is NOT a blocker; do not append \`blocked:\` for it.
+YOU own the entire finish on a direct-push lane. Committing locally is NEVER done, and pushing is NEVER done either. Do not stop after committing or after pushing to wait for firstmate to tell you to validate - drive the whole sequence yourself in one continuous flow: implement, commit, run the FULL /no-mistakes pipeline yourself, then complete the closing steps below.
 
-The task is complete only when committed on your branch.
-When you believe it is complete, append \`done: {summary}\` to the status file and stop.
-Firstmate will then instruct you to run /no-mistakes to validate.
+You run the FULL /no-mistakes pipeline yourself; its \`pr\` and \`ci\` steps not applying is expected, and a run ending \`passed\` with those steps skipped is COMPLETE - do not treat skipped PR/CI as a failure or a wait.
+A run reporting \`missing NO_MISTAKES_BITBUCKET_EMAIL\` is expected and is NOT a blocker; do not append \`blocked:\` for it.
 
 Before you invoke /no-mistakes, run \`$FM_ROOT/bin/fm-nm-preflight.sh\` from this worktree.
 If it refuses, do NOT invoke /no-mistakes: append \`blocked: {the refusal it printed}\` and stop.
@@ -565,7 +594,9 @@ You are a crewmate: an autonomous worker agent managed by firstmate. Work on you
 {TASK}
 
 $HERDR_SECTION
-
+${HYFIN_REPRO:+
+$HYFIN_REPRO
+}
 # Setup
 You are in a disposable git worktree of $REPO, at a detached HEAD on a clean default branch.
 
