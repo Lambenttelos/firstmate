@@ -152,6 +152,27 @@ test_grok_is_background_notify() {
   pass "grok supervision is Claude-shaped background notify with passive Stop-hook backstop"
 }
 
+test_jcode_is_foreground_checkpoint() {
+  local out ordinary
+  out=$("$RENDER" --harness jcode)
+  assert_contains "$out" "SUPERVISION OPERATING INSTRUCTIONS - primary harness: jcode" "jcode heading missing"
+  assert_contains "$out" "Mode: jcode foreground checkpoint." "jcode snippet missing foreground-checkpoint mode"
+  assert_contains "$out" "bin/fm-watch-checkpoint.sh" "jcode snippet missing checkpoint helper"
+  assert_contains "$out" 'notify: true' "jcode snippet missing the passive-notify evidence"
+  assert_not_contains "$out" "Mode: Unknown harness fallback." "jcode still renders the unknown fallback"
+  assert_not_contains "$out" "primary harness: unknown" "jcode heading still says unknown"
+
+  ordinary=$(printf '%s\n' "$out" | grep -F -- '- Ordinary wake:')
+  assert_contains "$ordinary" "next foreground" "jcode ordinary-wake line lost its foreground checkpoint"
+  assert_contains "$ordinary" "bin/fm-watch-checkpoint.sh" "jcode ordinary-wake line lost the checkpoint command"
+  assert_not_contains "$ordinary" "bin/fm-watch-arm.sh" "jcode ordinary-wake line incorrectly uses a background arm"
+
+  out=$("$RENDER" --harness jcode --repair-line)
+  assert_contains "$out" "foreground checkpoint" "jcode recovery line lost its checkpoint repair"
+  assert_contains "$out" "bin/fm-watch-checkpoint.sh" "jcode recovery line lost the checkpoint command"
+  pass "jcode supervision is codex-shaped bounded foreground checkpoint, not the unknown fallback"
+}
+
 test_grok_command_sources_effective_config() {
   local home config out
   home="$TMP_ROOT/grok-home"
@@ -185,5 +206,6 @@ test_away_posture_without_daemon
 test_repair_lines
 test_cross_harness_ordinary_continuation_and_repair_matrix
 test_grok_is_background_notify
+test_jcode_is_foreground_checkpoint
 test_grok_command_sources_effective_config
 test_pi_snippet_uses_effective_extension_path
