@@ -95,6 +95,7 @@ At session start, `bin/fm-session-start.sh` prints exactly one watcher supervisi
 Do not substitute another harness's wait shape when resuming supervision.
 Claude and Grok use tracked background-notify cycles around `bin/fm-watch-arm.sh`.
 Codex uses bounded foreground checkpoints through `bin/fm-watch-checkpoint.sh` because Codex cannot reason while a foreground tool call is running.
+jcode uses the same bounded foreground checkpoint, because its background task is passive-notify (`notify: true`, `wake: false`) and does not wake an idle model on exit (`docs/jcode-primary-supervision.md`).
 OpenCode uses `.opencode/plugins/fm-primary-watch-arm.js`, which coordinates with the turn-end guard plugin and wakes the TUI with `client.session.promptAsync`.
 Pi uses the tracked `.pi/extensions/fm-primary-turnend-guard.ts` plus the tracked `.pi/extensions/fm-primary-pi-watch.ts`, both project-local extensions Pi auto-discovers once trusted.
 When changing any primary watcher adapter, update `docs/supervision-protocols/`, `docs/turnend-guard.md` if a shared idle or turn-end hook changed, and the relevant concise fact below.
@@ -324,9 +325,10 @@ Grok's primary watcher protocol is Claude-shaped background-notify around `bin/f
 ## jcode (VERIFIED 2026-07-30, jcode server 0.64.2, launcher 0.62.1)
 
 jcode (github.com/1jehuang/jcode), a coding agent that drives Claude Max or ChatGPT Pro subscriptions.
-Verified as a CREWMATE and SECONDMATE target only.
-It is not yet verified as firstmate's own primary harness: it has no usable turn-end hook for the primary guard (see below), so the primary turn-end guard, watcher-arm adapter, pre-arm seatbelt, and session-start nudge still need their own design.
-`bin/fm-supervision-instructions.sh` therefore falls back to its `unknown` protocol when firstmate itself is detected on jcode.
+Verified as a CREWMATE and SECONDMATE target, and as firstmate's own PRIMARY harness for watcher supervision.
+Its primary watcher protocol is the codex-shaped bounded foreground checkpoint (`bin/fm-watch-checkpoint.sh`), because a jcode background task is passive-notify (`notify: true`, `wake: false`) and does not satisfy the `bin/fm-watch-arm.sh` arm-and-wake-on-exit contract; the verification record is `docs/jcode-primary-supervision.md`.
+The primary turn-end guard and pre-arm seatbelt are still unbuilt: jcode has no usable turn-end hook for a spawned client (see below), and the bounded foreground checkpoint does not depend on either hook because it returns control on its own bound.
+`bin/fm-supervision-instructions.sh` maps `jcode` to `docs/supervision-protocols/jcode.md`, so session start on jcode prints `primary harness: jcode`.
 
 | Fact | Value |
 |---|---|
