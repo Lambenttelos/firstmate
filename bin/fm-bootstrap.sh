@@ -11,6 +11,7 @@
 #                 "CREW_DISPATCH: invalid config/crew-dispatch.json - <reason>",
 #                 "FLEET_SYNC: <repo>: skipped|recovered|STUCK|FETCH FAILED|PIN FAILED: <detail>",
 #                 "PRESENT_DAEMON: <reason>",
+#                 "LIVENESS_WATCHDOG: <reason>",
 #                 "PR_CHECK_MIGRATION: <private remediation>",
 #                 "TANGLE: <remediation>",
 #                 "SECONDMATE_SYNC: secondmate <id>: skipped: <reason>",
@@ -47,6 +48,12 @@
 #          session keeps arming the watcher itself per turn. The sweep is silent
 #          when the feature is not opted in, when away mode owns supervision,
 #          and when the daemon is already running.
+#          A LIVENESS_WATCHDOG line means the opted-in external liveness watchdog
+#          (bin/fm-liveness-watchdog.sh) could not be launched, so the fleet has
+#          no outside-the-tree observer to alert and auto-resume if this primary
+#          dies with work in flight. The sweep is silent when the feature is not
+#          opted in (no config/liveness-watchdog), when away mode owns
+#          supervision, and when the watchdog is already running.
 #          A TANGLE line means the firstmate primary checkout (FM_ROOT) is stranded
 #          on a feature branch instead of its default branch - a crewmate's work
 #          landed in the primary instead of its own worktree; restore it per the line.
@@ -74,8 +81,9 @@
 #          refresh relays any completed fm-fleet-sync.sh output before the
 #          aggregate timeout skip line with timeout and elapsed seconds.
 #          Set FM_FLEET_PRUNE=0 to skip branch pruning during that refresh.
-#          Set FM_BOOTSTRAP_DETECT_ONLY=1 to skip the eight MUTATING sweeps
-#          (PR-check migration, present_daemon_sweep, afk_daemon_revive_sweep,
+#          Set FM_BOOTSTRAP_DETECT_ONLY=1 to skip the nine MUTATING sweeps
+#          (PR-check migration, present_daemon_sweep, liveness_watchdog_sweep,
+#          afk_daemon_revive_sweep,
 #          afk_reader_revive_sweep, secondmate_sync, secondmate_liveness_sweep,
 #          x_mode_setup, fleet_sync) while still printing every read-only detect line
 #          above; the TANGLE line switches to advisory-only wording with no
@@ -561,6 +569,27 @@ present_daemon_sweep() {
   return 0
 }
 
+liveness_watchdog_sweep() {
+  # Idempotent external liveness-watchdog guarantee - SESSION START ONLY, and
+  # only while this session actually holds the fleet lock. Unlike the present
+  # daemon (which lives to save a per-turn tax while the primary is healthy), the
+  # watchdog (bin/fm-liveness-watchdog.sh) exists for when the primary DIES: it
+  # runs outside the agent process tree and alerts + auto-resumes when work is in
+  # flight but supervision has gone stale. It is the one supervisor that must be
+  # relaunched at session start even after a turnover, because the very failure
+  # it defends against (a primary death that takes its watcher with it) also
+  # takes the watchdog's own relaunch opportunity until a new session starts.
+  # bin/fm-liveness-watchdog.sh owns every condition: inert without the local
+  # config/liveness-watchdog flag, stood down under away mode, and a no-op when
+  # already running - all return 0 silently. Only a real launch failure is
+  # actionable, and that surfaces as one LIVENESS_WATCHDOG line.
+  local out
+  if ! out=$(FM_HOME="$FM_HOME" "$SCRIPT_DIR/fm-liveness-watchdog.sh" start 2>&1); then
+    echo "LIVENESS_WATCHDOG: $(first_line "$out")"
+  fi
+  return 0
+}
+
 install_cmd() {
   case "$1" in
     tmux|node|git|gh|curl|jq|orca|zellij) echo "brew install $1  # or the platform's package manager" ;;
@@ -951,6 +980,7 @@ if [ "${FM_BOOTSTRAP_VERBOSE_FACTS:-0}" = 1 ] \
 fi
 if [ "${FM_BOOTSTRAP_DETECT_ONLY:-0}" != 1 ]; then
   present_daemon_sweep
+  liveness_watchdog_sweep
   afk_daemon_revive_sweep
   afk_reader_revive_sweep
   secondmate_liveness_sweep
