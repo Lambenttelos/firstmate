@@ -326,6 +326,7 @@ Grok's primary watcher protocol is Claude-shaped background-notify around `bin/f
 
 jcode (github.com/1jehuang/jcode), a coding agent that drives Claude Max or ChatGPT Pro subscriptions.
 Verified as a CREWMATE and SECONDMATE target, and as firstmate's own PRIMARY harness for watcher supervision.
+The fleet-owned fork `yjuyjuy/jcode` is the canonical source for FUTURE jcode builds and installs, and the local build patch is preserved there; `docs/jcode-fork.md` owns the fork registration, the preserved-patch record, and the unexecuted live-swap runbook.
 Its primary watcher protocol is the codex-shaped bounded foreground checkpoint (`bin/fm-watch-checkpoint.sh`), because a jcode background task is passive-notify (`notify: true`, `wake: false`) and does not satisfy the `bin/fm-watch-arm.sh` arm-and-wake-on-exit contract; the verification record is `docs/jcode-primary-supervision.md`.
 The primary turn-end guard and pre-arm seatbelt are still unbuilt: jcode has no usable turn-end hook for a spawned client (see below), and the bounded foreground checkpoint does not depend on either hook because it returns control on its own bound.
 `bin/fm-supervision-instructions.sh` maps `jcode` to `docs/supervision-protocols/jcode.md`, so session start on jcode prints `primary harness: jcode`.
