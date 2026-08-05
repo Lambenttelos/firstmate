@@ -11,6 +11,8 @@
 #                 "CREW_DISPATCH: invalid config/crew-dispatch.json - <reason>",
 #                 "FLEET_SYNC: <repo>: skipped|recovered|STUCK|FETCH FAILED|PIN FAILED: <detail>",
 #                 "PRESENT_DAEMON: <reason>",
+#                 "LIVENESS_WATCHDOG: <reason>",
+#                 "LIVENESS_ESCALATION: [<time>] <what happened + resume outcome>",
 #                 "PR_CHECK_MIGRATION: <private remediation>",
 #                 "TANGLE: <remediation>",
 #                 "SECONDMATE_SYNC: secondmate <id>: skipped: <reason>",
@@ -47,6 +49,20 @@
 #          session keeps arming the watcher itself per turn. The sweep is silent
 #          when the feature is not opted in, when away mode owns supervision,
 #          and when the daemon is already running.
+#          A LIVENESS_WATCHDOG line means the opted-in external liveness watchdog
+#          (bin/fm-liveness-watchdog.sh) could not be launched, so the fleet has
+#          no outside-the-tree observer to re-wake the supervisor pane and record
+#          an escalation if this primary dies with work in flight. The sweep is
+#          silent when the feature is not opted in (no config/liveness-watchdog),
+#          when away mode owns supervision, and when the watchdog is already
+#          running.
+#          A LIVENESS_ESCALATION line means the external watchdog DID fire while
+#          this session (or a prior one) was down: the primary lost supervision
+#          with work in flight, and the line states what happened and whether the
+#          watchdog's supervisor-pane re-wake recovered it. It is surfaced in both
+#          read-only and full modes; a lock-holding session clears it after this
+#          line (liveness_watchdog_sweep's ack), a read-only session leaves it for
+#          the lock holder. Read the full record at state/.liveness-escalation.
 #          A TANGLE line means the firstmate primary checkout (FM_ROOT) is stranded
 #          on a feature branch instead of its default branch - a crewmate's work
 #          landed in the primary instead of its own worktree; restore it per the line.
@@ -74,8 +90,9 @@
 #          refresh relays any completed fm-fleet-sync.sh output before the
 #          aggregate timeout skip line with timeout and elapsed seconds.
 #          Set FM_FLEET_PRUNE=0 to skip branch pruning during that refresh.
-#          Set FM_BOOTSTRAP_DETECT_ONLY=1 to skip the eight MUTATING sweeps
-#          (PR-check migration, present_daemon_sweep, afk_daemon_revive_sweep,
+#          Set FM_BOOTSTRAP_DETECT_ONLY=1 to skip the nine MUTATING sweeps
+#          (PR-check migration, present_daemon_sweep, liveness_watchdog_sweep,
+#          afk_daemon_revive_sweep,
 #          afk_reader_revive_sweep, secondmate_sync, secondmate_liveness_sweep,
 #          x_mode_setup, fleet_sync) while still printing every read-only detect line
 #          above; the TANGLE line switches to advisory-only wording with no
@@ -561,6 +578,41 @@ present_daemon_sweep() {
   return 0
 }
 
+liveness_watchdog_sweep() {
+  # Idempotent external liveness-watchdog guarantee - SESSION START ONLY, and
+  # only while this session actually holds the fleet lock. Unlike the present
+  # daemon (which lives to save a per-turn tax while the primary is healthy), the
+  # watchdog (bin/fm-liveness-watchdog.sh) exists for when the primary DIES: it
+  # runs outside the agent process tree and, when work is in flight but
+  # supervision has gone stale, re-wakes the primary's own supervisor pane and
+  # writes a durable escalation the captain sees on next attach. It is the one
+  # supervisor that must be relaunched at session start even after a turnover,
+  # because the very failure it defends against (a primary death that takes its
+  # watcher with it) also takes the watchdog's own relaunch opportunity until a
+  # new session starts.
+  #
+  # Three actions, in order:
+  #   1. record the supervisor pane into state/.supervisor-target. This MUST run
+  #      here, from a session-start subprocess that inherits the primary's herdr
+  #      env, because the detached watchdog loop inherits no such env and cannot
+  #      resolve the pane itself.
+  #   2. start the watchdog. It owns every condition: inert without the local
+  #      config/liveness-watchdog flag, stood down under away mode, and a no-op
+  #      when already running - all return 0 silently. Only a real launch failure
+  #      is actionable, and that surfaces as one LIVENESS_WATCHDOG line.
+  #   3. ack (clear) any durable escalation AFTER the read-only detect line above
+  #      surfaced it, so an escalation shows exactly once to the session that can
+  #      act on it. The durable check wake it also enqueued stays in the queue as
+  #      the second, independent surfacing channel.
+  local out
+  FM_HOME="$FM_HOME" "$SCRIPT_DIR/fm-liveness-watchdog.sh" record >/dev/null 2>&1 || true
+  if ! out=$(FM_HOME="$FM_HOME" "$SCRIPT_DIR/fm-liveness-watchdog.sh" start 2>&1); then
+    echo "LIVENESS_WATCHDOG: $(first_line "$out")"
+  fi
+  FM_HOME="$FM_HOME" "$SCRIPT_DIR/fm-liveness-watchdog.sh" ack >/dev/null 2>&1 || true
+  return 0
+}
+
 install_cmd() {
   case "$1" in
     tmux|node|git|gh|curl|jq|orca|zellij) echo "brew install $1  # or the platform's package manager" ;;
@@ -944,6 +996,17 @@ crew=
 if [ "${FM_BOOTSTRAP_VERBOSE_FACTS:-0}" = 1 ] && [ -n "$crew" ] && [ "$crew" != "default" ]; then
   echo "BOOTSTRAP_INFO: crew harness override active: $crew"
 fi
+# External liveness-watchdog durable escalation: surfaced in BOTH modes because a
+# read-only session still needs to see that the primary died and whether the
+# watchdog's auto-resume recovered it. The mutating liveness_watchdog_sweep below
+# acks (clears) it AFTER this line, so a lock-holding session shows it exactly
+# once; a read-only session prints it without clearing, leaving it for the
+# session that holds the lock. Its enqueued check wake is the second channel.
+if [ -f "$STATE/.liveness-escalation" ]; then
+  ls_summary=$(sed -n 's/^summary=//p' "$STATE/.liveness-escalation" 2>/dev/null | head -1)
+  ls_time=$(sed -n 's/^time=//p' "$STATE/.liveness-escalation" 2>/dev/null | head -1)
+  echo "LIVENESS_ESCALATION: [$ls_time] ${ls_summary:-primary supervision was lost while work was in flight; see state/.liveness-escalation}"
+fi
 crew_dispatch_validate
 if [ "${FM_BOOTSTRAP_VERBOSE_FACTS:-0}" = 1 ] \
   && ! fm_backlog_backend_manual "$CONFIG" && fm_tasks_axi_compatible; then
@@ -951,6 +1014,7 @@ if [ "${FM_BOOTSTRAP_VERBOSE_FACTS:-0}" = 1 ] \
 fi
 if [ "${FM_BOOTSTRAP_DETECT_ONLY:-0}" != 1 ]; then
   present_daemon_sweep
+  liveness_watchdog_sweep
   afk_daemon_revive_sweep
   afk_reader_revive_sweep
   secondmate_liveness_sweep

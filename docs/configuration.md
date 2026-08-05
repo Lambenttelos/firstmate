@@ -184,6 +184,27 @@ The daemon refuses to start while `state/.afk` exists, `bin/fm-afk-start.sh` sto
 
 `bin/fm-present-daemon.sh --help` owns the subcommands, the exact status lines, and the `FM_PRESENT_*` tuning knobs.
 
+## External liveness watchdog (config/liveness-watchdog)
+
+Where the present daemon keeps a watcher armed while the primary is HEALTHY, the external liveness watchdog (`bin/fm-liveness-watchdog.sh`) is for when the primary DIES.
+The hosted primary runs its watcher as a child of its own agent process, so a primary death for any reason takes the watcher with it and the fleet sits silent until a human attaches (incident: `data/scout-overnight-turnover-while-captain-asleep/report.md`).
+The watchdog runs a loop OUTSIDE the agent process tree - detached via `setsid`, reparented to init, the same mechanism the present daemon uses - and watches durable state that survives the primary's death: `state/*.meta` for work in flight and `state/.last-watcher-beat` for watcher liveness.
+When work is in flight but no watcher has beaten within the grace window, it re-wakes the primary's own supervisor pane AND writes a durable escalation.
+
+There is no phone push on this home; the escalation is local and durable.
+The watchdog records the primary's supervisor pane at session start into `state/.supervisor-target` (the detached loop inherits no herdr environment, so it cannot resolve the pane itself), then on a trigger reads that pane's liveness and acts: a live-but-idle pane gets an Enter nudge to re-drive its turn, a confidently dead shell gets a configured relaunch command run in the pane only if `config/liveness-resume` provides one, and a dead shell with no relaunch command or a home with no recorded pane gets a clean escalation.
+The escalation is written to `state/.liveness-escalation` and surfaced two ways the captain sees on next attach: a prominent `LIVENESS_ESCALATION:` line at session start (both read-only and full modes; a lock-holding session clears it after surfacing, a read-only session leaves it for the lock holder) and a durable `check` wake.
+Resume is capped per down-episode (`FM_LIVENESS_MAX_RESUMES`, default 3), then escalates instead of retrying forever.
+Its stale-beacon signal also catches a wedged-but-alive primary as a secondary benefit: the Enter nudge is the right, safe action for a live-but-idle supervisor pane, and it never relaunches a client it read as alive.
+
+The feature is inert without the local `config/liveness-watchdog` presence flag.
+It stands down under away mode, which already hosts a session-independent watcher through its own durable daemon.
+Session start launches it when this session holds the fleet lock, through `bin/fm-bootstrap.sh`'s `liveness_watchdog_sweep`, which also re-records the supervisor pane and acks a surfaced escalation; only a real launch failure prints an actionable `LIVENESS_WATCHDOG:` line.
+Session start is the natural relaunch point, because the failure the watchdog guards against also removes its own relaunch opportunity until a fresh session exists.
+
+It is not inherited into secondmate homes, because a secondmate is idle by default and its supervision is the parent's concern.
+`docs/liveness-watchdog.md` owns the full design, the `config/liveness-resume` relaunch command, the `FM_GUARD_GRACE` / `FM_LIVENESS_INTERVAL` / `FM_LIVENESS_MAX_RESUMES` knobs, and the verification record; `docs/examples/liveness-watchdog` carries a copyable relaunch example.
+
 ## Gate defaults (.no-mistakes.yaml)
 
 The tracked `.no-mistakes.yaml` keeps test evidence outside the repo and pins `commands.lint` to `bin/fm-lint.sh` so local lint matches CI.

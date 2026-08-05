@@ -1,0 +1,26 @@
+# config/liveness-resume - the OPTIONAL relaunch command for the external
+# liveness watchdog (bin/fm-liveness-watchdog.sh). Copy this into a local,
+# gitignored config/liveness-resume and edit.
+#
+# The watchdog always re-wakes the primary's recorded supervisor pane
+# (state/.supervisor-target) when the primary dies with work in flight: a
+# live-but-idle pane gets a gentle Enter nudge with NO config needed. This file
+# is only for the harder case - a supervisor pane that reads as a DEAD shell (the
+# client process is truly gone, not just idle). When that happens AND this file
+# exists, the watchdog runs this single command IN that pane via the backend's
+# text-submit to relaunch the client.
+#
+# When config/liveness-resume is ABSENT, a dead client is escalated for MANUAL
+# recovery but never relaunched. A live-but-idle pane is unaffected either way.
+#
+# This command is HOST/RUNTIME-SPECIFIC: it is however this host relaunches the
+# firstmate primary in its own pane. Keep any secret it needs in this gitignored
+# file, never committed.
+#
+# The watchdog caps attempts (FM_LIVENESS_MAX_RESUMES, default 3) within one
+# down-episode and then escalates instead of retrying forever, so this command
+# does not need its own loop or backoff.
+#
+# Example (illustrative - replace with this host's real relaunch line): resume
+# the jcode primary session by its recorded id.
+jcode --resume "$(cat "$FM_HOME/state/.primary-session-id" 2>/dev/null)"

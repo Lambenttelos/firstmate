@@ -2,7 +2,7 @@
 name: bootstrap-diagnostics
 description: >-
   Agent-only handling playbook for session-start bootstrap diagnostics.
-  Use whenever the session-start digest's bootstrap section prints an actionable diagnostic line - MISSING, MISSING_MANUAL, BACKEND_INVALID, NEEDS_GH_AUTH, TANGLE, CREW_DISPATCH invalid, FLEET_SYNC, PRESENT_DAEMON, PR_CHECK_MIGRATION, SECONDMATE_SYNC, SECONDMATE_LIVENESS, AFK_DAEMON, AFK_READER, NUDGE_SECONDMATES, or FMX - or when a standalone bin/fm-bootstrap.sh run prints one of those lines.
+  Use whenever the session-start digest's bootstrap section prints an actionable diagnostic line - MISSING, MISSING_MANUAL, BACKEND_INVALID, NEEDS_GH_AUTH, TANGLE, CREW_DISPATCH invalid, FLEET_SYNC, PRESENT_DAEMON, LIVENESS_WATCHDOG, LIVENESS_ESCALATION, PR_CHECK_MIGRATION, SECONDMATE_SYNC, SECONDMATE_LIVENESS, AFK_DAEMON, AFK_READER, NUDGE_SECONDMATES, or FMX - or when a standalone bin/fm-bootstrap.sh run prints one of those lines.
   A silent bootstrap section, or a BOOTSTRAP_INFO fact, means no skill load.
 user-invocable: false
 metadata:
@@ -45,6 +45,13 @@ When any diagnostic needs captain attention, report the plain consequence and re
 - `PRESENT_DAEMON: <reason>` - the opted-in present-mode supervision daemon (`bin/fm-present-daemon.sh`) could not be launched, so nothing is keeping a watcher armed on this session's behalf.
   Supervision is not down and never goes blind: the turn-end guard still fires its normal alarm and this session simply arms the watcher itself per turn, exactly as it did before the daemon existed.
   Read the reason, check `state/.present-daemon.log`, and either fix the cause or remove `config/present-daemon` to return to per-turn arming deliberately.
+- `LIVENESS_WATCHDOG: <reason>` - the opted-in external liveness watchdog (`bin/fm-liveness-watchdog.sh`) could not be launched, so the fleet has no outside-the-tree observer to re-wake the supervisor pane and record an escalation if this primary dies with work in flight.
+  In-session supervision is unaffected (the watcher and the turn-end guard still work); the gap is only the external safety net for a primary death, which is exactly the failure the session cannot self-recover from.
+  Read the reason, check `state/.liveness-watchdog.log`, and either fix the cause (often a missing `setsid`/`perl` to detach) or remove `config/liveness-watchdog` to disable the feature deliberately.
+- `LIVENESS_ESCALATION: [<time>] <what happened>` - the external watchdog fired while this session (or a prior one) was down: the primary lost supervision with work in flight, and the line states what happened and whether the watchdog's supervisor-pane re-wake acted (an Enter nudge, a relaunch, or a clean escalation with no action).
+  This is NOT a bootstrap failure - it is the durable escalation the watchdog exists to deliver, surfaced on next attach because there is no phone push on this home.
+  Read the full record at `state/.liveness-escalation`, then reconcile the fleet: verify whether the primary actually recovered (are the in-flight tasks progressing again, is a watcher beacon fresh now), and if the re-wake did not recover it, resume supervision and the affected work by hand.
+  A lock-holding session's session-start already cleared the record after surfacing it; a read-only session leaves it for the lock holder. Its enqueued `check: liveness-watchdog` wake is the second channel.
 - `PR_CHECK_MIGRATION: canonical polls rebuilt and armed; resume supervision for this home` - the non-executing migration rebuilt canonical task polls from validated metadata, and those polls are already armed.
   Independently verify the private per-task outcome record, then resume the emitted supervision protocol after finishing the session-start wake handling.
 - `PR_CHECK_MIGRATION: validated replacement polls armed; resume supervision for this home` - a retry proved canonical publication provenance, metadata identity binding, and single-link integrity for a replacement poll resolving an earlier ambiguous migration outcome.
