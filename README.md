@@ -209,6 +209,7 @@ Firstmate's skills live in two separate places with different audiences:
 - [docs/memory-report.md](docs/memory-report.md) - what is eating the machine's memory and who owns it: the phys_footprint evidence, why ownership comes from records rather than ancestry, and what may be called reclaimable.
 - [docs/turnend-guard.md](docs/turnend-guard.md) - the primary session's structural "no turn ends blind" backstop: verified per-harness hook mechanisms, scoping, loop safety, and fail-open tradeoffs.
 - [docs/supervision-protocols/](docs/supervision-protocols/) - rendered primary-harness watcher protocols for Claude, Codex, OpenCode, Pi, Grok, and unknown harness fallback.
+- [docs/jcode-fork.md](docs/jcode-fork.md) - the fleet-owned jcode fork registration, the preserved local build patch, and the unexecuted live-swap runbook.
 - [docs/scripts.md](docs/scripts.md) - the `bin/` toolbelt reference.
 - [`AGENTS.md`](AGENTS.md) - the distro's always-loaded operating contract and routing index for conditional procedures.
 - [CONTRIBUTING.md](CONTRIBUTING.md) - how to contribute, including the dev/test commands.
