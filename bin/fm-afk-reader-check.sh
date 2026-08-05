@@ -5,15 +5,19 @@
 # WHY THIS EXISTS. A paneless away home has TWO processes that must both be live:
 # the sub-supervisor daemon (bin/fm-supervise-daemon.sh), which classifies wakes
 # and appends escalation digests to the durable outbox, and the inbox reader
-# (bin/fm-afk-inbox.sh), which firstmate arms as its own harness-tracked
-# background task so the harness's task-completion notification delivers those
-# digests into an actual firstmate turn.
+# (bin/fm-afk-inbox.sh), which firstmate keeps armed through its resilient
+# wrapper (bin/fm-afk-inbox-arm.sh) as its own harness-tracked background task, so
+# the harness's task-completion notification delivers those digests into an
+# actual firstmate turn.
 #
 # The reader dying is self-concealing. Reviving it requires a firstmate turn, and
 # the only thing that starts a firstmate turn while the captain is away IS the
 # reader's delivery, so a dead reader can never announce itself through the channel
 # it owns. Evidence 2026-07-30: the reader ended at 22:33, nine escalations
-# accumulated unread until 09:55, and the fleet coasted roughly 9.5 hours.
+# accumulated unread until 09:55, and the fleet coasted roughly 9.5 hours. The
+# wrapper's resident reader and crash-relaunch shrink that window, but the wrapper
+# process itself can still be reaped on a session turnover, so this outer sweep
+# stays the belt-and-suspenders that re-arms it on the next firstmate turn.
 #
 # The daemon side of that gap is already covered: its paneless
 # undelivered-escalation alarm writes state/.subsuper-inject-wedged and fires the
@@ -87,7 +91,7 @@ main() {
   esac
   [ "$count" -gt 0 ] || return 0
 
-  printf 'AFK_READER: away-mode escalation reader is not running (no sign of life for %ss) and %s escalation record(s) are waiting; arm bin/fm-afk-inbox.sh as a tracked background task to deliver them\n' \
+  printf 'AFK_READER: away-mode escalation reader is not running (no sign of life for %ss) and %s escalation record(s) are waiting; arm bin/fm-afk-inbox-arm.sh as a tracked background task to deliver them\n' \
     "$age" "$count"
   return 0
 }

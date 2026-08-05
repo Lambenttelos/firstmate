@@ -7,12 +7,16 @@
 # delivery and appends each flushed digest to the durable outbox instead
 # (bin/fm-afk-outbox-lib.sh owns that record and acknowledgement contract).
 #
-# This script is the other half: firstmate arms it as the harness's OWN tracked
-# background task, exactly the way bin/fm-watch-arm.sh is armed, and the harness's
-# task-completion notification becomes the delivery mechanism. It blocks until an
-# unacknowledged record exists, prints the pending digests on stdout, marks them
-# acknowledged, and exits. Never fire it and forget with a shell `&`: that
-# backgrounded child is reaped when the call returns, leaving nothing listening.
+# This script is the other half: firstmate keeps it armed through its resilient
+# wrapper bin/fm-afk-inbox-arm.sh, which firstmate arms as the harness's OWN
+# tracked background task exactly the way bin/fm-watch-arm.sh is armed, and the
+# harness's task-completion notification becomes the delivery mechanism. This
+# reader blocks until an unacknowledged record exists, prints the pending digests
+# on stdout, marks them acknowledged, and exits. The wrapper (not this script) is
+# what firstmate arms directly: it runs this reader resident (--timeout 0) so a
+# quiet home never idle-exits it and relaunches it on a crash. Never fire this
+# reader with a shell `&`: that backgrounded child is reaped when the call
+# returns, leaving nothing listening.
 #
 # It exits promptly, and always after delivering anything already pending, when:
 #   - records were delivered (the normal case),

@@ -73,7 +73,8 @@ The shared no-mistakes gate refusal for fleet lifecycle entrypoints is summarize
 | `fm-afk-launch.sh`       | Own away-mode entry, exit, rollback, and any backend terminal lifecycle                 |
 | `fm-afk-return.sh`       | Own deterministic return shutdown, catch-up evidence, and the firstmate-actionable blocker gate |
 | `fm-afk-outbox-lib.sh`   | Own the durable away-mode paneless-delivery outbox: append-only records, portable lock, ack high-water mark, and compaction |
-| `fm-afk-inbox.sh`        | Blocking away-mode pull-delivery reader firstmate arms as a tracked background task: print pending digests, then acknowledge |
+| `fm-afk-inbox.sh`        | Blocking away-mode pull-delivery reader: print pending digests, then acknowledge (armed through fm-afk-inbox-arm.sh, not directly) |
+| `fm-afk-inbox-arm.sh`    | Resilient arm wrapper for the pull-delivery reader firstmate arms as a tracked background task: keep it resident, relaunch on crash with bounded backoff, escalate after repeated crashes, pass genuine outcomes through |
 | `fm-afk-reader-check.sh`  | Report an away-mode escalation reader that is not running while records wait for it, so session start can re-arm it |
 | `fm-afk-driver.sh`       | Advance the away-mode queue autonomously and safely: clean up finished lanes, nudge one that never pushed, start prepared queued work, report every action |
 | `fm-supervisor-target-lib.sh` | Resolve the shared supervisor target and backend for the daemon and launcher       |

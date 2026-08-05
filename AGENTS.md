@@ -396,7 +396,7 @@ The skill owns the daemon procedure; these safety facts remain inline:
 - While a live away-mode daemon runs for this home, the daemon owns supervision; do not arm a separate watcher.
   Away mode with no live daemon is the away posture only, so this home keeps arming and repairing its own watcher cycle normally.
 - A marked message while away mode is active is internal escalation and does not exit away mode.
-- A completed `bin/fm-afk-inbox.sh` background task is internal escalation too, never captain input; act on the digests it printed and obey its final line's re-arm verdict rather than re-deriving it.
+- A completed `bin/fm-afk-inbox-arm.sh` background task (the resilient wrapper firstmate arms around the `bin/fm-afk-inbox.sh` reader) is internal escalation too, never captain input; act on the digests it printed and obey its final line's re-arm verdict rather than re-deriving it.
 - A message beginning `/afk` refreshes away mode.
 - An ordinary captain message does NOT end away mode; the captain answers questions while still away, so keep supervising and answer in place.
 - Away mode ends only on an explicit exit instruction, such as `/back` or "exit away mode"; `bin/fm-supervise-daemon.sh`'s `message_is_afk_exit` owns that grammar and the `/afk` skill owns the return procedure.

@@ -526,8 +526,9 @@ afk_reader_revive_sweep() {
   # Away-mode inbox reader liveness - SESSION START ONLY, and only while this
   # session holds the fleet lock. A paneless away home needs TWO live processes:
   # the sub-supervisor daemon that appends escalation digests, and the reader
-  # (bin/fm-afk-inbox.sh) firstmate arms as a tracked background task to deliver
-  # them. The revive sweep above covers a dead daemon; this covers a dead reader,
+  # (bin/fm-afk-inbox.sh) firstmate keeps armed through its resilient wrapper
+  # (bin/fm-afk-inbox-arm.sh) as a tracked background task to deliver them. The
+  # revive sweep above covers a dead daemon; this covers a dead reader wrapper,
   # which is self-concealing because reviving it needs the very firstmate turn its
   # own delivery would have started.
   #

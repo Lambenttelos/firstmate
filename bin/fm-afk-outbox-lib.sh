@@ -15,8 +15,9 @@
 # (the durable wake queue survived), but away mode was silently useless.
 #
 # The pull path needs no pane: the daemon appends each flushed digest here, and
-# firstmate arms bin/fm-afk-inbox.sh as its own harness-tracked background task,
-# exactly the way bin/fm-watch-arm.sh is armed. The harness's own task-completion
+# firstmate keeps bin/fm-afk-inbox.sh armed through its resilient wrapper
+# bin/fm-afk-inbox-arm.sh as its own harness-tracked background task, exactly the
+# way bin/fm-watch-arm.sh is armed. The harness's own task-completion
 # notification becomes the delivery mechanism.
 #
 # RECORD FORMAT (one line per flushed digest, append only):
@@ -141,11 +142,28 @@ FM_AFK_INBOX_BEACON_STALE_DEFER_MULTIPLE=2
 # exist - so an absent beacon reads as the strongest possible form of "nothing is
 # listening" rather than as a fresh stamp. Same portable stat pair the watcher and
 # the daemon use, kept here so every beacon consumer measures age identically.
+#
+# The stat FLAVOR is decided ONCE by uname, never by a `stat -f || stat -c`
+# fallback: on GNU/Linux `stat -f %m` reads FILESYSTEM status (not mtime) and
+# EXITS 0 with garbage, so an `||` chain never reaches `stat -c %Y` and the age
+# comes back empty. An empty age silently defeats every beacon consumer - the
+# reader-liveness detector reads a healthy home and the daemon's undelivered
+# alarm never fires - which is the same never-decide-per-call discipline
+# bin/fm-watch.sh applies. A stat that cannot read the mtime falls back to `now`,
+# i.e. age 0, the safe direction that never fabricates staleness.
+if [ "$(uname)" = Darwin ]; then
+  _fm_afk_file_mtime() { stat -f %m "$1" 2>/dev/null; }
+else
+  _fm_afk_file_mtime() { stat -c %Y "$1" 2>/dev/null; }
+fi
 fm_afk_file_age() {  # <file>
   local f=$1 mtime now
   [ -e "$f" ] || { printf '999999'; return 0; }
   now=$(date +%s)
-  mtime=$(stat -f %m "$f" 2>/dev/null || stat -c %Y "$f" 2>/dev/null || printf '%s' "$now")
+  mtime=$(_fm_afk_file_mtime "$f")
+  case "$mtime" in
+    ''|*[!0-9]*) mtime=$now ;;
+  esac
   printf '%s' $(( now - mtime ))
 }
 
