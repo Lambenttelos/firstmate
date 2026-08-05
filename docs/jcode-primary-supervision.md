@@ -1,5 +1,11 @@
 # jcode primary-harness supervision (verification record)
 
+> Superseded in part by [`jcode-wake-adapter.md`](jcode-wake-adapter.md) (2026-08-05).
+> Finding 2 below concluded the async wake could not be verified from inside a single turn, so this record fell back to the bounded foreground checkpoint alone.
+> A later cross-turn test proved jcode DOES have a reliable wake primitive: a background task set to `wake: true` via the `bg` tool re-drives an idle model on completion.
+> The verified adapter is therefore the async `bin/fm-watch-arm.sh` cycle plus a mandatory `bg subscribe wake:true` step, with this checkpoint kept as the zero-dependency fallback.
+> This record stays valid for the bounded foreground checkpoint mechanics (Findings 3-4) and for the default `wake: false` behavior (Findings 1-2).
+
 This document records the empirical verification that promoted jcode out of `bin/fm-supervision-instructions.sh`'s `unknown` fallback and into a named supervision protocol.
 It is a backend-verification record: dates, versions, exact commands, and exact output, per the firstmate-coding-guidelines rule.
 
@@ -113,9 +119,10 @@ A separate check confirmed jcode's foreground `Bash` tool tolerates a long block
 
 ## Conclusion and consequences
 
-jcode's verified primary watcher protocol is the bounded foreground checkpoint `bin/fm-watch-checkpoint.sh --seconds "${FM_CODEX_WATCH_CHECKPOINT:-180}"`, identical in shape to codex.
+jcode's verified primary watcher protocol at the time of this record was the bounded foreground checkpoint `bin/fm-watch-checkpoint.sh --seconds "${FM_CODEX_WATCH_CHECKPOINT:-180}"`, identical in shape to codex.
 The model takes one checkpoint, handles any actionable wake it returns, then takes the next checkpoint while supervision is required.
-Do NOT use `bin/fm-watch-arm.sh` as jcode's normal supervision command: a jcode background task is passive-notify (`wake: false`) and does not satisfy the arm-and-wake-on-exit contract.
+The reason `bin/fm-watch-arm.sh` was not used as the normal supervision command here is Finding 2: a jcode background task DEFAULTS to passive `wake: false`, which does not satisfy the arm-and-wake-on-exit contract.
+That default is still true, but [`jcode-wake-adapter.md`](jcode-wake-adapter.md) later showed the default can be overridden: setting `wake: true` on the arm's background task via the `bg` tool makes its completion re-drive the idle model, so the async `bin/fm-watch-arm.sh` arm IS usable on jcode with that mandatory extra step, and the checkpoint remains the zero-dependency fallback.
 
 This closes the "primary harness: unknown" gap: `bin/fm-supervision-instructions.sh` now maps `jcode` to `docs/supervision-protocols/jcode.md` and emits a jcode-specific repair line, so session start on jcode prints `primary harness: jcode`.
 
