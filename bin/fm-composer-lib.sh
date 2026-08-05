@@ -173,6 +173,20 @@ fm_composer_strip_ghost() {
 #   idle, nothing typed:  "3>                                        ⏳"
 #   idle, text typed:     "3> hello world                            ⏳"
 #   mid-turn (busy):      "4…                                        ⏳"
+#   idle, skill active:   "22»                                       ⏳"
+#
+# The state glyph is chosen by jcode's own app state, NOT by pane focus - the
+# single source of truth is jcode-tui's input_prompt() (crates/jcode-tui/src/tui/
+# ui_input.rs), which returns one of exactly four prompt prefixes:
+#   "$ " shell mode; "… " while processing (busy); "» " (U+00BB) when a SKILL is
+#   active and idle; "> " otherwise (plain idle). The away-mode supervisor pane
+#   (firstmate itself) runs with a skill active, so its EMPTY, idle composer draws
+#   "NN» " rather than "NN> ". Both ">" and "»" are genuine idle agent-composer
+#   prompts, so both must reduce to the same "empty when nothing is typed"
+#   verdict. Verified 2026-08-05 (jcode server 0d5cd9f-dirty, herdr 0.7.x): an
+#   idle skill-active supervisor pane rendered "22»  ⏳" and read `pending`, the
+#   false-pending shape that wedged away-mode injection for 3+ hours (three missed
+#   wakes on 2026-08-04/05, see data/learnings.md).
 #
 # Every run is bright truecolor, so nothing is de-emphasised and the shared ghost
 # stripper keeps the whole row: without this recognizer an IDLE jcode pane reads
@@ -194,15 +208,53 @@ fm_composer_strip_ghost() {
 # a jcode composer row; returns 1 for any other row, leaving the caller's
 # existing classification untouched. Bash 3.2 safe: literal prefix/suffix
 # substitution only, no multibyte character classes.
+#
+# GLYPH-AGNOSTIC EMPTY BACKSTOP (fix 2, task fix-daemon-composer-defer-wedge):
+# the known-glyph list above (> … ») tracks jcode's current input_prompt()
+# states, but a FUTURE jcode build could add or rename a prompt glyph, and the
+# wedge this task fixes was precisely a new glyph ("»") the list did not know.
+# So the `*)` default no longer refuses every unknown glyph outright: an EMPTY
+# composer of jcode's shape must read empty regardless of its specific glyph, or
+# the same 3-hour silent-swallow wedge returns the next time the glyph changes.
+# The backstop reads empty ONLY when the row carries jcode's right-aligned status
+# indicator (U+23F3 ⏳) - which proves it is a composer row, not a transcript or
+# footer row (those end in "•", a rate string, "https", a percent) - AND the
+# content before the right-aligned padding is a lone glyph (no letters, digits,
+# or spaces = nothing was typed). A row with real typed text fails the lone-glyph
+# test and stays unmatched, the safe direction: the daemon defers and the
+# max-defer alarm still fires rather than an escalation being typed into an
+# unrecognized target. A digit-PREFIXED glyph is always jcode's own numbered
+# agent composer (never a bare dead shell), so this cannot relax the
+# bare-shell-glyph safety rule above.
 fm_composer_jcode_prompt_text() {  # <trimmed-row-content> -> typed text on stdout
-  local s=$1 digits rest
+  local s=$1 digits rest ind head
   digits=${s%%[!0-9]*}
   [ -n "$digits" ] || return 1
   rest=${s#"$digits"}
   case "$rest" in
     '>'*) rest=${rest#>} ;;
     '…'*) rest=${rest#…} ;;
-    *) return 1 ;;
+    '»'*) rest=${rest#»} ;;
+    *)
+      # Unknown/future prompt glyph: accept ONLY the empty-composer shape.
+      ind=$(printf '\342\217\263')  # U+23F3 HOURGLASS WITH FLOWING SAND
+      case "$s" in
+        *"$ind") ;;
+        *) return 1 ;;               # no jcode composer indicator -> not a composer
+      esac
+      head=${rest%%"  "*}            # content before the right-aligned padding
+      head="${head#"${head%%[![:space:]]*}"}"
+      head="${head%"${head##*[![:space:]]}"}"
+      # A lone glyph (one codepoint, 1-4 bytes) with no typed content is an empty
+      # composer; anything with letters, digits, spaces, or more than one glyph is
+      # real content and must NOT read empty here.
+      case "$head" in
+        ''|*[A-Za-z0-9]*|*' '*) return 1 ;;
+      esac
+      [ "${#head}" -le 4 ] || return 1
+      printf ''
+      return 0
+      ;;
   esac
   # Drop the right-aligned status indicator: everything from the first run of
   # two or more spaces onward.

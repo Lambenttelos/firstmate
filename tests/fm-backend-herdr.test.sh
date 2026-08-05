@@ -1817,6 +1817,54 @@ test_composer_state_jcode_busy_prompt_is_empty() {
   pass "fm_backend_herdr_composer_state: jcode's mid-turn prompt row reads empty"
 }
 
+# jcode's SKILL-ACTIVE idle prompt glyph (task fix-daemon-composer-defer-wedge,
+# verified 2026-08-05, jcode server 0d5cd9f-dirty + herdr 0.7.x). jcode's
+# input_prompt() (crates/jcode-tui/src/tui/ui_input.rs) draws "» " (U+00BB) for an
+# idle composer while a SKILL is active, not "> ". The away-mode supervisor pane
+# (firstmate itself) always runs with a skill active, so its EMPTY idle composer
+# is "NN» ... ⏳". Before this fix that row read `pending` and the away daemon
+# deferred every escalation for 3+ hours (three missed wakes). The fixture is the
+# real captured bytes: "22»" + right-aligned ⏳.
+test_composer_state_jcode_skill_active_prompt_is_empty() {
+  local dir log resp fb out
+  dir="$TMP_ROOT/composer-jcode-skill"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
+  printf '\x1b[38;2;255;80;80m22\x1b[38;2;138;180;248m\xc2\xbb \x1b[39m        \x1b[38;2;255;193;7m\xe2\x8f\xb3\n' > "$resp/1.out"
+  fb=$(make_herdr_fakebin "$dir")
+  out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_composer_state default:w1:p2' "$ROOT" )
+  [ "$out" = empty ] || fail "an idle skill-active jcode composer (» glyph) must read empty, got '$out' (pending here is the 3-hour away-mode wedge)"
+  pass "fm_backend_herdr_composer_state: jcode's idle skill-active (») prompt row reads empty"
+}
+
+# The glyph-agnostic safety backstop (fix 2 of the same task): a FUTURE jcode
+# build could rename the prompt glyph again, and the wedge this task fixes was
+# precisely a glyph the recognizer did not know. An EMPTY composer of jcode's
+# shape (a lone unknown glyph plus the right-aligned ⏳ indicator and no typed
+# text) must therefore still read empty, so a glyph change can never re-wedge
+# injection. A composer of that shape WITH real typed text must still read
+# pending (the safe direction). Fixture uses a deliberately-unknown glyph 'ǂ'.
+test_composer_state_jcode_future_glyph_empty_is_empty() {
+  local dir log resp fb out
+  dir="$TMP_ROOT/composer-jcode-future-empty"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
+  printf '\x1b[38;2;255;80;80m7\x1b[38;2;138;180;248m\xc7\x82 \x1b[39m        \x1b[38;2;255;193;7m\xe2\x8f\xb3\n' > "$resp/1.out"
+  fb=$(make_herdr_fakebin "$dir")
+  out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_composer_state default:w1:p2' "$ROOT" )
+  [ "$out" = empty ] || fail "an empty jcode composer with a future/unknown glyph must still read empty, got '$out' (a future glyph must never re-wedge injection)"
+  pass "fm_backend_herdr_composer_state: an empty jcode composer with an unknown future glyph still reads empty"
+}
+
+test_composer_state_jcode_future_glyph_with_text_is_pending() {
+  local dir log resp fb out
+  dir="$TMP_ROOT/composer-jcode-future-text"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
+  printf '\x1b[38;2;255;80;80m7\x1b[38;2;138;180;248m\xc7\x82 \x1b[39mreal unsubmitted text        \x1b[38;2;255;193;7m\xe2\x8f\xb3\n' > "$resp/1.out"
+  fb=$(make_herdr_fakebin "$dir")
+  out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_composer_state default:w1:p2' "$ROOT" )
+  [ "$out" = pending ] || fail "a jcode composer with a future glyph AND real typed text must read pending, got '$out' (never inject over real input)"
+  pass "fm_backend_herdr_composer_state: a future-glyph jcode composer with real text reads pending, never empty"
+}
+
 test_composer_state_jcode_typed_text_is_pending() {
   local dir log resp fb out
   dir="$TMP_ROOT/composer-jcode-pending"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
@@ -3003,6 +3051,9 @@ test_composer_state_grok_bright_truecolor_real_text_is_pending
 test_composer_state_codex_bare_prompt_glyph_is_empty
 test_composer_state_jcode_numbered_prompt_is_empty
 test_composer_state_jcode_busy_prompt_is_empty
+test_composer_state_jcode_skill_active_prompt_is_empty
+test_composer_state_jcode_future_glyph_empty_is_empty
+test_composer_state_jcode_future_glyph_with_text_is_pending
 test_composer_state_jcode_typed_text_is_pending
 test_composer_state_jcode_transcript_rows_are_not_a_composer
 test_composer_state_jcode_wrapped_tail_is_pending
