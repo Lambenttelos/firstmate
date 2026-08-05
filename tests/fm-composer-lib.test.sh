@@ -111,6 +111,46 @@ test_jcode_busy_prompt_row_is_empty() {
   pass "fm_composer_classify_content: a mid-turn jcode prompt row reads empty"
 }
 
+# jcode's SKILL-ACTIVE idle prompt glyph (task fix-daemon-composer-defer-wedge,
+# verified 2026-08-05). jcode's input_prompt() draws "» " (U+00BB) for an idle
+# composer while a skill is active (the away-mode supervisor pane always has one),
+# not "> ". Before this fix that idle-but-nonblank row read pending and wedged the
+# away daemon for 3+ hours.
+test_jcode_skill_active_prompt_row_is_empty() {
+  local out
+  out=$(classify 0 '22»                   ⏳')
+  [ "$out" = empty ] || fail "an idle skill-active jcode composer (») must read empty, got '$out' (pending here is the away-mode wedge)"
+  out=$(classify 0 '22»')
+  [ "$out" = empty ] || fail "a skill-active jcode prompt with no status glyph must read empty, got '$out'"
+  out=$(classify 0 '22» hello unsubmitted text     ⏳')
+  [ "$out" = pending ] || fail "real text in a skill-active jcode composer must read pending, got '$out'"
+  pass "fm_composer_classify_content: an idle skill-active jcode prompt row (») reads empty, typed text reads pending"
+}
+
+# The glyph-agnostic backstop (fix 2): an EMPTY jcode composer whose prompt glyph
+# is unknown to the recognizer (a future jcode build) must still read empty so a
+# glyph rename can never re-wedge injection, while the same shape with real typed
+# text stays pending and a row with no ⏳ composer indicator is never claimed.
+test_jcode_future_glyph_empty_backstop() {
+  local out
+  # 'ǂ' (U+01C2) is a deliberately-unknown prompt glyph. Empty composer -> empty.
+  out=$(classify 0 '7ǂ                    ⏳')
+  [ "$out" = empty ] || fail "an empty jcode composer with an unknown future glyph must read empty, got '$out'"
+  # Same shape with real text -> pending (never inject over real input).
+  out=$(classify 0 '7ǂ real unsubmitted text     ⏳')
+  [ "$out" = pending ] || fail "a future-glyph jcode composer with real text must read pending, got '$out'"
+  # No ⏳ composer indicator: not a recognized empty composer (the recognizer must
+  # not claim an arbitrary digit-plus-glyph row).
+  if fm_composer_jcode_prompt_text '7ǂ' >/dev/null 2>&1; then
+    fail "a lone future glyph with no ⏳ indicator must not be claimed as a jcode composer"
+  fi
+  # The dead-shell safety rule is untouched: a bare shell prompt with no digit
+  # prefix and no indicator stays unknown.
+  out=$(classify 0 '$')
+  [ "$out" = unknown ] || fail "a bare shell prompt must stay unknown, got '$out'"
+  pass "fm_composer_jcode_prompt_text: an empty future-glyph composer reads empty, text stays pending, dead shell stays unknown"
+}
+
 test_jcode_typed_text_is_pending() {
   local out
   out=$(classify 0 '3> hello unsubmitted text          ⏳')
@@ -278,6 +318,8 @@ test_idle_placeholder_case_mode_is_explicit
 test_real_text_is_pending
 test_jcode_idle_prompt_row_is_empty
 test_jcode_busy_prompt_row_is_empty
+test_jcode_skill_active_prompt_row_is_empty
+test_jcode_future_glyph_empty_backstop
 test_jcode_typed_text_is_pending
 test_jcode_recognizer_rejects_non_composer_rows
 test_jcode_wrapped_tail_is_pending
