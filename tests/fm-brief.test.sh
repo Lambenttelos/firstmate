@@ -594,6 +594,16 @@ test_briefs_bind_the_shared_machine_rules() {
     "ship brief must require an end-to-end coverage statement"
   assert_grep 'does not block the merge' "$brief" \
     "a declared coverage gap must be stated, not treated as a merge blocker"
+
+  # The coverage declaration is rule 4 of the four standing test-safety rules, so
+  # it must reach a freshly spawned scout too, not only a ship worker.
+  brief="$home/data/brief-rules-scout/brief.md"
+  assert_grep '# Test coverage declaration' "$brief" \
+    "scout brief must carry the coverage declaration section"
+  assert_grep 'built test-first' "$brief" \
+    "scout brief must require a test-first statement in the final report"
+  assert_grep 'end-to-end coverage' "$brief" \
+    "scout brief must require an end-to-end coverage statement"
   pass "fm-brief.sh: ship and scout briefs bind the shared-machine and coverage rules"
 }
 
