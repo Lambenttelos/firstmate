@@ -284,7 +284,13 @@ fi
 
 DESK_SNAPSHOT_BIN="${FM_DESK_SNAPSHOT_BIN:-$SCRIPT_DIR/fm-bearings-snapshot.sh}"
 if [ "$HAVE_JQ" -eq 1 ]; then
-  if BEAR=$(desk_bound "$DESK_SNAPSHOT_BIN" --json 2>/dev/null) \
+  # The desk is a strictly READ-ONLY projection that itself displays away
+  # status, so it must render a full fleet snapshot even while away mode is
+  # active. Skip ONLY the bearings away-return guard for this read; the bypass
+  # does not clear the away gate or mutate any catch-up state (see
+  # fm-bearings-snapshot.sh). Away or not, the projection output is identical,
+  # so a non-away render stays byte-unchanged.
+  if BEAR=$(FM_BEARINGS_SKIP_AFK_GUARD=1 desk_bound "$DESK_SNAPSHOT_BIN" --json 2>/dev/null) \
     && [ -n "$BEAR" ] && printf '%s' "$BEAR" | jq -e . >/dev/null 2>&1; then
     :
   else

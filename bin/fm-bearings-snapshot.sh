@@ -161,7 +161,17 @@ command -v jq >/dev/null 2>&1 || { echo "fm-bearings-snapshot: jq not found" >&2
 # The deterministic return-catch-up owner must clear before this or any other
 # ordinary captain request proceeds. Bearings does not reproduce that policy;
 # it only consults the shared read-only gate.
-"$SCRIPT_DIR/fm-afk-return.sh" guard || exit $?
+#
+# FM_BEARINGS_SKIP_AFK_GUARD=1 skips ONLY this guard consultation, for a
+# strictly read-only projection consumer (the captain's desk, which itself
+# displays away status) that must render a full fleet snapshot while away mode
+# is active. The bypass is read-only: it does not clear the away gate,
+# acknowledge escalations, or mutate any return catch-up state - it only skips
+# the refusal so the downstream --json projection can run. Every other path,
+# including the interactive/mutating bearings paths, still consults the gate.
+if [ "${FM_BEARINGS_SKIP_AFK_GUARD:-0}" != 1 ]; then
+  "$SCRIPT_DIR/fm-afk-return.sh" guard || exit $?
+fi
 
 NOW=${FM_BEARINGS_NOW:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}
 if [ "$ALL_LANDED" = 1 ] || [ "$ALL_SECONDMATES" = 1 ]; then

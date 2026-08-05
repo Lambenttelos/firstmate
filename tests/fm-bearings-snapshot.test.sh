@@ -853,6 +853,43 @@ EOF
   pass "repeated snapshots keep the same current landed baseline and ignore prior reports"
 }
 
+# The away-return guard must still refuse an ordinary bearings read while away
+# mode is active, but a strictly read-only consumer (the desk) may opt out of ONLY
+# that refusal via FM_BEARINGS_SKIP_AFK_GUARD=1 and still get the real projection.
+test_afk_guard_blocks_but_readonly_bypass_yields_real_data() {
+  local home fakebin json rc
+  home=$(make_home afk-bypass); write_fixture "$home"
+  fakebin=$(make_fakebin "$home")
+  : > "$home/state/.afk"
+
+  # Without the bypass, the away-return guard blocks the read (exit 3, no output).
+  set +e
+  json=$(PATH="$fakebin:$PATH" FM_HOME="$home" FM_BEARINGS_NOW=2026-07-11T18:00:00Z \
+    NET_LOG="$home/net.log" "$BEARINGS" --json 2>/dev/null); rc=$?
+  set -e
+  [ "$rc" -eq 3 ] || fail "away-return guard must still block an ordinary bearings read, got rc=$rc"
+  [ -z "$json" ] || fail "blocked bearings read must yield no projection, got: $json"
+
+  # With the read-only bypass, the same read yields the real projection.
+  json=$(PATH="$fakebin:$PATH" FM_HOME="$home" FM_BEARINGS_NOW=2026-07-11T18:00:00Z \
+    NET_LOG="$home/net.log" FM_BEARINGS_SKIP_AFK_GUARD=1 "$BEARINGS" --json) \
+    || fail "read-only bypass must produce a projection while away"
+  printf '%s' "$json" | jq -e '.schema == "fm-bearings.v1"' >/dev/null \
+    || fail "bypassed projection must be a valid bearings snapshot: $json"
+  printf '%s' "$json" | jq -e '.in_flight | any(.id == "ship-task")' >/dev/null \
+    || fail "bypassed projection must carry real fleet data: $json"
+
+  # The bypass is read-only: the away gate is untouched, so a subsequent
+  # ordinary read is still blocked.
+  [ -e "$home/state/.afk" ] || fail "bypass must not clear the away flag"
+  set +e
+  PATH="$fakebin:$PATH" FM_HOME="$home" FM_BEARINGS_NOW=2026-07-11T18:00:00Z \
+    NET_LOG="$home/net.log" "$BEARINGS" --json >/dev/null 2>&1; rc=$?
+  set -e
+  [ "$rc" -eq 3 ] || fail "away gate must remain armed after a read-only bypass, got rc=$rc"
+  pass "away-return guard blocks ordinary reads while a read-only bypass yields real data"
+}
+
 test_default_is_bounded_and_local_only() {
   local home fakebin toon json
   home=$(make_home bounded); write_fixture "$home"
@@ -1903,6 +1940,7 @@ test_parent_evidence_reconciles_by_verb_and_key
 test_nonprogressing_child_states_are_explicit
 test_registry_unavailability_and_bounds_are_explicit
 test_current_landed_baseline_is_repeatable_and_prior_report_independent
+test_afk_guard_blocks_but_readonly_bypass_yields_real_data
 test_default_is_bounded_and_local_only
 test_toon_json_parity
 test_landed_includes_secondmate_home_merges

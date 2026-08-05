@@ -53,6 +53,13 @@ make_snapshot() {  # <dir>
   cat > "$f" <<'SH'
 #!/usr/bin/env bash
 printf '%s\n' "${FM_HOME:-UNSET}" > "$SEEN_HOME"
+printf '%s\n' "${FM_BEARINGS_SKIP_AFK_GUARD:-0}" > "${SEEN_SKIP:-/dev/null}"
+# Simulate the real fm-bearings-snapshot.sh away-return guard: while away mode is
+# active (FAKE_AFK=1) an ordinary read is refused with exit 3, unless the
+# read-only bypass FM_BEARINGS_SKIP_AFK_GUARD=1 is set.
+if [ "${FAKE_AFK:-0}" = 1 ] && [ "${FM_BEARINGS_SKIP_AFK_GUARD:-0}" != 1 ]; then
+  exit 3
+fi
 case "${FAKE_MODE:-json}" in
   json)   printf '%s' "$FAKE_JSON" ;;
   broken) printf '{"decisions_open":[],"in_flight":42,"gates":[],"landed":[]}' ;;
@@ -80,6 +87,7 @@ SH
   PATH="$fakebin:$PATH" \
   FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" \
   FM_DESK_SNAPSHOT_BIN="$SNAP" SEEN_HOME="$home/seen-home" \
+  SEEN_SKIP="$home/seen-skip" \
   FM_DESK_OUT="$out" FM_DESK_NOW='2026-07-28 09:00' \
     bash "$DESK"
 }
@@ -139,5 +147,45 @@ assert_no_grep 'Nothing is waiting on you' "$OUT3" 'absent: decisions section mu
 
 # The count band is always present, even with the projection gone.
 assert_grep 'Ticket count' "$OUT3" 'absent: the required count band is still rendered'
+
+# --- away mode: the read-only desk still renders a FULL fleet, because it passes
+#     the read-only away-guard bypass to the snapshot ---------------------------
+# Regression: the desk previously rendered an empty "could not be read"/"missing"
+# page whenever state/.afk was set, because the bearings away-return guard refused
+# the read. The desk is strictly read-only (it displays away status), so it opts
+# out of ONLY that refusal.
+HOME4="$TMP_ROOT/home4"; mkdir -p "$HOME4"
+SNAP=$(make_snapshot "$HOME4")
+OUT4="$HOME4/desk.html"
+FAKE_MODE=json FAKE_JSON="$POPULATED" FAKE_AFK=1 run_desk "$HOME4" "$OUT4"
+
+assert_grep 'Ship one' "$OUT4" 'away: an in-flight row still reaches the page'
+assert_grep 'Decide alpha' "$OUT4" 'away: an open decision still reaches the page'
+assert_grep 'Ship old' "$OUT4" 'away: a landed row still reaches the page'
+assert_no_grep 'could not be read' "$OUT4" 'away: no fleet-state gap banner while away'
+assert_no_grep 'Some of this page is missing' "$OUT4" 'away: no global gap banner while away'
+assert_no_grep 'Nothing is running' "$OUT4" 'away: running section is not confident-empty'
+
+# The desk must have passed the read-only bypass to the snapshot.
+seen_skip=$(cat "$HOME4/seen-skip" 2>/dev/null || printf '')
+if [ "$seen_skip" = "1" ]; then
+  pass 'away: desk passed FM_BEARINGS_SKIP_AFK_GUARD=1 to the snapshot'
+else
+  fail "away: desk did not pass the read-only bypass, snapshot saw '$seen_skip'"
+fi
+
+# --- non-away render is byte-unchanged whether or not the bypass would matter --
+# The bypass only skips the guard; with away mode off, the output must match a
+# render that never set FAKE_AFK at all.
+HOME5="$TMP_ROOT/home5"; mkdir -p "$HOME5"
+SNAP=$(make_snapshot "$HOME5")
+OUT5A="$HOME5/desk-a.html"; OUT5B="$HOME5/desk-b.html"
+FAKE_MODE=json FAKE_JSON="$POPULATED" run_desk "$HOME5" "$OUT5A"
+FAKE_MODE=json FAKE_JSON="$POPULATED" FAKE_AFK=0 run_desk "$HOME5" "$OUT5B"
+if diff -q "$OUT5A" "$OUT5B" >/dev/null 2>&1; then
+  pass 'non-away: desk render is byte-unchanged with the bypass in play'
+else
+  fail 'non-away: desk render differs when the bypass path is exercised'
+fi
 
 echo "all fm-desk-refresh tests passed"
