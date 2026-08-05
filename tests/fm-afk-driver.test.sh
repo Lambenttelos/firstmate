@@ -452,7 +452,7 @@ test_reader_check_reports_a_dead_reader_with_records_waiting() {
   assert_contains "$out" "AFK_READER:" "a dead reader with records waiting was not reported: $out"
   assert_contains "$out" "1 escalation record(s) are waiting" \
     "the report does not say how many records are waiting: $out"
-  assert_contains "$out" "arm bin/fm-afk-inbox.sh" \
+  assert_contains "$out" "arm bin/fm-afk-inbox-arm.sh" \
     "the report does not instruct firstmate to arm the reader: $out"
   pass "a stale reader beacon with unread records is reported with the re-arm instruction"
 }

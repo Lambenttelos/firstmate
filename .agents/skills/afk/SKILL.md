@@ -75,7 +75,9 @@ approval authority; they differ only in what supervises.
 
 3. **On the paneless form, arm the away-mode inbox reader as a tracked background task.**
    This step belongs to the paneless entry, because the reader IS that form's delivery channel (see "Delivery channel" below); a pane-delivery entry does not arm a reader.
-   Run `bin/fm-afk-inbox.sh` through the harness's own tracked background mechanism, exactly the way `bin/fm-watch-arm.sh` is armed, and never with a shell `&`.
+   Run `bin/fm-afk-inbox-arm.sh` through the harness's own tracked background mechanism, exactly the way `bin/fm-watch-arm.sh` is armed, and never with a shell `&`.
+   The wrapper is the resilient arm layer around the bare reader `bin/fm-afk-inbox.sh`: it runs the reader resident so a quiet home never idle-exits it, self-relaunches it on a crash with bounded backoff, and passes every genuine reader outcome straight through.
+   Do not arm the bare `bin/fm-afk-inbox.sh` directly; the wrapper owns residence and crash recovery, and the bare reader alone reintroduces the hourly idle-exit gap this path removed.
    If you armed it on a session that turns out to have a pane, it costs nothing: it prints one line saying the pane is delivering and exits immediately.
    Each completion is an internal escalation, not captain input.
    Read the digests it printed and act on them.
