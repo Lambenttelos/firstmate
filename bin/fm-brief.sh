@@ -65,8 +65,8 @@
 # bin/fm-heavy-run.sh, test parallelism is capped at VITEST_MAX_WORKERS=2, every test run
 # is announced with TEST START / TEST END status lines, and a live browser reproduction
 # waits for firstmate's go-ahead because at most TWO may run fleet-wide at once.
-# Ship scaffolds additionally require the final report to declare whether the change was
-# built test-first and whether it has end-to-end coverage.
+# Every ship and scout scaffold additionally requires the final report to declare whether
+# the work was built test-first and whether it has end-to-end coverage.
 # Every ship and scout scaffold also carries the standing captain rules that bind every
 # worker, so they are structural instead of hand-pasted per dispatch: never force anything
 # (push to a NEW branch when blocked, never force-push, never force-release, never decide on
@@ -434,6 +434,10 @@ The report is the only thing that survives, so anything worth keeping must be in
    Append \`working: BROWSER END - {outcome}\` the moment it finishes so the slot is released.
 
 $CAPTAIN_RULES
+
+# Test coverage declaration
+If your investigation ran or added any test, or recommends a change, your report must state plainly whether that work was built test-first and whether it has end-to-end coverage.
+A gap does not block anything, but name the gap and its reason; the captain reviews every untested product change.
 
 # Definition of done
 Write your findings to \`$DATA/$ID/report.md\`.
