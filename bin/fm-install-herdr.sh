@@ -1,27 +1,29 @@
 #!/usr/bin/env bash
 # fm-install-herdr.sh - install CI's pinned, verified Herdr build.
 #
-# Single owner of the exact Herdr version, official release asset URL, and
+# Single owner of the exact Herdr version, fork release asset URL, and
 # SHA-256 pin used by the required real-Herdr CI lane. Never installs a
 # floating package-manager latest.
 #
 # Usage:
 #   fm-install-herdr.sh <destination-directory>
 #
-# Pins Herdr v0.7.4 (protocol 16), the suite-verified protocol-16 release.
-# Selects the official GitHub Releases asset for the host OS/arch, downloads
-# with a bounded max size, verifies SHA-256 before install, then refuses to
-# finish unless the binary reports the exact pin version and a client protocol
-# at or above the required floor (16 for the real-Herdr family).
+# Pins the yjuyjuy/herdr fork release v0.7.5-fm.1 (protocol 19), built from the
+# fork master that carries merged jcode agent support on top of upstream herdr
+# 0.7.5. The fork-suffixed version can never collide with an upstream herdr tag.
+# Selects the fork GitHub Releases asset for the host OS/arch, downloads with a
+# bounded max size, verifies SHA-256 before install, then refuses to finish
+# unless the binary reports the exact pin version and a client protocol at or
+# above the required floor (16 for the real-Herdr family).
 set -eu
 
 # Exact pin - change only with a re-verified real-Herdr matrix.
-FM_HERDR_CI_VERSION=0.7.4
+FM_HERDR_CI_VERSION=0.7.5-fm.1
 FM_HERDR_CI_TAG="v${FM_HERDR_CI_VERSION}"
 FM_HERDR_CI_MIN_PROTOCOL=16
-# Bounded download ceiling (bytes). The largest official 0.7.4 asset is under 20 MiB.
-FM_HERDR_CI_MAX_BYTES=25000000
-FM_HERDR_CI_REPO=ogulcancelik/herdr
+# Bounded download ceiling (bytes). The largest fork 0.7.5-fm.1 asset is under 30 MiB.
+FM_HERDR_CI_MAX_BYTES=40000000
+FM_HERDR_CI_REPO=yjuyjuy/herdr
 
 die() {
   printf 'fm-install-herdr.sh: %s\n' "$*" >&2
@@ -35,22 +37,22 @@ arch=$(uname -m)
 case "${os}-${arch}" in
   Linux-x86_64)
     ASSET=herdr-linux-x86_64
-    SHA256=bc0fc02d4ba500f9cac2353a43e67fe036785ecca6eb55378e050fac3c103059
+    SHA256=2d2421ca0b4082b21d200a34d74f8cf6249825497e4cbefa4934df38ee7226f8
     ;;
   Linux-aarch64|Linux-arm64)
     ASSET=herdr-linux-aarch64
-    SHA256=544e0002de42806d1ab64ccdef3a7e7414f24717b0b6b022bc9e57d2eefd26a2
+    SHA256=d5106283002b2effe22780969859de34d03a32aa357cd7c9bff04e28c7ed0889
     ;;
   Darwin-arm64)
     ASSET=herdr-macos-aarch64
-    SHA256=24992e1625dbdcb18354a59e299e4b263c312400b31396cdc07cd46ed57f24a7
+    SHA256=61238ade6131b6d1ebb963009ea839f9e8c2b30d5c4982e3bfcb1a99af9accef
     ;;
   Darwin-x86_64)
     ASSET=herdr-macos-x86_64
-    SHA256=ddf430133352e1712413d5d865b34a485546f4658893fc89986257d65a7585a8
+    SHA256=160642bf09de0b4727d6b4857d59509097db6a011451950e3df8a530d6ebf608
     ;;
   *)
-    die "unsupported platform ${os}-${arch}; official Herdr assets are linux/macos x86_64 and aarch64"
+    die "unsupported platform ${os}-${arch}; fork Herdr assets are linux/macos x86_64 and aarch64"
     ;;
 esac
 

@@ -5,6 +5,7 @@ It is the herdr equivalent of the tmux facts recorded in the `harness-adapters` 
 
 Herdr is [an agent-native terminal multiplexer](https://herdr.dev) with a socket API, CLI wrappers, and native per-pane agent-state detection.
 Originally verified against herdr 0.7.1, protocol 14, on macOS aarch64; the latest dated evidence below uses herdr 0.7.4, protocol 16.
+The pinned CI build is now our fork `yjuyjuy/herdr` release `v0.7.5-fm.1` (protocol 19), built from the fork master that carries merged jcode agent support on top of upstream herdr 0.7.5; `bin/fm-install-herdr.sh` owns that exact pin.
 Current real-herdr verification uses isolated named sessions plus the guarded `bin/fm-herdr-lab.sh` lifecycle helper, either directly or through the compatibility wrappers in `tests/herdr-test-safety.sh`.
 A 2026-07-02 cleanup bug proved that `HERDR_SESSION` alone is not a safe way to target destructive session cleanup; see "Session targeting: the `--session` flag, not `HERDR_SESSION` alone" below.
 All real-herdr verification in this document uses isolated sessions and guarded cleanup; the captain's default herdr session and live tmux fleet were never intended targets.
@@ -24,12 +25,29 @@ Prerequisites:
 
 ### CI pin and required real-Herdr lane
 
-The required GitHub Actions Herdr Behavior job uses the suite-verified releases pinned by `bin/fm-install-herdr.sh` and `bin/fm-install-treehouse.sh`, never a floating package-manager latest.
+The required GitHub Actions Herdr Behavior job uses the suite-verified release pinned by `bin/fm-install-herdr.sh` and the treehouse release pinned by `bin/fm-install-treehouse.sh`, never a floating package-manager latest.
 Those installer headers own the exact versions, release assets, checksums, download bounds, and post-install gates.
+The pinned Herdr release is a build of our fork `yjuyjuy/herdr` (`bin/fm-install-herdr.sh`'s `FM_HERDR_CI_REPO`), cut from the fork master that carries merged jcode agent support on top of upstream herdr, so CI validates against a fixed fork release rather than a drifting local build.
+The fork build reports a fork-suffixed version (for example `0.7.5-fm.1`) that can never collide with an upstream herdr tag, and it still satisfies the same protocol floor (`FM_HERDR_CI_MIN_PROTOCOL`).
 The workflow owns lane composition, while `bin/fm-test-run.sh --help` owns the exact family-selection and required gate-skip mechanics that prevent a missing Herdr binary from passing silently.
 Live harness credential tests stay outside that family and outside default CI.
 CI cleanup stays inside the guarded, non-default Herdr lab contract and preserves the default-session tripwire; `bin/fm-herdr-ci-cleanup.sh` owns the exact snapshot and teardown rules.
 The first required lane targets Linux x86_64; if a genuine unsupported platform invariant appears (focus, cleanup, or default-session tripwire), keep the failure evidence and move the job to macOS rather than skip or weaken the assertion.
+
+#### Fork release pin evidence (2026-08-05)
+
+The pinned fork release `yjuyjuy/herdr` `v0.7.5-fm.1` was built by the fork's own `Fork Release` workflow from fork master, which builds all four supported platform binaries and stamps the fork build channel (`HERDR_BUILD_CHANNEL=fm`, `HERDR_BUILD_ID=1`) into the release binaries only.
+A fresh install through the repinned `bin/fm-install-herdr.sh` was verified end to end on Linux x86_64:
+
+```text
+$ bash bin/fm-install-herdr.sh /tmp/fm-herdr-install-test
+fm-install-herdr.sh: downloading herdr-linux-x86_64 from https://github.com/yjuyjuy/herdr/releases/download/v0.7.5-fm.1/herdr-linux-x86_64
+fm-install-herdr.sh: installed herdr 0.7.5-fm.1 (protocol 19) to /tmp/fm-herdr-install-test/herdr
+herdr 0.7.5-fm.1
+```
+
+The installed binary reports the fork-suffixed version `0.7.5-fm.1`, satisfies the protocol floor (client protocol 19), and embeds the merged jcode agent-detection manifest (`id = "jcode"` in the bundled `agent-detection` catalog and jcode in the process-name identification list), so a jcode pane is now natively detected rather than falling through to the shared tail-regex fallback.
+The four asset SHA-256 pins in `bin/fm-install-herdr.sh` were recomputed independently from the served release assets and match the workflow's `SHA256SUMS.txt`.
 
 Select herdr by putting `herdr` in a local `config/backend` file - the durable way to pick it - or by exporting `FM_BACKEND=herdr` when you launch your harness for a one-off session; telling the first mate in chat to use herdr also works.
 It can also be auto-detected: when firstmate itself is running natively inside herdr (`HERDR_ENV=1`) and no explicit backend is set, firstmate auto-selects herdr and prints a one-time opt-out notice; running inside tmux nested in herdr always resolves to tmux instead.
