@@ -5,59 +5,78 @@
 # on 2026-07-29 the hosted firstmate primary was collected by an idle sweep,
 # which tree-killed its child supervision watcher in the same stroke. The fleet
 # sat silent 3h41m with no self-recovery, because the one process that would have
-# woken the session died with it. The idle-sweep cause is closed on the patched
-# daemon, but the STRUCTURAL gap remains: whenever the hosted primary dies for
-# ANY reason (daemon crash, deliberate restart, a reverted pin, a future
-# failure), its in-process watcher dies with it and nothing observes the fleet
-# until a human attaches.
+# woken the session died with it. The idle-sweep cause is closed, but the
+# STRUCTURAL gap remains: whenever the hosted primary dies for ANY reason (daemon
+# crash, deliberate restart, a reverted pin, a future failure), its in-process
+# watcher dies with it and nothing observes the fleet until a human attaches.
 #
 # This watchdog closes that gap. It runs OUTSIDE the agent process tree, so
 # whatever kills the primary cannot kill it, and it watches durable on-disk state
 # (state/*.meta plus the watcher beacon state/.last-watcher-beat) that SURVIVES
 # the primary's death. When work is recorded as under way but no watcher has
-# beaten within the grace window, the primary's supervision is gone: the watchdog
-# pushes an alert to the captain's phone AND attempts a capped, rate-limited
-# auto-resume, then alerts again with whether the resume succeeded.
+# beaten within the grace window, the primary's supervision is gone, and the
+# watchdog does two things:
 #
-# Outside-the-tree hosting on THIS host: there is no launchd (Linux), and no
-# systemd/cron available, so - exactly like bin/fm-present-daemon.sh - the loop
-# detaches with setsid (or a perl setsid fallback) into its own session leader
-# with no controlling terminal, which reparents it to init. A tree-kill of the
-# agent (the failure this defends against) therefore cannot reach it, and a
-# disconnecting terminal or a finished harness background task cannot reap it. If
-# the watchdog process itself ever dies, the next locked session start relaunches
-# it (bin/fm-bootstrap.sh liveness_watchdog_sweep), the same belt-and-suspenders
-# the present daemon uses.
+#   1. AUTO-RESUME: re-wakes the primary's own supervisor pane, the herdr pane
+#      firstmate itself runs in (recorded durably at session start into
+#      state/.supervisor-target, because this detached loop inherits no herdr
+#      env). It reads that pane's agent liveness: a live-but-idle client gets a
+#      gentle Enter nudge to re-drive its turn; a dead-shell husk optionally gets
+#      a configured relaunch command run IN that pane (config/liveness-resume).
+#      Resume is capped and rate-limited per down-episode: after the cap it stops
+#      re-nudging and just escalates, because a resume loop against a genuinely
+#      broken primary is worse than silence.
+#   2. DURABLE ESCALATION: writes state/.liveness-escalation, a bounded record of
+#      what happened and whether the resume succeeded. There is NO phone push on
+#      this home (the previous hosting runtime's phone-attach path is gone); the
+#      escalation is surfaced PROMINENTLY at the next session start
+#      (bin/fm-session-start.sh) and via a durable `check` wake, so the captain
+#      sees on next attach whether the fleet self-recovered or is still down.
 #
 # What it is NOT: it does not classify, decide, or act on ordinary wakes (that is
 # the watcher and firstmate itself), and it is not the fix for the composer-defer
-# wedge (bin/fm-supervise-daemon.sh deferring injection while the primary is
-# alive - a separate ticket). Its stale-beacon signal DOES incidentally catch a
-# wedged-but-alive primary as a secondary benefit: when the optional alive-probe
-# says the primary is still running but supervision has been dead past grace, it
-# alerts "supervision stalled, primary still alive" and deliberately does NOT
-# resume a live process. It does not attempt to fix that wedge.
+# wedge (a separate ticket). Its stale-beacon signal DOES incidentally catch a
+# wedged-but-alive primary as a secondary benefit: the Enter nudge is exactly the
+# right, safe action for a live-but-idle supervisor pane, and it never relaunches
+# a live client. It does not attempt to fix that wedge.
 #
 # Opt-in: inert unless config/liveness-watchdog exists. Away-mode interlock: the
 # away daemon (bin/fm-afk-launch.sh start-paneless) already hosts a durable,
 # session-independent watcher outside the session; this watchdog stands down
 # under state/.afk to avoid two supervisors racing a resume.
 #
+# Outside-the-tree hosting on THIS host: no launchd (Linux), no systemd user
+# session, no cron - so, exactly like bin/fm-present-daemon.sh, the loop detaches
+# with setsid (or a perl setsid fallback) into its own session leader with no
+# controlling terminal, which reparents it to init. A tree-kill of the agent
+# cannot reach it, and a disconnecting terminal or a finished harness background
+# task cannot reap it. If the watchdog process itself ever dies, the next locked
+# session start relaunches it (bin/fm-bootstrap.sh liveness_watchdog_sweep).
+#
 # Config (all local, gitignored; see docs/liveness-watchdog.md):
 #   config/liveness-watchdog       presence flag: enable the watchdog
-#   config/liveness-alarm          alarm channels (fm-alarm-lib grammar); falls
-#                                  back to config/wedge-alarm, then `auto`
-#   config/liveness-resume         auto-resume command run via `sh -c`; absent
-#                                  means resume is not possible and the alarm says so
-#   config/liveness-alive-probe    optional command; exit 0 = primary alive,
-#                                  nonzero = dead. Absent = treat as dead (resume)
+#   config/liveness-resume         OPTIONAL relaunch command run in the supervisor
+#                                  pane when it reads as a DEAD shell (e.g. the
+#                                  jcode --resume line). Absent = nudge-only: a
+#                                  dead client is escalated but not relaunched.
+# state (durable, gitignored):
+#   state/.supervisor-target       "<backend>\t<target>" of the primary's own
+#                                  pane, recorded at session start by `record`.
+#   state/.liveness-escalation     the durable escalation record surfaced at
+#                                  session start; cleared by `ack`.
 #
 # Usage:
-#   fm-liveness-watchdog.sh start    launch the loop DETACHED and return; prints one line
-#   fm-liveness-watchdog.sh run      run the loop in the foreground (what start execs)
-#   fm-liveness-watchdog.sh tick     evaluate ONCE and act; the pure decision, used by tests
+#   fm-liveness-watchdog.sh record   capture THIS session's supervisor pane into
+#                                    state/.supervisor-target (run at session
+#                                    start, from inside the primary's pane, so the
+#                                    herdr env is inherited). Prints one line.
+#   fm-liveness-watchdog.sh start    launch the loop DETACHED and return
+#   fm-liveness-watchdog.sh run      run the loop in the foreground (start execs this)
+#   fm-liveness-watchdog.sh tick     evaluate ONCE and act; the pure decision, for tests
 #   fm-liveness-watchdog.sh status   print running/not-running and exit 0/1
 #   fm-liveness-watchdog.sh stop     signal ONLY this home's recorded watchdog and wait
+#   fm-liveness-watchdog.sh escalation  print the durable escalation record, if any
+#   fm-liveness-watchdog.sh ack      clear the durable escalation record (after surfacing)
 #
 # Home scoping: every kill targets a pid recorded in THIS home's own lock. NEVER
 # a broad pkill, which would match every firstmate home on the machine.
@@ -69,34 +88,30 @@ SELF="$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")"
 . "$SCRIPT_DIR/fm-wake-lib.sh"
 # shellcheck source=bin/fm-supervision-lib.sh
 . "$SCRIPT_DIR/fm-supervision-lib.sh"
-# shellcheck source=bin/fm-alarm-lib.sh
-. "$SCRIPT_DIR/fm-alarm-lib.sh"
+# shellcheck source=bin/fm-supervisor-target-lib.sh
+. "$SCRIPT_DIR/fm-supervisor-target-lib.sh"
 
 CONFIG="${FM_CONFIG_OVERRIDE:-$FM_HOME/config}"
 FLAG="$CONFIG/liveness-watchdog"
-ALARM_CONFIG="$CONFIG/liveness-alarm"
-WEDGE_ALARM_CONFIG="$CONFIG/wedge-alarm"
 RESUME_CONFIG="$CONFIG/liveness-resume"
-ALIVE_PROBE_CONFIG="$CONFIG/liveness-alive-probe"
 AFK="$STATE/.afk"
 DAEMON_LOCK="$STATE/.liveness-watchdog.lock"
 LOG="$STATE/.liveness-watchdog.log"
-# Durable per-episode trigger state: the beacon key that armed the current
-# down-episode, how many resumes we have attempted in it, and whether we already
-# reported cap-reached. One line each; bounded, overwritten, never grows.
+SUPERVISOR_TARGET_FILE="$STATE/.supervisor-target"
+ESCALATION_FILE="$STATE/.liveness-escalation"
+# Durable per-episode trigger state (bounded, overwritten, never grows).
 EPISODE_MARKER="$STATE/.liveness-watchdog-episode"
 RESUME_COUNT_MARKER="$STATE/.liveness-watchdog-resumes"
 CAP_REPORTED_MARKER="$STATE/.liveness-watchdog-capreported"
 
-# The staleness threshold. Reuses the watcher-liveness grace so the watchdog and
-# the in-session guard (bin/fm-guard.sh) agree on "the watcher is down".
+# Staleness threshold. Reuses the watcher-liveness grace so the watchdog and the
+# in-session guard (bin/fm-guard.sh) agree on "the watcher is down".
 GRACE=${FM_GUARD_GRACE:-900}
 # How often the loop evaluates. Far shorter than GRACE so a real death is caught
 # within roughly one interval past grace, not a full grace window later.
 INTERVAL=${FM_LIVENESS_INTERVAL:-60}
-# Maximum auto-resume attempts within one down-episode before the watchdog stops
-# retrying and escalates through the alarm instead. A resume loop against a
-# genuinely broken primary is worse than silence.
+# Maximum resume attempts within one down-episode before the watchdog stops
+# re-nudging and just escalates.
 MAX_RESUMES=${FM_LIVENESS_MAX_RESUMES:-3}
 
 require_positive_int() {  # <name> <value>
@@ -125,67 +140,6 @@ away_mode_active() {
   [ -e "$AFK" ]
 }
 
-# The alarm config: prefer the dedicated liveness file, fall back to the wedge
-# alarm file (so a home that already wired a phone push for wedges gets liveness
-# alerts for free), then to fm-alarm-lib's own `auto` default when neither exists.
-resolve_alarm_config() {
-  if [ -f "$ALARM_CONFIG" ]; then
-    printf '%s\n' "$ALARM_CONFIG"
-  elif [ -f "$WEDGE_ALARM_CONFIG" ]; then
-    printf '%s\n' "$WEDGE_ALARM_CONFIG"
-  else
-    printf '%s\n' "$ALARM_CONFIG"  # absent; fm_alarm_notify falls back to `auto`
-  fi
-}
-
-fire_alarm() {  # <summary>
-  local summary=$1 config
-  config=$(resolve_alarm_config)
-  FM_ALARM_TITLE="firstmate: PRIMARY SUPERVISION DOWN" \
-    fm_alarm_notify "$config" "$summary" || true
-  if [ "$FM_ALARM_FIRED" -eq 1 ]; then
-    log_line "alarm fired: $summary"
-  else
-    log_line "alarm had no channel (configure config/liveness-alarm command:); summary: $summary"
-  fi
-}
-
-# Report the primary's aliveness via the optional probe. Prints "alive", "dead",
-# or "unknown". No probe configured -> "unknown", which the caller treats as
-# dead-enough to resume (the primary's supervision is provably gone either way).
-probe_primary() {
-  local out rc
-  [ -f "$ALIVE_PROBE_CONFIG" ] || { printf 'unknown\n'; return 0; }
-  out=$(cat "$ALIVE_PROBE_CONFIG" 2>/dev/null) || out=""
-  [ -n "$out" ] || { printf 'unknown\n'; return 0; }
-  if fm_alarm_run_bounded sh -c "$out" fm-liveness-probe >/dev/null 2>&1; then
-    printf 'alive\n'
-  else
-    rc=$?
-    if [ "$rc" -eq 124 ]; then
-      printf 'unknown\n'  # probe timed out; do not claim dead on a hang
-    else
-      printf 'dead\n'
-    fi
-  fi
-}
-
-# Attempt one auto-resume. Returns 0 when the configured command exits 0, 1 when
-# it fails, and 3 when no resume command is configured (nothing to run).
-attempt_resume() {
-  local cmd
-  [ -f "$RESUME_CONFIG" ] || return 3
-  cmd=$(cat "$RESUME_CONFIG" 2>/dev/null) || cmd=""
-  [ -n "$cmd" ] || return 3
-  log_line "resume: running configured command"
-  if fm_alarm_run_bounded sh -c "$cmd" fm-liveness-resume >> "$LOG" 2>&1; then
-    return 0
-  fi
-  return 1
-}
-
-# --- durable episode state --------------------------------------------------
-
 read_marker() {  # <path>
   cat "$1" 2>/dev/null || true
 }
@@ -193,6 +147,77 @@ read_marker() {  # <path>
 write_marker() {  # <path> <value>
   printf '%s\n' "$2" > "$1" 2>/dev/null || true
 }
+
+# --- supervisor-target record (record) -------------------------------------
+
+# Capture the primary's own supervisor pane into state/.supervisor-target. MUST
+# run from inside the primary's session (session start) so discover_supervisor_*
+# resolves the real pane from the inherited backend env; the detached loop later
+# reads this file because it inherits no such env. Records "<backend>\t<target>".
+record_supervisor_target() {
+  local target backend
+  target=$(discover_supervisor_target) || {
+    echo "liveness-watchdog: could not resolve supervisor pane (set FM_SUPERVISOR_TARGET); not recording" >&2
+    return 1
+  }
+  backend=$(discover_supervisor_backend) || {
+    echo "liveness-watchdog: could not resolve supervisor backend (set FM_SUPERVISOR_BACKEND); not recording" >&2
+    return 1
+  }
+  mkdir -p "$STATE" || return 1
+  local pending
+  pending=$(mktemp "$STATE/.supervisor-target.pending.XXXXXX") || return 1
+  printf '%s\t%s\n' "$backend" "$target" > "$pending" || { rm -f "$pending"; return 1; }
+  mv "$pending" "$SUPERVISOR_TARGET_FILE" || { rm -f "$pending"; return 1; }
+  echo "liveness-watchdog: recorded supervisor target $backend:$target"
+}
+
+# Read the recorded target into FM_LW_SUP_BACKEND / FM_LW_SUP_TARGET. Returns 1
+# when no valid record exists.
+FM_LW_SUP_BACKEND=""
+FM_LW_SUP_TARGET=""
+read_supervisor_target() {
+  FM_LW_SUP_BACKEND=""; FM_LW_SUP_TARGET=""
+  [ -f "$SUPERVISOR_TARGET_FILE" ] || return 1
+  IFS=$'\t' read -r FM_LW_SUP_BACKEND FM_LW_SUP_TARGET < "$SUPERVISOR_TARGET_FILE" || return 1
+  [ -n "$FM_LW_SUP_BACKEND" ] && [ -n "$FM_LW_SUP_TARGET" ]
+}
+
+# --- durable escalation (escalation / ack) ---------------------------------
+
+# Write the durable escalation record. Bounded, overwritten each time so it never
+# grows, and always carries the latest resume outcome.
+write_escalation() {  # <summary>
+  local pending
+  mkdir -p "$STATE" || return 1
+  pending=$(mktemp "$STATE/.liveness-escalation.pending.XXXXXX") || return 1
+  {
+    printf 'time=%s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')"
+    printf 'summary=%s\n' "$1"
+  } > "$pending" || { rm -f "$pending"; return 1; }
+  mv "$pending" "$ESCALATION_FILE" || { rm -f "$pending"; return 1; }
+  log_line "escalation recorded: $1"
+}
+
+print_escalation() {
+  [ -f "$ESCALATION_FILE" ] || { echo "liveness-watchdog: no escalation recorded"; return 1; }
+  cat "$ESCALATION_FILE"
+}
+
+ack_escalation() {
+  rm -f "$ESCALATION_FILE" 2>/dev/null || true
+  echo "liveness-watchdog: escalation acknowledged and cleared"
+}
+
+# Enqueue a durable check wake so a still-live-but-recovered session (rather than
+# a fresh session start) also learns of the escalation. Best-effort.
+enqueue_escalation_wake() {  # <summary>
+  fm_wake_append check liveness-watchdog \
+    "external liveness watchdog escalation: $1 (see state/.liveness-escalation and bin/fm-liveness-watchdog.sh escalation)" \
+    2>/dev/null || log_line "escalation wake enqueue failed"
+}
+
+# --- durable episode state --------------------------------------------------
 
 clear_episode() {
   rm -f "$EPISODE_MARKER" "$RESUME_COUNT_MARKER" "$CAP_REPORTED_MARKER" 2>/dev/null || true
@@ -211,18 +236,81 @@ episode_key() {
   fi
 }
 
+# --- resume: re-wake the recorded supervisor pane --------------------------
+
+# Probe the recorded supervisor pane's agent liveness. Prints alive|dead|unknown.
+# Uses fm_backend_agent_alive, which for jcode-on-herdr corroborates a no-agent
+# pane by reading its composer row (a live jcode client draws a numbered prompt
+# row; a bare-shell husk does not), so it is the correct alive-vs-dead signal for
+# the supervisor pane and never false-deads a live jcode lane.
+probe_supervisor() {
+  read_supervisor_target || { printf 'unknown\n'; return 0; }
+  # fm-backend.sh is heavy (sources adapters); load it lazily only when resuming.
+  # shellcheck source=bin/fm-backend.sh
+  . "$SCRIPT_DIR/fm-backend.sh" 2>/dev/null || { printf 'unknown\n'; return 0; }
+  local verdict
+  verdict=$(fm_backend_agent_alive "$FM_LW_SUP_BACKEND" "$FM_LW_SUP_TARGET" 2>/dev/null) || verdict=unknown
+  case "$verdict" in
+    alive|dead|unknown) printf '%s\n' "$verdict" ;;
+    *) printf 'unknown\n' ;;
+  esac
+}
+
+# Attempt one resume of the recorded supervisor pane, given its probed liveness.
+# Returns:
+#   0  a resume action was taken (Enter nudge, or a configured relaunch)
+#   2  the pane is alive-but-idle and got the Enter nudge (a subtype of 0 for the
+#      caller's message; treated as success)
+#   3  no supervisor target recorded (nothing to resume)
+#   4  the pane is a DEAD shell and NO relaunch command is configured (escalate)
+#   1  a resume action was attempted but failed
+attempt_resume() {  # <liveness alive|dead|unknown>
+  local liveness=$1 cmd
+  read_supervisor_target || return 3
+  # shellcheck source=bin/fm-backend.sh
+  . "$SCRIPT_DIR/fm-backend.sh" 2>/dev/null || return 1
+  case "$liveness" in
+    alive|unknown)
+      # A live-but-idle (or unreadable) supervisor pane: the safe, correct action
+      # is a gentle Enter to re-drive its turn. Never relaunch a possibly-live
+      # client. An unknown reads the same way: an Enter into a live idle pane just
+      # re-drives it, and an Enter into a truly dead shell is harmless.
+      log_line "resume: Enter nudge to $FM_LW_SUP_BACKEND:$FM_LW_SUP_TARGET (liveness=$liveness)"
+      if fm_backend_send_key "$FM_LW_SUP_BACKEND" "$FM_LW_SUP_TARGET" Enter >/dev/null 2>&1; then
+        return 2
+      fi
+      return 1
+      ;;
+    dead)
+      # A confidently dead shell: an Enter would do nothing. Relaunch only if the
+      # captain configured how to on this host.
+      if [ ! -f "$RESUME_CONFIG" ]; then
+        return 4
+      fi
+      cmd=$(cat "$RESUME_CONFIG" 2>/dev/null) || cmd=""
+      [ -n "$cmd" ] || return 4
+      log_line "resume: relaunch command in dead pane $FM_LW_SUP_BACKEND:$FM_LW_SUP_TARGET"
+      if fm_backend_send_text_submit "$FM_LW_SUP_BACKEND" "$FM_LW_SUP_TARGET" "$cmd" 3 0.4 1 >/dev/null 2>&1; then
+        return 0
+      fi
+      return 1
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
 # --- the core decision (tick) ----------------------------------------------
 
 # Evaluate once and act. Idempotent and side-effect-bounded so a test can drive
 # it directly without the loop. Returns 0 always (a watchdog never aborts).
 tick() {
   local in_flight watcher_fresh beacon_desc key seen_key resumes cap_reported
-  local primary summary rc
+  local liveness rc summary
 
   enabled || return 0
   if away_mode_active; then
-    # Away mode owns durable supervision through its own host; stand down and
-    # clear any episode so a later non-away outage is a fresh episode.
     clear_episode
     return 0
   fi
@@ -233,12 +321,10 @@ tick() {
   beacon_desc=$FM_SUP_BEACON_DESC
 
   if [ "$in_flight" -eq 0 ]; then
-    # A quiet fleet with nothing in flight is healthy and must NOT alert.
     clear_episode
     return 0
   fi
   if [ "$watcher_fresh" = true ]; then
-    # Supervision is alive; end any episode so a later restale re-arms fresh.
     clear_episode
     return 0
   fi
@@ -247,7 +333,6 @@ tick() {
   key=$(episode_key)
   seen_key=$(read_marker "$EPISODE_MARKER")
   if [ "$seen_key" != "$key" ]; then
-    # New down-episode: reset counters.
     write_marker "$EPISODE_MARKER" "$key"
     write_marker "$RESUME_COUNT_MARKER" 0
     rm -f "$CAP_REPORTED_MARKER" 2>/dev/null || true
@@ -257,47 +342,60 @@ tick() {
   case "$resumes" in ''|*[!0-9]*) resumes=0 ;; esac
   cap_reported=$(read_marker "$CAP_REPORTED_MARKER")
 
-  primary=$(probe_primary)
-  if [ "$primary" = alive ]; then
-    # Wedged-but-alive secondary case: supervision is gone but the primary
-    # process is still running. Never resume a live primary; alert once so the
-    # stall is visible, then wait for recovery or death.
-    if [ "$seen_key" != "$key" ]; then
-      fire_alarm "primary supervision has been DOWN past grace (${beacon_desc}) with $in_flight task(s) in flight, but the primary process is still ALIVE - possible wedge. NOT auto-resuming a live process. Attach and check."
-    fi
-    return 0
-  fi
-
-  # primary is dead or unknown -> the death case. Attempt a capped resume.
+  # Past the cap: stop re-nudging, escalate once.
   if [ "$resumes" -ge "$MAX_RESUMES" ]; then
     if [ "$cap_reported" != 1 ]; then
       write_marker "$CAP_REPORTED_MARKER" 1
-      fire_alarm "primary is DOWN with $in_flight task(s) in flight; auto-resume FAILED after $resumes attempt(s) (cap ${MAX_RESUMES}). Fleet is unsupervised - MANUAL recovery needed."
+      summary="primary supervision DOWN, $in_flight task(s) in flight (watcher beacon $beacon_desc). Auto-resume did NOT recover it after $resumes attempt(s) (cap $MAX_RESUMES). Fleet is unsupervised - MANUAL recovery needed."
+      write_escalation "$summary"
+      enqueue_escalation_wake "$summary"
     fi
     return 0
   fi
 
-  attempt_resume
+  liveness=$(probe_supervisor)
+  attempt_resume "$liveness"
   rc=$?
-  resumes=$((resumes + 1))
-  write_marker "$RESUME_COUNT_MARKER" "$resumes"
   case "$rc" in
-    0)
-      summary="primary was DOWN with $in_flight task(s) in flight (watcher beacon $beacon_desc). Auto-resume attempt $resumes SUCCEEDED - the fleet should self-recover. Verify on waking."
-      log_line "resume attempt $resumes succeeded"
-      ;;
     3)
-      summary="primary is DOWN with $in_flight task(s) in flight (watcher beacon $beacon_desc). NO auto-resume command is configured (config/liveness-resume) - the fleet is unsupervised and needs MANUAL recovery."
-      log_line "resume attempt $resumes: no resume command configured"
-      # No point retrying a resume that cannot run; treat as cap so we alert once.
-      write_marker "$RESUME_COUNT_MARKER" "$MAX_RESUMES"
+      # No supervisor target recorded: we cannot resume. Escalate once per
+      # episode so the gap is visible, but do not count it as a resume attempt.
+      if [ "$seen_key" != "$key" ]; then
+        summary="primary supervision DOWN, $in_flight task(s) in flight (watcher beacon $beacon_desc). NO supervisor pane recorded (state/.supervisor-target missing) - cannot auto-resume. Attach and recover manually."
+        write_escalation "$summary"
+        enqueue_escalation_wake "$summary"
+      fi
+      return 0
+      ;;
+    4)
+      # Dead shell with no relaunch command configured. Escalate once; do not spin.
+      if [ "$cap_reported" != 1 ]; then
+        write_marker "$CAP_REPORTED_MARKER" 1
+        summary="primary supervisor pane is a DEAD shell, $in_flight task(s) in flight (watcher beacon $beacon_desc). No relaunch command configured (config/liveness-resume) - cannot auto-resume a dead client. MANUAL recovery needed."
+        write_escalation "$summary"
+        enqueue_escalation_wake "$summary"
+      fi
+      return 0
+      ;;
+    0|2)
+      resumes=$((resumes + 1))
+      write_marker "$RESUME_COUNT_MARKER" "$resumes"
+      if [ "$rc" -eq 2 ]; then
+        summary="primary supervision was DOWN, $in_flight task(s) in flight (watcher beacon $beacon_desc). Sent an Enter nudge to the supervisor pane (attempt $resumes) to re-drive its turn. Verify on waking whether the fleet recovered."
+      else
+        summary="primary supervisor pane was a DEAD shell, $in_flight task(s) in flight (watcher beacon $beacon_desc). Ran the configured relaunch command (attempt $resumes). Verify on waking whether the primary came back."
+      fi
+      write_escalation "$summary"
+      enqueue_escalation_wake "$summary"
       ;;
     *)
-      summary="primary is DOWN with $in_flight task(s) in flight (watcher beacon $beacon_desc). Auto-resume attempt $resumes FAILED - will retry up to $MAX_RESUMES total, then escalate."
-      log_line "resume attempt $resumes failed (rc=$rc)"
+      resumes=$((resumes + 1))
+      write_marker "$RESUME_COUNT_MARKER" "$resumes"
+      summary="primary supervision DOWN, $in_flight task(s) in flight (watcher beacon $beacon_desc). Auto-resume attempt $resumes FAILED to drive the supervisor pane - will retry up to $MAX_RESUMES, then escalate."
+      write_escalation "$summary"
+      enqueue_escalation_wake "$summary"
       ;;
   esac
-  fire_alarm "$summary"
   return 0
 }
 
@@ -361,12 +459,11 @@ run_main() {
     return 0
   fi
   printf '%s\n' "$FM_HOME" > "$DAEMON_LOCK/fm-home" 2>/dev/null || true
-  # Bind the identity to THIS loop process. It must be computed for $$ directly,
-  # NOT $(fm_current_pid): a command substitution runs in a short-lived subshell
-  # whose BASHPID is a different, already-dead pid by the time fm_pid_identity
-  # reads /proc, leaving an empty identity that can never match. fm_lock_try_acquire
-  # wrote the lock's pid file from ${BASHPID:-$$} in this same process, so $$ is
-  # exactly the pid the identity must describe.
+  # Bind the identity to $$ directly, NOT $(fm_current_pid): a command
+  # substitution runs in a short-lived subshell whose BASHPID is a different,
+  # already-dead pid by the time fm_pid_identity reads /proc, leaving an empty
+  # identity that can never match. fm_lock_try_acquire wrote the lock's pid file
+  # from ${BASHPID:-$$} in this same process, so $$ is the pid to describe.
   fm_pid_identity "$$" > "$DAEMON_LOCK/pid-identity" 2>/dev/null || true
 
   trap on_exit EXIT
@@ -468,15 +565,18 @@ stop_main() {
 }
 
 usage() {
-  sed -n '2,66p' "$SELF" | sed 's/^# \{0,1\}//'
+  sed -n '2,80p' "$SELF" | sed 's/^# \{0,1\}//'
 }
 
 case "${1:-}" in
+  record) record_supervisor_target ;;
   start) start_main ;;
   run) run_main ;;
   tick) tick ;;
   status) status_main ;;
   stop) stop_main ;;
+  escalation) print_escalation ;;
+  ack) ack_escalation ;;
   -h|--help) usage ;;
-  *) echo "usage: $(basename "$0") start|run|tick|status|stop" >&2; exit 2 ;;
+  *) echo "usage: $(basename "$0") record|start|run|tick|status|stop|escalation|ack" >&2; exit 2 ;;
 esac
