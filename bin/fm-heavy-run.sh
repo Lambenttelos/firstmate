@@ -317,8 +317,11 @@ ensure_queue() {
   umask 077
   mkdir -p "$QUEUE" 2>/dev/null
   umask "$prior"
-  [ -d "$QUEUE" ] && [ ! -L "$QUEUE" ] && [ -w "$QUEUE" ] \
-    || refuse "queue directory $QUEUE is unusable"
+  local d
+  for d in "$HEAVY_DIR" "$QUEUE"; do
+    [ -d "$d" ] && [ ! -L "$d" ] && [ -O "$d" ] && [ -w "$d" ] \
+      || refuse "ledger directory $d is unusable or not owned by this user"
+  done
 }
 
 # --- status -----------------------------------------------------------------

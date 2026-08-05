@@ -452,7 +452,27 @@ test_pressure_guard_fails_open_when_status_absent_or_stale() {
   pass "fm-heavy-run.sh: the pressure guard fails open on an absent or stale verdict"
 }
 
+test_symlinked_ledger_dir_is_refused() {
+  # A ledger root the operating uid does not own (here, a symlink standing in for
+  # an attacker pre-created dir on a sticky world-writable tmp) must be refused
+  # without running the command.
+  local target ledger marker rc out
+  target="$TMP_ROOT/attacker-ledger"
+  ledger="$TMP_ROOT/symlinked-ledger"
+  mkdir -p "$target"
+  rm -rf "$ledger"
+  ln -s "$target" "$ledger"
+  marker="$TMP_ROOT/symlink-ledger-ran"
+  out=$(FM_HEAVY_RUN_DIR="$ledger" "$HR" --task hijack -- touch "$marker" 2>&1); rc=$?
+  expect_code 69 "$rc" "a symlinked ledger root must be refused, not used"
+  assert_absent "$marker" "a refused ledger must never run the command"
+  assert_contains "$out" "$ledger" "the refusal must name the offending path"
+  rm -f "$ledger"
+  pass "fm-heavy-run.sh: a symlinked ledger directory is refused"
+}
+
 test_script_parses
+test_symlinked_ledger_dir_is_refused
 test_help_includes_entire_header
 test_usage_error_runs_nothing
 test_passes_through_output_and_status
