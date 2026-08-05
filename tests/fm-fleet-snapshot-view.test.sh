@@ -752,6 +752,37 @@ test_parked_scout_decision_stays_pending() {
   pass "a scout still parked at a decision stays pending (terminal clear does not over-fire)"
 }
 
+# Regression: a single argv string on Linux is capped at MAX_ARG_STRLEN (128KB)
+# regardless of total ARG_MAX. fm-fleet-snapshot.sh once passed the whole
+# backlog/tasks JSON to jq as one --argjson argv string, so once the backlog
+# grew past ~128KB every live section of the captain's desk rendered the
+# "Current fleet state could not be read" gap wording because jq died with
+# "jq: Argument list too long". The blobs now travel on stdin, so a large
+# backlog must still produce a full, valid snapshot.
+test_large_backlog_survives_argv_limit() {
+  local home out bytes i body
+  home=$(make_home large-backlog)
+  # ~180KB of active queued+blocked task bodies, well past MAX_ARG_STRLEN.
+  body=$(printf 'x%.0s' {1..300})
+  {
+    printf '## In flight\n'
+    for i in $(seq 1 400); do
+      printf -- '- [ ] big-task-%03d - Big Task %03d %s (repo: alpha) (kind: ship) (priority: 3) (since 2026-07-07)\n' "$i" "$i" "$body"
+    done
+  } > "$home/data/backlog.md"
+  bytes=$(wc -c < "$home/data/backlog.md")
+  [ "$bytes" -gt 131072 ] \
+    || fail "fixture backlog must exceed MAX_ARG_STRLEN (128KB), got $bytes bytes"
+  out=$(FM_HOME="$home" "$SNAPSHOT" --json) \
+    || fail "snapshot must not fail on a >128KB backlog (argv-limit regression)"
+  printf '%s' "$out" | jq -e '
+    .schema == "fm-fleet-snapshot.v1"
+      and (.backlog.records | length) == 400
+  ' >/dev/null \
+    || fail "large-backlog snapshot must be full and valid, got: $(printf '%s' "$out" | head -c 200)"
+  pass "a >128KB backlog still renders a full valid snapshot (argv-limit regression)"
+}
+
 test_empty_fleet_json
 test_fixture_snapshot_json
 test_main_inventory_orphan_and_unstructured_disclosure
@@ -763,6 +794,7 @@ test_open_decision_transfers_to_captain_hold
 test_open_decision_clears_on_keyed_resolution
 test_completed_scout_report_is_pointer_not_pending
 test_parked_scout_decision_stays_pending
+test_large_backlog_survives_argv_limit
 test_scout_reports_include_teardown_reports
 test_backlog_tasks_axi_forms_and_overrides
 test_view_renders_snapshot
