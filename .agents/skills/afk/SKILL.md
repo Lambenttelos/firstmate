@@ -76,6 +76,7 @@ approval authority; they differ only in what supervises.
 3. **On the paneless form, arm the away-mode inbox reader as a tracked background task.**
    This step belongs to the paneless entry, because the reader IS that form's delivery channel (see "Delivery channel" below); a pane-delivery entry does not arm a reader.
    Run `bin/fm-afk-inbox-arm.sh` through the harness's own tracked background mechanism, exactly the way `bin/fm-watch-arm.sh` is armed, and never with a shell `&`.
+   On a jcode primary, "exactly the way `bin/fm-watch-arm.sh` is armed" includes the mandatory jcode wake step: after launching the reader arm as a `Bash run_in_background` task, set `wake: true` on that task id with the `bg` tool (subscribe), because a jcode background task defaults to `wake: false` and a `wake: false` completion never wakes the idle away session - that exact non-wake left away-mode escalations delivered but unread (`docs/jcode-wake-adapter.md`).
    The wrapper is the resilient arm layer around the bare reader `bin/fm-afk-inbox.sh`: it runs the reader resident so a quiet home never idle-exits it, self-relaunches it on a crash with bounded backoff, and passes every genuine reader outcome straight through.
    Do not arm the bare `bin/fm-afk-inbox.sh` directly; the wrapper owns residence and crash recovery, and the bare reader alone reintroduces the hourly idle-exit gap this path removed.
    If you armed it on a session that turns out to have a pane, it costs nothing: it prints one line saying the pane is delivering and exits immediately.

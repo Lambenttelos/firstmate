@@ -177,8 +177,11 @@ repair_line() {
     claude)
       printf '%s%s\n' "$prefix" 'repair missing watcher supervision with bin/fm-watch-arm.sh as its own Claude Code background task, never shell &.'
       ;;
-    codex|jcode)
+    codex)
       printf '%s%s%s%s\n' "$prefix" 'repair missing watcher supervision with a foreground checkpoint: bin/fm-watch-checkpoint.sh --seconds ' "$checkpoint_seconds" '.'
+      ;;
+    jcode)
+      printf '%s%s\n' "$prefix" 'repair missing watcher supervision as two paired actions: launch bin/fm-watch-arm.sh as its own Bash run_in_background task, then immediately set wake:true on that task id with the bg tool (subscribe). Never leave the task at the default wake:false, and never use shell &.'
       ;;
     pi)
       printf '%s%s%s%s%s%s\n' "$prefix" 'repair a missing or failed watcher cycle with the Pi tool fm_watch_arm_pi, or restart Pi with -e ' "$pi_turnend_ext" ' -e ' "$pi_ext" ' if the extensions are not loaded.'
@@ -204,8 +207,11 @@ ordinary_wake_line() {
     claude)
       printf '%s\n' '- Ordinary wake: re-arm exactly one bin/fm-watch-arm.sh Claude Code background task as directed below.'
       ;;
-    codex|jcode)
+    codex)
       printf '%s\n' '- Ordinary wake: take the next foreground bin/fm-watch-checkpoint.sh checkpoint as directed below.'
+      ;;
+    jcode)
+      printf '%s\n' '- Ordinary wake: re-arm one fresh cycle as directed below - launch bin/fm-watch-arm.sh as a Bash run_in_background task, then set wake:true on it with the bg tool.'
       ;;
     pi)
       printf '%s\n' '- Ordinary wake: the Pi extension already owns watcher continuity; do not arm another cycle.'
