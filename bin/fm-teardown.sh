@@ -171,6 +171,15 @@ KIND=$(grep '^kind=' "$META" | cut -d= -f2- || true)
 MODE=$(grep '^mode=' "$META" | cut -d= -f2- || true)
 [ -n "$MODE" ] || MODE=no-mistakes
 
+# Separately-leased extra worktrees (e.g. a full-stack lane's paired backend
+# checkout), one per meta line as "extra_worktree=<clone-abs>\t<worktree-abs>",
+# recorded at lease time by bin/fm-lease-extra-worktree.sh. fm_meta_get returns
+# only the LAST value of a key, so read every line directly. Each is returned to
+# its own pool alongside the primary worktree, with the same safety guards.
+extra_worktree_lines() {
+  grep '^extra_worktree=' "$META" 2>/dev/null | cut -d= -f2- || true
+}
+
 default_branch() {
   local ref branch
   ref=$(git -C "$PROJ" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null || true)
@@ -943,6 +952,90 @@ validate_worktree_teardown_safety() {
   fi
 }
 
+# Run the full worktree teardown-safety check against ONE extra (separately-leased)
+# worktree, reusing validate_worktree_teardown_safety unchanged. That function reads
+# the WT and PROJ globals and caches the resolved branch in
+# TEARDOWN_WORKTREE_BRANCH_FOR_SAFETY, so this saves and restores those globals and
+# clears the branch cache around the call. The extra worktree gets exactly the same
+# dirty / unpushed-and-unlanded refusal as the primary; a --force teardown skips it
+# the same way. Returns non-zero (loudly) when the extra worktree is unsafe.
+validate_extra_worktree_safety() {
+  local clone=$1 wt=$2 saved_wt saved_proj saved_branch rc
+  [ "$FORCE" != "--force" ] || return 0
+  [ -d "$wt" ] || return 0
+  saved_wt=$WT
+  saved_proj=$PROJ
+  saved_branch=${TEARDOWN_WORKTREE_BRANCH_FOR_SAFETY:-}
+  WT=$wt
+  PROJ=$clone
+  TEARDOWN_WORKTREE_BRANCH_FOR_SAFETY=
+  if validate_worktree_teardown_safety; then
+    rc=0
+  else
+    rc=$?
+    if [ "$rc" -eq "$TEARDOWN_WORKTREE_SAFETY_LOCK_BLOCKED" ]; then
+      # Mirror the primary flow: clear only a provably-stale lock, then re-check.
+      if cleanup_stale_lock_for_safety_check "$WT"; then
+        if validate_worktree_teardown_safety; then rc=0; else rc=1; fi
+      else
+        rc=1
+      fi
+    fi
+  fi
+  WT=$saved_wt
+  PROJ=$saved_proj
+  TEARDOWN_WORKTREE_BRANCH_FOR_SAFETY=$saved_branch
+  return "$rc"
+}
+
+# Validate every recorded extra worktree before any destructive return, so an
+# unsafe second worktree refuses teardown exactly like the primary. Returns
+# non-zero on the first unsafe extra worktree.
+validate_all_extra_worktrees_safety() {
+  local clone wt
+  [ "$FORCE" != "--force" ] || return 0
+  while IFS=$'\t' read -r clone wt; do
+    [ -n "$wt" ] || continue
+    validate_extra_worktree_safety "$clone" "$wt" || return 1
+  done <<EOF
+$(extra_worktree_lines)
+EOF
+}
+
+# Return every recorded extra worktree to its pool through the same guarded
+# treehouse-return path as the primary, from its own clone directory. Removes the
+# per-task hook files first so a reused pool slot cannot fire signals for a dead
+# task, then drops the local task branch best-effort. A return failure aborts
+# teardown loudly (the lease would otherwise stay silently held); a lock-refused
+# return propagates its distinct code so the caller can treat it like the primary.
+return_extra_worktrees() {
+  local clone wt branch rc
+  while IFS=$'\t' read -r clone wt; do
+    [ -n "$wt" ] || continue
+    [ -d "$wt" ] || continue
+    if [ ! -d "$clone" ] || ! command -v treehouse >/dev/null 2>&1; then
+      echo "error: cannot return extra worktree $wt; clone $clone missing or treehouse unavailable; lease may still be held" >&2
+      return 1
+    fi
+    branch=$(git -C "$wt" rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)
+    if [ "$branch" != HEAD ]; then
+      if git -C "$wt" checkout --detach -q 2>/dev/null; then
+        git -C "$wt" branch -D "$branch" >/dev/null 2>&1 || true
+      fi
+    fi
+    rm -f "$wt/.claude/settings.local.json" "$wt/.opencode/plugins/fm-turn-end.js" "$wt/.fm-grok-turnend"
+    if teardown_treehouse_return "$wt" "$clone" "extra worktree"; then
+      :
+    else
+      rc=$?
+      echo "error: treehouse return failed for extra worktree $wt; lease may still be held" >&2
+      return "$rc"
+    fi
+  done <<EOF
+$(extra_worktree_lines)
+EOF
+}
+
 require_orca_worktree_path_match() {
   local worktree_id=$1 inspected=$2 resolved inspected_abs resolved_abs
   resolved=$(fm_backend_worktree_path orca "$worktree_id") || {
@@ -1335,6 +1428,14 @@ if [ -d "$WT" ] && [ "$FORCE" != "--force" ]; then
   fi
 fi
 
+# A separately-leased extra worktree (e.g. a full-stack lane's paired backend
+# checkout) gets the SAME unlanded-work protection as the primary: refuse the whole
+# teardown before destroying anything if any extra worktree holds unpushed-and-
+# unlanded or uncommitted work. A --force teardown skips this the same way.
+if [ "$KIND" != secondmate ] && [ "$FORCE" != "--force" ]; then
+  validate_all_extra_worktrees_safety || exit 1
+fi
+
 # Before the worktree is destroyed, record a pushed-but-unmerged ship branch in the
 # durable merge queue so a released-yet-unmerged branch is never silently forgotten
 # (see bin/fm-merge-queue.sh, docs/merge-queue.md). Recording is read-only and runs
@@ -1380,6 +1481,17 @@ elif [ -d "$WT" ] && [ "$KIND" != secondmate ]; then
   fi
   teardown_treehouse_return "$WT" "$PROJ" "worktree" "$post_lock_cleanup_check" || {
     echo "error: treehouse return failed for worktree $WT; teardown aborted" >&2
+    exit 1
+  }
+fi
+
+# Return every separately-leased extra worktree to its own pool alongside the
+# primary, through the same guarded treehouse-return path (never a raw rm, never
+# --force). Safety was already validated above, so a return failure here means the
+# lease could not be released and teardown aborts loudly rather than leaving it held.
+if [ "$KIND" != secondmate ]; then
+  return_extra_worktrees || {
+    echo "error: could not return one or more extra worktrees; teardown aborted" >&2
     exit 1
   }
 fi

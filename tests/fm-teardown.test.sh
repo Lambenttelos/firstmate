@@ -1964,8 +1964,163 @@ test_alternate_branch_broadening_still_refuses_unpushed() {
   pass "alternate-branch broadening still refuses work absent from every origin ref (safety preserved)"
 }
 
+# --- extra (separately-leased BE) worktree return -----------------------------
+# A lane can lease a SECOND treehouse worktree beyond the primary (a full-stack
+# lane's paired backend checkout). It is recorded at lease time as an
+# extra_worktree=<clone>\t<worktree> meta line. Teardown must return BOTH worktrees
+# to their pools, protect the extra worktree with the SAME unlanded-work refusal as
+# the primary, and leave a lane WITHOUT a second worktree unchanged.
+
+# Replace the treehouse mock with one that appends each `treehouse return --force
+# <path>` target to $case_dir/returned.log, so a test can assert exactly which
+# worktrees were returned. Args: case_dir
+add_return_logging_treehouse() {
+  local case_dir=$1
+  cat > "$case_dir/fakebin/treehouse" <<SH
+#!/usr/bin/env bash
+if [ "\${1:-}" = return ]; then
+  shift
+  for a in "\$@"; do
+    case "\$a" in
+      --force) ;;
+      *) printf '%s\n' "\$a" >> "$case_dir/returned.log" ;;
+    esac
+  done
+fi
+exit 0
+SH
+  chmod +x "$case_dir/fakebin/treehouse"
+}
+
+# Create a SECOND clone of the same origin plus a worktree of it on a task branch,
+# then record it against the task as an extra_worktree line. Args: case_dir
+add_extra_worktree() {
+  local case_dir=$1
+  git clone -q "$case_dir/origin.git" "$case_dir/project-be"
+  git -C "$case_dir/project-be" remote set-head origin main 2>/dev/null || true
+  git -C "$case_dir/project-be" worktree add -q -b fm/task-x1-be "$case_dir/wt-be" main
+  printf 'extra_worktree=%s\t%s\n' "$case_dir/project-be" "$case_dir/wt-be" \
+    >> "$case_dir/state/task-x1.meta"
+}
+
+# (extra-1) a lane with a second BE worktree returns BOTH worktrees to their pools.
+test_extra_worktree_returns_both() {
+  local case_dir rc
+  case_dir=$(make_case extra-both)
+  add_return_logging_treehouse "$case_dir"
+  write_meta "$case_dir" no-mistakes ship
+  wt_commit "$case_dir" "primary shippable"
+  git -C "$case_dir/wt" push -q origin fm/task-x1
+  git -C "$case_dir/project" fetch -q origin
+  add_extra_worktree "$case_dir"
+  # The BE worktree's branch is pushed too, so it is landed and teardown-eligible.
+  git -C "$case_dir/wt-be" push -q origin fm/task-x1-be
+  git -C "$case_dir/project-be" fetch -q origin
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 0 "$rc" "extra-both: teardown should succeed and return both worktrees"
+  ! grep -q REFUSED "$case_dir/stderr" || fail "extra-both: teardown printed a REFUSED line"
+  [ -f "$case_dir/returned.log" ] || fail "extra-both: no worktree return was logged"
+  grep -qxF "$case_dir/wt" "$case_dir/returned.log" \
+    || fail "extra-both: primary worktree was not returned"$'\n'"$(cat "$case_dir/returned.log")"
+  grep -qxF "$case_dir/wt-be" "$case_dir/returned.log" \
+    || fail "extra-both: extra BE worktree was not returned"$'\n'"$(cat "$case_dir/returned.log")"
+  [ "$(wc -l < "$case_dir/returned.log")" -eq 2 ] \
+    || fail "extra-both: expected exactly two worktree returns"$'\n'"$(cat "$case_dir/returned.log")"
+  pass "a lane with a separately-leased BE worktree returns BOTH worktrees on teardown"
+}
+
+# (extra-2) a lane WITHOUT a second worktree is unchanged: exactly one return, no
+# error, no false lease-return attempt.
+test_no_extra_worktree_unchanged() {
+  local case_dir rc
+  case_dir=$(make_case extra-none)
+  add_return_logging_treehouse "$case_dir"
+  write_meta "$case_dir" no-mistakes ship
+  wt_commit "$case_dir" "primary shippable"
+  git -C "$case_dir/wt" push -q origin fm/task-x1
+  git -C "$case_dir/project" fetch -q origin
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 0 "$rc" "extra-none: teardown should succeed with a single worktree"
+  ! grep -q REFUSED "$case_dir/stderr" || fail "extra-none: teardown printed a REFUSED line"
+  [ "$(wc -l < "$case_dir/returned.log")" -eq 1 ] \
+    || fail "extra-none: expected exactly one worktree return"$'\n'"$(cat "$case_dir/returned.log")"
+  grep -qxF "$case_dir/wt" "$case_dir/returned.log" \
+    || fail "extra-none: primary worktree was not returned"
+  pass "a lane without a second worktree is unchanged (single return, no error)"
+}
+
+# (extra-3) a second worktree with unpushed-and-unlanded work triggers the SAME
+# refusal as the primary, and nothing is returned.
+test_extra_worktree_unlanded_refuses() {
+  local case_dir rc
+  case_dir=$(make_case extra-unlanded)
+  add_return_logging_treehouse "$case_dir"
+  write_meta "$case_dir" no-mistakes ship
+  wt_commit "$case_dir" "primary shippable"
+  git -C "$case_dir/wt" push -q origin fm/task-x1
+  git -C "$case_dir/project" fetch -q origin
+  add_extra_worktree "$case_dir"
+  # The BE worktree has a real unpushed change not landed anywhere (an empty commit
+  # would leave the tree equal to main and count as content-landed).
+  printf '%s\n' unlanded > "$case_dir/wt-be/be-feature.txt"
+  git -C "$case_dir/wt-be" add -- be-feature.txt
+  git -C "$case_dir/wt-be" -c user.email=t@t -c user.name=t \
+    commit -q -m "unpushed BE work"
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 1 "$rc" "extra-unlanded: teardown should refuse when the BE worktree has unlanded work"
+  grep -q REFUSED "$case_dir/stderr" || fail "extra-unlanded: no REFUSED line in stderr"
+  grep -qF "$case_dir/wt-be" "$case_dir/stderr" \
+    || fail "extra-unlanded: refusal did not name the BE worktree"$'\n'"$(cat "$case_dir/stderr")"
+  [ ! -f "$case_dir/returned.log" ] \
+    || fail "extra-unlanded: a worktree was returned despite the refusal"$'\n'"$(cat "$case_dir/returned.log")"
+  pass "a second worktree with unpushed-and-unlanded work refuses teardown (same protection as primary)"
+}
+
+# (extra-4) --force discards an unlanded second worktree the same way it does the
+# primary, and still returns both worktrees.
+test_extra_worktree_force_overrides_unlanded() {
+  local case_dir rc
+  case_dir=$(make_case extra-force)
+  add_return_logging_treehouse "$case_dir"
+  write_meta "$case_dir" no-mistakes ship
+  wt_commit "$case_dir" "primary work"
+  add_extra_worktree "$case_dir"
+  git -C "$case_dir/wt-be" -c user.email=t@t -c user.name=t \
+    commit -q --allow-empty -m "unpushed BE work"
+
+  set +e
+  run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 0 "$rc" "extra-force: --force teardown should succeed and return both worktrees"
+  [ -f "$case_dir/returned.log" ] || fail "extra-force: no worktree return was logged"
+  grep -qxF "$case_dir/wt-be" "$case_dir/returned.log" \
+    || fail "extra-force: extra BE worktree was not returned under --force"
+  pass "--force discards and returns an unlanded second worktree alongside the primary"
+}
+
 test_local_only_fork_remote_allows
 test_pushed_unmerged_releases_and_records_merge_queue
+test_extra_worktree_returns_both
+test_no_extra_worktree_unchanged
+test_extra_worktree_unlanded_refuses
+test_extra_worktree_force_overrides_unlanded
 test_forced_pushed_unmerged_still_records_merge_queue
 test_pushed_with_extra_local_commit_refuses
 test_pushed_but_dirty_refuses
