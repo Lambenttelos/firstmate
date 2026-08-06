@@ -136,6 +136,8 @@ SUB_HOME_MARKER=".fm-secondmate-home"
 . "$SCRIPT_DIR/fm-pr-lib.sh"
 # shellcheck source=bin/fm-merge-queue-lib.sh
 . "$SCRIPT_DIR/fm-merge-queue-lib.sh"
+# shellcheck source=bin/fm-completions-lib.sh
+. "$SCRIPT_DIR/fm-completions-lib.sh"
 if [ "$#" -lt 1 ] || ! fm_task_id_path_safe "$1"; then
   echo "error: invalid teardown request" >&2
   exit 2
@@ -170,6 +172,24 @@ KIND=$(grep '^kind=' "$META" | cut -d= -f2- || true)
 [ -n "$KIND" ] || KIND=ship
 MODE=$(grep '^mode=' "$META" | cut -d= -f2- || true)
 [ -n "$MODE" ] || MODE=no-mistakes
+
+# Completion-ledger landing SHA, captured now while the worktree still exists (the
+# destructive cleanup below removes it). The append-only ledger records this at the
+# authoritative completion point; fm-completions-lib.sh owns the field mechanics.
+# Priority: the forge's recorded pr_head= (merge/head commit) when present, else the
+# worktree's own HEAD for direct-push and local-only lanes whose pushed/merged head
+# IS that commit. When genuinely unknown, stay empty rather than guessing.
+PR_HEAD_META=$(grep '^pr_head=' "$META" | tail -1 | cut -d= -f2- || true)
+LANDING_SHA=$PR_HEAD_META
+if [ -z "$LANDING_SHA" ] && [ "$KIND" != scout ] && [ "$KIND" != secondmate ] \
+   && { [ "$MODE" = direct-push ] || [ "$MODE" = local-only ]; } \
+   && [ -n "$WT" ] && [ -d "$WT" ]; then
+  LANDING_SHA=$(git -C "$WT" rev-parse --verify HEAD 2>/dev/null || true)
+fi
+# Repo name for the ledger: the project clone's basename, or 'firstmate' when the
+# clone could not be resolved (e.g. a firstmate-repo task with no registry entry).
+COMPLETION_REPO=firstmate
+[ -z "$PROJ" ] || COMPLETION_REPO=$(basename "$PROJ")
 
 # Separately-leased extra worktrees (e.g. a full-stack lane's paired backend
 # checkout), one per meta line as "extra_worktree=<clone-abs>\t<worktree-abs>",
@@ -1570,4 +1590,10 @@ if [ "$KIND" != scout ] && [ "$KIND" != secondmate ] && [ "$MODE" != local-only 
   "$FM_ROOT/bin/fm-fleet-sync.sh" "$PROJ" || true
 fi
 echo "teardown $ID complete (window $T, worktree $WT)"
+# Authoritative completion point: append one durable, never-pruned ledger line for
+# this finished task. Captured LANDING_SHA (empty when unknown) and COMPLETION_REPO
+# were resolved above while the worktree still existed. The append is idempotent, so
+# a retried teardown never double-records. A failure here never fails the teardown.
+fm_completions_record "$DATA" "$ID" "$(date -u +%Y-%m-%d)" "$KIND" "$COMPLETION_REPO" "$LANDING_SHA" \
+  || echo "teardown: WARNING could not append $ID to the completion ledger" >&2
 backlog_refresh_reminder
