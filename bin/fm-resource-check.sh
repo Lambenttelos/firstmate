@@ -132,6 +132,35 @@
 # in active agents, so the number the ceiling is compared against is on the line
 # and the shed count below it needs no conversion in the reader's head.
 #
+# ACTIVE vs BLOCKED/PARKED CREWS - an ordinary crew is a running agent, so it is
+# always reported, but only an ACTIVELY-WORKING one is charged against the
+# ceiling. A crew that is BLOCKED (waiting on a captain decision or another
+# lane's unlanded work) or PARKED (idling on a long declared external wait) holds
+# a worktree but needs no active watching and wakes only when firstmate acts, so
+# like an idle secondmate it counts toward neither the ceiling nor the overage.
+# This is the captain's standing 2026-08-06 rule "6+6 COUNTS ONLY
+# ACTIVELY-WORKING CREWS; BLOCKED/PARKED CREWS DO NOT" (data/captain.md), the
+# bounded slice this script owns of the broader active-worker admission control
+# that queues at the idle->active transition.
+# The blocked/parked state comes from the durable status-event classifier, NOT a
+# live pane probe: a crew's own state/<id>.status log, read last-event-wins
+# through bin/fm-classify-lib.sh (needs-decision:/blocked: -> blocked,
+# paused: -> parked), reconciled the same way bin/fm-crew-state.sh reads it.
+# Probing a pane on the synchronous path is expensive and flaky - a crew
+# mid-tool-call can read momentarily idle - so this is a file-only read. It is
+# recomputed FRESH on every reading rather than cached with the liveness verdict,
+# because the moment a crew resumes it appends a working:/resolved: line and must
+# be re-counted immediately with no cache lag; the recompute is only a status
+# file read, so it stays cheap even on the cached synchronous path. A
+# BRIEFLY-waiting crew (heavy-run queue, CI, a short bounded wait) reports with
+# working: lines, so it is NOT parked and STILL counts - it wakes fast and
+# dropping it would over-dispatch and set two live lanes fighting for one watch.
+# Any crew whose state cannot be resolved to a blocked/parked verb is charged as
+# active, the same conservative default the idle-secondmate test uses. A
+# blocked/parked crew, like an idle secondmate, is never a shed candidate: the
+# shed count is measured on the ACTIVE crews alone. The reading names the count
+# in the split too ("... + 1 blocked/parked crew(s)"), so nothing is hidden.
+#
 # Every OTHER caller (bin/fm-spawn.sh before a dispatch, bin/fm-session-start.sh
 # inside its fast digest) READS that cache and never probes, so a wedged backend
 # can never delay a dispatch or a session start. A cached verdict is accepted
@@ -151,9 +180,13 @@
 #
 # Every reading can be injected for tests via FM_RESOURCE_CORES,
 # FM_RESOURCE_RAM_GB, FM_RESOURCE_LOAD1, FM_RESOURCE_AVAIL_MB,
-# FM_RESOURCE_SWAP_USED_MB, FM_RESOURCE_SWAP_TOTAL_MB, FM_RESOURCE_LIVE, and
-# FM_RESOURCE_PROC_ROOT (alternate /proc root). FM_RESOURCE_LIVE injects the
-# ordinary-crew count, with no persistent secondmates. FM_RESOURCE_OS overrides
+# FM_RESOURCE_SWAP_USED_MB, FM_RESOURCE_SWAP_TOTAL_MB, FM_RESOURCE_LIVE,
+# FM_RESOURCE_BLOCKED, and FM_RESOURCE_PROC_ROOT (alternate /proc root).
+# FM_RESOURCE_LIVE injects the ordinary-crew count, with no persistent
+# secondmates; when it is set the blocked/parked split defaults to 0 unless
+# FM_RESOURCE_BLOCKED overrides it, so an injected reading needs no status files.
+# FM_RESOURCE_BLOCKED injects how many of the live crews are blocked or parked
+# and is used verbatim, never reading a status file. FM_RESOURCE_OS overrides
 # the uname -s the swap classification keys on, so the Darwin informational-only
 # swap behavior is testable on any host. Injection is a test seam, not an
 # operating knob: an injected reading is used verbatim and never probed for.
@@ -161,6 +194,12 @@ set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
+# The shared status-event classifier supplies the file-only blocked/parked test
+# (last_status_line, status_is_paused, status_open_decisions). It is a pure
+# library - sourcing it defines functions and constants only, touches no backend,
+# and adds no probe to the synchronous dispatch or session-start paths.
+# shellcheck source=bin/fm-classify-lib.sh
+. "$SCRIPT_DIR/fm-classify-lib.sh" 2>/dev/null || true
 FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 PROC_ROOT="${FM_RESOURCE_PROC_ROOT:-/proc}"
@@ -414,6 +453,59 @@ count_metas() {  # <note>
   printf '%s\t%s\t%s\t%s' "$1" "$crews" "$smates" "$idle"
 }
 
+# crew_blocked_or_parked <meta-file>: 0 when that ordinary crew is BLOCKED (its
+# last status event is needs-decision or blocked - waiting on a captain decision
+# or another lane's unlanded work) or PARKED (a declared long external wait,
+# paused:). Both hold a worktree but need no active watching, so they are not
+# charged against the ceiling, exactly as an idle secondmate is not.
+#
+# It is a FILE-ONLY read of the crew's own status event log through the shared
+# classifier (last_status_line, status_line_verb, status_is_paused), never a
+# pane probe: probing is expensive and flaky and a crew mid-tool-call can read
+# momentarily idle, so the durable status signal is preferred. A crew that
+# resumes appends a working: or resolved: line (task brief rule 6), which flips
+# the last-event verb away from the blocked/parked set, so a resumed crew is
+# re-counted on the very next reading with no probe and no cache lag.
+#
+# A BRIEFLY-waiting crew (heavy-run queue, CI, a short bounded wait) reports with
+# working: lines, so it is NOT parked and STILL counts - it wakes fast and
+# dropping it would over-dispatch. Anything the classifier cannot resolve to a
+# blocked/parked verb (an empty log, a bare working:, an unreadable line, or an
+# absent classifier library) charges the crew as active, the same conservative
+# default the idle-secondmate test uses.
+crew_blocked_or_parked() {  # <meta-file>
+  local id log last verb
+  declare -F last_status_line >/dev/null 2>&1 || return 1
+  id=$(basename "$1"); id=${id%.meta}
+  log="$STATE/$id.status"
+  [ -f "$log" ] || return 1
+  last=$(last_status_line "$log")
+  [ -n "$last" ] || return 1
+  status_is_paused "$last" && return 0
+  verb=$(status_line_verb "$last")
+  case "$verb" in
+    needs-decision|blocked) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# count_blocked_parked_crews: how many ordinary (non-secondmate) crews are
+# currently blocked or parked, read FRESH from the status logs on every call.
+# It is deliberately NOT cached with the liveness verdict: the blocked/parked
+# state is what changes the instant a crew resumes, so recomputing it every
+# reading is what makes the "re-count a resumed crew immediately" guarantee hold
+# even on the synchronous cached path, and it is only a file read so it stays
+# cheap there. The caller clamps the result to the live crew count.
+count_blocked_parked_crews() {
+  local meta n=0
+  for meta in "$STATE"/*.meta; do
+    [ -f "$meta" ] || continue
+    is_secondmate_meta "$meta" && continue
+    crew_blocked_or_parked "$meta" && n=$((n + 1))
+  done
+  printf '%s' "$n"
+}
+
 mtime_of() {  # epoch seconds of <file>, empty when unreadable
   if [ "$(uname)" = Darwin ]; then
     stat -f %m "$1" 2>/dev/null
@@ -585,6 +677,21 @@ LIVE_REST=${LIVE_COUNTS#*$'\t'}
 SECONDMATES=${LIVE_REST%%$'\t'*}
 IDLE_SECONDMATES=${LIVE_REST##*$'\t'}
 
+# How many of the live crews are blocked or parked, read fresh every reading so a
+# resumed crew is re-counted immediately (see count_blocked_parked_crews). It is
+# clamped to the live CREWS count below so a lingering blocked meta whose agent
+# the sweep already excluded can never be subtracted twice. FM_RESOURCE_BLOCKED
+# is the matching test seam: like FM_RESOURCE_LIVE it is used verbatim and never
+# reads a status file, so a test can set the split without staging status logs.
+BLOCKED_PARKED=${FM_RESOURCE_BLOCKED:-}
+if [ -z "$BLOCKED_PARKED" ]; then
+  if [ -n "${FM_RESOURCE_LIVE:-}" ]; then
+    BLOCKED_PARKED=0
+  else
+    BLOCKED_PARKED=$(count_blocked_parked_crews)
+  fi
+fi
+
 if ! is_uint "$CORES" || [ "$CORES" -lt 1 ] \
   || ! is_num "$LOAD1" || ! is_num "$AVAIL_MB" \
   || ! is_num "$SWAP_USED" || ! is_num "$SWAP_TOTAL" \
@@ -593,6 +700,12 @@ if ! is_uint "$CORES" || [ "$CORES" -lt 1 ] \
   exit 3
 fi
 is_uint "$RAM_GB" || RAM_GB=0
+# A malformed blocked/parked count errs toward charging every crew as active (0),
+# the same conservative default an unknown crew state uses; and it can never
+# exceed the live crew count it is subtracted from.
+is_uint "$BLOCKED_PARKED" || BLOCKED_PARKED=0
+[ "$BLOCKED_PARKED" -le "$CREWS" ] || BLOCKED_PARKED=$CREWS
+ACTIVE_CREWS=$(( CREWS - BLOCKED_PARKED ))
 
 # --- classification ----------------------------------------------------------
 
@@ -628,11 +741,16 @@ elif [ "$SWAP_CLASS" = deg ] && [ "$RC" -lt 1 ]; then
   STATUS=degraded; RC=1
 fi
 
-# ACTIVE is the charged basis; LIVE is the reported total. An idle persistent
-# secondmate is in the second and not the first (see the header's CREWS vs
-# PERSISTENT SECONDMATES section).
-ACTIVE=$(( CREWS + SECONDMATES ))
-LIVE=$(( ACTIVE + IDLE_SECONDMATES ))
+# ACTIVE is the charged basis; LIVE is the reported total. Neither an idle
+# persistent secondmate NOR a blocked/parked crew is charged: both hold a
+# resource footprint that needs no active watching (an idle secondmate costs no
+# processor time and a decayed memory footprint; a blocked/parked crew is waiting
+# on a captain decision, another lane's unlanded work, or a long declared
+# external wait, and wakes only when firstmate acts), so both stay in LIVE and
+# out of ACTIVE. See the header's CREWS vs PERSISTENT SECONDMATES section and the
+# ACTIVE vs BLOCKED/PARKED CREWS section.
+ACTIVE=$(( ACTIVE_CREWS + SECONDMATES ))
+LIVE=$(( CREWS + SECONDMATES + IDLE_SECONDMATES ))
 PER_AGENT_MB=560
 BY_MEM=$(awk -v a="$AVAIL_MB" -v p="$PER_AGENT_MB" 'BEGIN{c=int(a/p); print (c < 1 ? 1 : c)}')
 BY_CPU=$(awk -v l="$LOAD_PER_CORE_EXACT" -v n="$ACTIVE" 'BEGIN{
@@ -646,19 +764,26 @@ if [ "$BY_MEM" -lt "$BY_CPU" ]; then CEILING=$BY_MEM; else CEILING=$BY_CPU; fi
 # The all-agents total is named first so nothing disappears from the reading just
 # because it stopped being charged, then the active figure the ceiling and the
 # overage are actually measured on, then its crew and secondmate breakdown,
-# because only crews are ever shed candidates (see the header).
+# because only actively-working crews are ever shed candidates (see the header).
+# Blocked/parked crews and idle secondmates follow the active figure so the split
+# always sums back to the total.
 SECONDMATE_NOTE=
 [ "$SECONDMATES" -eq 0 ] || SECONDMATE_NOTE=" + $SECONDMATES persistent secondmate(s)"
+BLOCKED_NOTE=
+[ "$BLOCKED_PARKED" -eq 0 ] || BLOCKED_NOTE=" + $BLOCKED_PARKED blocked/parked crew(s)"
 IDLE_NOTE=
 [ "$IDLE_SECONDMATES" -eq 0 ] || IDLE_NOTE=" + $IDLE_SECONDMATES idle secondmate(s)"
 
-printf 'resources: %s | load %s (%sx over %s cores) | avail %s MB of %s GB | swap %s%% of %sM | live agents %s = %s active (%s crew(s)%s)%s%s | recommended ceiling %s active agents\n' \
+printf 'resources: %s | load %s (%sx over %s cores) | avail %s MB of %s GB | swap %s%% of %sM | live agents %s = %s active (%s crew(s)%s)%s%s%s | recommended ceiling %s active agents\n' \
   "$STATUS" "$LOAD1" "$LOAD_PER_CORE" "$CORES" "$AVAIL_MB" "$RAM_GB" "$SWAP_PCT" "$SWAP_TOTAL" \
-  "$LIVE" "$ACTIVE" "$CREWS" "$SECONDMATE_NOTE" "$IDLE_NOTE" "$LIVE_NOTE" "$CEILING"
+  "$LIVE" "$ACTIVE" "$ACTIVE_CREWS" "$SECONDMATE_NOTE" "$BLOCKED_NOTE" "$IDLE_NOTE" "$LIVE_NOTE" "$CEILING"
 
 if [ "$RC" -ne 0 ] && [ "$ACTIVE" -gt "$CEILING" ]; then
   SHED=$(( ACTIVE - CEILING ))
-  [ "$SHED" -le "$CREWS" ] || SHED=$CREWS
+  # Only actively-working crews are shed candidates: a blocked/parked crew is
+  # already not being charged, so it is neither part of the overage nor something
+  # to shed for load.
+  [ "$SHED" -le "$ACTIVE_CREWS" ] || SHED=$ACTIVE_CREWS
   [ "$SHED" -lt 1 ] || printf 'resources: SHED %s crew(s) - stop the heaviest test and browser runs first, they cost far more than an idle agent\n' \
     "$SHED"
 fi

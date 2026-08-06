@@ -676,6 +676,157 @@ test_injected_live_count_still_wins() {
   pass "the FM_RESOURCE_LIVE injection seam still overrides both crew-count paths"
 }
 
+# --- blocked/parked crews excluded from the active count --------------------
+# A crew waiting on a captain decision or another lane's unlanded work (blocked:)
+# or idling on a long declared external wait (paused:) holds a worktree but needs
+# no active watching, so like an idle secondmate it must count toward neither the
+# ceiling nor the overage. The state comes from the durable status-event
+# classifier (the crew's own state/<id>.status), NEVER a pane probe. These tests
+# stage real status logs and a cached liveness verdict, so no probe runs and the
+# split is what is under test. write_crew_status <home> <id> <line...>: stage a
+# crew meta plus its status log with the given event lines.
+write_crew_status() {
+  local home=$1 id=$2 line
+  shift 2
+  fm_write_meta "$home/state/$id.meta" "window=firstmate:fm-$id" "harness=claude"
+  : > "$home/state/$id.status"
+  for line in "$@"; do
+    printf '%s\n' "$line" >> "$home/state/$id.status"
+  done
+}
+
+# run_blocked <home> <override>...: a healthy-baseline synchronous reading in
+# <home> (no --sweep), so the staged cached verdict and the fresh status read are
+# what produce the split. FM_RESOURCE_LOAD1=40 makes the host critical so the
+# ceiling and shed advice are observable.
+run_blocked() {
+  local home=$1
+  shift
+  RC=0
+  OUT=$(env FM_RESOURCE_INTERVAL=900 FM_RESOURCE_CORES=10 FM_RESOURCE_RAM_GB=16 \
+    FM_RESOURCE_LOAD1=40 FM_RESOURCE_AVAIL_MB=8000 FM_RESOURCE_SWAP_USED_MB=100 \
+    FM_RESOURCE_SWAP_TOTAL_MB=8192 FM_HOME="$home" "$@" "$CHECK" 2>&1) || RC=$?
+}
+
+test_blocked_and_parked_crews_are_excluded_from_the_active_count() {
+  local home
+  home=$(make_home blocked-excluded)
+  # alpha actively working, beta blocked, gamma parked, delta needs-decision.
+  write_crew_status "$home" alpha "working: building"
+  write_crew_status "$home" beta "working: setup" "blocked: waiting on captain decision"
+  write_crew_status "$home" gamma "paused: upstream release"
+  write_crew_status "$home" delta "needs-decision: option a or b"
+  # A cached verdict pins liveness so no probe runs; four live crews.
+  printf '4 0 0 0\n' > "$home/state/.resource-live"
+  run_blocked "$home"
+  expect_code 2 "$RC" "critical exit with blocked and parked crews present"
+  assert_contains "$OUT" "live agents 4 = 1 active (1 crew(s)) + 3 blocked/parked crew(s)" \
+    "blocked, parked, and needs-decision crews must leave the active count and be named in the split"
+  assert_contains "$OUT" "recommended ceiling 1 active agents" \
+    "the ceiling must be derived from the one active crew, not all four"
+  assert_not_contains "$OUT" "SHED" \
+    "with only one active crew at a ceiling of one there is no overage; blocked/parked crews are never shed"
+  pass "blocked, parked and needs-decision crews are excluded from the charged active count"
+}
+
+test_a_briefly_waiting_crew_still_counts_as_active() {
+  local home
+  home=$(make_home briefly-waiting)
+  # alpha queued on the heavy-run queue, beta mid-CI: both report working:, so
+  # both must STILL count - they wake fast and dropping them over-dispatches.
+  write_crew_status "$home" alpha "working: TEST START - unit suite, queued on heavy-run"
+  write_crew_status "$home" beta "working: PR opened, waiting on CI"
+  printf '2 0 0 0\n' > "$home/state/.resource-live"
+  run_blocked "$home"
+  expect_code 2 "$RC" "critical exit with two briefly-waiting crews"
+  assert_contains "$OUT" "live agents 2 = 2 active (2 crew(s))" \
+    "a crew on the heavy-run queue or waiting on CI reports working: and must still count"
+  assert_not_contains "$OUT" "blocked/parked" \
+    "a briefly-waiting crew must not be reported as blocked/parked"
+  pass "a briefly-waiting crew (heavy-run queue, CI) still counts as active"
+}
+
+test_unknown_crew_state_is_charged_as_active() {
+  local home
+  home=$(make_home unknown-charged)
+  # alpha has no status log at all; beta's log is empty. Neither resolves to a
+  # blocked/parked verb, so both must be charged as active (the conservative
+  # default), exactly as an unreadable secondmate home is charged.
+  fm_write_meta "$home/state/alpha.meta" "window=firstmate:fm-alpha" "harness=claude"
+  fm_write_meta "$home/state/beta.meta" "window=firstmate:fm-beta" "harness=claude"
+  : > "$home/state/beta.status"
+  printf '2 0 0 0\n' > "$home/state/.resource-live"
+  run_blocked "$home"
+  expect_code 2 "$RC" "critical exit with unknown-state crews"
+  assert_contains "$OUT" "live agents 2 = 2 active (2 crew(s))" \
+    "a crew with no or empty status log is charged as active, the conservative default"
+  assert_not_contains "$OUT" "blocked/parked" \
+    "unknown state must never be read as blocked/parked"
+  pass "a crew whose state cannot be resolved is charged as active"
+}
+
+test_a_resumed_crew_is_recounted_immediately() {
+  local home
+  home=$(make_home resumed-recount)
+  write_crew_status "$home" alpha "working: building"
+  write_crew_status "$home" beta "blocked: waiting on captain decision"
+  printf '2 0 0 0\n' > "$home/state/.resource-live"
+  run_blocked "$home"
+  expect_code 2 "$RC" "critical exit before beta resumes"
+  assert_contains "$OUT" "live agents 2 = 1 active (1 crew(s)) + 1 blocked/parked crew(s)" \
+    "beta must be excluded while its last event is blocked:"
+  # beta resumes: it appends a resolved:/working: line, and the very next reading
+  # must re-count it with no probe and no cache refresh.
+  printf 'resolved: captain chose option a\nworking: implementing\n' >> "$home/state/beta.status"
+  run_blocked "$home"
+  expect_code 2 "$RC" "critical exit after beta resumes"
+  assert_contains "$OUT" "live agents 2 = 2 active (2 crew(s))" \
+    "a resumed crew must be re-counted on the very next reading, no cache lag"
+  assert_not_contains "$OUT" "blocked/parked" "the resumed crew must leave the blocked/parked split"
+  pass "a crew that resumes is re-counted as active immediately"
+}
+
+test_a_blocked_secondmate_meta_never_enters_the_crew_split() {
+  local home sm
+  home=$(make_home blocked-secondmate)
+  sm=$(make_home blocked-secondmate-sm)
+  # A blocked ordinary crew AND an idle secondmate: the secondmate must stay in
+  # its own idle bucket, never counted as a blocked/parked crew.
+  write_crew_status "$home" alpha "blocked: waiting on decision"
+  fm_write_secondmate_meta "$home/state/sm.meta" "$sm" "firstmate:fm-sm"
+  printf '1 0 1 0\n' > "$home/state/.resource-live"
+  run_blocked "$home"
+  expect_code 2 "$RC" "critical exit with a blocked crew and an idle secondmate"
+  assert_contains "$OUT" "live agents 2 = 0 active (0 crew(s)) + 1 blocked/parked crew(s) + 1 idle secondmate(s)" \
+    "a blocked crew and an idle secondmate occupy separate buckets and the split sums to the total"
+  assert_not_contains "$OUT" "SHED" \
+    "a home with no active crew has nothing to shed"
+  pass "a secondmate is never miscounted as a blocked/parked crew"
+}
+
+test_the_shed_count_is_capped_at_active_crews_not_all_crews() {
+  local home
+  home=$(make_home shed-active-only)
+  # Three active crews and two blocked: at 4.0 per core ACTIVE=3 halves to a
+  # ceiling of 1, an overage of 2, which must cap at the three ACTIVE crews (2),
+  # never rise toward all five live crews.
+  write_crew_status "$home" a1 "working: building"
+  write_crew_status "$home" a2 "working: building"
+  write_crew_status "$home" a3 "working: building"
+  write_crew_status "$home" b1 "blocked: waiting on decision"
+  write_crew_status "$home" b2 "paused: upstream release"
+  printf '5 0 0 0\n' > "$home/state/.resource-live"
+  run_blocked "$home"
+  expect_code 2 "$RC" "critical exit with three active and two blocked crews"
+  assert_contains "$OUT" "live agents 5 = 3 active (3 crew(s)) + 2 blocked/parked crew(s)" \
+    "only the three working crews are active; the two waiting ones are split out"
+  assert_contains "$OUT" "recommended ceiling 1 active agents" \
+    "the ceiling halves the three active crews to one"
+  assert_contains "$OUT" "SHED 2 crew(s)" \
+    "the overage is measured and capped on the active crews, not all five live crews"
+  pass "the shed count is measured on active crews and never counts blocked/parked ones"
+}
+
 # --- herdr backend live-agent count ----------------------------------------
 # The regression under test (2026-08-01): the sweep excluded a lane the moment
 # its backend probe read `dead`, and it probed with fm_backend_agent_alive. On
@@ -1137,6 +1288,12 @@ rc=0
 ( test_malformed_sweep_budget_never_disables_the_budget ) || rc=1
 ( test_malformed_probe_timeout_never_takes_monitoring_dark ) || rc=1
 ( test_injected_live_count_still_wins ) || rc=1
+( test_blocked_and_parked_crews_are_excluded_from_the_active_count ) || rc=1
+( test_a_briefly_waiting_crew_still_counts_as_active ) || rc=1
+( test_unknown_crew_state_is_charged_as_active ) || rc=1
+( test_a_resumed_crew_is_recounted_immediately ) || rc=1
+( test_a_blocked_secondmate_meta_never_enters_the_crew_split ) || rc=1
+( test_the_shed_count_is_capped_at_active_crews_not_all_crews ) || rc=1
 ( test_herdr_live_lanes_are_counted_from_pane_presence ) || rc=1
 ( test_herdr_gone_pane_is_excluded_from_the_count ) || rc=1
 ( test_unreadable_host_is_unknown_and_never_alarms ) || rc=1
