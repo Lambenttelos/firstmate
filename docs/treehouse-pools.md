@@ -143,6 +143,30 @@ This was not hypothetical: pool slots 11, 12 and 14 were created after the clone
 `bin/fm-spawn.sh` now also applies an *absolute* test before the relative one: a ship or scout project must be a direct child of this home's projects directory, which is what the registry model already means by a registered project.
 `tests/fm-spawn-foreign-clone.test.sh` covers the bypass directly, including a self-consistent foreign clone, a path that climbs out of the projects directory, and a subdirectory standing in for a clone.
 
+## Separately-leased extra worktrees
+
+Most tasks use exactly one worktree, the primary one `bin/fm-spawn.sh` records as `worktree=` in `state/<id>.meta`.
+Some lanes need a SECOND isolated checkout beyond that primary one.
+The canonical case is full-stack product work: a `hyfin-server` lane that also needs a paired `hyfin` backend checkout to stand up a live local stack.
+Each such checkout is a treehouse worktree leased from that clone's own (home-pinned) pool, and every leased worktree occupies a pool slot until it is returned.
+
+The failure this closes: `bin/fm-teardown.sh` returned only the primary worktree, and a separately-leased second worktree was never recorded anywhere teardown could see, so its lease was never returned.
+Those orphaned leases accumulate until the pool hits `max_trees` and new spawns can no longer get a worktree.
+
+The fix is durable recording at lease time.
+`bin/fm-lease-extra-worktree.sh <task-id> <clone-dir>` leases the worktree AND appends one line to the task's meta in the same step, so a leased slot can never exist without a record teardown reads:
+
+```
+extra_worktree=<clone-abs-path>\t<worktree-abs-path>
+```
+
+The clone path is recorded alongside the worktree because teardown returns the worktree by running `treehouse return` from that clone, matching how the primary worktree is returned from its project.
+There may be more than one such line; teardown reads every `extra_worktree=` line, not just the last.
+
+`bin/fm-teardown.sh` returns every recorded extra worktree to its pool alongside the primary, through the same guarded `treehouse return` path (never a raw `rm`, never `--force`).
+Each extra worktree gets exactly the same unlanded-work protection as the primary: teardown refuses the whole operation before destroying anything if any extra worktree holds uncommitted or unpushed-and-unlanded work, and `--force` discards it the same way it discards an unlanded primary.
+`tests/fm-teardown.test.sh` covers both-return, single-worktree-unchanged, unlanded-refusal, and forced-discard.
+
 ## Maintaining this file
 
 Record measured facts here, with the command and its real output, not assumptions.
