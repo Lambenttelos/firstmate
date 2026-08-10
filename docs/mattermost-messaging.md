@@ -1,0 +1,108 @@
+# Mattermost captain-firstmate messaging (design)
+
+Status: design proposal, two open decisions pending captain (see "Open decisions").
+Owner of the mechanism once built: `bin/fm-mm-poll.sh` and `bin/fm-mm-post.sh` headers.
+Config owner: [docs/configuration.md](configuration.md).
+
+## Goal
+
+Two-way messaging between the captain and firstmate over Mattermost, so the captain can command the fleet and receive escalations from a phone with no terminal.
+Inbound Mattermost messages behave like a captain steer.
+Outbound firstmate escalations (the things AGENTS.md section 9 already surfaces) reach the captain in Mattermost.
+Both reuse the existing supervision and away-mode paths rather than inventing a parallel loop.
+
+This mirrors the existing X mode (`bin/fm-x-poll.sh`, docs/configuration.md "X mode"), which already solves the same shape of problem: an external message source ingested into firstmate's watcher wake path, with autonomous away-mode reply delivery, gated by a gitignored token.
+Mattermost messaging is X mode's private, single-captain sibling.
+
+## What the Mattermost MCP can and cannot do
+
+Firstmate sessions already have a Mattermost MCP with three tools: `get_thread` (read a thread), `post_reply` (reply into a thread, `confirm: true` required), `get_file` (fetch an attachment).
+
+Hard limits that shape this design:
+
+- The MCP is **agent-only**. It is callable from an agent turn, never from a shell script. `bin/fm-watch.sh` is a plain shell loop and cannot call it.
+- There is **no channel-list and no search** tool. Firstmate cannot discover the control channel; the captain must name it.
+- There is **no new-message signal / no long-poll**. Nothing pushes "a new message arrived" to the MCP.
+- `post_reply` **requires explicit confirmation** (`confirm: true`) and needs a thread root post id to reply into.
+- There are **no reactions** and no read-cursor tool.
+
+The consequence is decisive: the MCP alone cannot drive a watcher-integrated inbound path.
+The watcher is the only always-on component; it is shell; it cannot call the MCP; and the MCP has nothing to poll against anyway.
+If inbound depended on the MCP, firstmate would only ever notice a captain message when it happened to take an agent turn for some other reason, so an away-mode phone message would not wake it. That fails the brief's integration requirement.
+
+## Transport decision: REST poll, MCP as the rich reader
+
+The environment has `curl` and `jq` (the same tools X mode requires).
+Mattermost exposes a standard REST API v4.
+So the transport is a **shell-side REST poll**, exactly like `bin/fm-x-poll.sh`, authorized by a Mattermost personal access token in the home's gitignored `.env`.
+
+- Inbound: `bin/fm-mm-poll.sh` calls `GET /api/v4/channels/{channel_id}/posts?since=<epoch_ms>`, keeps only posts newer than the last-seen cursor that were authored by the captain (not by firstmate's own bot account), stashes each to `state/mm-inbox/<post_id>.json`, and prints one wake line per new message. The watcher's existing `*.check.sh` sweep runs it and turns its output into a wake, identical to the X-mode shim.
+- Outbound: `bin/fm-mm-post.sh` calls `POST /api/v4/posts` with `{channel_id, message, root_id?}`. The token is the authorization, so there is no confirm gate on this path.
+
+The MCP does not disappear. It remains the **agent-facing rich reader**: when firstmate needs the full thread with attachments (a screenshot the captain sent from a phone), the agent uses `get_thread` / `get_file` on the permalink the poll recorded. The MCP is a convenience for reading, never the transport.
+
+Why a separate token rather than the MCP's own credentials: the MCP holds its Mattermost credentials internally and does not expose them to the shell. The watcher is shell. So the always-on transport needs its own credential. The brief anticipates this ("any token", gitignored like `.env`).
+
+## Channel / DM model
+
+One Mattermost channel (or DM) is the captain<->firstmate control channel.
+Its `channel_id` is configured (see Open decisions); firstmate cannot discover it.
+
+- Captain messages are identified by author: any post in the control channel whose `user_id` is not firstmate's own bot user id is a captain steer. Firstmate learns its own bot user id once via `GET /api/v4/users/me` and caches it, so it never ingests its own posts as captain input (the same self-post filter X mode needs).
+- Thread mapping is flat: the channel itself is the conversation. An outbound escalation that answers a specific captain post is threaded as a reply to that post (`root_id` = the captain post id) so the phone shows context; an unprompted escalation is a new root post. This needs no thread bookkeeping and no channel-list.
+- One home, one control channel. A secondmate home that opts in has its own token and its own control channel; nothing is shared across homes (same isolation as X mode).
+
+## Inbound path (captain -> firstmate)
+
+1. The watcher's slow `*.check.sh` sweep runs `bin/fm-mm-poll.sh` (armed by a byte-static identity shim exactly like `state/x-watch.check.sh`, validated before execution, so the watcher's trusted-check contract is unchanged).
+2. The poll fetches posts since the durable cursor `state/mm-cursor` (epoch ms), filters to captain-authored posts with non-empty message, stashes each to `state/mm-inbox/<post_id>.json`, advances the cursor, and prints `mm-message <post_id>` per new post.
+3. That line becomes a watcher wake through the existing `fm_wake_append check` + wake path. No new loop.
+4. On the `check: ... mm-message <post_id>` wake, firstmate reads the stashed message and treats it as a captain steer. When the message is richer than plain text (attachments), the agent reads the full thread via the MCP `get_thread` on the recorded permalink.
+
+Cadence: like X mode, an opted-in home writes `config/mm-mode.env` exporting `FM_CHECK_INTERVAL=30`, so the control channel is polled every 30 seconds instead of the default 300. A non-opted-in home is completely inert (no shim, no cadence change, no poll), the same additive posture X mode has.
+
+### Away-mode integration (inbound)
+
+When the captain is afk and messaging from a phone, the inbound wake is a normal watcher wake, and the away-mode daemon already owns watcher wakes. A captain Mattermost message during away mode is an operational input, handled by the away-mode daemon exactly as any other steer-shaped wake: it does not need a new daemon. A marked-internal escalation stays internal; a genuine captain instruction is acted on with no elevation of authority (see safety policy).
+
+## Outbound path (firstmate -> captain)
+
+Outbound reuses the escalation content firstmate already produces per AGENTS.md section 9. It does not invent new escalation triggers.
+
+- Foreground (captain present): firstmate posts escalations to the control channel with `bin/fm-mm-post.sh`. This is a courtesy mirror of what it already says in chat.
+- Away mode (captain afk, no terminal): the away-mode daemon already buffers each escalation digest to the durable outbox (`bin/fm-afk-outbox-lib.sh`) and delivers it through the armed reader (`bin/fm-afk-inbox.sh`). The Mattermost outbound helper is wired in as an **additional delivery sink** for that same digest, so the captain's phone receives exactly the digests the away-mode path already produces. It reuses the daemon; it does not duplicate it.
+
+The away-mode outbox already guarantees at-least-once delivery and never loses a record, so a failed Mattermost post simply retries on the next delivery, the same as the pane path.
+
+## Safety policy (the safety-sensitive decision)
+
+The transport token authorizes firstmate to **read the control channel and post escalations to it**. It does not expand approval authority for anything else. Concretely:
+
+- A phone message is a steer, never an approval. An inbound Mattermost message NEVER auto-approves a merge, a destructive action, an irreversible action, or a security-sensitive choice. Those still require the captain's explicit word under the existing rules, whether firstmate is present or afk. Away mode never expands authority (AGENTS.md section 8), and this path does not either.
+- Firstmate never auto-executes a captain-directed destructive action received over Mattermost. If a phone message asks for something destructive/irreversible/security-sensitive, firstmate treats it as a request and replies in-channel asking for the explicit confirmation the existing rules already require, rather than acting.
+- Outbound auto-post is limited to escalation content (AGENTS.md section 9 material) plus firstmate's own replies to captain questions. It never posts an action's execution as a fait accompli it was not already authorized to take.
+- The agent-side MCP `post_reply` keeps its `confirm: true` gate untouched. Only the REST helper (`bin/fm-mm-post.sh`), authorized by the token, posts autonomously, and only escalation/answer content. This is the exact boundary the brief asks for: an autonomous away-mode escalation may post, but no captain-directed destructive action is ever silently auto-posted or auto-executed.
+
+No AGENTS.md section 1 boundary is weakened. Firstmate still never writes to a project, never merges without the captain's word, never tears down unlanded work, and crewmates still never address the captain. This feature only adds a captain<->firstmate transport.
+
+## Config (all gitignored, home `.env` / `config/`)
+
+- `MM_SERVER_URL` - Mattermost base URL, e.g. `https://mm.example.com`.
+- `MM_TOKEN` - Mattermost personal access token (the opt-in; absent = feature fully inert).
+- `MM_CONTROL_CHANNEL_ID` - the control channel id (captain-provided; not discoverable).
+- Optional `MM_POLL_INTERVAL` override, defaulting to 30s via generated `config/mm-mode.env`, mirroring X mode.
+
+Generated runtime state under `state/`: `mm-inbox/<post_id>.json` (stashed messages), `mm-cursor` (last-seen epoch ms), `mm-watch.check.sh` (byte-static poll shim), `mm-self-user` (cached bot user id), `mm-poll.error` (rate-limited diagnostic dedupe). All follow the X-mode artifact conventions.
+
+## Open decisions (needs-decision, do not guess)
+
+1. Control channel. The captain must designate the control surface and provide its `channel_id` (firstmate cannot discover it - no channel-list tool). Options: (a) a dedicated channel such as `firstmate-control`, recommended, one clean fleet-control surface; (b) a DM between the captain and firstmate's bot account. Recommendation: a dedicated channel (a), flat thread model, escalations threaded onto the captain post they answer.
+
+2. Auto-post safety policy. Confirm the policy above: outbound escalations and firstmate's own answers auto-post via the token; inbound phone messages are steers that never auto-approve or auto-execute a merge, destructive, irreversible, or security-sensitive action; the MCP `post_reply` confirm gate stays intact. Recommendation: adopt as written.
+
+Both are genuine captain choices (channel identity is un-discoverable; the auto-post policy is safety-sensitive), so implementation stops here until the captain rules.
+
+## Maintaining this file
+
+Keep this as the design and rationale record.
+Once built, the exact flags, wire calls, and paths live in the script headers and docs/configuration.md; this file points at them rather than restating them.
