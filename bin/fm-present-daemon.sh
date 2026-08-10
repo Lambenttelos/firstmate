@@ -39,6 +39,27 @@
 # Opt-in: the whole feature is inert unless the local, gitignored
 # config/present-daemon presence flag exists. See docs/configuration.md.
 #
+# Pane-wake (config/present-daemon-pane-wake). By default the daemon only keeps a
+# watcher armed and re-arms silently. On claude and grok a background task's
+# completion re-drives the model by default, so a silent re-arm is enough - the
+# arm-task completion wakes the model. jcode background tasks default to a passive
+# notification that does NOT wake an idle model, and the wake flag can only be set
+# from the model's own bg call, not from any script, so a silently re-armed
+# watcher cannot wake an idle jcode session (docs/jcode-wake-adapter.md,
+# docs/jcode-primary-supervision.md). When pane-wake is enabled the daemon ALSO
+# injects one short wake line into firstmate's own supervisor pane on each
+# actionable watcher cycle, which jcode always re-drives on, exactly as the
+# away-mode daemon (bin/fm-supervise-daemon.sh) already injects escalations.
+# It is enabled when the local, gitignored config/present-daemon-pane-wake flag is
+# present (its contents are ignored unless the first non-empty line is "off"),
+# OR automatically when firstmate's own harness is jcode (the harness that needs
+# it); claude and grok stay on the silent-re-arm path unless the flag forces it.
+# Supported supervisor backends are tmux and herdr only; anything else, or a pane
+# that does not positively resolve, degrades silently to the silent-re-arm
+# behavior. Pane-wake never runs in away mode - the away daemon owns the pane
+# then - which the existing away-mode interlock already guarantees. See
+# docs/configuration.md.
+#
 # Away-mode interlock: while state/.afk exists the away daemon owns supervision,
 # so the two never supervise concurrently. `start` refuses under the flag,
 # bin/fm-afk-start.sh stops this daemon before the away daemon takes over, and a
@@ -63,12 +84,35 @@ SELF="$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")"
 # shellcheck source=bin/fm-wake-lib.sh
 . "$SCRIPT_DIR/fm-wake-lib.sh"
 
+# Pane-wake reuses the away daemon's injection primitives rather than
+# reinventing them: fm_operational_input_construct builds the typed wake line,
+# fm-backend.sh dispatches the busy/composer guards and the verify-retry submit,
+# and fm-supervisor-target-lib.sh resolves firstmate's own pane the same single
+# way the away daemon does. All three are source-safe.
+# shellcheck source=bin/fm-operational-input.sh
+. "$SCRIPT_DIR/fm-operational-input.sh"
+# shellcheck source=bin/fm-supervisor-target-lib.sh
+. "$SCRIPT_DIR/fm-supervisor-target-lib.sh"
+# fm-tmux-lib.sh owns FM_TMUX_BUSY_REGEX_DEFAULT (the busy-footer fallback the
+# pane-wake busy-guard reuses); the away daemon sources it for the same reason.
+# shellcheck source=bin/fm-tmux-lib.sh
+. "$SCRIPT_DIR/fm-tmux-lib.sh"
+# shellcheck source=bin/fm-backend.sh
+. "$SCRIPT_DIR/fm-backend.sh"
+
 CONFIG="${FM_CONFIG_OVERRIDE:-$FM_HOME/config}"
 ARM="$SCRIPT_DIR/fm-watch-arm.sh"
 FLAG="$CONFIG/present-daemon"
+PANE_WAKE_FLAG="$CONFIG/present-daemon-pane-wake"
 AFK="$STATE/.afk"
 DAEMON_LOCK="$STATE/.present-daemon.lock"
 LOG="$STATE/.present-daemon.log"
+# Supervisor backends pane-wake knows how to inject into (matches the away
+# daemon's FM_SUPERVISOR_SUPPORTED_BACKENDS). Anything else degrades silently.
+PANE_WAKE_SUPPORTED_BACKENDS="tmux herdr"
+# Retry/settle knobs for the verify-retry submit, mirroring the away daemon's.
+PANE_WAKE_CONFIRM_RETRIES=${FM_PRESENT_PANE_WAKE_RETRIES:-3}
+PANE_WAKE_CONFIRM_SLEEP=${FM_PRESENT_PANE_WAKE_SLEEP:-0.5}
 # An arm cycle shorter than this counts as "rapid" for crash-loop detection.
 RAPID_SECONDS=${FM_PRESENT_RAPID_SECONDS:-5}
 # Consecutive rapid failures before the daemon surfaces a degraded wake.
@@ -116,8 +160,132 @@ enabled() {
   [ -f "$FLAG" ]
 }
 
+# pane_wake_enabled: decide whether the daemon should ALSO pane-inject a wake on
+# actionable cycles, on top of the silent re-arm. Precedence:
+#   1. config/present-daemon-pane-wake present -> on, UNLESS its first non-empty,
+#      non-comment line is "off" (an explicit local disable that also overrides
+#      the jcode auto path below).
+#   2. otherwise auto-on when firstmate's own harness is jcode - the harness whose
+#      background tasks do not wake an idle model, so the silent re-arm alone
+#      cannot wake it. claude and grok re-drive on background-task completion, so
+#      they stay on the silent-re-arm path.
+# Harness comes from FM_SUPERVISOR_HARNESS when set (a testing seam and the same
+# override the away daemon honors) else bin/fm-harness.sh. A harness read that
+# fails is treated as not-jcode, so the safe default (silent re-arm) holds.
+pane_wake_enabled() {
+  local first harness
+  if [ -f "$PANE_WAKE_FLAG" ]; then
+    first=$(grep -vE '^[[:space:]]*(#|$)' "$PANE_WAKE_FLAG" 2>/dev/null | head -1)
+    first=${first#"${first%%[![:space:]]*}"}
+    first=${first%"${first##*[![:space:]]}"}
+    [ "$first" = off ] && return 1
+    return 0
+  fi
+  harness=${FM_SUPERVISOR_HARNESS:-}
+  [ -n "$harness" ] || harness=$("$SCRIPT_DIR/fm-harness.sh" 2>/dev/null || printf 'unknown')
+  [ "$harness" = jcode ]
+}
+
 away_mode_active() {
   [ -e "$AFK" ]
+}
+
+# --- pane-wake (resolve once at startup, inject on actionable cycles) --------
+# Resolved once in run_main and read by the injector. Empty target means
+# pane-wake degraded silently to the silent-re-arm behavior (no pane, unsupported
+# backend, or feature off).
+PANE_WAKE_ACTIVE=0
+PANE_WAKE_TARGET=
+PANE_WAKE_BACKEND=
+
+# pane_wake_resolve: at startup, decide whether pane-wake is active for this run
+# and, if so, resolve firstmate's own supervisor pane ONCE using the shared owner
+# the away daemon uses. Degrades SILENTLY (logs, sets PANE_WAKE_ACTIVE=0) rather
+# than blocking supervision when the feature is off, the backend is unsupported,
+# or no real pane resolves (only the firstmate:0 / FALLBACK guess remained). Never
+# runs under away mode - the away daemon owns the pane then.
+pane_wake_resolve() {
+  local target backend rc=0
+  PANE_WAKE_ACTIVE=0
+  PANE_WAKE_TARGET=
+  PANE_WAKE_BACKEND=
+  if ! pane_wake_enabled; then
+    log_line "pane-wake: disabled (silent re-arm only)"
+    return 0
+  fi
+  if away_mode_active; then
+    log_line "pane-wake: skipped (away mode owns the pane)"
+    return 0
+  fi
+  backend=$(discover_supervisor_backend) || true
+  if ! fm_backend_list_contains "$PANE_WAKE_SUPPORTED_BACKENDS" "$backend"; then
+    log_line "pane-wake: degraded (unsupported supervisor backend '$backend'; silent re-arm only)"
+    return 0
+  fi
+  target=$(discover_supervisor_target) || rc=$?
+  # rc != 0 means only the firstmate:0 fallback remained - no pane was positively
+  # identified, so degrade rather than type into an unrelated pane.
+  if [ "$rc" -ne 0 ]; then
+    log_line "pane-wake: degraded (no supervisor pane identified; silent re-arm only)"
+    return 0
+  fi
+  PANE_WAKE_TARGET=$target
+  PANE_WAKE_BACKEND=$backend
+  PANE_WAKE_ACTIVE=1
+  log_line "pane-wake: active (backend=$backend target=$target)"
+}
+
+# pane_wake_inject: nudge firstmate's own pane to read the already-queued wake.
+# Reuses the away daemon's guards and submit primitive: never types into a busy
+# pane mid-turn (fm_backend_busy_state fallback to the busy-footer regex), never
+# into anything but a confirmed-empty genuine agent composer
+# (fm_backend_composer_state), and never into a pane that has gone away
+# (fm_backend_target_exists). A deferred inject is fine - the wake is already
+# durably queued by the watcher, so the pane inject is only the nudge to read it,
+# and the next actionable cycle retries. Best-effort: always returns 0 so a
+# failed nudge can never break the re-arm loop.
+pane_wake_inject() {
+  local target=$PANE_WAKE_TARGET backend=$PANE_WAKE_BACKEND msg verdict tail40
+  [ "$PANE_WAKE_ACTIVE" -eq 1 ] || return 0
+  # Away mode may have been entered mid-run; the loop breaks on it separately, but
+  # guard here too so a race never injects while the away daemon owns the pane.
+  away_mode_active && return 0
+  fm_backend_target_exists "$backend" "$target" || {
+    log_line "pane-wake: target '$target' gone; skipping nudge (wake already queued)"
+    return 0
+  }
+  # Busy-guard: never inject into a pane whose agent is mid-turn.
+  case "$(fm_backend_busy_state "$backend" "$target" 2>/dev/null)" in
+    busy)
+      log_line "pane-wake: deferred (pane busy, agent mid-turn); wake stays queued"
+      return 0
+      ;;
+    *)
+      tail40=$(fm_backend_capture "$backend" "$target" 40 2>/dev/null) || tail40=
+      if printf '%s' "$tail40" | grep -v '^[[:space:]]*$' | tail -6 \
+        | grep -qiE "${FM_BUSY_REGEX:-$FM_TMUX_BUSY_REGEX_DEFAULT}"; then
+        log_line "pane-wake: deferred (pane busy footer); wake stays queued"
+        return 0
+      fi
+      ;;
+  esac
+  # Composer-guard: inject only into a confirmed-empty genuine agent composer.
+  if [ "$(fm_backend_composer_state "$backend" "$target" 2>/dev/null)" != empty ]; then
+    log_line "pane-wake: deferred (composer not confirmed-empty); wake stays queued"
+    return 0
+  fi
+  # Reuse the existing 'watcher' operational kind - this is a watcher wake nudge.
+  fm_operational_input_construct watcher \
+    'Present-mode watcher surfaced an actionable wake. Run bin/fm-wake-drain.sh first and handle the queued wake.' \
+    msg || return 0
+  verdict=$(fm_backend_send_text_submit "$backend" "$target" "$msg" \
+    "$PANE_WAKE_CONFIRM_RETRIES" "$PANE_WAKE_CONFIRM_SLEEP" "$PANE_WAKE_CONFIRM_SLEEP" 2>/dev/null)
+  if [ "$verdict" = empty ]; then
+    log_line "pane-wake: nudged pane $target"
+  else
+    log_line "pane-wake: nudge unconfirmed (verdict=${verdict:-unknown}); wake stays queued"
+  fi
+  return 0
 }
 
 # The daemon lock records only the field names fm_lock_clean_known_files knows,
@@ -228,6 +396,11 @@ run_main() {
   trap on_exit EXIT
   trap handle_signal HUP TERM INT
 
+  # Resolve pane-wake once, before the loop. It degrades silently to today's
+  # silent re-arm when the feature is off, the backend is unsupported, or no real
+  # pane resolves, so it can never block supervision.
+  pane_wake_resolve
+
   log_line "start pid=$(fm_current_pid) home=$FM_HOME"
   while [ "$RUNNING" -eq 1 ]; do
     if away_mode_active; then
@@ -247,6 +420,12 @@ run_main() {
       [ "$failures" -eq 0 ] || log_line "recovered after $failures rapid failure(s)"
       failures=0
       degraded=0
+      # rc 0 is an actionable wake exit (the arm returns 0 only on a surfaced
+      # wake or a benign tick). The watcher already durably queued that wake; on
+      # a harness whose background completion does not re-drive an idle model,
+      # nudge firstmate's own pane so it reads the queued wake. A no-op unless
+      # pane-wake resolved active, and best-effort so it can never break re-arm.
+      [ "$rc" -eq 0 ] && pane_wake_inject
       # A clean-but-instant return would otherwise re-arm in a tight loop and
       # burn a core on a resource-constrained host. One second is invisible
       # against the guard grace and makes the loop unspinnable by construction.
@@ -360,14 +539,20 @@ stop_main() {
 }
 
 usage() {
-  sed -n '2,58p' "$SELF" | sed 's/^# \{0,1\}//'
+  sed -n '2,79p' "$SELF" | sed 's/^# \{0,1\}//'
 }
 
-case "${1:-}" in
-  start) start_main ;;
-  run) run_main ;;
-  status) status_main ;;
-  stop) stop_main ;;
-  -h|--help) usage ;;
-  *) echo "usage: $(basename "$0") start|run|status|stop" >&2; exit 2 ;;
-esac
+# Everything above is source-safe: the pane-wake decision and injection helpers
+# are pure enough for unit tests to source this file and call them with fake
+# backend primitives on PATH. The subcommand dispatch below runs only when the
+# script is EXECUTED, never when sourced (only tests source it).
+if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
+  case "${1:-}" in
+    start) start_main ;;
+    run) run_main ;;
+    status) status_main ;;
+    stop) stop_main ;;
+    -h|--help) usage ;;
+    *) echo "usage: $(basename "$0") start|run|status|stop" >&2; exit 2 ;;
+  esac
+fi

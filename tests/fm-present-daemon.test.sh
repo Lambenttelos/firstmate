@@ -25,6 +25,13 @@ set -u
 TMP_ROOT=$(fm_test_tmproot fm-present-daemon)
 STARTED_PIDS=()
 
+# The launch-based tests below exercise the re-arm loop, not pane-wake, so pin a
+# neutral (non-jcode) supervisor harness for the whole process: pane-wake then
+# stays off in every launched daemon unless a test opts in, keeping those tests
+# independent of whichever runtime this suite happens to run on. The
+# sourced-function pane-wake tests override FM_SUPERVISOR_HARNESS per call.
+export FM_SUPERVISOR_HARNESS=claude
+
 cleanup_daemons() {
   local pid
   for pid in "${STARTED_PIDS[@]:-}"; do
@@ -47,6 +54,19 @@ make_home() {  # <dir> <arm-body>
   # fm-wake-lib.sh sources its own siblings, so the copied bin/ needs them too.
   cp "$ROOT/bin/fm-wake-lib.sh" "$ROOT/bin/fm-mutex-lib.sh" \
     "$ROOT/bin/fm-pid-lib.sh" "$dir/bin/"
+  # Pane-wake sources these siblings at daemon startup (source-safe), plus
+  # fm-harness.sh for the jcode auto-detect; a copied bin/ needs them or the
+  # daemon cannot start. The backend adapters under bin/backends are sourced
+  # lazily only when pane-wake actually injects, so they are copied too.
+  cp "$ROOT/bin/fm-operational-input.sh" "$ROOT/bin/fm-supervisor-target-lib.sh" \
+    "$ROOT/bin/fm-backend.sh" "$ROOT/bin/fm-harness.sh" \
+    "$ROOT/bin/fm-tmux-lib.sh" "$ROOT/bin/fm-composer-lib.sh" \
+    "$ROOT/bin/fm-backend-hometag-lib.sh" "$dir/bin/"
+  mkdir -p "$dir/bin/backends"
+  cp "$ROOT/bin/backends/tmux.sh" "$ROOT/bin/backends/herdr.sh" \
+    "$ROOT/bin/backends/zellij.sh" "$ROOT/bin/backends/orca.sh" \
+    "$ROOT/bin/backends/cmux.sh" "$dir/bin/backends/"
+  chmod +x "$dir/bin/fm-harness.sh"
   chmod +x "$dir/bin/fm-present-daemon.sh"
   printf '#!/usr/bin/env bash\n%s\n' "$arm_body" > "$dir/bin/fm-watch-arm.sh"
   chmod +x "$dir/bin/fm-watch-arm.sh"
@@ -355,6 +375,175 @@ test_supervision_block_reports_a_live_daemon() {
   pass "supervision instructions defer re-arming to a live present daemon and never to a dead one"
 }
 
+# --- pane-wake decision + guard reuse (sourced-function tests) ---------------
+# These source the REAL bin/fm-present-daemon.sh (the dispatch at its foot is
+# guarded so a source runs only the definitions) and exercise the pane-wake
+# helpers directly with fake backend primitives, so the decision and guard logic
+# is pinned without launching a real watcher or touching a real pane.
+
+# Run a bash snippet with the daemon sourced and its backend primitives replaced
+# by test doubles. The snippet is evaluated after sourcing; it prints its own
+# result. FM_SUPERVISOR_HARNESS/target/backend and the config dir are inherited
+# from the caller's environment. STATE points at a scratch dir so log_line has
+# somewhere to write.
+pane_wake_eval() {  # <home> <snippet>
+  local home=$1 snippet=$2
+  mkdir -p "$home/state" "$home/config"
+  FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$home/state" \
+    FM_CONFIG_OVERRIDE="$home/config" bash -c '
+      set -u
+      # shellcheck source=/dev/null
+      . "'"$ROOT"'/bin/fm-present-daemon.sh"
+      '"$snippet"'
+    '
+}
+
+test_pane_wake_disabled_by_default_on_claude() {
+  local home="$TMP_ROOT/pw-claude" out
+  out=$(FM_SUPERVISOR_HARNESS=claude pane_wake_eval "$home" '
+    if pane_wake_enabled; then echo ENABLED; else echo DISABLED; fi')
+  [ "$out" = DISABLED ] || fail "pane-wake must be OFF on claude with no flag, got: $out"
+  pass "pane-wake stays off on a claude primary when the flag is absent"
+}
+
+test_pane_wake_auto_on_for_jcode() {
+  local home="$TMP_ROOT/pw-jcode" out
+  out=$(FM_SUPERVISOR_HARNESS=jcode pane_wake_eval "$home" '
+    if pane_wake_enabled; then echo ENABLED; else echo DISABLED; fi')
+  [ "$out" = ENABLED ] || fail "pane-wake must auto-enable on jcode, got: $out"
+  pass "pane-wake auto-enables on a jcode primary without the flag"
+}
+
+test_pane_wake_flag_forces_on_for_claude() {
+  local home="$TMP_ROOT/pw-flag-on" out
+  mkdir -p "$home/config"
+  : > "$home/config/present-daemon-pane-wake"
+  out=$(FM_SUPERVISOR_HARNESS=claude pane_wake_eval "$home" '
+    if pane_wake_enabled; then echo ENABLED; else echo DISABLED; fi')
+  [ "$out" = ENABLED ] || fail "the flag must force pane-wake on even for claude, got: $out"
+  pass "config/present-daemon-pane-wake forces pane-wake on regardless of harness"
+}
+
+test_pane_wake_flag_off_forces_off_for_jcode() {
+  local home="$TMP_ROOT/pw-flag-off" out
+  mkdir -p "$home/config"
+  printf 'off\n' > "$home/config/present-daemon-pane-wake"
+  out=$(FM_SUPERVISOR_HARNESS=jcode pane_wake_eval "$home" '
+    if pane_wake_enabled; then echo ENABLED; else echo DISABLED; fi')
+  [ "$out" = DISABLED ] || fail "a flag reading 'off' must force pane-wake off even on jcode, got: $out"
+  pass "config/present-daemon-pane-wake='off' overrides the jcode auto path"
+}
+
+test_pane_wake_resolve_active_with_real_pane() {
+  local home="$TMP_ROOT/pw-resolve" out
+  # shellcheck disable=SC2016 # $PANE_WAKE_* must expand inside the sourced subshell, not here.
+  out=$(FM_SUPERVISOR_HARNESS=jcode FM_SUPERVISOR_BACKEND=tmux FM_SUPERVISOR_TARGET='%3' \
+    pane_wake_eval "$home" '
+      pane_wake_resolve
+      echo "$PANE_WAKE_ACTIVE|$PANE_WAKE_BACKEND|$PANE_WAKE_TARGET"')
+  [ "$out" = "1|tmux|%3" ] || fail "resolve must activate with a real tmux pane, got: $out"
+  pass "pane_wake_resolve activates when a real supervisor pane resolves"
+}
+
+test_pane_wake_resolve_degrades_on_fallback_pane() {
+  local home="$TMP_ROOT/pw-fallback" out
+  # No FM_SUPERVISOR_TARGET, no TMUX_PANE, no HERDR env: only the firstmate:0
+  # fallback remains, so pane-wake must degrade silently (no pane identified).
+  # The vars are unset INSIDE the sourced subshell (env(1) cannot run a shell
+  # function like pane_wake_eval), before pane_wake_resolve reads them.
+  # shellcheck disable=SC2016 # $PANE_WAKE_ACTIVE must expand inside the sourced subshell, not here.
+  out=$(FM_SUPERVISOR_HARNESS=jcode FM_SUPERVISOR_BACKEND=tmux \
+    pane_wake_eval "$home" '
+      unset TMUX_PANE HERDR_ENV HERDR_PANE_ID FM_SUPERVISOR_TARGET
+      pane_wake_resolve
+      echo "$PANE_WAKE_ACTIVE"')
+  [ "$out" = 0 ] || fail "resolve must degrade when only the firstmate:0 fallback remains, got: $out"
+  pass "pane_wake_resolve degrades silently when no real supervisor pane resolves"
+}
+
+test_pane_wake_resolve_degrades_on_unsupported_backend() {
+  local home="$TMP_ROOT/pw-unsupported" out
+  # shellcheck disable=SC2016 # $PANE_WAKE_ACTIVE must expand inside the sourced subshell, not here.
+  out=$(FM_SUPERVISOR_HARNESS=jcode FM_SUPERVISOR_BACKEND=zellij FM_SUPERVISOR_TARGET='z1' \
+    pane_wake_eval "$home" '
+      pane_wake_resolve
+      echo "$PANE_WAKE_ACTIVE"')
+  [ "$out" = 0 ] || fail "resolve must degrade on an unsupported backend, got: $out"
+  pass "pane_wake_resolve degrades silently on an unsupported supervisor backend"
+}
+
+test_pane_wake_resolve_off_when_disabled() {
+  local home="$TMP_ROOT/pw-resolve-off" out
+  # shellcheck disable=SC2016 # $PANE_WAKE_ACTIVE must expand inside the sourced subshell, not here.
+  out=$(FM_SUPERVISOR_HARNESS=claude FM_SUPERVISOR_BACKEND=tmux FM_SUPERVISOR_TARGET='%3' \
+    pane_wake_eval "$home" '
+      pane_wake_resolve
+      echo "$PANE_WAKE_ACTIVE"')
+  [ "$out" = 0 ] || fail "resolve must stay inactive when pane-wake is disabled, got: $out"
+  pass "pane_wake_resolve stays inactive when pane-wake is disabled (claude, no flag)"
+}
+
+# The guard-reuse tests replace the backend primitives with doubles AFTER
+# sourcing, then drive pane_wake_inject. The submit double records reaching the
+# submit primitive by touching a marker file (pane_wake_inject sends the real
+# submit's stderr to /dev/null, so the double cannot signal through stderr),
+# proving a busy pane or a non-empty composer defers before the submit.
+test_pane_wake_inject_submits_on_idle_empty_pane() {
+  local home="$TMP_ROOT/pw-inject-ok" out
+  out=$(pane_wake_eval "$home" '
+    PANE_WAKE_ACTIVE=1; PANE_WAKE_BACKEND=tmux; PANE_WAKE_TARGET=%3
+    fm_backend_target_exists() { return 0; }
+    fm_backend_busy_state() { printf idle; }
+    fm_backend_capture() { printf "an idle agent prompt\n"; }
+    fm_backend_composer_state() { printf empty; }
+    fm_backend_send_text_submit() { : > "'"$home"'/submit.mark"; printf empty; }
+    pane_wake_inject
+    if [ -e "'"$home"'/submit.mark" ]; then echo SUBMITTED; else echo NOSUBMIT; fi')
+  [ "$out" = SUBMITTED ] || fail "inject must submit into an idle, confirmed-empty pane, got: $out"
+  pass "pane_wake_inject submits the wake nudge into an idle empty pane"
+}
+
+test_pane_wake_inject_defers_on_busy_pane() {
+  local home="$TMP_ROOT/pw-inject-busy" out
+  out=$(pane_wake_eval "$home" '
+    PANE_WAKE_ACTIVE=1; PANE_WAKE_BACKEND=tmux; PANE_WAKE_TARGET=%3
+    fm_backend_target_exists() { return 0; }
+    fm_backend_busy_state() { printf busy; }
+    fm_backend_capture() { printf ""; }
+    fm_backend_composer_state() { printf empty; }
+    fm_backend_send_text_submit() { : > "'"$home"'/submit.mark"; printf empty; }
+    pane_wake_inject
+    if [ -e "'"$home"'/submit.mark" ]; then echo SUBMITTED; else echo DEFERRED; fi')
+  [ "$out" = DEFERRED ] || fail "inject must defer on a busy pane, never submit, got: $out"
+  pass "pane_wake_inject defers (no submit) when the supervisor pane is busy"
+}
+
+test_pane_wake_inject_defers_on_pending_composer() {
+  local home="$TMP_ROOT/pw-inject-pending" out
+  out=$(pane_wake_eval "$home" '
+    PANE_WAKE_ACTIVE=1; PANE_WAKE_BACKEND=tmux; PANE_WAKE_TARGET=%3
+    fm_backend_target_exists() { return 0; }
+    fm_backend_busy_state() { printf idle; }
+    fm_backend_capture() { printf "an idle prompt\n"; }
+    fm_backend_composer_state() { printf pending; }
+    fm_backend_send_text_submit() { : > "'"$home"'/submit.mark"; printf empty; }
+    pane_wake_inject
+    if [ -e "'"$home"'/submit.mark" ]; then echo SUBMITTED; else echo DEFERRED; fi')
+  [ "$out" = DEFERRED ] || fail "inject must defer on a non-empty composer, got: $out"
+  pass "pane_wake_inject defers (no submit) when the composer holds unsubmitted text"
+}
+
+test_pane_wake_inject_noop_when_inactive() {
+  local home="$TMP_ROOT/pw-inject-inactive" out
+  out=$(pane_wake_eval "$home" '
+    PANE_WAKE_ACTIVE=0; PANE_WAKE_BACKEND=tmux; PANE_WAKE_TARGET=%3
+    fm_backend_target_exists() { echo "REACHED" >&2; return 0; }
+    pane_wake_inject 2>"'"$home"'/reach.log"
+    if grep -q "^REACHED" "'"$home"'/reach.log"; then echo REACHED; else echo NOOP; fi')
+  [ "$out" = NOOP ] || fail "inject must be a no-op when pane-wake is inactive, got: $out"
+  pass "pane_wake_inject is a no-op when pane-wake did not resolve active"
+}
+
 test_inert_without_flag
 test_loop_rearms_after_each_cycle
 test_session_lock_is_never_touched
@@ -365,3 +554,15 @@ test_crash_loop_backs_off_and_surfaces_one_wake
 test_degraded_wake_is_reported_not_acted_on
 test_daemon_death_leaves_turnend_alarm_intact
 test_supervision_block_reports_a_live_daemon
+test_pane_wake_disabled_by_default_on_claude
+test_pane_wake_auto_on_for_jcode
+test_pane_wake_flag_forces_on_for_claude
+test_pane_wake_flag_off_forces_off_for_jcode
+test_pane_wake_resolve_active_with_real_pane
+test_pane_wake_resolve_degrades_on_fallback_pane
+test_pane_wake_resolve_degrades_on_unsupported_backend
+test_pane_wake_resolve_off_when_disabled
+test_pane_wake_inject_submits_on_idle_empty_pane
+test_pane_wake_inject_defers_on_busy_pane
+test_pane_wake_inject_defers_on_pending_composer
+test_pane_wake_inject_noop_when_inactive

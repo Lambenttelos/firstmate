@@ -185,6 +185,22 @@ If the daemon dies, its orphaned watcher ends on the next actionable wake, the b
 Away mode and present mode never supervise concurrently.
 The daemon refuses to start while `state/.afk` exists, `bin/fm-afk-start.sh` stops it before the away daemon takes over, and a running loop re-checks the flag between arm cycles.
 
+### Pane-wake (config/present-daemon-pane-wake)
+
+Keeping a watcher armed is enough on claude and grok, where a background task's completion re-drives the model by default, so the arm-task completion itself wakes an idle session.
+It is not enough on jcode: a jcode background task defaults to a passive notification that does not wake an idle model, and the wake flag can only be set from the model's own `bg` call, not from any script (`docs/jcode-wake-adapter.md`, `docs/jcode-primary-supervision.md`).
+A silently re-armed watcher therefore cannot wake an idle jcode session.
+
+Pane-wake closes that gap: when enabled, the daemon ALSO injects one short wake line into firstmate's own supervisor pane on each actionable watcher cycle, which jcode always re-drives on, exactly as the away-mode sub-supervisor already injects escalations.
+It reuses that daemon's shared primitives: `bin/fm-supervisor-target-lib.sh` resolves the pane once at startup, and `bin/fm-backend.sh` supplies the busy-guard, the confirmed-empty-composer guard, and the verify-retry submit, so a nudge never lands in a busy pane mid-turn, in a non-empty composer, or in a dead shell.
+The wake is already durably queued by the watcher, so a deferred nudge is fine and the next actionable cycle retries.
+
+Pane-wake is enabled when the local, gitignored `config/present-daemon-pane-wake` flag is present (its contents are ignored unless the first non-empty, non-comment line is `off`, which force-disables it), OR automatically when firstmate's own harness is jcode.
+claude and grok stay on the silent-re-arm path unless the flag forces pane-wake on.
+Supported supervisor backends are tmux and herdr only; an unsupported backend, or a pane that does not positively resolve (only the legacy `firstmate:0` fallback remained), degrades silently to today's silent-re-arm behavior rather than blocking supervision or typing into an unrelated pane.
+Pane-wake never runs in away mode, where the away daemon owns the pane; the existing away-mode interlock already guarantees this.
+It is not inherited into secondmate homes, for the same reason the present daemon is not.
+
 `bin/fm-present-daemon.sh --help` owns the subcommands, the exact status lines, and the `FM_PRESENT_*` tuning knobs.
 
 ## External liveness watchdog (config/liveness-watchdog)
