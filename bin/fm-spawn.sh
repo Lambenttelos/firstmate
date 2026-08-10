@@ -117,7 +117,9 @@
 #   A harness with no positional prompt (jcode) carries no __BRIEF__ placeholder:
 #   its brief, model, and effort are delivered to the live session after launch by
 #   jcode_post_launch_delivery(), which waits FM_SPAWN_JCODE_READY_POLLS seconds
-#   for the composer, then submits /model, /effort, and a launch-brief pointer.
+#   for the composer, submits /model and /effort best-effort, then submits the
+#   launch-brief pointer as a separately-verified step (jcode_submit_brief_verified)
+#   that re-submits Enter until the composer clears, so the brief is never dropped.
 # Per-harness turn-end hooks are installed automatically; some live outside the worktree.
 # grok uses a firstmate-owned global hook under ${GROK_HOME:-$HOME/.grok}/hooks
 # plus a gitignored .fm-grok-turnend worktree pointer and a state token.
@@ -172,6 +174,19 @@ fm_refuse_if_gate_agent
 # its composer before giving up on delivering the launch profile and brief. It
 # connects to an already-running shared server, so this is client startup only.
 FM_SPAWN_JCODE_READY_POLLS=${FM_SPAWN_JCODE_READY_POLLS:-30}
+# The brief is the LAST and longest message jcode_post_launch_delivery submits,
+# and it is the one that used to race jcode's slash-command handling and get
+# dropped: the composer was left holding the typed-but-unsubmitted brief while
+# the short /model and /effort lines landed (observed twice 2026-08-10,
+# data/learnings.md "jcode spawn: /model ... verdict pending + brief dropped").
+# The fix submits the brief as its own separately-verified step: after the slash
+# commands settle, confirm the composer actually cleared and re-submit if it did
+# not, up to FM_SPAWN_JCODE_BRIEF_SUBMIT_TRIES attempts. This mirrors the
+# verified-submit model bin/fm-send.sh already uses, so a swallowed brief Enter
+# is retried rather than silently abandoned. FM_SPAWN_JCODE_BRIEF_SETTLE is the
+# per-attempt pause before re-reading the composer.
+FM_SPAWN_JCODE_BRIEF_SUBMIT_TRIES=${FM_SPAWN_JCODE_BRIEF_SUBMIT_TRIES:-3}
+FM_SPAWN_JCODE_BRIEF_SETTLE=${FM_SPAWN_JCODE_BRIEF_SETTLE:-1}
 # Skip the watcher guard when re-exec'd for one pair of a batch (FM_SPAWN_NO_GUARD is
 # set by the batch loop below), so the guard runs once for the batch, not once per pair.
 [ -n "${FM_SPAWN_NO_GUARD:-}" ] || "$FM_ROOT/bin/fm-guard.sh" || true
@@ -567,16 +582,25 @@ launch_template() {
 # (verified: `/model claude-opus-4-8 high` typed and submitted correctly with a
 # 1.2s settle, while a too-fast Enter lands in the popup instead).
 #
+# The slash commands are delivered BEST-EFFORT: a swallowed or falsely-pending
+# /model or /effort is warned about but must NEVER abort brief delivery. The
+# brief is the payload; effort and model are secondary. The original bug
+# (observed twice 2026-08-10, data/learnings.md) was exactly the opposite: the
+# FIRST slash command verified as `pending` (jcode's slash-popup submit race),
+# the function returned early, and the brief - the last and longest message -
+# was never delivered at all, leaving the pane idle holding nothing.
+#
 # The brief is delivered as a POINTER to data/<id>/brief.md rather than as the
 # brief text: the brief is many lines, and every backend's composer submit is
 # line-oriented, so a raw newline would submit a partial brief. That matches
 # AGENTS.md's standing rule that long instructions travel as a file. The pointer
 # still rides the canonical launch-brief operational input, so the crewmate
 # receives it as a structurally typed launch brief exactly like every other
-# harness.
+# harness. It is submitted through jcode_submit_brief_verified, which confirms
+# the composer actually cleared and re-submits Enter if it did not.
 jcode_post_launch_delivery() {  # <target> <brief-path> <model> <effort>
-  local target=$1 brief=$2 model=$3 effort=$4 i=0 state=unknown verdict line settle
-  local lines=()
+  local target=$1 brief=$2 model=$3 effort=$4 i=0 state=unknown verdict line
+  local slash_lines=()
   # Wait for the TUI: until its composer row exists there is nothing to type
   # into, and a message typed into the still-starting client is lost.
   while [ "$i" -lt "$FM_SPAWN_JCODE_READY_POLLS" ]; do
@@ -590,30 +614,69 @@ jcode_post_launch_delivery() {  # <target> <brief-path> <model> <effort>
     return 1
   fi
   if [ -n "$model" ] && [ "$model" != default ]; then
-    lines+=("/model $model")
+    slash_lines+=("/model $model")
   fi
   if [ -n "$effort" ] && [ "$effort" != default ]; then
-    lines+=("/effort $effort")
+    slash_lines+=("/effort $effort")
   fi
-  line=$(printf 'Read %s and follow it as your task brief.' "$brief" \
-    | "$FM_ROOT/bin/fm-operational-input.sh" encode launch-brief) \
-    || { echo "warning: could not encode the jcode launch brief for $target" >&2; return 1; }
-  lines+=("$line")
-  for line in "${lines[@]}"; do
-    case "$line" in
-      /*) settle=1.2 ;;
-      *) settle=0.3 ;;
-    esac
-    verdict=$(fm_backend_send_text_submit "$BACKEND" "$target" "$line" 3 0.4 "$settle" 2>/dev/null) || verdict=send-failed
+  # Slash commands: best-effort, one at a time, each with the slash-popup settle.
+  # A pending/send-failed verdict is reported and delivery CONTINUES to the brief.
+  for line in "${slash_lines[@]}"; do
+    verdict=$(fm_backend_send_text_submit "$BACKEND" "$target" "$line" 3 0.4 1.2 2>/dev/null) || verdict=send-failed
     case "$verdict" in
       pending|send-failed)
-        echo "warning: jcode did not accept '$line' on $target (verdict $verdict); inspect the pane before relying on the task" >&2
-        return 1
+        echo "warning: jcode did not confirm '$line' on $target (verdict $verdict); continuing to deliver the brief regardless" >&2
         ;;
     esac
     sleep 1
   done
+  line=$(printf 'Read %s and follow it as your task brief.' "$brief" \
+    | "$FM_ROOT/bin/fm-operational-input.sh" encode launch-brief) \
+    || { echo "warning: could not encode the jcode launch brief for $target" >&2; return 1; }
+  if ! jcode_submit_brief_verified "$target" "$line"; then
+    echo "warning: jcode did not confirm the brief submitted on $target (the composer still held the unsubmitted brief after ${FM_SPAWN_JCODE_BRIEF_SUBMIT_TRIES} attempts); inspect the pane before relying on the task" >&2
+    return 1
+  fi
   return 0
+}
+
+# jcode_submit_brief_verified: type the brief once, submit it, then INDEPENDENTLY
+# confirm the composer cleared - and if it did not, re-submit Enter only (never
+# retype, which would duplicate the brief) up to FM_SPAWN_JCODE_BRIEF_SUBMIT_TRIES
+# times. This is the separately-verified brief-submit step: jcode drops the last,
+# longest paste under slash-command racing, so a single submit-and-trust is not
+# enough for the payload. Composer verdicts (fm_backend_composer_state): `empty`
+# means the box cleared (brief submitted, turn idle or already running - jcode's
+# idle "N>" and busy "N…" rows both read empty); `pending` means the brief is
+# still sitting unsubmitted, the retry cue; `unknown` means the pane could not be
+# read, treated leniently as delivered at exhaustion exactly as bin/fm-send.sh
+# treats an unreadable pane, since only a positively-confirmed swallow is an error.
+jcode_submit_brief_verified() {  # <target> <brief-line>
+  local target=$1 line=$2 attempt=0 typed=0 verdict state last=unknown
+  while [ "$attempt" -lt "$FM_SPAWN_JCODE_BRIEF_SUBMIT_TRIES" ]; do
+    attempt=$((attempt + 1))
+    if [ "$typed" -eq 0 ]; then
+      # First attempt types the brief once and runs the backend's own
+      # verified type+submit (it retries Enter internally, never retyping).
+      verdict=$(fm_backend_send_text_submit "$BACKEND" "$target" "$line" 3 0.4 0.3 2>/dev/null) || verdict=send-failed
+      typed=1
+      [ "$verdict" = empty ] && return 0
+    else
+      # The brief text is already in the composer from a prior swallowed attempt;
+      # re-submit Enter ONLY. Retyping would duplicate the brief.
+      fm_backend_send_key "$BACKEND" "$target" Enter 2>/dev/null || true
+    fi
+    sleep "$FM_SPAWN_JCODE_BRIEF_SETTLE"
+    state=$(fm_backend_composer_state "$BACKEND" "$target" 2>/dev/null) || state=unknown
+    last=$state
+    [ "$state" = empty ] && return 0
+  done
+  # Exhausted. A composer still positively holding the brief (pending) is a hard
+  # failure; an unreadable pane (unknown) is lenient, assume delivered.
+  case "$last" in
+    pending) return 1 ;;
+    *) return 0 ;;
+  esac
 }
 
 case "$ARG3" in
