@@ -14,6 +14,10 @@ STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 LOCK="$STATE/.lock"
 mkdir -p "$STATE"
 
+# One owner for "is this pid alive (and not a defunct zombie)?".
+# shellcheck source=bin/fm-pid-lib.sh
+. "$SCRIPT_DIR/fm-pid-lib.sh"
+
 # Known harness command names; extend when a new adapter is verified.
 HARNESS_RE='claude|codex|opencode|grok|jcode|^pi$'
 
@@ -35,9 +39,9 @@ harness_pid() {
   return 1
 }
 
-holder_alive() {  # true if $1 is a live process that looks like a harness
+holder_alive() {  # true if $1 is a live, non-zombie process that looks like a harness
   local pid=$1 comm
-  kill -0 "$pid" 2>/dev/null || return 1
+  fm_pid_alive "$pid" || return 1  # false for a dead OR defunct (STAT Z) pid
   comm=$(ps -o comm= -p "$pid" 2>/dev/null) || return 1
   printf '%s' "$(basename "$comm") $(ps -o args= -p "$pid" 2>/dev/null)" | grep -qE "$HARNESS_RE"
 }

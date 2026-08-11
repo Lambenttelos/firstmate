@@ -9,11 +9,29 @@
 # bin/fm-wake-lib.sh sources it for the queue and lock helpers built on top.
 
 fm_pid_alive() {
-  local pid=$1
+  local pid=$1 proc_root stat_line state
   case "$pid" in
     ''|*[!0-9]*) return 1 ;;
   esac
-  kill -0 "$pid" 2>/dev/null
+  kill -0 "$pid" 2>/dev/null || return 1
+  # kill -0 succeeds on a defunct (zombie) process because its pid still exists
+  # in the table, so read the process state and treat Z/defunct as dead: this
+  # container's init never reaps zombies, and a bare kill -0 would otherwise let
+  # a day-dead holder pin the session lock or the heavy-run queue forever.
+  proc_root=${FM_PROC_ROOT_OVERRIDE:-/proc}
+  if [ "$(uname)" = Linux ] && [ -r "$proc_root/$pid/stat" ]; then
+    stat_line=$(cat "$proc_root/$pid/stat" 2>/dev/null) || return 0
+    # After the final comm delimiter ')', the next field is the state char.
+    read -r state _ <<< "${stat_line##*)}"
+    [ "$state" = Z ] && return 1
+    return 0
+  fi
+  # Non-Linux fallback: ps state field, Z (also shown as 'Z+') marks a zombie.
+  state=$(ps -o state= -p "$pid" 2>/dev/null | tr -d ' ')
+  case "$state" in
+    Z*) return 1 ;;
+  esac
+  return 0
 }
 
 fm_pid_identity() {
