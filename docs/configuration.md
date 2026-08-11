@@ -680,6 +680,36 @@ In dry-run, `fm-x-dismiss.sh` records `{request_id, endpoint:"dismiss"}` to the 
 The live answer and follow-up bodies intentionally stay the same shape, including optional `image`; the relay distinguishes them by endpoint, and dismiss stays `{request_id}`.
 These paths need `jq` to build the JSON payload, but they run before token and network checks, so they need neither `FMX_PAIRING_TOKEN` nor `curl`.
 
+## Mattermost captain-firstmate messaging (.env)
+
+Mattermost messaging lets the captain command the fleet and receive escalations over a Mattermost control channel with no terminal, so a phone is enough.
+It is the private, single-captain sibling of X mode, and [docs/mattermost-messaging.md](mattermost-messaging.md) owns the design and rationale.
+This section owns the config contract; the exact wire calls and paths live in the `bin/fm-mm-poll.sh`, `bin/fm-mm-post.sh`, and `bin/fm-mm-lib.sh` headers.
+
+It is off unless the home's gitignored `.env` contains a non-empty `MM_TOKEN` (a Mattermost personal access token).
+Absent that token every entry point is a hard no-op: `bin/fm-mm-poll.sh` exits silently and `bin/fm-mm-post.sh` posts nothing, so a non-opted-in home is completely inert.
+The token authorizes reading the control channel and posting escalations and firstmate's own answers to it.
+It does not expand any approval authority: an inbound Mattermost message is a captain steer, never an approval, and never auto-approves or auto-executes a merge or any destructive, irreversible, or security-sensitive action (AGENTS.md sections 8 and 9).
+
+The transport is a shell-side Mattermost REST v4 poll authorized by `MM_TOKEN`, because the Mattermost MCP is agent-only, has no channel-list or new-message signal, and gates `post_reply` behind explicit confirmation, so it cannot drive the always-on shell watcher.
+The MCP remains the agent-side rich reader for a thread and its attachments once a message has woken firstmate.
+
+Config values resolve from `.env` (or the environment, which wins for a direct invocation or a test):
+
+- `MM_TOKEN` - the Mattermost personal access token; the single opt-in gate.
+- `MM_SERVER_URL` - the Mattermost base URL, e.g. `https://mattermost.hyfin.app`.
+- `MM_CHANNEL_ID` - the control channel id; when set it wins and no name lookup runs.
+- `MM_TEAM` and `MM_CHANNEL` - the team and channel URL slugs (e.g. `dashnow` and `fm-cyuan`); used to resolve the channel id once when `MM_CHANNEL_ID` is unset, because the MCP cannot discover a channel and the captain names it by URL. The resolved id is cached to `state/mm-channel-id`.
+- `MM_DRY_RUN` - truthy previews an outbound post to `state/mm-outbox/` without posting.
+- `MM_ENV_FILE` - optional alternate `.env`-style file for direct client invocations.
+
+Inbound wiring reuses the watcher's custom-check path: register `bin/fm-mm-poll.sh` as the home's `state/<id>.check.sh` and bind it with `bin/fm-check-register.sh`, so the watcher runs it each slow-check cycle and its `mm-message <post_id>` output becomes an ordinary `check:` wake on the existing supervision and away-mode escalation path.
+The poll filters out firstmate's own posts using its bot user id (resolved once via `GET /api/v4/users/me`, cached to `state/mm-self-user`), advances a durable `state/mm-cursor` (epoch ms), anchors that cursor to now on first run so channel history is never replayed, and stashes each new captain post to `state/mm-inbox/<post_id>.json`.
+
+Outbound escalations reuse the content firstmate already surfaces per AGENTS.md section 9: `bin/fm-mm-post.sh` posts them with the token, threading a reply onto the captain post it answers via `--root` or posting a new root for an unprompted escalation.
+A planned future integration would add the same helper as an additional delivery sink for the digests the away-mode outbox produces (`bin/fm-afk-outbox-lib.sh`); it is not yet wired in this change (no away-mode code calls `bin/fm-mm-post.sh` today).
+All generated state lives under the already-gitignored `state/`.
+
 ## Environment variables
 
 Runtime tuning via environment variables (defaults shown):
@@ -744,6 +774,13 @@ FMX_DISCORD_REPLY_MAX_CHARS=1900   # Discord reply per-message split budget; val
 FMX_X_THREAD_MAX=25     # maximum messages in one auto-split reply thread
 FMX_FOLLOWUP_MAX_AGE_SECS=604800   # local window for posting X-mode completion follow-ups (7 days)
 FMX_FOLLOWUP_MAX_COUNT=3   # local cap on X-mode completion follow-ups per linked mention
+MM_TOKEN=               # Mattermost messaging opt-in; a Mattermost personal access token. Absent = the feature is fully inert
+MM_SERVER_URL=          # Mattermost base URL, e.g. https://mattermost.hyfin.app
+MM_CHANNEL_ID=          # control channel id; when set it wins and no team/name lookup runs
+MM_TEAM=                # team URL slug (e.g. dashnow); with MM_CHANNEL resolves the channel id once when MM_CHANNEL_ID is unset
+MM_CHANNEL=             # control channel URL slug (e.g. fm-cyuan); see MM_TEAM
+MM_DRY_RUN=             # truthy previews an outbound Mattermost post to state/mm-outbox/ without posting
+MM_ENV_FILE=            # optional alternate .env file for direct Mattermost client invocations
 FM_LOCK_STALE_AFTER=2   # seconds before dead-pid lock records can be reclaimed; mid-acquire locks keep at least 2s grace
 FM_GUARD_GRACE=900      # seconds before guard warnings, arm health checks, and the primary turn-end guard treat a watcher beacon as stale
 FM_AFK_DAEMON_PENDING_TTL=300   # seconds an away-mode daemon-start intent marker (state/.supervise-daemon.starting) reads as owned before it decays to daemon-free; bounds the bring-up window (docs/turnend-guard.md "Away Mode")
