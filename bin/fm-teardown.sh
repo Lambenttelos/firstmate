@@ -2,8 +2,16 @@
 # Tear down a finished task: return the treehouse worktree, release the Orca
 # worktree, or retire a secondmate home; kill the recorded runtime endpoint,
 # clear volatile state, refresh/prune the project's clone for remote-backed ship
-# tasks, then print a backlog-refresh reminder for ship and scout teardowns
+# tasks, then close or print a backlog-refresh reminder for ship and scout teardowns
 # (a secondmate teardown prints none, since secondmates are not backlog items).
+# When the task's branch is VERIFIABLY merged into the default branch (its PR is
+# merged, or - for direct-push autoland - the branch's fresh origin tip is an ancestor
+# of the fresh origin default branch), teardown auto-closes the backlog ticket with
+# `tasks-axi done`, closing the drift where autoland lands work but the ticket never
+# flips to done. Only a proven merge auto-closes: pushed-but-unmerged (merge queue),
+# detached-HEAD/scratch-branch containment, and local-only landing all keep the plain
+# print-reminder. `config/backlog-backend=manual` never auto-closes. A backlog-close
+# failure only warns; it never blocks the worktree release.
 # REFUSES if the worktree holds work that is NEITHER durable on a remote NOR landed,
 # because cleanup hard-resets/removes the worktree and kills its processes. The
 # worktree is disposable - so teardown releases it - when its branch is fully PUSHED
@@ -172,6 +180,13 @@ KIND=$(grep '^kind=' "$META" | cut -d= -f2- || true)
 [ -n "$KIND" ] || KIND=ship
 MODE=$(grep '^mode=' "$META" | cut -d= -f2- || true)
 [ -n "$MODE" ] || MODE=no-mistakes
+
+# Set by capture_ticket_merge_evidence while the worktree still exists, and read by
+# backlog_refresh_reminder at the very end (after the worktree is gone) to decide
+# whether to auto-close the backlog ticket. Empty means "no verified merge", so the
+# reminder-only path runs. Initialized here so set -u is satisfied even when the
+# capture step is skipped (scout, secondmate, local-only, or a missing worktree).
+TICKET_MERGE_EVIDENCE=
 
 # Completion-ledger landing SHA, captured now while the worktree still exists (the
 # destructive cleanup below removes it). The append-only ledger records this at the
@@ -592,6 +607,78 @@ record_pushed_unmerged_to_merge_queue() {
   }
 }
 
+# Capture whether THIS task's ticket is verifiably merged into the default branch,
+# while the worktree still exists (the destructive cleanup below removes it). Sets
+# TICKET_MERGE_EVIDENCE to a short human evidence string ONLY when a real merge is
+# proven, so backlog_refresh_reminder can auto-close the ticket after cleanup. Left
+# empty for every non-merge durable-release path (pushed-but-unmerged, detached HEAD
+# or scratch branch contained in default, local-only landing target), so those keep
+# the existing print-reminder behavior.
+#
+# This reuses teardown's own already-computed merge tests; it does NOT introduce a
+# second independent merge check. Two accepted merge proofs, both provable and both
+# meaning the recorded branch itself merged rather than merely landed by some other
+# path:
+#   1. pr_is_merged: GitHub reports the task's PR merged with a head that contains the
+#      local work (the no-mistakes / direct-PR squash-or-merge flow).
+#   2. the recorded branch's fresh origin tip is an ancestor of the fresh origin
+#      default branch (the direct-push autoland flow, where the worker merged its own
+#      fm/<id> branch onto the origin default). branch_fully_pushed_to_origin already
+#      fetches and confirms the branch tip; this adds only the is-ancestor test that
+#      distinguishes a merged branch from a pushed-but-unmerged one.
+# Never sets evidence for a dirty or unlanded worktree: it runs only after the safety
+# checks have already released the worktree, and each proof independently requires a
+# real remote merge state.
+capture_ticket_merge_evidence() {
+  local branch name origin_default origin_branch
+  TICKET_MERGE_EVIDENCE=
+  case "$KIND" in scout|secondmate) return 0 ;; esac
+  [ "$MODE" != local-only ] || return 0
+  [ -n "$WT" ] && [ -d "$WT" ] || return 0
+
+  branch=${TEARDOWN_WORKTREE_BRANCH_FOR_SAFETY:-}
+  [ -n "$branch" ] || branch=$(git -C "$WT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)
+
+  if [ "$branch" != HEAD ] && pr_is_merged "$branch"; then
+    TICKET_MERGE_EVIDENCE="PR merged, head contains the local work"
+    return 0
+  fi
+
+  # Direct-push autoland: the branch tip on origin is an ancestor of origin's default
+  # branch, i.e. the branch really merged (not just pushed-but-unmerged).
+  [ "$branch" != HEAD ] || return 0
+  branch_fully_pushed_to_origin "$branch" || return 0
+  name=$(default_branch) || return 0
+  git -C "$WT" remote get-url origin >/dev/null 2>&1 || return 0
+  git -C "$WT" fetch --quiet origin "+refs/heads/$name:refs/remotes/origin/$name" >/dev/null 2>&1 || return 0
+  origin_branch=$(git -C "$WT" rev-parse --quiet --verify "refs/remotes/origin/$branch^{commit}" 2>/dev/null) || return 0
+  origin_default="refs/remotes/origin/$name"
+  git -C "$WT" rev-parse --quiet --verify "$origin_default^{commit}" >/dev/null 2>&1 || return 0
+  if git -C "$WT" merge-base --is-ancestor "$origin_branch" "$origin_default" 2>/dev/null; then
+    TICKET_MERGE_EVIDENCE="$branch is an ancestor of origin/$name"
+  fi
+}
+
+# Auto-close the backlog ticket for a verified merge, then re-scan. Called only from
+# backlog_refresh_reminder's merged branch. Failure-tolerant by contract: a failed
+# close never blocks teardown (the worktree is already released by the time this
+# runs), so on any tasks-axi error it prints a loud warning and returns non-zero so
+# the caller falls back to the ordinary print-reminder line. Never passes --yes and
+# never touches the worktree.
+auto_close_backlog_ticket() {
+  local done_cmd=$1 evidence=$2 out
+  # `close_sub` holds the literal subcommand so the token `done` is never parsed as a
+  # loop keyword here (shellcheck SC1010).
+  local close_sub='done'
+  if out=$( (cd "$FM_HOME" && tasks-axi "$close_sub" "$ID" --note "auto-closed at teardown: $evidence") 2>&1); then
+    printf '%s\n' "Backlog: auto-closed $ID at teardown ($evidence). Run tasks-axi ready for dependency-cleared candidates, check date gates, and dispatch only work whose blockers are gone and date is due."
+    return 0
+  fi
+  echo "teardown: WARNING could not auto-close $ID in the backlog; close it by hand with: $done_cmd" >&2
+  [ -z "$out" ] || echo "teardown: tasks-axi error: $out" >&2
+  return 1
+}
+
 backlog_refresh_reminder() {
   local pr done_cmd report_path
   [ "$KIND" = secondmate ] && return 0
@@ -616,6 +703,18 @@ backlog_refresh_reminder() {
         fi
         ;;
     esac
+    # When this task's branch is verifiably merged into the default branch (captured
+    # above, before the worktree was removed), auto-close the ticket instead of only
+    # printing the reminder that firstmate then has to remember to run - the recurring
+    # backlog-drift gap where autoland lands work but the ticket never flips to done.
+    # A failed close falls through to the ordinary reminder line below and never
+    # blocks teardown (the worktree is already released). The manual backlog backend
+    # never auto-closes: fm_tasks_axi_backend_available is already false for it, so
+    # this whole branch is skipped and the hand-edit reminder prints instead.
+    if [ -n "$TICKET_MERGE_EVIDENCE" ] && [ "$KIND" != scout ] \
+       && auto_close_backlog_ticket "$done_cmd" "$TICKET_MERGE_EVIDENCE"; then
+      return 0
+    fi
     printf '%s\n' "Backlog: $ID just finished. Run $done_cmd, then run tasks-axi ready for dependency-cleared candidates, check date gates, and dispatch only work whose blockers are gone and date is due."
   else
     printf '%s\n' "Backlog: $ID just finished. Update data/backlog.md - move $ID to Done, keep Done to the 10 most recent, then re-scan Queued and dispatch only work whose blockers are gone and date is due."
@@ -1463,6 +1562,15 @@ fi
 if [ "$KIND" != scout ] && [ "$KIND" != secondmate ] \
    && [ "$MODE" != local-only ] && [ -d "$WT" ]; then
   record_pushed_unmerged_to_merge_queue || true
+fi
+
+# Also while the worktree still exists, capture whether this task's branch is
+# verifiably merged into the default branch, so the end-of-run backlog reminder can
+# auto-close the ticket for a real merge (see capture_ticket_merge_evidence and
+# backlog_refresh_reminder). Read-only and best-effort: a failure leaves the evidence
+# empty, which simply keeps the print-reminder behavior.
+if [ -d "$WT" ]; then
+  capture_ticket_merge_evidence || true
 fi
 
 # Best-effort: drop the local task branch so the shared repo does not accumulate refs.

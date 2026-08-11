@@ -174,6 +174,55 @@ SH
   chmod +x "$case_dir/fakebin/tasks-axi"
 }
 
+# Compatible tasks-axi that also RECORDS every `tasks-axi done` invocation (one line
+# per call, the full argument list) to $case_dir/tasks-axi-done.log, so the auto-close
+# behavior can be asserted. Args: case_dir
+add_recording_tasks_axi() {
+  local case_dir=$1
+  cat > "$case_dir/fakebin/tasks-axi" <<SH
+#!/usr/bin/env bash
+if [ "\${1:-}" = --version ]; then printf '%s\n' '0.1.1'; exit 0; fi
+if [ "\${1:-}" = update ] && [ "\${2:-}" = --help ]; then printf '%s\n' '  --archive-body'; exit 0; fi
+if [ "\${1:-}" = mv ] && [ "\${2:-}" = --help ]; then printf '%s\n' 'usage: tasks-axi mv <id> [<id>...] --to <p>'; exit 0; fi
+if [ "\${1:-}" = done ]; then printf '%s\n' "\$*" >> "$case_dir/tasks-axi-done.log"; exit 0; fi
+exit 0
+SH
+  chmod +x "$case_dir/fakebin/tasks-axi"
+}
+
+# Compatible tasks-axi whose `done` subcommand always FAILS (records the attempt, then
+# exits non-zero with an error on stderr), to prove a backlog-close failure never
+# blocks the worktree release. Args: case_dir
+add_failing_done_tasks_axi() {
+  local case_dir=$1
+  cat > "$case_dir/fakebin/tasks-axi" <<SH
+#!/usr/bin/env bash
+if [ "\${1:-}" = --version ]; then printf '%s\n' '0.1.1'; exit 0; fi
+if [ "\${1:-}" = update ] && [ "\${2:-}" = --help ]; then printf '%s\n' '  --archive-body'; exit 0; fi
+if [ "\${1:-}" = mv ] && [ "\${2:-}" = --help ]; then printf '%s\n' 'usage: tasks-axi mv <id> [<id>...] --to <p>'; exit 0; fi
+if [ "\${1:-}" = done ]; then printf '%s\n' "\$*" >> "$case_dir/tasks-axi-done.log"; echo "error: task not found" >&2; exit 1; fi
+exit 0
+SH
+  chmod +x "$case_dir/fakebin/tasks-axi"
+}
+
+# Merge the worktree's task branch into origin's default branch with a real merge
+# commit, so the branch tip is a fresh ancestor of origin/main. This reproduces the
+# direct-push autoland flow, where the worker merged its own fm/<id> branch onto the
+# origin default. Args: case_dir
+merge_task_branch_into_origin_default() {
+  local case_dir=$1 tmp
+  git -C "$case_dir/wt" push -q origin fm/task-x1
+  tmp="$case_dir/_merge"
+  git clone -q "$case_dir/origin.git" "$tmp"
+  git -C "$tmp" fetch -q origin fm/task-x1
+  git -C "$tmp" checkout -q main
+  git -C "$tmp" -c user.email=t@t -c user.name=t merge -q --no-ff --no-edit origin/fm/task-x1
+  git -C "$tmp" push -q origin main
+  rm -rf "$tmp"
+  git -C "$case_dir/project" fetch -q origin
+}
+
 # Write a meta file for the task. Args: case_dir mode kind
 write_meta() {
   local case_dir=$1 mode=$2 kind=$3
@@ -2115,6 +2164,94 @@ test_extra_worktree_force_overrides_unlanded() {
   pass "--force discards and returns an unlanded second worktree alongside the primary"
 }
 
+# Auto-close (a): a MERGED branch auto-closes the ticket. direct-push autoland flow -
+# the task branch is merged into origin's default branch, so teardown runs
+# `tasks-axi done` itself instead of only printing the reminder.
+test_merged_branch_auto_closes_ticket() {
+  local case_dir out
+  case_dir=$(make_case autoclose-merged)
+  write_meta "$case_dir" direct-push ship
+  wt_commit_file "$case_dir" feature.txt hello "validated work"
+  merge_task_branch_into_origin_default "$case_dir"
+  add_recording_tasks_axi "$case_dir"
+
+  out=$(run_teardown "$case_dir") || fail "autoclose-merged: teardown failed for a merged branch"
+  [ -f "$case_dir/tasks-axi-done.log" ] \
+    || fail "autoclose-merged: teardown never called tasks-axi done: $out"
+  grep -F 'done task-x1' "$case_dir/tasks-axi-done.log" >/dev/null \
+    || fail "autoclose-merged: tasks-axi done was not called for task-x1: $(cat "$case_dir/tasks-axi-done.log")"
+  grep -F 'auto-closed at teardown' "$case_dir/tasks-axi-done.log" >/dev/null \
+    || fail "autoclose-merged: close note missing the auto-close evidence: $(cat "$case_dir/tasks-axi-done.log")"
+  printf '%s\n' "$out" | grep -F 'auto-closed task-x1 at teardown' >/dev/null \
+    || fail "autoclose-merged: teardown did not report the auto-close: $out"
+  printf '%s\n' "$out" | grep -F 'just finished. Run tasks-axi done' >/dev/null \
+    && fail "autoclose-merged: teardown still printed the manual done reminder: $out"
+  pass "a verifiably merged branch auto-closes its backlog ticket at teardown"
+}
+
+# Auto-close (b): a pushed-but-UNMERGED branch does NOT auto-close. It goes to the
+# merge queue and keeps the plain print-reminder, because the merge has not happened.
+test_pushed_unmerged_does_not_auto_close_ticket() {
+  local case_dir out
+  case_dir=$(make_case autoclose-pushed-unmerged)
+  write_meta "$case_dir" no-mistakes ship
+  wt_commit_file "$case_dir" feature.txt hello "pushed unmerged work"
+  push_branch_then_forget_local_ref "$case_dir"
+  add_recording_tasks_axi "$case_dir"
+
+  out=$(run_teardown "$case_dir") || fail "autoclose-pushed-unmerged: teardown failed"
+  [ -f "$case_dir/tasks-axi-done.log" ] \
+    && fail "autoclose-pushed-unmerged: teardown wrongly auto-closed an unmerged branch: $(cat "$case_dir/tasks-axi-done.log")"
+  printf '%s\n' "$out" | grep -F 'just finished. Run tasks-axi done' >/dev/null \
+    || fail "autoclose-pushed-unmerged: teardown dropped the manual done reminder: $out"
+  pass "a pushed-but-unmerged branch is NOT auto-closed (stays open for the merge queue)"
+}
+
+# Auto-close (c): config/backlog-backend=manual never auto-closes, even for a merged
+# branch. It falls back to the manual hand-edit reminder.
+test_manual_backend_does_not_auto_close_merged_ticket() {
+  local case_dir out
+  case_dir=$(make_case autoclose-manual-backend)
+  write_meta "$case_dir" direct-push ship
+  wt_commit_file "$case_dir" feature.txt hello "validated work"
+  merge_task_branch_into_origin_default "$case_dir"
+  add_recording_tasks_axi "$case_dir"
+  printf '%s\n' manual > "$case_dir/config/backlog-backend"
+
+  out=$(run_teardown "$case_dir") || fail "autoclose-manual-backend: teardown failed"
+  [ -f "$case_dir/tasks-axi-done.log" ] \
+    && fail "autoclose-manual-backend: manual backend still auto-closed via tasks-axi: $(cat "$case_dir/tasks-axi-done.log")"
+  printf '%s\n' "$out" | grep -F 'Update data/backlog.md - move task-x1 to Done' >/dev/null \
+    || fail "autoclose-manual-backend: manual hand-edit reminder missing: $out"
+  pass "config/backlog-backend=manual never auto-closes, even for a merged branch"
+}
+
+# Auto-close (d): a FAILED close still completes teardown. The worktree is released,
+# and teardown warns loudly and prints the manual done command rather than aborting.
+test_failed_auto_close_still_completes_teardown() {
+  local case_dir rc out err
+  case_dir=$(make_case autoclose-close-fails)
+  write_meta "$case_dir" direct-push ship
+  wt_commit_file "$case_dir" feature.txt hello "validated work"
+  merge_task_branch_into_origin_default "$case_dir"
+  add_failing_done_tasks_axi "$case_dir"
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+  out=$(cat "$case_dir/stdout"); err=$(cat "$case_dir/stderr")
+
+  expect_code 0 "$rc" "autoclose-close-fails: teardown must complete despite a backlog-close failure"
+  printf '%s\n' "$out" | grep -F "teardown task-x1 complete" >/dev/null \
+    || fail "autoclose-close-fails: worktree release did not complete: $out"
+  printf '%s\n' "$err" | grep -F 'could not auto-close task-x1' >/dev/null \
+    || fail "autoclose-close-fails: no loud warning about the failed close: $err"
+  [ -f "$case_dir/tasks-axi-done.log" ] \
+    || fail "autoclose-close-fails: teardown never attempted the close"
+  pass "a failed backlog close warns loudly but never blocks the worktree release"
+}
+
 test_local_only_fork_remote_allows
 test_pushed_unmerged_releases_and_records_merge_queue
 test_extra_worktree_returns_both
@@ -2173,3 +2310,7 @@ test_head_on_alternate_origin_branch_allows
 test_direct_push_head_on_alternate_origin_branch_allows
 test_head_on_origin_default_via_any_ref_allows
 test_alternate_branch_broadening_still_refuses_unpushed
+test_merged_branch_auto_closes_ticket
+test_pushed_unmerged_does_not_auto_close_ticket
+test_manual_backend_does_not_auto_close_merged_ticket
+test_failed_auto_close_still_completes_teardown
