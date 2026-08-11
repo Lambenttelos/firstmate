@@ -1049,6 +1049,94 @@ test_linux_pid_identity_ignores_wall_clock_and_detects_pid_reuse() {
   pass "Linux process identity detects pid reuse"
 }
 
+# Zombie/defunct guard: a bare kill -0 succeeds on a defunct (STAT Z) process
+# because its pid still exists in the table, so fm_pid_alive and holder_alive
+# must read the process state and treat Z as dead. Without this a day-dead
+# firstmate/jcode zombie pins the session lock READ-ONLY and wedges the
+# heavy-run queue forever. Fake /proc/<pid>/stat via FM_PROC_ROOT_OVERRIDE
+# rather than trying to spawn a real unreapable zombie.
+LOCK_LIB="$ROOT/bin/fm-lock.sh"
+PID_LIB="$ROOT/bin/fm-pid-lib.sh"
+
+write_fake_proc_stat_state() {  # <proc_root> <pid> <state-char>
+  local proc_root=$1 pid=$2 state=$3
+  mkdir -p "$proc_root/$pid"
+  printf '%s (jcode) %s 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22\n' \
+    "$pid" "$state" > "$proc_root/$pid/stat"
+}
+
+test_pid_alive_live_dead_and_zombie() {
+  local dir proc_root live_pid
+  dir=$(make_case pid-alive-zombie)
+  proc_root="$dir/proc"
+
+  # A genuinely live process reads alive.
+  sleep 30 &
+  live_pid=$!
+  fm_alive() { FM_PROC_ROOT_OVERRIDE="$1" bash -c '. "$1"; fm_pid_alive "$2"' _ "$PID_LIB" "$2"; }
+
+  fm_alive "$proc_root" "$live_pid" \
+    || fail "fm_pid_alive rejected a genuinely live pid $live_pid"
+
+  # A non-existent pid reads dead (kill -0 fails, no /proc entry needed).
+  local dead_pid=$live_pid
+  kill "$live_pid" 2>/dev/null || true
+  wait "$live_pid" 2>/dev/null || true
+  if fm_alive "$proc_root" "$dead_pid"; then
+    fail "fm_pid_alive treated a reaped pid $dead_pid as alive"
+  fi
+
+  # A defunct (STAT Z) pid: kill -0 would succeed, but fake /proc marks it Z.
+  # Use our own live pid so kill -0 succeeds, then override state to Z.
+  sleep 30 &
+  local zpid=$!
+  write_fake_proc_stat_state "$proc_root" "$zpid" Z
+  if fm_alive "$proc_root" "$zpid"; then
+    kill "$zpid" 2>/dev/null || true
+    fail "fm_pid_alive treated a defunct STAT Z pid $zpid as alive"
+  fi
+  # Same pid, live state char, reads alive through the fake /proc.
+  write_fake_proc_stat_state "$proc_root" "$zpid" S
+  fm_alive "$proc_root" "$zpid" \
+    || fail "fm_pid_alive rejected a live-state pid $zpid via fake /proc"
+  kill "$zpid" 2>/dev/null || true
+  wait "$zpid" 2>/dev/null || true
+  pass "fm_pid_alive: live alive, reaped dead, defunct STAT Z dead"
+}
+
+test_holder_alive_treats_zombie_harness_as_dead() {
+  local dir proc_root zpid livepid
+  dir=$(make_case holder-alive-zombie)
+  proc_root="$dir/proc"
+  holder() { FM_PROC_ROOT_OVERRIDE="$proc_root" bash -c '. "$1"; holder_alive "$2"' _ "$LOCK_LIB" "$1"; }
+
+  # A live harness-named pid (this test host runs bash; force a harness match by
+  # using a real live pid whose args grep the harness regex is impractical, so
+  # assert the guard directly: a Z-state pid is never a live holder even though
+  # kill -0 succeeds and comm may read a harness name).
+  sleep 30 &
+  zpid=$!
+  write_fake_proc_stat_state "$proc_root" "$zpid" Z
+  if holder "$zpid"; then
+    kill "$zpid" 2>/dev/null || true
+    fail "holder_alive treated a defunct STAT Z pid $zpid as a live holder"
+  fi
+  kill "$zpid" 2>/dev/null || true
+  wait "$zpid" 2>/dev/null || true
+
+  # A non-existent pid is not a live holder.
+  sleep 5 &
+  livepid=$!
+  kill "$livepid" 2>/dev/null || true
+  wait "$livepid" 2>/dev/null || true
+  if holder "$livepid"; then
+    fail "holder_alive treated a reaped pid $livepid as a live holder"
+  fi
+  pass "holder_alive: defunct STAT Z and reaped pids are not live holders"
+}
+
+test_pid_alive_live_dead_and_zombie
+test_holder_alive_treats_zombie_harness_as_dead
 test_singleton_start
 test_pid_identity_is_locale_invariant
 test_linux_pid_identity_ignores_wall_clock_and_detects_pid_reuse
