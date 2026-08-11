@@ -1,8 +1,8 @@
 # Mattermost captain-firstmate messaging (design)
 
-Status: design proposal, two open decisions pending captain (see "Open decisions").
-Owner of the mechanism once built: `bin/fm-mm-poll.sh` and `bin/fm-mm-post.sh` headers.
-Config owner: [docs/configuration.md](configuration.md).
+Status: accepted, implemented. Both open decisions resolved by the captain (see "Resolved decisions").
+Owner of the mechanism: `bin/fm-mm-poll.sh`, `bin/fm-mm-post.sh`, and `bin/fm-mm-lib.sh` headers.
+Config owner: [docs/configuration.md](configuration.md#mattermost-captain-firstmate-messaging-env).
 
 ## Goal
 
@@ -85,22 +85,28 @@ The transport token authorizes firstmate to **read the control channel and post 
 
 No AGENTS.md section 1 boundary is weakened. Firstmate still never writes to a project, never merges without the captain's word, never tears down unlanded work, and crewmates still never address the captain. This feature only adds a captain<->firstmate transport.
 
-## Config (all gitignored, home `.env` / `config/`)
+## Config (home `.env`, all gitignored)
 
-- `MM_SERVER_URL` - Mattermost base URL, e.g. `https://mm.example.com`.
+[docs/configuration.md](configuration.md#mattermost-captain-firstmate-messaging-env) owns the full config contract. The keys:
+
 - `MM_TOKEN` - Mattermost personal access token (the opt-in; absent = feature fully inert).
-- `MM_CONTROL_CHANNEL_ID` - the control channel id (captain-provided; not discoverable).
-- Optional `MM_POLL_INTERVAL` override, defaulting to 30s via generated `config/mm-mode.env`, mirroring X mode.
+- `MM_SERVER_URL` - Mattermost base URL, e.g. `https://mattermost.hyfin.app`.
+- `MM_CHANNEL_ID` - the control channel id; wins when set, no name lookup runs.
+- `MM_TEAM` and `MM_CHANNEL` - team and channel URL slugs, used to resolve the channel id once when `MM_CHANNEL_ID` is unset (the id is not discoverable, so the captain names it by URL).
+- `MM_DRY_RUN` - preview an outbound post to `state/mm-outbox/` without posting.
+- `MM_ENV_FILE` - optional alternate `.env`-style file for direct invocations.
 
-Generated runtime state under `state/`: `mm-inbox/<post_id>.json` (stashed messages), `mm-cursor` (last-seen epoch ms), `mm-watch.check.sh` (byte-static poll shim), `mm-self-user` (cached bot user id), `mm-poll.error` (rate-limited diagnostic dedupe). All follow the X-mode artifact conventions.
+Cadence: the inbound poll is registered as the home's watcher custom check, so it runs on the watcher's existing slow-check interval (`FM_CHECK_INTERVAL`). A home that wants a faster control-channel cadence lowers that interval by the existing mechanism rather than adding a second cadence knob.
 
-## Open decisions (needs-decision, do not guess)
+Generated runtime state under `state/` (all gitignored): `mm-inbox/<post_id>.json` (stashed captain messages), `mm-cursor` (last-seen epoch ms), `mm-self-user` (cached bot user id), `mm-channel-id` (cached resolved control channel id), `mm-poll.error` (rate-limited diagnostic dedupe), and `mm-outbox/` (dry-run previews). The inbound poll is wired through the watcher's existing custom-check path (`state/<id>.check.sh` registered with `bin/fm-check-register.sh`), so it needs no new watcher gate.
 
-1. Control channel. The captain must designate the control surface and provide its `channel_id` (firstmate cannot discover it - no channel-list tool). Options: (a) a dedicated channel such as `firstmate-control`, recommended, one clean fleet-control surface; (b) a DM between the captain and firstmate's bot account. Recommendation: a dedicated channel (a), flat thread model, escalations threaded onto the captain post they answer.
+## Resolved decisions
 
-2. Auto-post safety policy. Confirm the policy above: outbound escalations and firstmate's own answers auto-post via the token; inbound phone messages are steers that never auto-approve or auto-execute a merge, destructive, irreversible, or security-sensitive action; the MCP `post_reply` confirm gate stays intact. Recommendation: adopt as written.
+Both were genuine captain choices (the channel id is un-discoverable and the auto-post policy is safety-sensitive), so implementation waited on the captain's ruling. The captain answered both on 2026-08-10:
 
-Both are genuine captain choices (channel identity is un-discoverable; the auto-post policy is safety-sensitive), so implementation stops here until the captain rules.
+1. Control channel: the channel at `https://mattermost.hyfin.app/dashnow/channels/fm-cyuan`, team slug `dashnow`, channel slug `fm-cyuan`. Its id is resolved once from those slugs and cached to `state/mm-channel-id`, or set directly via `MM_CHANNEL_ID`. Flat thread model; escalations threaded onto the captain post they answer.
+
+2. Auto-post safety policy: approved as written above. The token authorizes reading the control channel and auto-posting escalations and firstmate's own answers. An inbound phone message is a steer that never auto-approves or auto-executes a merge or any destructive, irreversible, or security-sensitive action. The agent-side MCP `post_reply` confirm gate stays intact.
 
 ## Maintaining this file
 
