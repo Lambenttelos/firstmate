@@ -707,7 +707,7 @@ Inbound wiring reuses the watcher's custom-check path: register `bin/fm-mm-poll.
 The poll filters out firstmate's own posts using its bot user id (resolved once via `GET /api/v4/users/me`, cached to `state/mm-self-user`), advances a durable `state/mm-cursor` (epoch ms), anchors that cursor to now on first run so channel history is never replayed, and stashes each new captain post to `state/mm-inbox/<post_id>.json`.
 
 Outbound escalations reuse the content firstmate already surfaces per AGENTS.md section 9: `bin/fm-mm-post.sh` posts them with the token, threading a reply onto the captain post it answers via `--root` or posting a new root for an unprompted escalation.
-In away mode the same helper is the additional delivery sink for the digests the away-mode outbox already produces (`bin/fm-afk-outbox-lib.sh`), so a phone receives exactly what the away-mode path already buffers, reusing the daemon rather than duplicating it.
+A planned future integration would add the same helper as an additional delivery sink for the digests the away-mode outbox produces (`bin/fm-afk-outbox-lib.sh`); it is not yet wired in this change (no away-mode code calls `bin/fm-mm-post.sh` today).
 All generated state lives under the already-gitignored `state/`.
 
 ## Environment variables

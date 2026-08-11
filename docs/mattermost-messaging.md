@@ -1,6 +1,6 @@
 # Mattermost captain-firstmate messaging (design)
 
-Status: accepted, implemented. Both open decisions resolved by the captain (see "Resolved decisions").
+Status: accepted; inbound poll and outbound poster implemented this change. Away-mode auto-delivery (calling the outbound poster from the away-mode daemon) is designed but not yet wired and is a future step. Both open decisions resolved by the captain (see "Resolved decisions").
 Owner of the mechanism: `bin/fm-mm-poll.sh`, `bin/fm-mm-post.sh`, and `bin/fm-mm-lib.sh` headers.
 Config owner: [docs/configuration.md](configuration.md#mattermost-captain-firstmate-messaging-env).
 
@@ -70,9 +70,9 @@ When the captain is afk and messaging from a phone, the inbound wake is a normal
 Outbound reuses the escalation content firstmate already produces per AGENTS.md section 9. It does not invent new escalation triggers.
 
 - Foreground (captain present): firstmate posts escalations to the control channel with `bin/fm-mm-post.sh`. This is a courtesy mirror of what it already says in chat.
-- Away mode (captain afk, no terminal): the away-mode daemon already buffers each escalation digest to the durable outbox (`bin/fm-afk-outbox-lib.sh`) and delivers it through the armed reader (`bin/fm-afk-inbox.sh`). The Mattermost outbound helper is wired in as an **additional delivery sink** for that same digest, so the captain's phone receives exactly the digests the away-mode path already produces. It reuses the daemon; it does not duplicate it.
+- Away mode (captain afk, no terminal): the away-mode daemon already buffers each escalation digest to the durable outbox (`bin/fm-afk-outbox-lib.sh`) and delivers it through the armed reader (`bin/fm-afk-inbox.sh`). The planned future integration adds the Mattermost outbound helper as an **additional delivery sink** for that same digest, so the captain's phone would receive exactly the digests the away-mode path already produces. This sink is **not yet wired** in this change: no code in `bin/fm-afk-outbox-lib.sh` or the away daemon calls `bin/fm-mm-post.sh` today. It is designed to reuse the daemon, not duplicate it.
 
-The away-mode outbox already guarantees at-least-once delivery and never loses a record, so a failed Mattermost post simply retries on the next delivery, the same as the pane path.
+Once wired, the away-mode outbox already guarantees at-least-once delivery and never loses a record, so a failed Mattermost post would simply retry on the next delivery, the same as the pane path.
 
 ## Safety policy (the safety-sensitive decision)
 
