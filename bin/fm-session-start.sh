@@ -121,6 +121,17 @@ case "$STATUS_TAIL" in ''|*[!0-9]*) STATUS_TAIL=5 ;; esac
 BACKLOG_LIMIT=${FM_SESSION_START_BACKLOG_LIMIT:-80}
 case "$BACKLOG_LIMIT" in ''|*[!0-9]*|0) BACKLOG_LIMIT=80 ;; esac
 
+# Recent-tail window for the two large consolidated context files (captain.md,
+# learnings.md): the last N lines emitted alongside the curated top so newest
+# dated rulings appended below the consolidation seam are never dropped.
+CONTEXT_TAIL=${FM_SESSION_START_CONTEXT_TAIL:-40}
+case "$CONTEXT_TAIL" in ''|*[!0-9]*|0) CONTEXT_TAIL=40 ;; esac
+# Per-file escape hatches: force a full cat of either big file when set to 1.
+CAPTAIN_FULL=${FM_SESSION_START_CAPTAIN_FULL:-0}
+case "$CAPTAIN_FULL" in 1) CAPTAIN_FULL=1 ;; *) CAPTAIN_FULL=0 ;; esac
+LEARNINGS_FULL=${FM_SESSION_START_LEARNINGS_FULL:-0}
+case "$LEARNINGS_FULL" in 1) LEARNINGS_FULL=1 ;; *) LEARNINGS_FULL=0 ;; esac
+
 RULE='================================================================================'
 SUBRULE='--------------------------------------------------------------------------------'
 
@@ -145,6 +156,68 @@ print_file_or_absent() {
   else
     printf 'ABSENT\n'
   fi
+}
+
+# print_file_compact_top <path> <label> <marker_regex> <force_full>:
+# a shape-2 emit for the two large consolidated context files (captain.md and
+# learnings.md). Both carry a "# Detailed ... (inlined from former topic
+# files ...)" seam: above it is the curated recent top, below it is a bulk
+# topical archive that also accrues the newest dated one-off rulings at its
+# very end. Full cat of these two files is ~92% of the digest's token cost.
+#
+# This prints the curated top (everything ABOVE the seam line) PLUS a head+tail
+# window (the last FM_SESSION_START_CONTEXT_TAIL lines, so newest dated rulings
+# appended after the seam are never dropped), an elision notice for the omitted
+# middle, and a pointer to read the full file on demand.
+#
+# Safety: ABSENT vs (present, empty) semantics are identical to
+# print_file_or_absent. If the seam marker is not found (an un-consolidated or
+# future-reshaped file), it falls back to a FULL cat so content is never
+# truncated blindly. force_full=1 (per-file escape-hatch env) also forces full.
+print_file_compact_top() {
+  local path=$1 label=$2 marker=$3 force_full=${4:-0}
+  local total marker_line top_end tail_start omitted
+  local tail_lines=$CONTEXT_TAIL
+  if [ ! -f "$path" ]; then
+    subsection "$label"
+    printf 'ABSENT\n'
+    return
+  fi
+  if [ ! -s "$path" ]; then
+    subsection "$label"
+    printf '(present, empty)\n'
+    return
+  fi
+
+  # Force-full escape hatch, or marker absent: emit the whole file verbatim
+  # under the plain label so behavior is byte-identical to print_file_or_absent.
+  marker_line=$(grep -n -m1 -E "$marker" "$path" | cut -d: -f1)
+  if [ "$force_full" = "1" ] || [ -z "$marker_line" ]; then
+    subsection "$label"
+    cat "$path"
+    return
+  fi
+
+  total=$(wc -l < "$path")
+  total=${total//[!0-9]/}
+  top_end=$((marker_line - 1))
+  tail_start=$((total - tail_lines + 1))
+  [ "$tail_start" -lt 1 ] && tail_start=1
+
+  # If the tail window would overlap the curated top (small file), just cat it
+  # all - there is no meaningful middle to elide.
+  if [ "$tail_start" -le "$((top_end + 1))" ]; then
+    subsection "$label"
+    cat "$path"
+    return
+  fi
+
+  omitted=$((tail_start - 1 - top_end))
+  subsection "$label (curated recent top + newest rulings; full archive on demand)"
+  sed -n "1,${top_end}p" "$path"
+  printf '\n[detail omitted: %d line(s) of topical archive below the consolidation seam. Read %s in full, or grep it, only when a specific older item is needed. Newest dated rulings follow below.]\n\n' \
+    "$omitted" "$path"
+  sed -n "${tail_start},\$p" "$path"
 }
 
 print_backlog_pointer() {
@@ -364,9 +437,11 @@ fi
 section "CONTEXT"
 print_file_or_absent "$DATA/projects.md" "data/projects.md"
 print_file_or_absent "$DATA/secondmates.md" "data/secondmates.md"
-print_file_or_absent "$DATA/captain.md" "data/captain.md"
+print_file_compact_top "$DATA/captain.md" "data/captain.md" \
+  '^# Detailed standing rules \(inlined from former topic files' "$CAPTAIN_FULL"
 print_file_or_absent "$DATA/captain-shared.md" "data/captain-shared.md (shared, main-authoritative, read-only in secondmate homes)"
-print_file_or_absent "$DATA/learnings.md" "data/learnings.md"
+print_file_compact_top "$DATA/learnings.md" "data/learnings.md" \
+  '^# Detailed learnings \(inlined from former topic files' "$LEARNINGS_FULL"
 
 # --- 5. fleet-state digest ---------------------------------------------
 section "FLEET STATE"
@@ -495,15 +570,20 @@ cat <<'EOF'
 The digest above is complete for this session start. Do NOT re-read
 data/projects.md, data/secondmates.md, data/captain.md,
 data/captain-shared.md, data/learnings.md,
-or state/*.meta now - they were just printed in full.
+or state/*.meta now - they were just printed.
+data/captain.md and data/learnings.md were emitted TRIMMED (curated recent top
+plus the newest dated rulings via a tail window, with the middle archive
+elided); reading one of those two files in full is EXPECTED when a specific
+older item below the elision is actually needed, and is not a violation.
 Do NOT bulk-read data/backlog.md now either: the compact identity/metadata
 listing was just printed with a pointer for targeted full-body follow-up.
 Do NOT bulk-read state/*.status now either: their bounded tails were just
 printed with full log paths for targeted follow-up when older wake-event
 history is actually needed. Re-reading everything defeats the entire point
-of this command. Re-read a file only if this digest flagged it ABSENT (then
-rebuild or create it per AGENTS.md), its contents looked unparseable/corrupt,
-or an individual full status log is needed for older wake-event history.
+of this command. Otherwise re-read a file only if this digest flagged it
+ABSENT (then rebuild or create it per AGENTS.md), its contents looked
+unparseable/corrupt, or an individual full status log is needed for older
+wake-event history.
 EOF
 
 exit 0
