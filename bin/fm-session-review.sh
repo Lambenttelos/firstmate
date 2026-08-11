@@ -149,6 +149,26 @@ if [ "$MERGE_COUNT" -ge "$MERGE_BATCH" ]; then
     "$MERGE_COUNT finished branch(es) are pushed but unmerged - a batch worth landing; bin/fm-merge-queue.sh list has the compare links"
 fi
 
+# --- doc/lint drift: repos whose skipped-doc/lint batch is big enough ---------
+# Small / doc-irrelevant lanes run no-mistakes with document+lint skipped, so
+# drift accumulates silently on a repo's dev. fm-doclint-batch.sh evaluates the
+# per-repo threshold cheaply from data/completions.tsv + the marker ref and
+# prints one status line per threshold-met repo. Surface each as one actionable
+# finding; firstmate dispatches the on-demand pass lane, merge-queue style. No
+# standing worker, no second supervision cycle. See docs/doclint-batch.md.
+DOCLINT_READY=$("$SCRIPT_DIR/fm-doclint-batch.sh" ready 2>/dev/null || printf '')
+if [ -n "$DOCLINT_READY" ]; then
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    repo=${line%%:*}
+    fm_hourly_add_finding "doclint:$repo" \
+      "$repo has un-doc/lint-ed lanes ready for a batch pass" \
+      "$line - dispatch a batch document+lint pass lane with: bin/fm-doclint-batch.sh brief $repo"
+  done <<EOF
+$DOCLINT_READY
+EOF
+fi
+
 # --- report -------------------------------------------------------------------
 REPORT_PATH=$(fm_hourly_report_path "$STATE" review)
 {

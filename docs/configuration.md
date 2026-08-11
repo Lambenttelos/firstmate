@@ -415,6 +415,7 @@ Arming is idempotent and creates a cadence stamp only when it is absent, so elap
 
 Both passes are silent unless they have something the fleet has not already been told about.
 The session review reports only what has not moved - an open decision nobody has answered, a worker that has posted nothing for hours, queued work with nothing running, a batch of finished-but-unmerged branches - because a point-in-time fleet review is what the watcher heartbeat already provides.
+It also surfaces any repo whose skipped-doc/lint batch has grown big enough for a batched document+lint recovery pass, one actionable line per repo carrying the dispatch command; see [doclint-batch.md](doclint-batch.md).
 A queued item that is blocked by another item or captain-held is not dispatchable, so it never counts toward the idle-capacity finding.
 Both passes ignore a persistent secondmate's record, which is idle by contract, so it neither counts as work under way nor reads as a stalled worker.
 The cleanup sweep silently reclaims bookkeeping that can hold no work (watcher temp residue, suppression markers for a fleet that no longer exists) and reports without removing anything that could hold unlanded work, leaving [`bin/fm-teardown.sh`](../bin/fm-teardown.sh) the single owner of the landed-work test.
