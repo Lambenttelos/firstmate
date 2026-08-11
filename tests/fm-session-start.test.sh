@@ -347,6 +347,110 @@ EOF
   pass "context digest distinguishes ABSENT, empty-but-present, and populated files"
 }
 
+# --- context digest: shape-2 trim of the two big consolidated files ----------
+
+# Build a captain.md-shaped file: curated top, a "# Detailed standing rules
+# (inlined from former topic files ...)" seam, a bulk archive middle, then
+# newest dated rulings at the very end.
+write_big_captain_fixture() {
+  local path=$1 i
+  {
+    printf '# Captain\n'
+    printf 'CURATED-TOP-FACT alpha\n'
+    printf 'CURATED-TOP-FACT beta\n'
+    printf '# Detailed standing rules (inlined from former topic files, consolidated 2026-07-26)\n'
+    for i in $(seq 1 200); do printf 'ARCHIVE-MIDDLE-LINE %d\n' "$i"; done
+    printf 'NEWEST-RULING autoland grant 2026-08-10\n'
+    printf 'NEWEST-RULING account rotation 2026-08-11\n'
+  } > "$path"
+}
+
+test_context_digest_shape2_seam_split() {
+  local rec root home fakebin out cap_section
+  rec=$(new_world context-shape2)
+  IFS='|' read -r root home fakebin <<EOF
+$rec
+EOF
+  make_fake_toolchain "$fakebin"
+  make_fake_ps_claude "$fakebin"
+
+  write_big_captain_fixture "$home/data/captain.md"
+
+  out=$(FM_SESSION_START_CONTEXT_TAIL=3 run_session_start "$home" "$root" "$fakebin:$BASE_PATH")
+
+  # Curated top above the seam is still emitted.
+  assert_contains "$out" "CURATED-TOP-FACT alpha" "curated top was dropped"
+  assert_contains "$out" "CURATED-TOP-FACT beta" "curated top was dropped"
+  # Newest dated rulings (tail window) survive even though they are below seam.
+  assert_contains "$out" "NEWEST-RULING autoland grant 2026-08-10" "newest ruling in tail window was dropped"
+  assert_contains "$out" "NEWEST-RULING account rotation 2026-08-11" "newest ruling in tail window was dropped"
+  # Elision notice for the omitted middle.
+  assert_contains "$out" "detail omitted:" "no elision notice emitted"
+  # Trimmed label with the on-demand pointer.
+  assert_contains "$out" "data/captain.md (curated recent top" "trimmed label/pointer missing"
+  # The bulk archive middle is elided (a middle line must not appear).
+  cap_section=$(printf '%s\n' "$out" | awk '/^data\/captain\.md/{flag=1;next}/^data\/captain-shared/{flag=0}flag')
+  printf '%s\n' "$cap_section" | grep -q 'ARCHIVE-MIDDLE-LINE 100' \
+    && fail "middle archive line 100 was not elided: $cap_section"
+
+  pass "context digest emits shape-2 seam split with head+tail window and elision"
+}
+
+test_context_digest_shape2_missing_seam_full_cat() {
+  local rec root home fakebin out i
+  rec=$(new_world context-noseam)
+  IFS='|' read -r root home fakebin <<EOF
+$rec
+EOF
+  make_fake_toolchain "$fakebin"
+  make_fake_ps_claude "$fakebin"
+
+  # No "# Detailed learnings (inlined ...)" seam -> must fall back to full cat.
+  {
+    printf '# Fleet learnings\n'
+    for i in $(seq 1 120); do printf 'NOSEAM-LINE %d\n' "$i"; done
+  } > "$home/data/learnings.md"
+
+  out=$(FM_SESSION_START_CONTEXT_TAIL=3 run_session_start "$home" "$root" "$fakebin:$BASE_PATH")
+
+  # Every line present (full cat), no elision notice, plain label.
+  assert_contains "$out" "NOSEAM-LINE 1" "missing-seam file was truncated at head"
+  assert_contains "$out" "NOSEAM-LINE 60" "missing-seam file elided the middle instead of full cat"
+  assert_contains "$out" "NOSEAM-LINE 120" "missing-seam file dropped the tail"
+  printf '%s\n' "$out" | awk '/^data\/learnings\.md/{flag=1;next}/^====/{flag=0}flag' \
+    | grep -q 'detail omitted:' && fail "missing-seam file wrongly emitted an elision notice"
+
+  pass "context digest falls back to full cat when the consolidation seam is absent"
+}
+
+test_context_digest_shape2_absent_and_full_escape_hatch() {
+  local rec root home fakebin out
+  rec=$(new_world context-shape2-absent)
+  IFS='|' read -r root home fakebin <<EOF
+$rec
+EOF
+  make_fake_toolchain "$fakebin"
+  make_fake_ps_claude "$fakebin"
+
+  # captain.md deliberately ABSENT; learnings.md present with a seam.
+  write_big_captain_fixture "$home/data/learnings-src"
+  sed 's/# Detailed standing rules/# Detailed learnings/' "$home/data/learnings-src" > "$home/data/learnings.md"
+  rm -f "$home/data/learnings-src"
+
+  # Escape hatch forces a FULL cat of learnings.md (middle line reappears).
+  out=$(FM_SESSION_START_LEARNINGS_FULL=1 run_session_start "$home" "$root" "$fakebin:$BASE_PATH")
+
+  # ABSENT captain.md still prints the explicit marker under its plain label.
+  cap_section=$(printf '%s\n' "$out" | awk '/^data\/captain\.md$/{flag=1;next}/^data\//{flag=0}flag')
+  assert_contains "$cap_section" "ABSENT" "absent captain.md did not print ABSENT under the trimmed helper"
+  # Forced-full learnings.md shows the archive middle and no elision notice.
+  assert_contains "$out" "ARCHIVE-MIDDLE-LINE 100" "FM_SESSION_START_LEARNINGS_FULL did not force a full cat"
+  printf '%s\n' "$out" | awk '/^data\/learnings\.md/{flag=1;next}/^====/{flag=0}flag' \
+    | grep -q 'detail omitted:' && fail "forced-full learnings.md wrongly emitted an elision notice"
+
+  pass "context digest keeps ABSENT semantics and honors the force-full escape hatch"
+}
+
 # --- lock refusal: read-only path --------------------------------------------
 
 test_lock_refusal_read_only_path() {
@@ -995,6 +1099,9 @@ EOF
 }
 
 test_context_digest_absent_empty_present
+test_context_digest_shape2_seam_split
+test_context_digest_shape2_missing_seam_full_cat
+test_context_digest_shape2_absent_and_full_escape_hatch
 test_lock_refusal_read_only_path
 test_output_ordering_diagnostics_lead
 test_herdr_backend_diagnostics_follow_real_session_start
