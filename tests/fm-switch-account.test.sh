@@ -3,26 +3,25 @@
 # the helper that broadcasts jcode's per-session `/account claude switch <label>`
 # into every live worker pane.
 #
-# The whole reason these tests exist is the no-args pane auto-discovery path.
-# That path used to fail SILENTLY: under `set -euo pipefail`, a state/*.meta with
-# no `window=` line (for example a service sidecar such as state/.lavish-lan.meta,
-# which records only port=/bind=/target=) makes the discovery grep exit non-zero,
-# that status propagates through the command substitution, and set -e kills the
-# whole script with exit 1 before it can print anything or reach a real target.
-# A related bug wrote grep/herdr stderr to LITERAL files (2>e_find, 2>e_meta, ...)
-# instead of suppressing it, leaving stray e_* files behind.
+# Two reasons these tests exist:
 #
-# These tests pin the fixed behavior with everything injected: a fake repo layout
-# (bin/ + state/) and a fake herdr on PATH, so no assertion depends on any real
-# pane, task, or account.
+# 1. The no-args pane auto-discovery path. That path used to fail SILENTLY:
+#    under `set -euo pipefail`, a state/*.meta with no target (for example a
+#    service sidecar such as state/.lavish-lan.meta, which records only
+#    port=/bind=/target=) made the discovery grep exit non-zero, that status
+#    propagated through the command substitution, and set -e killed the whole
+#    script with exit 1 before it reached a real target.
 #
-#   - no-args discovery lists every windowed pane and SKIPS a windowless meta   (the bug)
-#   - discovery exits 0 in that case, not 1                                     (the bug)
-#   - the default: session prefix is stripped from discovered pane ids          (id shape)
-#   - explicit pane-id args bypass discovery and are used verbatim              (explicit)
-#   - no stray e_* files are left in the repo root                              (redirect bug)
-#   - a state/ with zero windowed metas reports "no target panes" and exits 1   (empty)
-#   - a missing label argument exits 2 with usage                              (arg guard)
+# 2. The composer pending-text guard (captain-reported bug): the script used to
+#    type `/account claude switch <label>` + Enter into every pane blindly. If a
+#    pane held a half-typed prompt the switch command was appended onto it and
+#    the whole thing got garbled. The fix checks each pane's composer state and
+#    clears pending text with one Escape before sending, skipping panes that
+#    stay pending (real human typing) or read unknown (dead/non-agent pane).
+#
+# Everything is injected: a fake repo layout (bin/ + state/) plus a fake
+# fm-backend.sh whose composer states are scripted per target, so no assertion
+# depends on any real pane, task, backend, or account.
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -34,46 +33,88 @@ assert_present "$SRC" "bin/fm-switch-account.sh is missing"
 
 TMPROOT=$(fm_test_tmproot fm-switch-account)
 
-# Build a fake repo layout the script will cd into: bin/<script> + state/*.meta.
-# The script resolves its root as dirname/.. of its own path, so placing it in
-# REPO/bin makes REPO/state the discovery dir.
+# Build a fake repo layout the script cds into: bin/<script> + bin/fm-backend.sh
+# + state/*.meta. The script resolves its root as dirname/.. of its own path and
+# sources fm-backend.sh from its own bin dir, so a fake fm-backend.sh next to it
+# controls every backend primitive.
 REPO="$TMPROOT/repo"
-mkdir -p "$REPO/bin" "$REPO/state" "$TMPROOT/fakebin"
+mkdir -p "$REPO/bin" "$REPO/state"
 cp "$SRC" "$REPO/bin/fm-switch-account.sh"
 chmod +x "$REPO/bin/fm-switch-account.sh"
 
-# Fake herdr: record every invocation, print a stub line, always succeed. The
-# `read` subcommand emits a line so the confirmation tail has something to show.
-cat > "$TMPROOT/fakebin/herdr" <<'SH'
+# Per-target scripted composer states. COMPOSER_DIR holds one file per target
+# (":"/"/" -> "_"); each line is one state, consumed one per composer_state call,
+# so a pane can read pending then empty (Escape cleared it) or pending twice
+# (stubborn). A missing file defaults to empty.
+COMPOSER_DIR="$TMPROOT/composer"
+BACKEND_LOG="$TMPROOT/backend.log"
+
+sanitize() { printf '%s' "$1" | tr ':/' '__'; }
+
+set_composer() {  # <target> <state...>
+  local t=$1; shift
+  mkdir -p "$COMPOSER_DIR"
+  local f
+  f="$COMPOSER_DIR/$(sanitize "$t")"
+  : > "$f"
+  local s
+  for s in "$@"; do printf '%s\n' "$s" >> "$f"; done
+}
+
+# Fake fm-backend.sh: meta helpers plus scripted composer/send/capture. It reads
+# COMPOSER_DIR and appends every send to BACKEND_LOG.
+cat > "$REPO/bin/fm-backend.sh" <<'SH'
 #!/usr/bin/env bash
-printf 'HERDR %s\n' "$*" >> "$HERDR_LOG"
-case "${1:-} ${2:-}" in
-  "pane read") echo "stub pane content" ;;
-esac
-exit 0
+fm_meta_get() { grep "^$2=" "$1" 2>/dev/null | tail -1 | cut -d= -f2- || true; }
+fm_backend_of_meta() { local v; v=$(fm_meta_get "$1" backend); printf '%s' "${v:-tmux}"; }
+fm_backend_target_of_meta() {
+  local meta=$1 backend terminal window
+  backend=$(fm_backend_of_meta "$meta")
+  if [ "$backend" = orca ]; then
+    terminal=$(fm_meta_get "$meta" terminal)
+    [ -n "$terminal" ] && { printf '%s' "$terminal"; return 0; }
+  fi
+  window=$(fm_meta_get "$meta" window)
+  [ -n "$window" ] && printf '%s' "$window"
+}
+_fst_san() { printf '%s' "$1" | tr ':/' '__'; }
+fm_backend_composer_state() {  # <backend> <target>
+  local target=$2 f line
+  f="$COMPOSER_DIR/$(_fst_san "$target")"
+  [ -f "$f" ] || { printf 'empty'; return 0; }
+  line=$(head -1 "$f")
+  # consume the first line so the next call sees the following state
+  sed -i '1d' "$f" 2>/dev/null || tail -n +2 "$f" > "$f.n" && mv "$f.n" "$f" 2>/dev/null || true
+  printf '%s' "${line:-empty}"
+}
+fm_backend_send_key() {  # <backend> <target> <key>
+  printf 'send_key %s %s %s\n' "$1" "$2" "$3" >> "$BACKEND_LOG"
+}
+fm_backend_send_text_submit() {  # <backend> <target> <text> ...
+  printf 'send_text %s %s %s\n' "$1" "$2" "$3" >> "$BACKEND_LOG"
+  printf 'empty'
+}
+fm_backend_capture() {  # <backend> <target> <lines>
+  printf 'capture %s %s\n' "$1" "$2" >> "$BACKEND_LOG"
+  echo "stub pane content"
+}
 SH
-chmod +x "$TMPROOT/fakebin/herdr"
-export HERDR_LOG="$TMPROOT/herdr.log"
-: > "$HERDR_LOG"
 
-# Skip the real inter-keystroke and confirmation waits so the suite runs fast.
-export FM_SWITCH_SEND_SETTLE=0 FM_SWITCH_CONFIRM_WAIT=0
-
-PATH="$TMPROOT/fakebin:$PATH"
+export COMPOSER_DIR BACKEND_LOG
+# Skip real waits.
+export FM_SWITCH_SEND_SETTLE=0 FM_SWITCH_CONFIRM_WAIT=0 FM_SWITCH_CLEAR_SETTLE=0
 
 run_switch() {  # <args...> -> sets OUT / RC
-  : > "$HERDR_LOG"
+  : > "$BACKEND_LOG"
   OUT=$(cd "$REPO" && ./bin/fm-switch-account.sh "$@" 2>&1)
   RC=$?
 }
 
 # --- case 1: no-args discovery skips a windowless meta and lists the rest -----
-#
-# Two windowed task metas plus one windowless sidecar meta (the exact shape that
-# used to kill the script). Discovery must list the two panes, skip the sidecar,
-# and exit 0.
-fm_write_meta "$REPO/state/alpha.meta" "window=default:w1:p2" "project=alpha"
-fm_write_meta "$REPO/state/bravo.meta" "window=default:w2:p3" "project=bravo"
+# herdr-backed metas exercise the default: prefix strip. bravo omits backend=
+# so it resolves to tmux (P1 compat) and keeps its full id.
+fm_write_meta "$REPO/state/alpha.meta" "backend=herdr" "window=default:w1:p2" "project=alpha"
+fm_write_meta "$REPO/state/bravo.meta" "window=w2:p3" "project=bravo"
 fm_write_meta "$REPO/state/.lavish-lan.meta" "port=4388" "bind=0.0.0.0" "target=4387"
 
 run_switch claude-2
@@ -82,51 +123,95 @@ assert_contains "$OUT" "in 2 pane(s)" "discovery must find exactly the two windo
 assert_contains "$OUT" "w1:p2" "discovery must include the first windowed pane"
 assert_contains "$OUT" "w2:p3" "discovery must include the second windowed pane"
 assert_not_contains "$OUT" "no target panes" "discovery must not report an empty target set"
-# The default: session prefix must be stripped from the discovered id.
-assert_not_contains "$OUT" "default:w1:p2" "the default: prefix must be stripped from pane ids"
-# The switch command must have been sent to both panes.
-assert_grep "pane send-text w1:p2 /account claude switch claude-2" "$HERDR_LOG" "switch command must reach the first pane"
-assert_grep "pane send-text w2:p3 /account claude switch claude-2" "$HERDR_LOG" "switch command must reach the second pane"
+assert_not_contains "$OUT" "default:w1:p2" "the default: prefix must be stripped from herdr pane ids"
 pass "no-args discovery lists windowed panes and skips a windowless meta"
 
-# --- case 2: no stray e_* files left in the repo root -------------------------
-#
-# The old redirect bug wrote stderr to literal files e_find/e_meta/e_send/e_key/
-# e_read. After a full run the repo root must contain none of them.
-strays=""
-for f in "$REPO"/e_*; do
-  [ -e "$f" ] && strays="$strays $(basename "$f")"
-done
-[ -z "$strays" ] || fail "run left stray stderr files in repo root:$strays"
-pass "no stray e_* stderr files are created"
+# --- case 2: each discovered target is sent on its recorded backend -----------
+# alpha resolves to herdr (id stripped to w1:p2), bravo has no backend= so it
+# resolves to tmux (P1 compat) and keeps its full id.
+run_switch claude-2
+assert_grep "send_text herdr w1:p2 /account claude switch claude-2" "$BACKEND_LOG" "herdr meta must be sent on herdr with a stripped id"
+assert_grep "send_text tmux w2:p3 /account claude switch claude-2" "$BACKEND_LOG" "backendless meta must be sent on tmux"
+pass "each discovered target is sent on its recorded backend"
 
-# --- case 3: explicit pane-id args bypass discovery ---------------------------
-#
-# With explicit args the state dir must be ignored entirely: only the given ids
-# are targeted, verbatim (no default: stripping is needed since caller controls them).
+# --- case 3: an empty composer is sent the switch command normally ------------
+set_composer "w1:p2" empty
+set_composer "w2:p3" empty
+run_switch claude-2
+expect_code 0 "$RC" "empty composers must exit 0"
+assert_grep "send_text herdr w1:p2 /account claude switch claude-2" "$BACKEND_LOG" "empty composer must receive the switch"
+assert_no_grep "send_key" "$BACKEND_LOG" "an empty composer must never get an Escape"
+pass "an empty composer is sent the switch command with no Escape"
+
+# --- case 4: a pending composer gets Escape-cleared then sent -----------------
+# First read pending, Escape, second read empty -> proceed.
+set_composer "w1:p2" pending empty
+set_composer "w2:p3" empty
+run_switch claude-2
+expect_code 0 "$RC" "an Escape-clearable pending composer must exit 0"
+assert_grep "send_key herdr w1:p2 Escape" "$BACKEND_LOG" "a pending composer must get one Escape"
+assert_grep "send_text herdr w1:p2 /account claude switch claude-2" "$BACKEND_LOG" "a cleared composer must then be sent the switch"
+pass "a pending composer is Escape-cleared before the switch is sent"
+
+# --- case 5: a stubbornly-pending composer is SKIPPED, never garbled ----------
+# pending on both reads (Escape did not clear) -> skip, no send.
+set_composer "w1:p2" pending pending
+set_composer "w2:p3" empty
+run_switch claude-2
+expect_code 0 "$RC" "a stubborn pending pane must not fail the run"
+assert_grep "send_key herdr w1:p2 Escape" "$BACKEND_LOG" "the stubborn pane must still have been Escape-tried once"
+assert_contains "$OUT" "SKIPPED" "a stubborn pending pane must be reported skipped"
+assert_no_grep "send_text herdr w1:p2 " "$BACKEND_LOG" "a stubborn pending pane must never be sent the switch"
+assert_grep "send_text tmux w2:p3 /account claude switch claude-2" "$BACKEND_LOG" "the other pane must still be switched"
+pass "a stubbornly-pending composer is skipped, never garbled"
+
+# --- case 6: an unknown composer state is SKIPPED, never blind-injected -------
+set_composer "w1:p2" unknown
+set_composer "w2:p3" empty
+run_switch claude-2
+expect_code 0 "$RC" "an unknown pane must not fail the run"
+assert_contains "$OUT" "SKIPPED" "an unknown composer must be reported skipped"
+assert_no_grep "send_text herdr w1:p2 " "$BACKEND_LOG" "an unknown composer must never be injected into"
+assert_grep "send_text tmux w2:p3 /account claude switch claude-2" "$BACKEND_LOG" "the healthy pane must still be switched"
+pass "an unknown composer state is skipped, never blind-injected"
+
+# --- case 7: explicit pane-id args bypass discovery and use herdr -------------
+# Explicit ids have no meta, so they keep the historical herdr assumption and
+# are used verbatim.
+set_composer "pX:p9" empty
+set_composer "pY:p1" empty
 run_switch claude-4 pX:p9 pY:p1
 expect_code 0 "$RC" "explicit pane args must exit 0"
 assert_contains "$OUT" "in 2 pane(s)" "explicit args must target exactly the given panes"
-assert_grep "pane send-text pX:p9 /account claude switch claude-4" "$HERDR_LOG" "explicit pane pX:p9 must be targeted"
-assert_grep "pane send-text pY:p1 /account claude switch claude-4" "$HERDR_LOG" "explicit pane pY:p1 must be targeted"
-assert_no_grep "w1:p2" "$HERDR_LOG" "explicit args must not fall back to discovered panes"
-pass "explicit pane-id args bypass discovery and are used verbatim"
+assert_grep "send_text herdr pX:p9 /account claude switch claude-4" "$BACKEND_LOG" "explicit pane pX:p9 must be targeted on herdr"
+assert_grep "send_text herdr pY:p1 /account claude switch claude-4" "$BACKEND_LOG" "explicit pane pY:p1 must be targeted on herdr"
+assert_no_grep "w1:p2" "$BACKEND_LOG" "explicit args must not fall back to discovered panes"
+pass "explicit pane-id args bypass discovery and use herdr"
 
-# --- case 4: a state/ with zero windowed metas reports no targets and exits 1 -
+# --- case 8: a state/ with zero windowed metas reports no targets and exits 1 -
 EMPTY="$TMPROOT/empty"
 mkdir -p "$EMPTY/bin" "$EMPTY/state"
 cp "$SRC" "$EMPTY/bin/fm-switch-account.sh"
 chmod +x "$EMPTY/bin/fm-switch-account.sh"
+cp "$REPO/bin/fm-backend.sh" "$EMPTY/bin/fm-backend.sh"
 fm_write_meta "$EMPTY/state/.lavish-lan.meta" "port=4388" "bind=0.0.0.0"
 OUT=$(cd "$EMPTY" && ./bin/fm-switch-account.sh claude-2 2>&1); RC=$?
 expect_code 1 "$RC" "a state dir with no windowed metas must exit 1"
 assert_contains "$OUT" "no target panes found" "empty discovery must report no target panes"
 pass "no windowed metas reports no targets and exits 1"
 
-# --- case 5: a missing label exits 2 with usage -------------------------------
+# --- case 9: a missing label exits 2 with usage -------------------------------
 OUT=$(cd "$REPO" && ./bin/fm-switch-account.sh 2>&1); RC=$?
 expect_code 2 "$RC" "a missing label must exit 2"
 assert_contains "$OUT" "usage:" "a missing label must print usage"
 pass "a missing label argument exits 2 with usage"
+
+# --- case 10: no stray e_* files left in the repo root ------------------------
+strays=""
+for f in "$REPO"/e_*; do
+  [ -e "$f" ] && strays="$strays $(basename "$f")"
+done
+[ -z "$strays" ] || fail "run left stray stderr files in repo root:$strays"
+pass "no stray e_* stderr files are created"
 
 pass "fm-switch-account.sh: all checks passed"
