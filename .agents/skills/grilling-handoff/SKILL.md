@@ -12,6 +12,10 @@ A grilling session stress-tests a fuzzy design before anyone builds it.
 Firstmate does not run the grilling; the captain drives a separate griller agent by hand.
 This skill owns both ends of that handoff so nothing leaks between them: the session's own identity (a session that goes out and never comes back stays visible), the ADR number the session will produce (two concurrent sessions can never claim the same number), and the handback (findings arrive as a document firstmate intakes into real queue items, not as re-explained conversation).
 
+Firstmate spawns and owns the griller pane itself, in this fleet's default harness, and the captain switches into that pane to drive the grilling by hand.
+The pane is hands-off: firstmate creates it but never supervises, steers, nudges, turn-end-pokes, or otherwise injects into it, because a grilling is the captain's live interview and any firstmate injection would corrupt it.
+This is enforced structurally by spawning with `--unsupervised`, which records `supervise=off` in the task's runtime record and drops the pane from every supervision path (see the spawn step below).
+
 The brief is the contract and the handback document is the deliverable.
 
 This skill has two entry points, selected by the first argument:
@@ -26,7 +30,7 @@ If the captain's phrasing does not name an entry point, infer it: a request to s
 Given one or more tickets or a described chunk of work that needs grilling.
 
 1. **Pick the slug and date.**
-   The slug is lowercase letters, digits, and dashes; it becomes the branch name `grill/<slug>`, the worktree name, and the session directory name, so choose it once and reuse it everywhere.
+   The slug is lowercase letters, digits, and dashes; it becomes the session directory name, the spawned griller's task id `grill-<slug>`, and the tracking item id `grill-<slug>`, so choose it once and reuse it everywhere.
    The date is today in `YYYY-MM-DD`.
    One session may cover a **cluster** of related tickets under a single slug when they share context - grilling coupled tickets separately wastes the captain's time re-explaining that shared context.
    Genuinely independent work gets separate slugs and separate sessions.
@@ -61,22 +65,24 @@ Given one or more tickets or a described chunk of work that needs grilling.
    tasks-axi hold grill-<slug> --reason "grilling session out: <slug> (<project>), handback <session_dir>/handback.md" --kind captain
    ```
 
-6. **Report to the captain** the reserved ADR number, the project, and a copy-pasteable command block that launches the griller, because the captain carries this by hand to the griller agent.
-   Fill every value from what prepare already holds:
+6. **Spawn the griller pane yourself, hands-off.**
+   Firstmate creates the pane through the normal spawn path in this fleet's default harness - the same harness firstmate's ordinary crew resolve to, through the normal harness and dispatch selection, never a hardcoded adapter or model.
+   Spawn it with `--unsupervised` so the pane records `supervise=off` and is dropped from every supervision path (no turn-end poke, no stall or wedge watch, no steer): the pane is the captain's live interview and firstmate must never touch it.
+
+   `bin/fm-spawn.sh` delivers the task's own brief at `data/<task-id>/brief.md` to the launched agent, so write the griller's initial instruction there (a short pointer to the real grilling brief), then spawn with task id `grill-<slug>`:
 
    ```
-   cd <captain's own checkout of <project>>
-   claude -w "grill/<slug>" --model claude-opus-5 --effort high "/grill-with-docs <session_dir>/brief.md"
+   mkdir -p data/grill-<slug>
+   printf '%s\n' 'Run /grill-with-docs <session_dir>/brief.md and follow that brief to drive this grilling session.' > data/grill-<slug>/brief.md
+   bin/fm-spawn.sh grill-<slug> projects/<name> --unsupervised
    ```
 
-   The brief path is the absolute `<session_dir>/brief.md`, and the worktree name is `grill/<slug>`.
-   `<captain's own checkout of <project>>` is the captain's own working copy of the product repo, which lives OUTSIDE firstmate's home - never firstmate's clone under `projects/<name>`.
-   This matters because `claude -w` creates the new worktree at `<checkout>/.claude/worktrees/`, inside whatever checkout the captain `cd`s into; using the captain's own clone lands that worktree outside firstmate's home, while pointing at firstmate's clone would put it inside firstmate's read-only, fleet-synced clone - exactly what the "Where you work" rule forbids.
-   The captain's clones live at `~/workspace/work/<repo>` or `~/workspace/personal/<repo>`.
-   Resolve the work-versus-personal half rather than assuming it: probe for `<repo>` under each root, and when it exists under both, disambiguate on the clone's `origin` remote against the project's registered remote.
-   Some repo names (e.g. `firstmate`) exist under both roots, so a naive guess picks wrong.
-   If it is still ambiguous after that, emit the command with the candidate you chose and state the other candidate plainly in the report rather than silently picking.
-   `claude-opus-5` and `high` are sensible defaults the captain can edit in place before running - `high` effort suits a grilling session.
+   The spawn allocates an isolated disposable worktree of firstmate's own clone `projects/<name>` exactly like any crewmate lane, so the grilling never touches firstmate's primary checkout.
+   The pointer names the durable griller brief written in step 4 (`<session_dir>/brief.md`); the griller reads that brief and drives the interview through the `/grill-with-docs` skill.
+   The griller runs whatever harness the fleet default resolves to; do not carry an alternate launch command.
+
+7. **Report to the captain** the reserved ADR number, the project, the pane to switch into (the spawn prints `window=<target>` - relay that target), and the reminder that the captain drives the grilling by hand and then tells firstmate to take over.
+   Include the one-line prompt the captain pastes back to firstmate when the grilling is done (from the "Prompt back to firstmate" section below).
 
 ### Brief template
 
@@ -105,9 +111,9 @@ You also have permission to conclude **"no map needed, this is one small ticket"
 
 ## Where you work
 
-- Product repo: <name>. The launch command your captain ran created your worktree under their own checkout of the product repo (at `.claude/worktrees/`), OUTSIDE firstmate's working directory, so firstmate's own read-only clone stays untouched.
-- Branch/worktree: `grill/<slug>`.
+- Product repo: <name>. Firstmate spawned this pane and it launched in an isolated disposable worktree of firstmate's own clone of the product repo, allocated for this grilling task, distinct from firstmate's primary checkout. Work here; do not reach outside this worktree.
 - Grilling skill: use `/grill-with-docs`; it runs the interview and creates the decision records (ADRs) and a glossary as it goes, which fits the reserved ADR number this session already holds. If the origin is firstmate-task, use `/wayfinder` afterwards to produce the map and tickets.
+- This is the captain's interview: the captain drives it in this pane by hand. Firstmate created this pane but does NOT supervise it and will not steer, nudge, or interrupt you.
 
 ## ADR
 
@@ -145,7 +151,7 @@ It covers both outcomes cleanly.
 - slug: <slug>
 - date: <YYYY-MM-DD>
 - origin: <wayfinder-map | firstmate-task>
-- branch: grill/<slug>
+- branch: <the branch you committed the ADR and any deliverables on>
 
 ## ADR
 
@@ -200,7 +206,7 @@ Given a slug (and usually the handback path from the prompt line above).
    - **map** - file each listed ticket as a backlog item and record its blocking edges exactly as the handback declares them, so the dependency graph survives.
    - **single-ticket** - file the one ticket as a single backlog item; there are no edges.
 
-4. **Close the tracking item** from prepare step 4:
+4. **Close the tracking item** from the prepare tracking-hold step:
 
    ```
    tasks-axi resolve grill-<slug>
@@ -209,6 +215,19 @@ Given a slug (and usually the handback path from the prompt line above).
    (Use the backend's resolve/close verb per section 10; the point is the captain-gated `grill-<slug>` hold no longer resurfaces.)
 
 5. Mark the ledger row for this slug `landed` in `data/grilling/adr-reservations.md` so the ledger reflects that the session came back.
+
+6. **Release the griller pane firstmate owns.**
+   Firstmate spawned this pane, so firstmate cleans it up after a successful intake with the normal teardown path:
+
+   ```
+   bin/fm-teardown.sh grill-<slug>
+   ```
+
+   Teardown kills the recorded pane, releases its disposable worktree, and clears its runtime record.
+   The grilling session directory and handback under `data/grilling/<date>-<slug>/` are the durable record and are NOT touched by this - only the live pane is released.
+   The handback is the deliverable and the pane is disposable, so intake steps 1-5 already succeeded before this: even if the captain closed the pane, its runtime record persists until teardown runs (closing the pane does not remove the record), so teardown still finds it, kills the already-dead endpoint harmlessly, and releases the worktree.
+   Only if teardown was already run for this slug (its record is genuinely gone) does teardown report no record for the task; that means the pane is already released, so treat it as done rather than a failed intake.
+   If teardown refuses because the worktree holds genuinely unlanded work (the griller committed but did not push a deliverable), that is the ordinary unlanded-work guard: report it to the captain rather than forcing, since the intake itself is already complete.
 
 Filing tickets is intake recording the session's produced work into the queue; it is not authorization to build.
 Dispatch of that work follows the ordinary lifecycle in section 7 on the captain's word.

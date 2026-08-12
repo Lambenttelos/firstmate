@@ -448,6 +448,13 @@ recorded_windows() {
   local meta w seen=
   for meta in "$STATE"/*.meta; do
     [ -e "$meta" ] || continue
+    # An --unsupervised pane (supervise=off) is deliberately hands-off: firstmate
+    # created it but must never observe, steer, or poke it (the grilling-handoff
+    # griller pane, a live interview any injection would corrupt). Dropping it
+    # HERE excludes it from every supervision path this list feeds - the
+    # stale/wedge loop, the turn-end/event fast wake, and the context sweep - so
+    # the exclusion is enforced in one place rather than per-consumer.
+    [ "$(grep '^supervise=' "$meta" | cut -d= -f2- || true)" = off ] && continue
     w=$(fm_backend_target_of_meta "$meta")
     [ -n "$w" ] || continue
     case "$seen" in

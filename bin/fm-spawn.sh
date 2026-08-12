@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Spawn a direct report: a crewmate in a treehouse or Orca worktree, or a
 # secondmate in its isolated firstmate home.
-# Usage: fm-spawn.sh <task-id> <project-dir> [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>] [--env <KEY=VAL>]... [--scout]
+# Usage: fm-spawn.sh <task-id> <project-dir> [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>] [--env <KEY=VAL>]... [--scout] [--unsupervised]
 #        fm-spawn.sh <task-id> [<firstmate-home>] [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>] [--env <KEY=VAL>]... --secondmate
 #   --harness <name> is the explicit per-spawn harness/profile adapter. The old
 #   positional harness arg still works for back-compat.
@@ -83,6 +83,17 @@
 #   --scout records kind=scout in the task's meta (report deliverable, scratch worktree;
 #   see AGENTS.md task lifecycle); --secondmate records kind=secondmate and launches in a
 #   provisioned firstmate home; the default is kind=ship.
+#   --unsupervised records supervise=off in the task's meta and installs NO
+#   turn-end hook, and the watcher (bin/fm-watch.sh recorded_windows) drops any
+#   supervise=off pane from every supervision path: the stale/wedge loop, the
+#   turn-end/event fast wake, and the context sweep. The result is a genuinely
+#   hands-off pane that firstmate creates but never peeks, steers, nudges, or
+#   pokes. It exists for a live interview firstmate must not touch (the
+#   grilling-handoff griller pane); any firstmate injection would corrupt that
+#   interview. supervise=off is orthogonal to kind and combines with the default
+#   ship kind or with --scout; it is refused with --secondmate (a secondmate is
+#   supervised through its status writes by design). The default omits the field,
+#   so an ordinary spawn's meta stays byte-identical (absent supervise= means on).
 #   Before a secondmate launch, the home is locally fast-forwarded to the primary
 #   default-branch commit when safe; skipped syncs warn and launch unchanged.
 #   Ship/scout spawns refuse to launch unless the project is one of THIS home's
@@ -209,6 +220,7 @@ if [ -z "${FM_SPAWN_NO_GUARD:-}" ]; then
   esac
 fi
 KIND=ship
+UNSUPERVISED=off
 HARNESS_ARG=
 MODEL=
 EFFORT=
@@ -245,6 +257,7 @@ for a in "$@"; do
   case "$a" in
     --scout) KIND=scout ;;
     --secondmate) KIND=secondmate ;;
+    --unsupervised) UNSUPERVISED=on ;;
     --harness) want_value=harness ;;
     --harness=*) HARNESS_ARG=${a#--harness=}; HARNESS_SET=1 ;;
     --model) want_value=model ;;
@@ -270,6 +283,9 @@ done
 [ "$MODEL_SET" -eq 0 ] || [ -n "$MODEL" ] || { echo "error: --model requires a non-empty value" >&2; exit 1; }
 [ "$EFFORT_SET" -eq 0 ] || [ -n "$EFFORT" ] || { echo "error: --effort requires a non-empty value" >&2; exit 1; }
 [ "$BACKEND_SET" -eq 0 ] || [ -n "$BACKEND_ARG" ] || { echo "error: --backend requires a non-empty value" >&2; exit 1; }
+# --unsupervised is a hands-off crewmate/scout pane; a secondmate is supervised
+# through its own status writes by design, so the combination is contradictory.
+[ "$UNSUPERVISED" = off ] || [ "$KIND" != secondmate ] || { echo "error: --unsupervised cannot combine with --secondmate" >&2; exit 1; }
 # Validate each --env KEY=VAL form. KEY must be a POSIX shell env-var name
 # (letters/digits/underscore, not starting with a digit); VAL is anything (may
 # be empty).
@@ -446,6 +462,7 @@ if [ "${#POS[@]}" -gt 0 ] && [ "${POS[0]}" != "$idpart" ] && case "$idpart" in *
   [ -z "$MODEL" ] || shared_args+=(--model "$MODEL")
   [ -z "$EFFORT" ] || shared_args+=(--effort "$EFFORT")
   [ -z "$BACKEND_ARG" ] || shared_args+=(--backend "$BACKEND_ARG")
+  [ "$UNSUPERVISED" = off ] || shared_args+=(--unsupervised)
   for pair in "${POS[@]}"; do
     case "$pair" in
       *=*) : ;;
@@ -1458,7 +1475,11 @@ exclude_path() {
   mkdir -p "$(dirname "$EXCL")"
   grep -qxF "$rel" "$EXCL" 2>/dev/null || echo "$rel" >> "$EXCL"
 }
-if [ "$KIND" != secondmate ]; then
+# An unsupervised pane installs NO turn-end hook: the watcher never enrolls it
+# (recorded_windows drops supervise=off), so a turn-end signal would wake nobody,
+# and the whole point is a pane firstmate never observes. Skip the hook for it
+# exactly as a secondmate skips it.
+if [ "$KIND" != secondmate ] && [ "$UNSUPERVISED" = off ]; then
   case "$HARNESS" in
     claude*)
       mkdir -p "$WT/.claude"
@@ -1584,6 +1605,10 @@ META_WINDOW=$T
   echo "tasktmp=$TASK_TMP"
   echo "model=${MODEL:-default}"
   echo "effort=${EFFORT:-default}"
+  # supervise=off is written only for an --unsupervised pane, so an ordinary
+  # spawn's meta stays byte-identical (absent supervise= means on). The watcher's
+  # recorded_windows drops any supervise=off pane from every supervision path.
+  [ "$UNSUPERVISED" = off ] || echo "supervise=off"
   # backend= is written only for a non-default (non-tmux) backend, so the
   # default path's meta stays byte-identical (absent backend= means tmux;
   # data/fm-backend-design-d7's P1 compatibility contract).
