@@ -26,3 +26,4 @@ config/present-daemon
 config/liveness-watchdog
 config/liveness-resume
 .codex/skills
+/.treehouse
