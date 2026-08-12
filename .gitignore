@@ -22,6 +22,7 @@ config/context-stow-threshold
 config/herdr-presentation-spaces
 config/heavy-run-slots
 config/watcher-cadence
+config/captain-preferences
 config/present-daemon
 config/liveness-watchdog
 config/liveness-resume

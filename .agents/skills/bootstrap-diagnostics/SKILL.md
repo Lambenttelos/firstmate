@@ -2,7 +2,7 @@
 name: bootstrap-diagnostics
 description: >-
   Agent-only handling playbook for session-start bootstrap diagnostics.
-  Use whenever the session-start digest's bootstrap section prints an actionable diagnostic line - MISSING, MISSING_MANUAL, BACKEND_INVALID, NEEDS_GH_AUTH, TANGLE, CREW_DISPATCH invalid, FLEET_SYNC, PRESENT_DAEMON, LIVENESS_WATCHDOG, LIVENESS_ESCALATION, PR_CHECK_MIGRATION, SECONDMATE_SYNC, SECONDMATE_LIVENESS, AFK_DAEMON, AFK_READER, NUDGE_SECONDMATES, or FMX - or when a standalone bin/fm-bootstrap.sh run prints one of those lines.
+  Use whenever the session-start digest's bootstrap section prints an actionable diagnostic line - MISSING, MISSING_MANUAL, BACKEND_INVALID, NEEDS_GH_AUTH, TANGLE, CONFIG_DRIFT, CREW_DISPATCH invalid, FLEET_SYNC, PRESENT_DAEMON, LIVENESS_WATCHDOG, LIVENESS_ESCALATION, PR_CHECK_MIGRATION, SECONDMATE_SYNC, SECONDMATE_LIVENESS, AFK_DAEMON, AFK_READER, NUDGE_SECONDMATES, or FMX - or when a standalone bin/fm-bootstrap.sh run prints one of those lines.
   A silent bootstrap section, or a BOOTSTRAP_INFO fact, means no skill load.
 user-invocable: false
 metadata:
@@ -27,6 +27,10 @@ When any diagnostic needs captain attention, report the plain consequence and re
 - `TANGLE: <remediation>` - the primary checkout is stranded on a feature branch instead of its default branch; `AGENTS.md` section 8 explains why this guard exists and what it protects.
   The work is safe on that branch ref; restore the primary to its default branch with the printed `git -C <root> checkout <default>`, then re-validate that branch in a proper worktree.
   This is the only sanctioned firstmate-initiated git write to the primary, and it is a non-destructive branch switch that strands nothing.
+- `CONFIG_DRIFT: <value> is <live> but the captain's recorded preference is <recorded> (...)` - a captain-owned operating value (the watcher cadence knobs today) has drifted from the captain's standing preference recorded in `config/captain-preferences`.
+  It surfaces in both read-only and full modes because a silent drift matters regardless of the lock, and it never blocks the session.
+  Decide which value is right rather than reflexively reconciling: if the live value is a leftover a prior session left behind, set `config/watcher-cadence` back to the recorded value so the config owner reads correctly (`docs/configuration.md` "Watcher cadence" and "Captain-owned value drift alarm" own the mechanism); if the change is intended and standing, update `config/captain-preferences` to the new value so the preference is the current truth.
+  When the right value is genuinely a captain call, surface the plain drift and ask, using `AGENTS.md` section 9's translation contract, rather than silently picking one.
 - `CREW_DISPATCH: invalid config/crew-dispatch.json - <reason>` - the optional dispatch profile file exists but failed low-cost bootstrap validation; continue with the normal fallback chain, resolve and pass the chosen fallback harness explicitly while the file remains present, fix the malformed schema, unverified harness name, unknown selector, or invalid harness/effort pair when convenient, and do not select a bad profile.
 - `FLEET_SYNC: <repo>: skipped: <reason>` - a benign one-off skip (no origin, local-only, an unreadable ref); bootstrap continued, investigate only if it blocks work.
   A skip can also report the bounded fleet-refresh timeout (`FM_FLEET_SYNC_BOOTSTRAP_TIMEOUT`, or a fleet-size-aware default with a 20 second floor); a timeout never blocks startup.

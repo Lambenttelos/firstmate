@@ -538,7 +538,7 @@ Firstmate is the nudger, never the granter: the waiter still re-acquires through
 ## Watcher cadence (config/watcher-cadence)
 
 `config/watcher-cadence` is an optional local, gitignored file that tunes the supervision watcher's cadence knobs, read by [`bin/fm-watch.sh`](../bin/fm-watch.sh).
-This section is the single owner of the knob; the script's header owns the resolver and the runtime loop it feeds.
+This section is the single owner of the knob; [`bin/fm-cadence-lib.sh`](../bin/fm-cadence-lib.sh) owns the resolver, shared with the drift alarm below so the value the watcher consumes and the value the alarm audits are resolved by one function.
 The file follows the same present/absent/malformed contract as `config/heavy-run-slots`: present means override, absent means the built-in default, and a malformed value falls back to the default loudly, never silently.
 
 The format is one `key = value` line per knob, where the value is a non-negative integer number of seconds.
@@ -553,8 +553,12 @@ An unknown key is itself a loud condition: the file said something the reader co
 A malformed value for a recognized key falls back to that key's default and is reported, so the operator sees why the value they wrote was not applied.
 Both classes of warning go to the watcher's stderr and its durable triage log at startup.
 
-The equivalent environment variables (`FM_SIGNAL_GRACE`, `FM_POLL`, `FM_HEARTBEAT`) still win over the file, as the operator override and test seam.
-The file exists because those env variables are unreachable in normal operation: the arm-command seatbelt ([`bin/fm-arm-pretool-check.sh`](../bin/fm-arm-pretool-check.sh)) refuses an env-prefixed invocation such as `FM_SIGNAL_GRACE=240 bin/fm-watch-arm.sh` as a compound wrapper, so firstmate cannot set them at arm time.
+Precedence is config-authoritative: a valid value in `config/watcher-cadence` wins over the equivalent environment variable (`FM_SIGNAL_GRACE`, `FM_POLL`, `FM_HEARTBEAT`), and the environment supplies a knob only when the file is silent on that key, as the operator override and test seam.
+This is deliberate and is the fix for the drift class that motivated the file's owner role.
+The value used to live only in a local settings file that any session could lower for a short-lived debugging reason and never restore, so a temporary value silently became the permanent one.
+Making the captain's owning file outrank a stale environment value means a leftover `FM_POLL` from a prior session can no longer quietly win.
+A key whose file value is malformed still falls back to that key's default loudly and does not consult the environment for that key, because the owning file said something and the reader must not paper over it with a possibly-stale environment value.
+The file exists because those environment variables are unreachable in normal operation: the arm-command seatbelt ([`bin/fm-arm-pretool-check.sh`](../bin/fm-arm-pretool-check.sh)) refuses an env-prefixed invocation such as `FM_SIGNAL_GRACE=240 bin/fm-watch-arm.sh` as a compound wrapper, so firstmate cannot set them at arm time.
 The watcher reading a file sidesteps that entirely: firstmate edits `config/watcher-cadence` and arms with a clean, unprefixed `bin/fm-watch-arm.sh`.
 
 The raised `signal_grace` default of `240` is deliberate and evidence-based.
@@ -563,6 +567,30 @@ A 240s window spans that burst so ordinary worker chatter batches into one wake,
 
 This does not delay a genuine terminal event.
 The coalescing linger is skipped when the first scan already carries a captain-relevant verb (`done:`, `failed:`, `needs-decision:`, `blocked:`), so a real terminal wake still surfaces promptly and only no-verb chatter pays the wait.
+
+## Captain-owned value drift alarm (config/captain-preferences)
+
+`config/captain-preferences` is an optional local, gitignored file that records the captain's standing preference for captain-owned operating values, so a startup alarm can shout when a live value has silently drifted from it.
+This section is the single owner of the file's schema, and [`bin/fm-drift-check.sh`](../bin/fm-drift-check.sh) owns the comparison mechanism and the generalized list of owned values it audits.
+
+It exists because the watcher poll cadence drifted for weeks with no owner and no provenance: any session could lower it for a short-lived debugging reason, nothing recorded the captain's standing preference, and nothing compared the live value against it, so a temporary value silently became the permanent one.
+The config owner (`config/watcher-cadence` above, read in preference to the environment) is the missing-ownership half of the fix, this alarm is the missing-provenance half, and the two compose.
+
+The format is one `key = value` line per recorded preference, parsed exactly like `config/watcher-cadence`: blank lines and `#` comment lines are ignored, whitespace around the key and value is tolerated, and the last occurrence of a key wins.
+A key that is absent, empty, or whitespace records no preference for that value, so drift is not evaluated for it (absence is not agreement).
+The recognized keys are one per captain-owned value.
+The watcher cadence knobs are recorded as `watcher_poll`, `watcher_signal_grace`, and `watcher_heartbeat`, whose live value is resolved by the same [`bin/fm-cadence-lib.sh`](../bin/fm-cadence-lib.sh) the watcher uses, so the audited value is byte-for-byte the value a running watcher would consume.
+
+At session start, [`bin/fm-bootstrap.sh`](../bin/fm-bootstrap.sh) runs the alarm in both detect-only and full modes, exactly like the tangle check, because a read-only session still needs to see that a captain-owned value drifted.
+For every owned value whose preference is recorded, it compares the live value against it and, on a mismatch, prints one loud line and nothing when they agree:
+
+```
+CONFIG_DRIFT: <label> is <live> but the captain's recorded preference is <recorded> (...)
+```
+
+The alarm never mutates anything and never fails the session.
+The remedy is in the line: set `config/watcher-cadence` back to the recorded value, or update `config/captain-preferences` when the change is intended.
+Generalizing to a new captain-owned value is cheap: append one producer row to `fm_drift_owned_values` in `bin/fm-drift-check.sh` and document its preference key here.
 
 ## Toolchain
 

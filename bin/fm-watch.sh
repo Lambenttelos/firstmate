@@ -164,14 +164,14 @@ else
   stat_sig()   { stat -c '%s:%Y' "$1" 2>/dev/null; }
 fi
 
-# Watcher cadence config file. docs/configuration.md owns the knob; this is its
-# reader. The file is optional, local, and gitignored, and follows the same
-# present/absent/malformed contract as config/heavy-run-slots: present means
-# override, absent means the built-in default below, a malformed value falls
-# back LOUDLY to the default (never silently). Format is one key=value per line,
-# with keys signal_grace, poll, heartbeat; blank lines and #-comments ignored;
-# an unknown key is itself a malformed condition reported loudly. A key present
-# in the file but with an empty value is treated as absent (falls to default).
+# Watcher cadence config file. docs/configuration.md owns the knob and
+# bin/fm-cadence-lib.sh owns the resolver (shared with the startup drift alarm
+# bin/fm-drift-check.sh, so the value the watcher CONSUMES and the value the
+# alarm AUDITS are resolved by one function and cannot drift apart). The file is
+# optional, local, and gitignored, and follows the same present/absent/malformed
+# contract as config/heavy-run-slots: present means override, absent means the
+# built-in default below, a malformed value falls back LOUDLY to the default
+# (never silently).
 #
 # This reader lives in the watcher, NOT at the arm command, on purpose: the
 # arm-command seatbelt (bin/fm-arm-pretool-check.sh) refuses an env-prefixed
@@ -180,57 +180,20 @@ fi
 # reading a file sidesteps that: firstmate edits config/watcher-cadence and
 # arms with no env prefix, so bin/fm-watch-arm.sh stays a clean single command.
 #
-# Env var still WINS over the file (operator override and test seam), matching
-# every other knob here; the file only supplies a value when the env var is
-# unset. Warnings are collected here and emitted in the runtime section (near
-# the host-resource fallback log), because the log helper is defined later.
+# PRECEDENCE is config-authoritative: a VALID value in config/watcher-cadence
+# wins over the environment, and the env var supplies a value only when the file
+# is silent on that key (operator override and test seam). This is the fix for
+# the settings.local.json drift class - a stale FM_POLL a prior debugging
+# session left in the environment no longer outranks the captain's owning file.
+# Warnings are collected in FM_CADENCE_WARNINGS and emitted in the runtime
+# section (near the host-resource fallback log), because the log helper is
+# defined later.
+# shellcheck source=bin/fm-cadence-lib.sh
+. "$SCRIPT_DIR/fm-cadence-lib.sh"
 CADENCE_FILE="$CONFIG/watcher-cadence"
-CADENCE_WARNINGS=""
-CADENCE_RESULT=""
-# Resolve one cadence key into the global CADENCE_RESULT: env override wins, then
-# the file's key=value, then the default. A malformed value records a warning and
-# yields the default. The result is a GLOBAL rather than stdout on purpose: a
-# command substitution ($(...)) runs in a subshell, so warnings appended to
-# CADENCE_WARNINGS there would be lost. The caller reads CADENCE_RESULT right after.
-# Usage: cadence_knob <env-var-name> <file-key> <default>
-cadence_knob() {  # <env-var-name> <file-key> <default>
-  local env_name=$1 key=$2 default=$3 env_val file_val
-  eval "env_val=\${$env_name:-}"
-  if [ -n "$env_val" ]; then
-    case "$env_val" in
-      ''|*[!0-9]*)
-        CADENCE_WARNINGS="$CADENCE_WARNINGS${CADENCE_WARNINGS:+; }malformed \$$env_name '$env_val', using default ${default}s"
-        CADENCE_RESULT=$default; return 0 ;;
-    esac
-    CADENCE_RESULT=$env_val; return 0
-  fi
-  if [ ! -f "$CADENCE_FILE" ]; then CADENCE_RESULT=$default; return 0; fi
-  file_val=$(sed -n "s/^[[:space:]]*${key}[[:space:]]*=[[:space:]]*//p" "$CADENCE_FILE" 2>/dev/null \
-    | grep -v '^[[:space:]]*#' | tail -n 1 | tr -d '[:space:]')
-  if [ -z "$file_val" ]; then CADENCE_RESULT=$default; return 0; fi
-  case "$file_val" in
-    ''|*[!0-9]*)
-      CADENCE_WARNINGS="$CADENCE_WARNINGS${CADENCE_WARNINGS:+; }malformed $key '$file_val' in $CADENCE_FILE, using default ${default}s"
-      CADENCE_RESULT=$default; return 0 ;;
-  esac
-  CADENCE_RESULT=$file_val
-}
-# Detect keys in the file the reader does not recognize, so a typo'd knob is
-# surfaced loudly instead of silently ignored (the file said something, and the
-# watcher must not pretend it was heard).
-if [ -f "$CADENCE_FILE" ]; then
-  while IFS= read -r _line || [ -n "$_line" ]; do
-    _stripped=$(printf '%s' "$_line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-    case "$_stripped" in ''|'#'*) continue ;; esac
-    _k=${_stripped%%=*}; _k=$(printf '%s' "$_k" | tr -d '[:space:]')
-    case "$_k" in
-      signal_grace|poll|heartbeat) ;;
-      *) CADENCE_WARNINGS="$CADENCE_WARNINGS${CADENCE_WARNINGS:+; }unknown cadence key '$_k' in $CADENCE_FILE, ignored" ;;
-    esac
-  done < "$CADENCE_FILE"
-  unset _line _stripped _k
-fi
-cadence_knob FM_POLL poll 300; POLL=$CADENCE_RESULT  # seconds between cycles (captain default: 5 min).
+FM_CADENCE_WARNINGS=""
+fm_cadence_scan_unknown_keys "$CADENCE_FILE"
+fm_cadence_resolve "$CADENCE_FILE" FM_POLL poll 300; POLL=$FM_CADENCE_RESULT  # seconds between cycles (captain default: 5 min).
                                       # INVARIANT: POLL < grace (WATCHER_STALE_GRACE,
                                       # set above from FM_WATCHER_STALE_GRACE, then
                                       # FM_GUARD_GRACE) so a full cycle's wait never
@@ -241,7 +204,7 @@ cadence_knob FM_POLL poll 300; POLL=$CADENCE_RESULT  # seconds between cycles (c
                                       # grace default of 900, which is the captain's
                                       # operating pair. If either value is changed,
                                       # keep POLL below the grace.
-cadence_knob FM_HEARTBEAT heartbeat 600; HEARTBEAT=$CADENCE_RESULT  # base seconds between heartbeat scans
+fm_cadence_resolve "$CADENCE_FILE" FM_HEARTBEAT heartbeat 600; HEARTBEAT=$FM_CADENCE_RESULT  # base seconds between heartbeat scans
 HEARTBEAT_MAX=${FM_HEARTBEAT_MAX:-7200}  # heartbeat backoff cap
 CHECK_INTERVAL=${FM_CHECK_INTERVAL:-600}  # seconds between *.check.sh sweeps (captain default: 10 min)
 CHECK_TIMEOUT=${FM_CHECK_TIMEOUT:-30}     # seconds allowed per *.check.sh
@@ -269,7 +232,7 @@ case "$RESOURCE_INTERVAL" in
     RESOURCE_INTERVAL=$RESOURCE_INTERVAL_DEFAULT
     ;;
 esac
-cadence_knob FM_SIGNAL_GRACE signal_grace 240; SIGNAL_GRACE=$CADENCE_RESULT  # seconds to linger after a
+fm_cadence_resolve "$CADENCE_FILE" FM_SIGNAL_GRACE signal_grace 240; SIGNAL_GRACE=$FM_CADENCE_RESULT  # seconds to linger after a
                                       # signal so trailing signals coalesce into one wake.
                                       # Raised from 30 to 240 on 2026-07-24 evidence: one lane
                                       # produced four wakes in minutes (status append, turn-end,
@@ -1255,9 +1218,9 @@ fm_pid_identity "$WATCHER_PID" > "$WATCH_LOCK/pid-identity" 2>/dev/null || true
 # or an unknown key already fell back to its safe default above, but the operator
 # who wrote the file must see why it was not honored. Both to stderr (visible when
 # the watcher is armed in the foreground) and the triage log (durable).
-if [ -n "$CADENCE_WARNINGS" ]; then
-  echo "watcher: cadence config: $CADENCE_WARNINGS" >&2
-  triage_log "cadence config: $CADENCE_WARNINGS"
+if [ -n "$FM_CADENCE_WARNINGS" ]; then
+  echo "watcher: cadence config: $FM_CADENCE_WARNINGS" >&2
+  triage_log "cadence config: $FM_CADENCE_WARNINGS"
 fi
 
 while :; do

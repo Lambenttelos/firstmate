@@ -15,6 +15,7 @@
 #                 "LIVENESS_ESCALATION: [<time>] <what happened + resume outcome>",
 #                 "PR_CHECK_MIGRATION: <private remediation>",
 #                 "TANGLE: <remediation>",
+#                 "CONFIG_DRIFT: <value> is <live> but the captain's recorded preference is <recorded> (...)",
 #                 "SECONDMATE_SYNC: secondmate <id>: skipped: <reason>",
 #                 "NUDGE_SECONDMATES: secondmate <id>: send failed: <reason>",
 #                 "BOOTSTRAP_INFO: nudged fm-<id> with '<message>'",
@@ -992,6 +993,12 @@ if [ -n "$tangle_branch" ]; then
     echo "TANGLE: primary checkout on feature branch '$tangle_branch' (expected '$tangle_default'); the work is safe on that ref - restore the primary with: git -C $FM_ROOT checkout $tangle_default, then re-validate the branch in a proper worktree"
   fi
 fi
+# Captain-owned value drift alarm: SHOUT a CONFIG_DRIFT line when a live operating
+# value has drifted from the captain's recorded preference (config/captain-preferences).
+# Detect-only and non-mutating, so it runs in BOTH modes exactly like TANGLE; a
+# read-only session must still see that a captain-owned value silently drifted.
+# bin/fm-drift-check.sh owns the mechanism and the generalized owned-value list.
+"$SCRIPT_DIR/fm-drift-check.sh" || true
 crew=
 [ -f "$CONFIG/crew-harness" ] && crew=$(tr -d '[:space:]' < "$CONFIG/crew-harness" || true)
 if [ "${FM_BOOTSTRAP_VERBOSE_FACTS:-0}" = 1 ] && [ -n "$crew" ] && [ "$crew" != "default" ]; then

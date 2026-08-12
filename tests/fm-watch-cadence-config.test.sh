@@ -9,7 +9,7 @@
 #
 # The resolver cases source bin/fm-watch.sh in a subshell (its source guard
 # returns before the lock/loop, so only the top-level knob resolution runs) and
-# read the resolved values and CADENCE_WARNINGS the runtime would emit. The
+# read the resolved values and FM_CADENCE_WARNINGS the runtime would emit. The
 # behavioral cases run a real watcher exactly the way fm-watch-triage.test.sh
 # does, so the coalescing proof exercises the shipped loop, not a reimplementation.
 set -u
@@ -26,7 +26,7 @@ TMP_ROOT=$(fm_test_tmproot fm-watch-cadence-config)
 #
 # Source the watcher in a subshell with an isolated state/config home, no env
 # knobs, and print the three resolved cadence values plus the collected
-# CADENCE_WARNINGS. The source guard makes this load the knob block and return
+# FM_CADENCE_WARNINGS. The source guard makes this load the knob block and return
 # before acquiring the singleton lock or entering the loop.
 # Usage: resolve_cadence <config-dir> [env assignment ...]
 resolve_cadence() {  # <config-dir> [VAR=val ...]
@@ -39,7 +39,7 @@ resolve_cadence() {  # <config-dir> [VAR=val ...]
     FM_STATE_OVERRIDE="$state" FM_CONFIG_OVERRIDE="$cfg" "$@" bash -c '
       . "$1" >/dev/null 2>&1
       printf "poll=%s signal_grace=%s heartbeat=%s\n" "$POLL" "$SIGNAL_GRACE" "$HEARTBEAT"
-      printf "warnings=%s\n" "$CADENCE_WARNINGS"
+      printf "warnings=%s\n" "$FM_CADENCE_WARNINGS"
     ' _ "$WATCH"
 }
 
@@ -106,16 +106,50 @@ EOF
   pass "an unknown cadence key is ignored but reported loudly"
 }
 
-test_env_wins_over_file() {
+test_valid_file_wins_over_env() {
   local cfg out
-  cfg="$TMP_ROOT/envwins"; mkdir -p "$cfg"
+  cfg="$TMP_ROOT/filewins"; mkdir -p "$cfg"
+  cat > "$cfg/watcher-cadence" <<'EOF'
+signal_grace = 90
+poll = 120
+EOF
+  # Config-authoritative precedence: a VALID file value outranks the env var, which
+  # is the fix for the settings.local.json drift class - a stale FM_POLL a prior
+  # debugging session left in the environment must NOT win over the captain's file.
+  out=$(resolve_cadence "$cfg" FM_SIGNAL_GRACE=15 FM_POLL=1)
+  printf '%s' "$out" | grep -q 'poll=120 signal_grace=90' \
+    || fail "a valid file value did not win over the env override: $out"
+  pass "a valid config/watcher-cadence value wins over the env var (config-authoritative precedence)"
+}
+
+test_env_used_when_file_silent() {
+  local cfg out
+  cfg="$TMP_ROOT/envfallback"; mkdir -p "$cfg"
+  # A file that speaks only for signal_grace; poll is silent, so env supplies poll.
   cat > "$cfg/watcher-cadence" <<'EOF'
 signal_grace = 90
 EOF
-  out=$(resolve_cadence "$cfg" FM_SIGNAL_GRACE=15)
-  printf '%s' "$out" | grep -q 'signal_grace=15' \
-    || fail "env FM_SIGNAL_GRACE did not win over the file: $out"
-  pass "an explicit env knob still wins over the file (operator override and test seam intact)"
+  out=$(resolve_cadence "$cfg" FM_POLL=42)
+  printf '%s' "$out" | grep -q 'poll=42 signal_grace=90' \
+    || fail "env did not supply the knob the file was silent on: $out"
+  pass "the env var supplies a knob only when the file is silent on it (operator override and test seam intact)"
+}
+
+test_malformed_file_value_does_not_fall_to_env() {
+  local cfg out
+  cfg="$TMP_ROOT/malformednoenv"; mkdir -p "$cfg"
+  # A malformed file value falls to the DEFAULT loudly and must NOT consult the env
+  # for that key: the owning file said something, and a possibly-stale env value
+  # must not paper over it.
+  cat > "$cfg/watcher-cadence" <<'EOF'
+poll = soon
+EOF
+  out=$(resolve_cadence "$cfg" FM_POLL=42)
+  printf '%s' "$out" | grep -q 'poll=300' \
+    || fail "a malformed file value consulted the env instead of the default: $out"
+  printf '%s' "$out" | grep -q "warnings=.*malformed poll 'soon'" \
+    || fail "a malformed file value fell back silently (no warning): $out"
+  pass "a malformed file value falls to the default loudly and never consults the env for that key"
 }
 
 test_raised_default_is_240() {
@@ -248,7 +282,9 @@ test_absent_uses_defaults
 test_present_overrides
 test_malformed_falls_back_loudly
 test_unknown_key_warns
-test_env_wins_over_file
+test_valid_file_wins_over_env
+test_env_used_when_file_silent
+test_malformed_file_value_does_not_fall_to_env
 test_raised_default_is_240
 test_burst_coalesces_into_one_wake
 test_terminal_verb_skips_linger
