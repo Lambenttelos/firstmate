@@ -225,7 +225,8 @@ Given a slug (and usually the handback path from the prompt line above).
 
    Teardown kills the recorded pane, releases its disposable worktree, and clears its runtime record.
    The grilling session directory and handback under `data/grilling/<date>-<slug>/` are the durable record and are NOT touched by this - only the live pane is released.
-   The handback is the deliverable and the pane is disposable, so intake steps 1-5 already succeeded before this: if the captain already closed the pane, its record may be gone and teardown has nothing to release, which is fine - do not treat a missing pane as a failed intake.
+   The handback is the deliverable and the pane is disposable, so intake steps 1-5 already succeeded before this: even if the captain closed the pane, its runtime record persists until teardown runs (closing the pane does not remove the record), so teardown still finds it, kills the already-dead endpoint harmlessly, and releases the worktree.
+   Only if teardown was already run for this slug (its record is genuinely gone) does teardown report no record for the task; that means the pane is already released, so treat it as done rather than a failed intake.
    If teardown refuses because the worktree holds genuinely unlanded work (the griller committed but did not push a deliverable), that is the ordinary unlanded-work guard: report it to the captain rather than forcing, since the intake itself is already complete.
 
 Filing tickets is intake recording the session's produced work into the queue; it is not authorization to build.
