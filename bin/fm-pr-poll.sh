@@ -4,8 +4,12 @@
 # otherwise, including on every error, so a failed lookup can never be read as
 # a merge. The provider-tagged identity is data in the sidecar and is never
 # interpolated into this source: these bytes are identical for every task.
-# Each provider is read through its own standard CLI, gh for GitHub and glab
-# for GitLab, so an upstream checkout needs no extra tooling to follow either.
+# Each provider is read through its own standard interface, gh for GitHub,
+# glab for GitLab, and the Bitbucket Cloud REST API (curl + jq) for Bitbucket,
+# so an upstream checkout follows GitHub and GitLab with no extra tooling and
+# Bitbucket when curl, jq, and the NO_MISTAKES_BITBUCKET_* credentials are
+# present. A Bitbucket poll with a missing tool or credential stays silent,
+# exactly like every other error, so it can never be misread as a merge.
 set -u
 LC_ALL=C
 export LC_ALL
@@ -63,6 +67,54 @@ case "$provider" in
     esac
     [ "$url" = "https://github.com/$owner/$repo/pull/$number" ] || exit 0
     state=$(gh pr view "$url" --json state -q .state 2>/dev/null) || exit 0
+    [ "$state" = MERGED ] && printf '%s\n' merged
+    ;;
+  bitbucket)
+    # Bitbucket Cloud is served only from the constant web host bitbucket.org and
+    # addresses a repository by a validated two-segment workspace/repository path.
+    [ "$host" = bitbucket.org ] || exit 0
+    workspace=${path%%/*}
+    repo=${path#*/}
+    [ "${#workspace}" -ge 1 ] && [ "${#workspace}" -le 100 ] || exit 0
+    case "$workspace" in
+      .|..|*/*|*[!A-Za-z0-9._-]*) exit 0 ;;
+    esac
+    [ "${#repo}" -ge 1 ] && [ "${#repo}" -le 100 ] || exit 0
+    case "$repo" in
+      .|..|*/*|*[!A-Za-z0-9._-]*) exit 0 ;;
+    esac
+    [ "$url" = "https://bitbucket.org/$workspace/$repo/pull-requests/$number" ] || exit 0
+    # The REST API host is distinct from the web host and is resolved from the
+    # optional NO_MISTAKES_BITBUCKET_API_BASE_URL override, defaulting to
+    # api.bitbucket.org. An override must be a plain https URL with no
+    # whitespace, so a malformed value stays silent rather than targeting an
+    # unexpected host.
+    api_base=${NO_MISTAKES_BITBUCKET_API_BASE_URL:-https://api.bitbucket.org}
+    case "$api_base" in
+      https://*) ;;
+      *) exit 0 ;;
+    esac
+    case "$api_base" in
+      *[[:space:]]*) exit 0 ;;
+    esac
+    api_base=${api_base%/}
+    # Silent unless curl, jq, and both credential parts are present: a missing
+    # tool or credential is indistinguishable from a PR that is never merged, so
+    # it must never be reported as a merge.
+    command -v curl >/dev/null 2>&1 || exit 0
+    command -v jq >/dev/null 2>&1 || exit 0
+    [ -n "${NO_MISTAKES_BITBUCKET_EMAIL:-}" ] || exit 0
+    [ -n "${NO_MISTAKES_BITBUCKET_API_TOKEN:-}" ] || exit 0
+    # The credential is passed to curl only through a private --config file, never
+    # on the command line, so the token cannot leak into a process listing.
+    cfg=$(mktemp "${TMPDIR:-/tmp}/fm-bb-poll.XXXXXX") || exit 0
+    printf 'user = "%s:%s"\n' "$NO_MISTAKES_BITBUCKET_EMAIL" "$NO_MISTAKES_BITBUCKET_API_TOKEN" > "$cfg" 2>/dev/null || { rm -f -- "$cfg"; exit 0; }
+    response=$(curl --silent --show-error --config "$cfg" \
+      --header 'Accept: application/json' \
+      "$api_base/2.0/repositories/$workspace/$repo/pullrequests/$number" 2>/dev/null)
+    rm -f -- "$cfg"
+    [ -n "$response" ] || exit 0
+    state=$(printf '%s' "$response" | jq -r '.state // empty' 2>/dev/null) || exit 0
     [ "$state" = MERGED ] && printf '%s\n' merged
     ;;
   gitlab)

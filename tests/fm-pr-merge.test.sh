@@ -301,6 +301,98 @@ test_parses_pr_url_for_gh_axi() {
   pass "fm-pr-merge parses a GitHub PR URL into gh-axi number and --repo arguments"
 }
 
+# curl mock for the Bitbucket path: records method+url to a log and emits a body
+# plus HTTP status, matching curl --write-out. It is used for both the poll arm
+# inside fm-pr-check.sh (which does no network on arm) and the merge POST.
+add_bitbucket_curl_mock() {
+  local case_dir=$1
+  cat > "$case_dir/fakebin/curl" <<'SH'
+#!/usr/bin/env bash
+method=GET
+url=
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --request) method=$2; shift 2 ;;
+    --config|--data-binary|--header|--write-out|--output) shift 2 ;;
+    --silent|--show-error) shift ;;
+    -*) shift ;;
+    *) url=$1; shift ;;
+  esac
+done
+printf '%s %s\n' "$method" "$url" >> "$FM_TEST_BB_LOG"
+printf '%s' '{"state":"MERGED"}'
+printf '200'
+SH
+  chmod +x "$case_dir/fakebin/curl"
+}
+
+# Run fm-pr-merge on a Bitbucket URL with the Bitbucket credentials set and the
+# curl mock on PATH. jq is a real dependency and is expected on the test host.
+run_pr_merge_bitbucket() {
+  local case_dir=$1 rc; shift
+  FM_ROOT_OVERRIDE="$ROOT" \
+  FM_STATE_OVERRIDE="$case_dir/state" \
+  FM_TEST_BB_LOG="$case_dir/bb.log" \
+  NO_MISTAKES_BITBUCKET_EMAIL=me@example.com \
+  NO_MISTAKES_BITBUCKET_API_TOKEN=tok-secret \
+  PATH="$case_dir/fakebin:$PATH" \
+    "$PR_MERGE" "$@"
+  rc=$?
+  return "$rc"
+}
+
+test_bitbucket_merge_records_pr_and_merges() {
+  if ! command -v jq >/dev/null 2>&1; then
+    pass "fm-pr-merge Bitbucket path skipped: jq not installed on this host"
+    return
+  fi
+  local case_dir rc
+  case_dir=$(make_case bitbucket-merge)
+  mkdir -p "$case_dir/wt"
+  add_bitbucket_curl_mock "$case_dir"
+  : > "$case_dir/bb.log"
+
+  set +e
+  run_pr_merge_bitbucket "$case_dir" task-x1 https://bitbucket.org/dashnow/hyfin/pull-requests/9 \
+    > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 0 "$rc" "bitbucket-merge: fm-pr-merge should succeed on a Bitbucket PR"
+  assert_grep 'pr=https://bitbucket.org/dashnow/hyfin/pull-requests/9' "$case_dir/state/task-x1.meta" \
+    "bitbucket-merge: pr= was not recorded"
+  grep -qxF 'POST https://api.bitbucket.org/2.0/repositories/dashnow/hyfin/pullrequests/9/merge' "$case_dir/bb.log" \
+    || fail "bitbucket-merge: the Bitbucket merge endpoint was not hit: $(cat "$case_dir/bb.log")"
+  pass "fm-pr-merge records pr= and merges a Bitbucket PR through the REST API"
+}
+
+test_bitbucket_merge_refuses_without_credentials() {
+  local case_dir rc
+  case_dir=$(make_case bitbucket-nocred)
+  mkdir -p "$case_dir/wt"
+  add_bitbucket_curl_mock "$case_dir"
+  : > "$case_dir/bb.log"
+
+  set +e
+  FM_ROOT_OVERRIDE="$ROOT" \
+  FM_STATE_OVERRIDE="$case_dir/state" \
+  FM_TEST_BB_LOG="$case_dir/bb.log" \
+  NO_MISTAKES_BITBUCKET_EMAIL='' \
+  NO_MISTAKES_BITBUCKET_API_TOKEN='' \
+  PATH="$case_dir/fakebin:$PATH" \
+    "$PR_MERGE" task-x1 https://bitbucket.org/dashnow/hyfin/pull-requests/9 \
+    > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 1 "$rc" "bitbucket-nocred: fm-pr-merge should refuse without Bitbucket credentials"
+  assert_grep 'NO_MISTAKES_BITBUCKET_EMAIL' "$case_dir/stderr" \
+    "bitbucket-nocred: refusal did not name the missing credential"
+  assert_no_grep 'merge' "$case_dir/bb.log" \
+    "bitbucket-nocred: the Bitbucket merge endpoint was hit without credentials"
+  pass "fm-pr-merge refuses a Bitbucket merge when credentials are absent"
+}
+
 # Run fm-pr-merge in orphan mode with only a fakebin (no task meta, no state
 # dir needed), routing gh-axi to the log and DATA to a case-local dir.
 run_pr_merge_orphan() {
@@ -414,6 +506,8 @@ test_repo_override_args_refuse_before_recording
 test_explicit_merge_method_not_overridden
 test_method_equals_merge_method_not_overridden
 test_parses_pr_url_for_gh_axi
+test_bitbucket_merge_records_pr_and_merges
+test_bitbucket_merge_refuses_without_credentials
 test_orphan_merges_and_records_evidence_without_meta
 test_orphan_repo_mismatch_refuses
 test_orphan_repo_override_args_refuse
