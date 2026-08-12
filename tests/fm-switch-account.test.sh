@@ -129,10 +129,24 @@ export COMPOSER_DIR BACKEND_LOG
 # Skip real waits.
 export FM_SWITCH_SEND_SETTLE=0 FM_SWITCH_CONFIRM_WAIT=0 FM_SWITCH_CLEAR_SETTLE=0
 
+# Fake auth.json so label validation is deterministic and never depends on the
+# host's real jcode account file. The known labels here (claude-2, claude-4) are
+# exactly the ones the cases below switch to.
+AUTH_JSON="$TMPROOT/auth.json"
+cat > "$AUTH_JSON" <<'JSON'
+{"anthropic_accounts":[{"label":"claude-2","email":"a@example.com"},{"label":"claude-4","email":"b@example.com"}],"active_anthropic_account":"claude-2"}
+JSON
+export FM_SWITCH_AUTH_JSON="$AUTH_JSON"
+
 run_switch() {  # <args...> -> sets OUT / RC
   : > "$BACKEND_LOG"
   OUT=$(cd "$REPO" && ./bin/fm-switch-account.sh "$@" 2>&1)
   RC=$?
+}
+
+# assert_empty_file <file> <msg>: file must exist and be empty (no pane sends).
+assert_empty_file() {
+  [ -f "$1" ] && [ ! -s "$1" ] || fail "$2 (file not empty: $1)"
 }
 
 # --- case 1: no-args discovery lists the recorded targets verbatim ------------
@@ -246,6 +260,47 @@ OUT=$(cd "$REPO" && ./bin/fm-switch-account.sh 2>&1); RC=$?
 expect_code 2 "$RC" "a missing label must exit 2"
 assert_contains "$OUT" "usage:" "a missing label must print usage"
 pass "a missing label argument exits 2 with usage"
+
+# --- case 9a: --help prints usage, exits 0, broadcasts nothing -----------------
+# REPEAT-OFFENSE guard: `fm-switch-account.sh --help` used to be broadcast into
+# every live worker pane. It must now print usage and never touch a pane.
+run_switch --help
+expect_code 0 "$RC" "--help must exit 0"
+assert_contains "$OUT" "usage:" "--help must print usage"
+assert_empty_file "$BACKEND_LOG" "--help must never send anything to a pane"
+pass "--help prints usage and broadcasts nothing"
+
+# --- case 9b: --status shows active + known labels, broadcasts nothing ---------
+run_switch --status
+expect_code 0 "$RC" "--status must exit 0"
+assert_contains "$OUT" "active account: claude-2" "--status must report the active account"
+assert_contains "$OUT" "claude-4" "--status must list the known labels"
+assert_empty_file "$BACKEND_LOG" "--status must never send anything to a pane"
+pass "--status shows active and known labels, broadcasts nothing"
+
+# --- case 9c: an unrecognized dashed first arg is rejected, broadcasts nothing -
+# The core repeat-offense fix: a leading-dash arg that is not a known flag (a
+# typo like --stat, or -x) must be rejected with usage BEFORE any pane send.
+run_switch --nope
+expect_code 2 "$RC" "an unrecognized dashed arg must exit non-zero"
+assert_contains "$OUT" "unrecognized option" "an unrecognized dashed arg must be rejected"
+assert_empty_file "$BACKEND_LOG" "an unrecognized dashed arg must never be broadcast"
+pass "an unrecognized dashed first arg is rejected and broadcasts nothing"
+
+# --- case 9d: an unknown (non-dashed) label is rejected before broadcasting ----
+run_switch claude-99
+expect_code 2 "$RC" "an unknown label must exit non-zero"
+assert_contains "$OUT" "unknown account label" "an unknown label must be rejected"
+assert_empty_file "$BACKEND_LOG" "an unknown label must never be broadcast"
+pass "an unknown account label is rejected before any pane send"
+
+# --- case 9e: an unreadable auth set skips validation (legit switch survives) --
+# When auth.json cannot be read the known set is empty; validation is skipped so
+# a legitimate switch is never blocked by a missing account file.
+OUT=$(cd "$REPO" && FM_SWITCH_AUTH_JSON="$TMPROOT/nope.json" ./bin/fm-switch-account.sh claude-2 2>&1); RC=$?
+expect_code 0 "$RC" "a missing auth file must not block a switch"
+assert_contains "$OUT" "in 2 pane(s)" "a missing auth file skips validation and still switches"
+pass "a missing auth file skips validation rather than blocking the switch"
 
 # --- case 10: no stray e_* files left in the repo root ------------------------
 strays=""

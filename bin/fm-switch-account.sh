@@ -7,8 +7,13 @@
 #
 # Usage:
 #   bin/fm-switch-account.sh <label> [pane_id ...]
+#   bin/fm-switch-account.sh --help | --status
 #
-#   <label>     required, e.g. claude-2 or claude-4
+#   <label>     required, e.g. claude-1 or claude-2. Validated against the known
+#               account labels in jcode's auth.json BEFORE anything is broadcast.
+#   --help      print usage and exit 0 without broadcasting.
+#   --status    print the currently active account and the known labels without
+#               broadcasting a switch.
 #   pane_id...  optional explicit herdr targets in the full
 #               "<session>:<workspace>:<pane>" form (e.g. "default:w1J:p3"), the
 #               same value meta records in window=; if omitted, all live worker
@@ -55,10 +60,87 @@ confirm_wait="${FM_SWITCH_CONFIRM_WAIT:-5}"
 # Settle between the Escape that clears a pending composer and the re-check.
 clear_settle="${FM_SWITCH_CLEAR_SETTLE:-0.5}"
 
+usage() {
+  cat >&2 <<EOF
+usage: $0 <label> [pane_id ...]
+       $0 --help | --status
+
+  <label>     account label to switch every live worker to (e.g. claude-1).
+              Must be one of the known account labels; validated before any
+              pane is touched.
+  --help      show this help and exit without broadcasting.
+  --status    show the active account and known labels without broadcasting.
+EOF
+}
+
+# Resolve jcode's auth.json. Overridable for tests via FM_SWITCH_AUTH_JSON.
+auth_json="${FM_SWITCH_AUTH_JSON:-${JCODE_HOME:-$HOME/.jcode}/auth.json}"
+
+# Print the known account labels (one per line), best effort. Empty when the
+# auth file is missing or unreadable - callers must treat empty as "unknown set".
+known_labels() {
+  [ -f "$auth_json" ] || return 0
+  grep -o '"label"[[:space:]]*:[[:space:]]*"[^"]*"' "$auth_json" 2>/dev/null \
+    | sed 's/.*"\([^"]*\)"$/\1/'
+}
+
+# Print the currently active account label, best effort.
+active_label() {
+  [ -f "$auth_json" ] || return 0
+  grep -o '"active_anthropic_account"[[:space:]]*:[[:space:]]*"[^"]*"' "$auth_json" 2>/dev/null \
+    | head -1 | sed 's/.*"\([^"]*\)"$/\1/'
+}
+
 label="${1:-}"
+
+# Subcommands and guard: handle --help/--status and reject any leading-dash first
+# arg that is not a recognized flag BEFORE broadcasting anything. Typing an
+# unrecognized flag (--help, --status, a typo) used to be sent verbatim into
+# every live worker pane; this guard stops that.
+case "$label" in
+  --help | -h | help)
+    usage
+    exit 0
+    ;;
+  --status | status)
+    active="$(active_label)"
+    echo "active account: ${active:-unknown}"
+    mapfile -t _st_labels < <(known_labels)
+    if [ "${#_st_labels[@]}" -gt 0 ]; then
+      echo "known labels:"
+      printf '  %s\n' "${_st_labels[@]}"
+    else
+      echo "known labels: (none found in $auth_json)"
+    fi
+    exit 0
+    ;;
+  -*)
+    echo "error: unrecognized option '$label'" >&2
+    usage
+    exit 2
+    ;;
+esac
+
 if [ -z "$label" ]; then
-  echo "usage: $0 <label> [pane_id ...]" >&2
+  usage
   exit 2
+fi
+
+# Validate the label against the known account set before broadcasting. An
+# unknown label is a typo, not a switch target: reject it here so it is never
+# broadcast into every live worker pane. When the known set cannot be read
+# (auth.json missing), skip validation rather than block a legitimate switch.
+mapfile -t _known < <(known_labels)
+if [ "${#_known[@]}" -gt 0 ]; then
+  _match=0
+  for _l in "${_known[@]}"; do
+    [ "$_l" = "$label" ] && { _match=1; break; }
+  done
+  if [ "$_match" -eq 0 ]; then
+    echo "error: unknown account label '$label' (known: ${_known[*]})" >&2
+    usage
+    exit 2
+  fi
 fi
 shift || true
 
