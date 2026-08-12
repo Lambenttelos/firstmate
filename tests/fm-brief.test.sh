@@ -190,7 +190,7 @@ test_direct_push_autoland_dod_semantics() {
 # hyfin and hyfin-server ship briefs carry a "Live stack repro" block with the
 # exact own-local-stack commands so a live merchant repro is never falsely declared
 # impossible. Any other repo, and the scout variant, must NOT carry it. The block
-# still defers to the fleet-wide two-at-once live-browser cap.
+# carries the non-blocking browser announce.
 test_hyfin_live_stack_repro_block() {
   local home id brief
   home="$TMP_ROOT/hyfin-repro-home"
@@ -210,8 +210,8 @@ test_hyfin_live_stack_repro_block() {
     "hyfin ship brief lost the Playwright lane pointer"
   assert_grep "docs/e2e-lanes.md" "$brief" \
     "hyfin ship brief lost the e2e-lanes doc reference"
-  assert_grep "at most TWO live browser reproductions run fleet-wide at once" "$brief" \
-    "hyfin ship brief dropped the fleet-wide live-browser cap deference"
+  assert_grep 'working: BROWSER START' "$brief" \
+    "hyfin ship brief dropped the non-blocking browser announce"
   # hyfin-server ship brief carries it too.
   id="brief-hyfinserver-c2"
   FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" hyfin-server >/dev/null 2>&1
@@ -577,12 +577,14 @@ test_briefs_bind_the_shared_machine_rules() {
       "$kind brief must require a TEST START announcement"
     assert_grep 'working: TEST END' "$brief" \
       "$kind brief must require a TEST END announcement"
-    assert_grep 'TWO live browser reproductions' "$brief" \
-      "$kind brief must state the fleet-wide two-browser ceiling"
-    assert_grep 'working: BROWSER WAIT' "$brief" \
-      "$kind brief must make the crewmate wait for a browser go-ahead"
+    assert_grep 'working: BROWSER START' "$brief" \
+      "$kind brief must require a BROWSER START announcement"
     assert_grep 'working: BROWSER END' "$brief" \
-      "$kind brief must release the browser slot when the run finishes"
+      "$kind brief must require a BROWSER END announcement"
+    assert_grep 'never wait on firstmate for a slot' "$brief" \
+      "$kind brief must keep the browser announce non-blocking"
+    assert_no_grep 'working: BROWSER WAIT' "$brief" \
+      "$kind brief must not make the crewmate wait for a browser slot"
   done
 
   brief="$home/data/brief-rules-ship/brief.md"
