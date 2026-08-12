@@ -19,6 +19,19 @@
 #    clears pending text with one Escape before sending, skipping panes that
 #    stay pending (real human typing) or read unknown (dead/non-agent pane).
 #
+# 3. The herdr target must be passed VERBATIM (task
+#    fix-jcode-composer-probe-unknown-blocks-account-switch): a herdr meta records
+#    window= as the full "<session>:<workspace>:<pane>" id (e.g.
+#    "default:w1J:p3"), and the herdr adapter's parse_target splits on the FIRST
+#    colon only - the leading field is the herdr --session, the remainder is the
+#    whole pane id. An earlier version stripped the "default:" prefix, leaving
+#    "w1J:p3", which herdr then read as session=w1J pane=p3 and rejected as
+#    pane_not_found, so EVERY live jcode composer probe returned `unknown` and the
+#    script skipped the whole fleet. The fake fm-backend.sh below emulates that
+#    same first-colon split in its composer/send/capture stubs, so a target that
+#    is not passed verbatim reads `unknown` here exactly as real herdr would -
+#    that is what makes case 1 a genuine regression guard, not a string check.
+#
 # Everything is injected: a fake repo layout (bin/ + state/) plus a fake
 # fm-backend.sh whose composer states are scripted per target, so no assertion
 # depends on any real pane, task, backend, or account.
@@ -78,8 +91,20 @@ fm_backend_target_of_meta() {
   [ -n "$window" ] && printf '%s' "$window"
 }
 _fst_san() { printf '%s' "$1" | tr ':/' '__'; }
+# Emulate the herdr adapter's fm_backend_herdr_parse_target: a herdr target is
+# "<session>:<workspace>:<pane>" and it splits on the FIRST colon only, using
+# the leading field as the herdr --session. Our fake live panes all live under
+# the "default" session, so a herdr target whose first field is not "default"
+# is a target that was NOT passed verbatim (e.g. a "default:"-stripped id) and
+# reads unknown, exactly as real herdr would return pane_not_found. tmux targets
+# are opaque here and always resolve.
+_fst_herdr_bad_target() {  # <backend> <target> -> 0 when herdr and NOT default:*
+  [ "$1" = herdr ] || return 1
+  case "$2" in default:*) return 1 ;; *) return 0 ;; esac
+}
 fm_backend_composer_state() {  # <backend> <target>
   local target=$2 f line
+  _fst_herdr_bad_target "$1" "$target" && { printf 'unknown'; return 0; }
   f="$COMPOSER_DIR/$(_fst_san "$target")"
   [ -f "$f" ] || { printf 'empty'; return 0; }
   line=$(head -1 "$f")
@@ -110,9 +135,9 @@ run_switch() {  # <args...> -> sets OUT / RC
   RC=$?
 }
 
-# --- case 1: no-args discovery skips a windowless meta and lists the rest -----
-# herdr-backed metas exercise the default: prefix strip. bravo omits backend=
-# so it resolves to tmux (P1 compat) and keeps its full id.
+# --- case 1: no-args discovery lists the recorded targets verbatim ------------
+# herdr-backed metas keep their full "default:<ws>:<pane>" id (the adapter needs
+# it verbatim). bravo omits backend= so it resolves to tmux (P1 compat).
 fm_write_meta "$REPO/state/alpha.meta" "backend=herdr" "window=default:w1:p2" "project=alpha"
 fm_write_meta "$REPO/state/bravo.meta" "window=w2:p3" "project=bravo"
 fm_write_meta "$REPO/state/.lavish-lan.meta" "port=4388" "bind=0.0.0.0" "target=4387"
@@ -120,72 +145,88 @@ fm_write_meta "$REPO/state/.lavish-lan.meta" "port=4388" "bind=0.0.0.0" "target=
 run_switch claude-2
 expect_code 0 "$RC" "no-args discovery must exit 0 with a windowless meta present"
 assert_contains "$OUT" "in 2 pane(s)" "discovery must find exactly the two windowed panes"
-assert_contains "$OUT" "w1:p2" "discovery must include the first windowed pane"
+assert_contains "$OUT" "default:w1:p2" "discovery must keep the herdr target verbatim (adapter splits on the first colon)"
 assert_contains "$OUT" "w2:p3" "discovery must include the second windowed pane"
 assert_not_contains "$OUT" "no target panes" "discovery must not report an empty target set"
-assert_not_contains "$OUT" "default:w1:p2" "the default: prefix must be stripped from herdr pane ids"
-pass "no-args discovery lists windowed panes and skips a windowless meta"
+pass "no-args discovery lists windowed panes verbatim and skips a windowless meta"
 
 # --- case 2: each discovered target is sent on its recorded backend -----------
-# alpha resolves to herdr (id stripped to w1:p2), bravo has no backend= so it
-# resolves to tmux (P1 compat) and keeps its full id.
+# alpha resolves to herdr with its FULL id (default:w1:p2), bravo has no
+# backend= so it resolves to tmux (P1 compat) and keeps its full id.
 run_switch claude-2
-assert_grep "send_text herdr w1:p2 /account claude switch claude-2" "$BACKEND_LOG" "herdr meta must be sent on herdr with a stripped id"
+assert_grep "send_text herdr default:w1:p2 /account claude switch claude-2" "$BACKEND_LOG" "herdr meta must be sent on herdr with its verbatim id"
 assert_grep "send_text tmux w2:p3 /account claude switch claude-2" "$BACKEND_LOG" "backendless meta must be sent on tmux"
 pass "each discovered target is sent on its recorded backend"
 
 # --- case 3: an empty composer is sent the switch command normally ------------
-set_composer "w1:p2" empty
+set_composer "default:w1:p2" empty
 set_composer "w2:p3" empty
 run_switch claude-2
 expect_code 0 "$RC" "empty composers must exit 0"
-assert_grep "send_text herdr w1:p2 /account claude switch claude-2" "$BACKEND_LOG" "empty composer must receive the switch"
+assert_grep "send_text herdr default:w1:p2 /account claude switch claude-2" "$BACKEND_LOG" "empty composer must receive the switch"
 assert_no_grep "send_key" "$BACKEND_LOG" "an empty composer must never get an Escape"
 pass "an empty composer is sent the switch command with no Escape"
 
+# --- case 3b: REGRESSION - a live herdr composer must NOT read unknown ---------
+# The bug this task fixes: the script stripped "default:" from the herdr target,
+# leaving "w1:p2", which the adapter read as session=w1 pane=p2 and rejected,
+# so every live jcode composer probed `unknown` and the whole fleet was skipped
+# with zero switched. The fake backend above emulates that same first-colon
+# split, so a stripped target would read unknown here too. Assert the live
+# herdr pane is actually switched (verbatim target reaches the send path) and
+# is never reported skipped-as-unknown.
+set_composer "default:w1:p2" empty
+set_composer "w2:p3" empty
+run_switch claude-2
+assert_grep "send_text herdr default:w1:p2 /account claude switch claude-2" "$BACKEND_LOG" "a live herdr composer must actually be switched, not skipped as unknown"
+assert_not_contains "$OUT" "default:w1:p2: SKIPPED" "a live herdr composer must never be skipped as unknown (the stripped-target regression)"
+pass "a live herdr composer is switched, never skipped unknown from a mangled target"
+
 # --- case 4: a pending composer gets Escape-cleared then sent -----------------
 # First read pending, Escape, second read empty -> proceed.
-set_composer "w1:p2" pending empty
+set_composer "default:w1:p2" pending empty
 set_composer "w2:p3" empty
 run_switch claude-2
 expect_code 0 "$RC" "an Escape-clearable pending composer must exit 0"
-assert_grep "send_key herdr w1:p2 Escape" "$BACKEND_LOG" "a pending composer must get one Escape"
-assert_grep "send_text herdr w1:p2 /account claude switch claude-2" "$BACKEND_LOG" "a cleared composer must then be sent the switch"
+assert_grep "send_key herdr default:w1:p2 Escape" "$BACKEND_LOG" "a pending composer must get one Escape"
+assert_grep "send_text herdr default:w1:p2 /account claude switch claude-2" "$BACKEND_LOG" "a cleared composer must then be sent the switch"
 pass "a pending composer is Escape-cleared before the switch is sent"
 
 # --- case 5: a stubbornly-pending composer is SKIPPED, never garbled ----------
 # pending on both reads (Escape did not clear) -> skip, no send.
-set_composer "w1:p2" pending pending
+set_composer "default:w1:p2" pending pending
 set_composer "w2:p3" empty
 run_switch claude-2
 expect_code 0 "$RC" "a stubborn pending pane must not fail the run"
-assert_grep "send_key herdr w1:p2 Escape" "$BACKEND_LOG" "the stubborn pane must still have been Escape-tried once"
+assert_grep "send_key herdr default:w1:p2 Escape" "$BACKEND_LOG" "the stubborn pane must still have been Escape-tried once"
 assert_contains "$OUT" "SKIPPED" "a stubborn pending pane must be reported skipped"
-assert_no_grep "send_text herdr w1:p2 " "$BACKEND_LOG" "a stubborn pending pane must never be sent the switch"
+assert_no_grep "send_text herdr default:w1:p2 " "$BACKEND_LOG" "a stubborn pending pane must never be sent the switch"
 assert_grep "send_text tmux w2:p3 /account claude switch claude-2" "$BACKEND_LOG" "the other pane must still be switched"
 pass "a stubbornly-pending composer is skipped, never garbled"
 
 # --- case 6: an unknown composer state is SKIPPED, never blind-injected -------
-set_composer "w1:p2" unknown
+set_composer "default:w1:p2" unknown
 set_composer "w2:p3" empty
 run_switch claude-2
 expect_code 0 "$RC" "an unknown pane must not fail the run"
 assert_contains "$OUT" "SKIPPED" "an unknown composer must be reported skipped"
-assert_no_grep "send_text herdr w1:p2 " "$BACKEND_LOG" "an unknown composer must never be injected into"
+assert_no_grep "send_text herdr default:w1:p2 " "$BACKEND_LOG" "an unknown composer must never be injected into"
 assert_grep "send_text tmux w2:p3 /account claude switch claude-2" "$BACKEND_LOG" "the healthy pane must still be switched"
 pass "an unknown composer state is skipped, never blind-injected"
 
 # --- case 7: explicit pane-id args bypass discovery and use herdr -------------
 # Explicit ids have no meta, so they keep the historical herdr assumption and
-# are used verbatim.
-set_composer "pX:p9" empty
-set_composer "pY:p1" empty
-run_switch claude-4 pX:p9 pY:p1
+# are used verbatim. Per the fixed contract they must be the full
+# "<session>:<workspace>:<pane>" form the adapter needs (the same value meta
+# records in window=), so the fake backend's first-colon split resolves them.
+set_composer "default:wX:p9" empty
+set_composer "default:wY:p1" empty
+run_switch claude-4 default:wX:p9 default:wY:p1
 expect_code 0 "$RC" "explicit pane args must exit 0"
 assert_contains "$OUT" "in 2 pane(s)" "explicit args must target exactly the given panes"
-assert_grep "send_text herdr pX:p9 /account claude switch claude-4" "$BACKEND_LOG" "explicit pane pX:p9 must be targeted on herdr"
-assert_grep "send_text herdr pY:p1 /account claude switch claude-4" "$BACKEND_LOG" "explicit pane pY:p1 must be targeted on herdr"
-assert_no_grep "w1:p2" "$BACKEND_LOG" "explicit args must not fall back to discovered panes"
+assert_grep "send_text herdr default:wX:p9 /account claude switch claude-4" "$BACKEND_LOG" "explicit pane default:wX:p9 must be targeted on herdr"
+assert_grep "send_text herdr default:wY:p1 /account claude switch claude-4" "$BACKEND_LOG" "explicit pane default:wY:p1 must be targeted on herdr"
+assert_no_grep "default:w1:p2" "$BACKEND_LOG" "explicit args must not fall back to discovered panes"
 pass "explicit pane-id args bypass discovery and use herdr"
 
 # --- case 8: a state/ with zero windowed metas reports no targets and exits 1 -

@@ -9,7 +9,9 @@
 #   bin/fm-switch-account.sh <label> [pane_id ...]
 #
 #   <label>     required, e.g. claude-2 or claude-4
-#   pane_id...  optional explicit herdr pane ids; if omitted, all live worker
+#   pane_id...  optional explicit herdr targets in the full
+#               "<session>:<workspace>:<pane>" form (e.g. "default:w1J:p3"), the
+#               same value meta records in window=; if omitted, all live worker
 #               targets recorded in state/<id>.meta are targeted, each on the
 #               backend that meta records (defaulting to tmux per the P1
 #               compatibility contract in fm_backend_of_meta).
@@ -72,11 +74,17 @@ if [ "${#panes[@]}" -eq 0 ]; then
     # A meta without a resolvable target is not a target; `|| true` keeps that
     # expected miss from tripping set -e/pipefail.
     target="$(fm_backend_target_of_meta "$metafile" 2>/dev/null || true)"
-    # Strip an optional backend-session prefix (e.g. "default:") that herdr
-    # pane commands do not accept; keep only the trailing "<ws>:<pane>" id.
-    if [ "$backend" = herdr ]; then
-      target="${target##*default:}"
-    fi
+    # Pass the recorded target verbatim. A herdr target is the full
+    # "<session>:<workspace>:<pane>" form (e.g. "default:w1J:p3"), and the herdr
+    # adapter's fm_backend_herdr_parse_target splits on the FIRST colon only:
+    # the leading field is the herdr session it passes as --session, the
+    # remainder is the whole pane id. Stripping the "default:" prefix left
+    # "w1J:p3", which herdr then reads as session=w1J pane=p3 and rejects as
+    # pane_not_found, so EVERY live jcode composer probe returned `unknown` and
+    # fm-switch-account skipped the whole fleet (task
+    # fix-jcode-composer-probe-unknown-blocks-account-switch, verified live
+    # 2026-08-12). Every other fm_backend_* caller passes this same meta window=
+    # value unchanged, so this script must too.
     [ -n "$target" ] || continue
     panes+=("$target")
     target_backends["$target"]="${backend:-tmux}"
