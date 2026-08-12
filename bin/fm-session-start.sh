@@ -43,6 +43,12 @@
 #                       data/captain-shared.md, data/learnings.md: read-only,
 #                       always safe, always runs.
 #   5. fleet digest   - a compact data/backlog.md identity/metadata listing,
+#                       a prominent cross-session stall banner (any worker a
+#                       prior session left paused/blocked, read via
+#                       bin/fm-crew-state.sh, surfaced above the per-task status
+#                       tails so a shared-account or rate-limit stall is loud at
+#                       attach instead of buried; paused is age-gated by
+#                       FM_SESSION_START_STALL_THRESHOLD, blocked always shows),
 #                       every state/*.meta, a bounded state/*.status tail,
 #                       one host CPU/memory/swap reading with the concurrent-crew
 #                       ceiling it supports (bin/fm-resource-check.sh, so the
@@ -121,6 +127,16 @@ case "$STATUS_TAIL" in ''|*[!0-9]*) STATUS_TAIL=5 ;; esac
 BACKLOG_LIMIT=${FM_SESSION_START_BACKLOG_LIMIT:-80}
 case "$BACKLOG_LIMIT" in ''|*[!0-9]*|0) BACKLOG_LIMIT=80 ;; esac
 
+# Cross-session stall surfacing. A task a PRIOR session left paused (a bounded
+# external wait) or blocked (needs firstmate action) must be LOUD at attach, not
+# buried in the per-task status tails a firstmate has to go read. STALL_THRESHOLD
+# (seconds) gates only the paused case: any blocked worker surfaces regardless of
+# age because it needs action, while a paused worker surfaces only once its last
+# status event is older than the threshold, so a fresh pause from THIS session's
+# own recent dispatch does not nag. Default 1800 (30 min).
+STALL_THRESHOLD=${FM_SESSION_START_STALL_THRESHOLD:-1800}
+case "$STALL_THRESHOLD" in ''|*[!0-9]*) STALL_THRESHOLD=1800 ;; esac
+
 # Recent-tail window for the two large consolidated context files (captain.md,
 # learnings.md): the last N lines emitted alongside the curated top so newest
 # dated rulings appended below the consolidation seam are never dropped.
@@ -134,6 +150,9 @@ case "$LEARNINGS_FULL" in 1) LEARNINGS_FULL=1 ;; *) LEARNINGS_FULL=0 ;; esac
 
 RULE='================================================================================'
 SUBRULE='--------------------------------------------------------------------------------'
+# The field separator fm-crew-state.sh emits between "state: · source: · detail".
+# Kept identical so print_cross_session_stalls can split that line reliably.
+CREW_STATE_SEP=' · '
 
 section() { printf '\n%s\n%s\n%s\n' "$RULE" "$1" "$RULE"; }
 subsection() { printf '\n%s\n%s\n' "$1" "$SUBRULE"; }
@@ -304,6 +323,78 @@ print_status_tail() {
   tail -n "$STATUS_TAIL" "$status"
 }
 
+# Portable file mtime in epoch seconds; empty on failure.
+file_mtime_epoch() {
+  if [ "$(uname)" = Darwin ]; then
+    stat -f %m "$1" 2>/dev/null
+  else
+    stat -c %Y "$1" 2>/dev/null
+  fi
+}
+
+# Cross-session stall surfacing. Scan every task's CURRENT state via
+# bin/fm-crew-state.sh (the same current-state reconciliation the rest of the
+# fleet uses - NOT a tail of the status EVENT log) and surface, prominently and
+# separately from the per-task status tails, any worker a prior session left
+# stalled:
+#   - blocked: needs firstmate action -> always surfaced, any age.
+#   - paused:  a bounded external wait (rate-limit reset, upstream release,
+#              scheduled window) -> surfaced only once its last status event is
+#              older than STALL_THRESHOLD, so a pause THIS session just created
+#              does not nag.
+# A shared-account usage-window stall left by an 11:39 session was invisible to
+# the 17:14 session precisely because it lived only in status tails; this makes
+# it loud at attach. Complements classify-auth-limit-as-blocked-not-paused (which
+# reclassifies auth stalls to blocked) and any shared-account rollup - it only
+# makes the cross-session stall visible, it does not reclassify anything.
+print_cross_session_stalls() {
+  local now stall_lines meta id state_line state detail status age m
+  now=$(date +%s)
+  stall_lines=""
+  for meta in "$STATE"/*.meta; do
+    [ -f "$meta" ] || continue
+    id=$(basename "$meta" .meta)
+    state_line=$("$SCRIPT_DIR/fm-crew-state.sh" "$id" 2>/dev/null) || continue
+    # Parse "state: <s> · source: <src> · <detail>".
+    state=${state_line#state: }
+    state=${state%%"$CREW_STATE_SEP"*}
+    detail=""
+    case "$state_line" in
+      *"$CREW_STATE_SEP"source:*"$CREW_STATE_SEP"*) detail=${state_line#*"$CREW_STATE_SEP"source:*"$CREW_STATE_SEP"} ;;
+    esac
+    case "$state" in
+      blocked)
+        stall_lines="$stall_lines$(printf 'BLOCKED  %-40s needs firstmate action: %s\n' "$id" "${detail:-no detail}")
+"
+        ;;
+      paused)
+        status="$STATE/$id.status"
+        age=""
+        if [ -f "$status" ]; then
+          m=$(file_mtime_epoch "$status")
+          case "$m" in ''|*[!0-9]*) m="" ;; esac
+          [ -n "$m" ] && age=$((now - m))
+        fi
+        # Surface a pause only once it is older than the threshold.
+        if [ -n "$age" ] && [ "$age" -ge "$STALL_THRESHOLD" ]; then
+          stall_lines="$stall_lines$(printf 'PAUSED   %-40s external wait, idle %dm: %s\n' "$id" "$((age / 60))" "${detail:-no detail}")
+"
+        elif [ -z "$age" ]; then
+          # No readable status mtime: cannot bound the age, so surface it rather
+          # than silently hide a possibly-old pause.
+          stall_lines="$stall_lines$(printf 'PAUSED   %-40s external wait, idle unknown: %s\n' "$id" "${detail:-no detail}")
+"
+        fi
+        ;;
+    esac
+  done
+  if [ -n "$stall_lines" ]; then
+    subsection "STALLED WORKERS FROM A PRIOR SESSION (act on these first)"
+    printf 'These workers are idle waiting - surfaced here so a cross-session stall is not buried in status tails below. BLOCKED needs your action; PAUSED is a bounded external wait rechecked on a long cadence.\n'
+    printf '%s' "$stall_lines"
+  fi
+}
+
 hash_file() {
   local file=$1
   [ -f "$file" ] || return 1
@@ -446,6 +537,11 @@ print_file_compact_top "$DATA/learnings.md" "data/learnings.md" \
 # --- 5. fleet-state digest ---------------------------------------------
 section "FLEET STATE"
 print_backlog_compact "$DATA/backlog.md" "data/backlog.md"
+
+# Cross-session stall banner FIRST in the fleet digest, above the per-task
+# status tails, so a paused/blocked worker a prior session left behind is loud
+# at attach instead of buried where a firstmate has to go read it.
+print_cross_session_stalls
 
 subsection "Work under way (state/*.meta)"
 META_FOUND=0
