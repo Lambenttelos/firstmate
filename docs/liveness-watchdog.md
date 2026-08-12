@@ -30,7 +30,7 @@ On a trigger it does two things:
    The supervisor pane is the herdr pane firstmate itself runs in.
    It is recorded durably at session start into `state/.supervisor-target`, because the detached watchdog loop inherits none of the primary's herdr environment and cannot resolve the pane itself.
    The watchdog reads that pane's agent liveness (`fm_backend_agent_alive`, which for jcode-on-herdr corroborates a no-agent pane by reading its composer row) and acts:
-   - a live-but-idle client gets a gentle Enter nudge to re-drive its turn;
+   - a live-but-idle client gets a wake to re-drive its turn, whose form depends on the primary harness: on claude and grok a bare Enter re-drives the idle turn, so the watchdog sends a gentle Enter nudge; on jcode a bare Enter does NOT re-drive an idle model (see [jcode-wake-adapter.md](jcode-wake-adapter.md)), so the watchdog instead injects a typed, marked wake line via the backend's verify-retry text submit, the same mechanism the present-mode daemon's pane-wake uses. The harness comes from `FM_SUPERVISOR_HARNESS` when set, else `bin/fm-harness.sh`; an unreadable harness falls back to the safe bare-Enter path.
    - a confidently dead-shell husk gets a configured relaunch command run in the pane, but only if the captain provided one (`config/liveness-resume`);
    - a dead shell with no relaunch command, or a home with no recorded supervisor pane, gets a clean escalation and no pane action.
    Resume is capped and rate-limited per down-episode (`FM_LIVENESS_MAX_RESUMES`, default 3): after the cap it stops re-nudging and just escalates, because a resume loop against a genuinely broken primary is worse than silence.
@@ -46,7 +46,7 @@ A fresh watcher beacon means supervision is alive and never acts.
 ### The wedged-but-alive secondary benefit
 
 The trigger signal (beacon stale past grace while work is in flight) also catches a primary that is still ALIVE but whose supervision has stalled - the shape of the composer-defer wedge (`bin/fm-supervise-daemon.sh`), among others.
-For a live-but-idle supervisor pane the Enter nudge is exactly the right, safe action, and the watchdog never relaunches a client it read as alive.
+For a live-but-idle supervisor pane the wake is exactly the right, safe action (a bare Enter on claude and grok, a typed wake line on jcode), and the watchdog never relaunches a client it read as alive.
 This watchdog does not attempt to fix that wedge (that is a separate ticket); it only re-drives the pane and records the escalation so the stall is never invisible.
 
 ## Outside-the-tree hosting
@@ -83,6 +83,8 @@ Tuning knobs (environment, all optional):
 - `FM_GUARD_GRACE` - staleness threshold in seconds (default 900). Shared with the in-session guard so both agree on "the watcher is down".
 - `FM_LIVENESS_INTERVAL` - how often the loop evaluates, in seconds (default 60). Far shorter than the grace so a real death is caught within roughly one interval past grace.
 - `FM_LIVENESS_MAX_RESUMES` - maximum resume attempts within one down-episode (default 3). Once the cap is hit the watchdog stops re-nudging and escalates instead.
+- `FM_LIVENESS_WAKE_RETRIES` / `FM_LIVENESS_WAKE_SLEEP` - verify-retry knobs for the jcode text-submit wake (defaults 3 and 0.5s). Only the submission is retried, never the typing. They mirror the present-mode daemon's pane-wake submit and are irrelevant on the bare-Enter (claude/grok) path.
+- `FM_SUPERVISOR_HARNESS` - overrides the detected primary harness the resume decision uses (testing seam; falls back to `bin/fm-harness.sh`).
 
 ### Auto-resume is capped and idempotent
 

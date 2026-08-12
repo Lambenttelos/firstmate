@@ -184,6 +184,7 @@ If the daemon dies, its orphaned watcher ends on the next actionable wake, the b
 
 Away mode and present mode never supervise concurrently.
 The daemon refuses to start while `state/.afk` exists, `bin/fm-afk-start.sh` stops it before the away daemon takes over, and a running loop re-checks the flag between arm cycles.
+Because away entry stops it, `bin/fm-afk-return.sh` restarts it on return, once the away daemon is confirmed stopped, so an in-session away-return does not leave supervision without a beacon re-arm engine until the next session start (the 2026-08-12 blackout, where the watcher beacon went dark past grace three times in one hour after a same-session return).
 
 ### Pane-wake (config/present-daemon-pane-wake)
 

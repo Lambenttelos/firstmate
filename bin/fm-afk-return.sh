@@ -172,6 +172,20 @@ return_reconcile() {
     if ! "$SCRIPT_DIR/fm-afk-launch.sh" stop; then
       lifecycle_ok=0
       append_evidence lifecycle 'away-mode shutdown failed; lifecycle state preserved for retry' "$evidence"
+    else
+      # Away entry stopped the present-mode supervision daemon so the two
+      # supervisors never race (bin/fm-afk-start.sh). Return must restart it, or
+      # supervision reverts to the per-turn re-arm tax with no beacon re-arm
+      # engine until the next session start - the 2026-08-12 blackout, where the
+      # watcher beacon went dark past grace three times in one hour. Run it ONLY
+      # after the away daemon is confirmed stopped, so the interlock holds. The
+      # daemon's own start self-checks the config flag, away mode, and
+      # already-running, so this is a safe idempotent no-op when the feature is
+      # off; a launch failure is not a catch-up blocker (the turn-end guard still
+      # backstops), so it is best-effort and only recorded as evidence.
+      if ! "$SCRIPT_DIR/fm-present-daemon.sh" start >/dev/null 2>&1; then
+        append_evidence lifecycle 'present-mode supervision daemon did not restart on return; supervision falls back to per-turn re-arm - relaunch it or start a fresh session' "$evidence"
+      fi
     fi
   fi
 

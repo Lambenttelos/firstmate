@@ -90,6 +90,11 @@ SELF="$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")"
 . "$SCRIPT_DIR/fm-supervision-lib.sh"
 # shellcheck source=bin/fm-supervisor-target-lib.sh
 . "$SCRIPT_DIR/fm-supervisor-target-lib.sh"
+# The typed operational-input construct, so a jcode resume injects the same
+# marked wake line the present-daemon pane-wake uses rather than a bare Enter
+# (which does not re-drive an idle jcode model; docs/jcode-wake-adapter.md).
+# shellcheck source=bin/fm-operational-input.sh
+. "$SCRIPT_DIR/fm-operational-input.sh"
 
 CONFIG="${FM_CONFIG_OVERRIDE:-$FM_HOME/config}"
 FLAG="$CONFIG/liveness-watchdog"
@@ -113,6 +118,11 @@ INTERVAL=${FM_LIVENESS_INTERVAL:-60}
 # Maximum resume attempts within one down-episode before the watchdog stops
 # re-nudging and just escalates.
 MAX_RESUMES=${FM_LIVENESS_MAX_RESUMES:-3}
+# Verify-retry knobs for the jcode text-submit wake, mirroring the present
+# daemon's pane-wake submit (bin/fm-present-daemon.sh). Only the submission is
+# retried, never the typing.
+WAKE_CONFIRM_RETRIES=${FM_LIVENESS_WAKE_RETRIES:-3}
+WAKE_CONFIRM_SLEEP=${FM_LIVENESS_WAKE_SLEEP:-0.5}
 
 require_positive_int() {  # <name> <value>
   case "$2" in
@@ -238,6 +248,19 @@ episode_key() {
 
 # --- resume: re-wake the recorded supervisor pane --------------------------
 
+# Resolve firstmate's own primary harness for the resume decision. Comes from
+# FM_SUPERVISOR_HARNESS when set (a testing seam and the same override the
+# present daemon and away daemon honor) else bin/fm-harness.sh. A harness read
+# that fails is treated as not-jcode, so the safe default (the bare Enter nudge
+# that works on claude and grok) holds. Mirrors bin/fm-present-daemon.sh's
+# pane_wake_enabled harness resolution.
+resume_harness() {
+  local harness=${FM_SUPERVISOR_HARNESS:-}
+  [ -n "$harness" ] || harness=$("$SCRIPT_DIR/fm-harness.sh" 2>/dev/null || printf 'unknown')
+  [ -n "$harness" ] || harness=unknown
+  printf '%s' "$harness"
+}
+
 # Probe the recorded supervisor pane's agent liveness. Prints alive|dead|unknown.
 # Uses fm_backend_agent_alive, which for jcode-on-herdr corroborates a no-agent
 # pane by reading its composer row (a live jcode client draws a numbered prompt
@@ -258,23 +281,44 @@ probe_supervisor() {
 
 # Attempt one resume of the recorded supervisor pane, given its probed liveness.
 # Returns:
-#   0  a resume action was taken (Enter nudge, or a configured relaunch)
+#   0  a resume action was taken (a configured relaunch)
 #   2  the pane is alive-but-idle and got the Enter nudge (a subtype of 0 for the
-#      caller's message; treated as success)
+#      caller's message; treated as success) - the claude/grok path
+#   5  the pane is alive-but-idle on jcode and got a text-submit wake line (a
+#      subtype of success): a bare Enter does not re-drive an idle jcode model,
+#      so this injects the same marked wake the present-daemon pane-wake uses
 #   3  no supervisor target recorded (nothing to resume)
 #   4  the pane is a DEAD shell and NO relaunch command is configured (escalate)
 #   1  a resume action was attempted but failed
 attempt_resume() {  # <liveness alive|dead|unknown>
-  local liveness=$1 cmd
+  local liveness=$1 cmd harness msg
   read_supervisor_target || return 3
   # shellcheck source=bin/fm-backend.sh
   . "$SCRIPT_DIR/fm-backend.sh" 2>/dev/null || return 1
   case "$liveness" in
     alive|unknown)
-      # A live-but-idle (or unreadable) supervisor pane: the safe, correct action
-      # is a gentle Enter to re-drive its turn. Never relaunch a possibly-live
-      # client. An unknown reads the same way: an Enter into a live idle pane just
-      # re-drives it, and an Enter into a truly dead shell is harmless.
+      # A live-but-idle (or unreadable) supervisor pane. The correct wake action
+      # depends on the primary harness. On claude and grok a bare Enter re-drives
+      # the idle turn, so the minimal-action Enter nudge is right (and an Enter
+      # into a truly dead shell is harmless). On jcode a bare Enter does NOT
+      # re-drive an idle model (docs/jcode-wake-adapter.md), so a bare Enter is
+      # structurally inert - exactly the 2026-08-12 recovery gap where three
+      # Enter nudges per outage no-op'd. For jcode, inject the same typed,
+      # marked wake line the present-daemon pane-wake uses, via a verify-retry
+      # text submit, so the idle model actually re-drives its turn. Never
+      # relaunch a possibly-live client either way.
+      harness=$(resume_harness)
+      if [ "$harness" = jcode ]; then
+        fm_operational_input_construct away-supervisor \
+          'External liveness watchdog: primary supervision beacon went dark with work in flight. Re-drive supervision now: run bin/fm-wake-drain.sh first, then handle the fleet.' \
+          msg || return 1
+        log_line "resume: jcode text-submit wake to $FM_LW_SUP_BACKEND:$FM_LW_SUP_TARGET (liveness=$liveness)"
+        if fm_backend_send_text_submit "$FM_LW_SUP_BACKEND" "$FM_LW_SUP_TARGET" "$msg" \
+          "$WAKE_CONFIRM_RETRIES" "$WAKE_CONFIRM_SLEEP" "$WAKE_CONFIRM_SLEEP" >/dev/null 2>&1; then
+          return 5
+        fi
+        return 1
+      fi
       log_line "resume: Enter nudge to $FM_LW_SUP_BACKEND:$FM_LW_SUP_TARGET (liveness=$liveness)"
       if fm_backend_send_key "$FM_LW_SUP_BACKEND" "$FM_LW_SUP_TARGET" Enter >/dev/null 2>&1; then
         return 2
@@ -377,11 +421,13 @@ tick() {
       fi
       return 0
       ;;
-    0|2)
+    0|2|5)
       resumes=$((resumes + 1))
       write_marker "$RESUME_COUNT_MARKER" "$resumes"
       if [ "$rc" -eq 2 ]; then
         summary="primary supervision was DOWN, $in_flight task(s) in flight (watcher beacon $beacon_desc). Sent an Enter nudge to the supervisor pane (attempt $resumes) to re-drive its turn. Verify on waking whether the fleet recovered."
+      elif [ "$rc" -eq 5 ]; then
+        summary="primary supervision was DOWN, $in_flight task(s) in flight (watcher beacon $beacon_desc). Injected a wake line into the jcode supervisor pane (attempt $resumes) to re-drive its turn. Verify on waking whether the fleet recovered."
       else
         summary="primary supervisor pane was a DEAD shell, $in_flight task(s) in flight (watcher beacon $beacon_desc). Ran the configured relaunch command (attempt $resumes). Verify on waking whether the primary came back."
       fi

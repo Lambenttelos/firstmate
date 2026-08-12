@@ -54,6 +54,7 @@ make_home() {  # <dir>
   mkdir -p "$dir/bin" "$dir/state" "$dir/config"
   cp "$ROOT"/bin/fm-liveness-watchdog.sh "$ROOT"/bin/fm-wake-lib.sh \
      "$ROOT"/bin/fm-supervision-lib.sh "$ROOT"/bin/fm-supervisor-target-lib.sh \
+     "$ROOT"/bin/fm-operational-input.sh \
      "$ROOT"/bin/fm-mutex-lib.sh "$ROOT"/bin/fm-pid-lib.sh "$dir/bin/"
   chmod +x "$dir/bin/fm-liveness-watchdog.sh"
   # Fake backend: liveness is read from $dir/fake-liveness (default unknown);
@@ -63,6 +64,14 @@ fm_backend_agent_alive() { cat "$dir/fake-liveness" 2>/dev/null || echo unknown;
 fm_backend_send_key() { printf 'KEY\t%s\t%s\t%s\n' "\$1" "\$2" "\$3" >> "$dir/sent.log"; return 0; }
 fm_backend_send_text_submit() { printf 'TEXT\t%s\t%s\t%s\n' "\$1" "\$2" "\$3" >> "$dir/sent.log"; return 0; }
 EOF
+  # Fake harness resolver: prints $dir/fake-harness (default claude, a harness
+  # whose bare Enter DOES re-drive its turn), so the default cases exercise the
+  # Enter path. A jcode home is set explicitly per test.
+  cat > "$dir/bin/fm-harness.sh" <<EOF
+#!/usr/bin/env bash
+cat "$dir/fake-harness" 2>/dev/null || echo claude
+EOF
+  chmod +x "$dir/bin/fm-harness.sh"
   # A recorded supervisor pane so resume has a target by default.
   printf 'herdr\tdefault:w1:p1\n' > "$dir/state/.supervisor-target"
 }
@@ -83,6 +92,7 @@ stale_beacon() {
 }
 in_flight() { : > "$1/state/task-abc.meta"; }
 set_liveness() { printf '%s\n' "$2" > "$1/fake-liveness"; }
+set_harness() { printf '%s\n' "$2" > "$1/fake-harness"; }
 
 escalation_summary() { sed -n 's/^summary=//p' "$1/state/.liveness-escalation" 2>/dev/null; }
 sent_log() { cat "$1/sent.log" 2>/dev/null || true; }
@@ -135,21 +145,45 @@ wd "$H" tick
   || fail "a fresh watcher beacon means supervision is alive; no action"
 pass "quiet when the watcher beacon is fresh"
 
-# --- down + ALIVE supervisor -> Enter nudge + escalation --------------------
+# --- down + ALIVE supervisor on a non-jcode harness -> Enter nudge ----------
+# claude and grok re-drive their turn on a bare Enter, so the minimal-action
+# Enter nudge is correct for them and must be preserved.
 
 H=$TMP_ROOT/nudge
 make_home "$H"; enable_flag "$H"
+set_harness "$H" claude
 in_flight "$H"; stale_beacon "$H"; set_liveness "$H" alive
 wd "$H" tick
 assert_contains "$(sent_log "$H")" "KEY	herdr	default:w1:p1	Enter" \
-  "a live-but-idle supervisor pane must get an Enter nudge"
+  "a live-but-idle supervisor pane on claude must get an Enter nudge"
 assert_contains "$(escalation_summary "$H")" "Enter nudge" \
   "the durable escalation must record the Enter nudge"
 [ "$(relaunch_count "$H")" -eq 0 ] || fail "a live pane must never be relaunched"
-pass "down with a live supervisor pane: Enter nudge and escalation, no relaunch"
+pass "down with a live claude supervisor pane: Enter nudge and escalation, no relaunch"
+
+# --- down + ALIVE supervisor on a JCODE harness -> text-submit wake ---------
+# Regression for the 2026-08-12 recovery gap: a bare Enter does NOT re-drive an
+# idle jcode model (docs/jcode-wake-adapter.md), so on jcode the watchdog must
+# pane-INJECT a real wake line via send-text-submit instead of a bare Enter.
+
+H=$TMP_ROOT/nudge-jcode
+make_home "$H"; enable_flag "$H"
+set_harness "$H" jcode
+in_flight "$H"; stale_beacon "$H"; set_liveness "$H" alive
+wd "$H" tick
+[ "$(nudge_count "$H")" -eq 0 ] \
+  || fail "a jcode supervisor pane must NOT get a bare Enter (it does not wake an idle model)"
+assert_contains "$(sent_log "$H")" "TEXT	herdr	default:w1:p1	" \
+  "a live-but-idle jcode supervisor pane must get a text-submit wake, not a bare Enter"
+assert_contains "$(escalation_summary "$H")" "wake" \
+  "the durable escalation must record the wake"
+pass "down with a live jcode supervisor pane: text-submit wake, not a bare Enter"
 
 # --- idempotent within an episode, capped, then final escalation ------------
+# Continues the claude nudge home above (bare-Enter path), where nudges are the
+# KEY-count actions the cap bounds.
 
+H=$TMP_ROOT/nudge
 wd "$H" tick
 wd "$H" tick
 [ "$(nudge_count "$H")" -eq 3 ] || fail "nudges should reach the cap of 3, got $(nudge_count "$H")"

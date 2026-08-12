@@ -43,6 +43,19 @@ file="$FM_HOME/state/.fake-drain"
 [ -f "$file" ] && cat "$file"
 : > "$file"
 SH
+  # Fake present-mode daemon: records every invocation so a test can assert the
+  # return path restarts it (the entry path stopped it). `start` honors a
+  # $FM_HOME/state/.fail-present-start-once knob to simulate a launch failure.
+  cat > "$dir/bin/fm-present-daemon.sh" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$1" >> "$FM_HOME/present-daemon.log"
+if [ "${1:-}" = start ] && [ -e "$FM_HOME/state/.fail-present-start-once" ]; then
+  rm -f "$FM_HOME/state/.fail-present-start-once"
+  echo "present-daemon: FAILED - simulated" >&2
+  exit 1
+fi
+exit 0
+SH
   chmod +x "$dir/bin/"*.sh
   # Fail loudly on an incomplete library set. A missing sourced dependency leaves
   # the portable lock helpers undefined, which degrades every outbox assertion
@@ -182,6 +195,51 @@ EOF
   assert_contains "$out" 'catch-up wake:' "captain-owned decision wake was not surfaced in catch-up"
   [ ! -e "$dir/home/state/.afk-return-catchup" ] || fail "captain-owned decision incorrectly opened a firstmate blocker gate"
   pass "captain-owned needs-decision remains reportable without masquerading as a firstmate-actionable blocker"
+}
+
+# Regression for the 2026-08-12 supervision blackout: away-mode ENTRY stops the
+# present-mode supervision daemon (bin/fm-afk-start.sh), but RETURN never
+# restarted it, so after an in-session return the beacon re-arm engine was gone
+# until the next session start. A long interactive turn then let the beacon age
+# past grace three times in one hour. The return path must restart the daemon
+# once the away daemon is confirmed stopped, restoring the entry/return symmetry.
+test_return_restarts_present_daemon_on_clean_return() {
+  local dir out
+  dir="$TMP_ROOT/present-restart"
+  install_runner "$dir"
+  : > "$dir/home/config/present-daemon"
+  date +%s > "$dir/home/state/.afk"
+  : > "$dir/home/state/.fake-drain"
+  out=$(run_return "$dir" begin) || fail "clean return did not clear catch-up: $out"
+  assert_contains "$out" 'catch-up clear' "clean return did not announce ordinary work may proceed"
+  [ -f "$dir/home/present-daemon.log" ] || fail "return never invoked the present-mode daemon"
+  grep -qx start "$dir/home/present-daemon.log" \
+    || fail "return did not restart the present-mode daemon on a clean return"
+  pass "clean away-return restarts the present-mode supervision daemon"
+}
+
+# The restart must not race the away daemon: it runs only AFTER the away daemon
+# is confirmed stopped. When away shutdown fails, the return gate stays open and
+# the present daemon must NOT be started (two supervisors must never race).
+test_return_skips_present_daemon_when_shutdown_fails() {
+  local dir out rc
+  dir="$TMP_ROOT/present-restart-interlock"
+  install_runner "$dir"
+  : > "$dir/home/config/present-daemon"
+  date +%s > "$dir/home/state/.afk"
+  : > "$dir/home/state/.fake-drain"
+  touch "$dir/home/state/.fail-terminal-stop-once"
+  printf 'herdr\tsynthetic:pane\tsynthetic-workspace\n' > "$dir/home/state/.afk-daemon-terminal"
+  set +e
+  out=$(run_return "$dir" begin)
+  rc=$?
+  set -e
+  [ "$rc" -eq 3 ] || fail "failed away shutdown should keep the return gated (rc=$rc): $out"
+  if [ -f "$dir/home/present-daemon.log" ]; then
+    grep -qx start "$dir/home/present-daemon.log" \
+      && fail "present daemon was started while away shutdown had failed (supervisors would race)"
+  fi
+  pass "return does not start the present daemon while away shutdown is unresolved"
 }
 
 test_away_reentry_refuses_pending_return_gate() {
@@ -404,6 +462,8 @@ test_return_clears_inbox_state_only_under_the_outbox_lock() {
 test_return_gate_orders_catchup_before_bearings
 test_explicit_reclassification_requires_durable_reason
 test_captain_decision_does_not_masquerade_as_firstmate_blocker
+test_return_restarts_present_daemon_on_clean_return
+test_return_skips_present_daemon_when_shutdown_fails
 test_away_reentry_refuses_pending_return_gate
 test_check_retries_recorded_terminal_teardown
 test_return_reports_undelivered_inbox_records
