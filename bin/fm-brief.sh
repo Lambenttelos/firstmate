@@ -49,7 +49,7 @@
 # hyfin and hyfin-server ship briefs additionally carry a "Live stack repro" block
 # with the exact commands to stand up an own local stack (recaptcha auto-bypasses
 # locally, no AWS creds needed), so a live merchant repro is never falsely declared
-# impossible; it still defers to the fleet-wide two-at-once live-browser cap.
+# impossible.
 # Scout tasks ignore mode - their deliverable is a report, not a merge.
 # Every scaffold's status protocol distinguishes the configured
 # declared-external-wait verb (FM_CLASSIFY_PAUSED_VERB, default "paused") from
@@ -64,7 +64,8 @@
 # freshly spawned crewmate obeys them without being steered: heavy commands go through
 # bin/fm-heavy-run.sh, test parallelism is capped at VITEST_MAX_WORKERS=2, every test run
 # is announced with TEST START / TEST END status lines, and a live browser reproduction
-# waits for firstmate's go-ahead because at most TWO may run fleet-wide at once.
+# is announced with BROWSER START / BROWSER END status lines as a non-blocking
+# coordination announce.
 # Every ship and scout scaffold additionally requires the final report to declare whether
 # the work was built test-first and whether it has end-to-end coverage.
 # Every ship and scout scaffold also carries the standing captain rules that bind every
@@ -328,8 +329,7 @@ REPO=${POS[1]}
 # declaring a live merchant repro impossible because nothing told them they can stand
 # up their OWN local stack, where recaptcha auto-bypasses and no AWS creds are needed.
 # This block gives them the exact commands so "live stack unavailable" stops being an
-# accepted ceiling for a payment or receipt bug, while still honoring the fleet-wide
-# two-at-once live-browser cap in Rule 10.
+# accepted ceiling for a payment or receipt bug.
 case "$REPO" in
   hyfin|hyfin-server)
     HYFIN_REPRO=$(cat <<'EOF'
@@ -342,7 +342,7 @@ Recaptcha auto-bypasses locally, so you need no AWS credentials: `hyfin-server s
 - Seed throwaway sites ONLY via `tests/v8/e2e/7. pricing/lib/seed.js`, NEVER a real site.
 - Reference: `hyfin/docs/e2e-lanes.md`.
 
-Still honor Rule 10: at most TWO live browser reproductions run fleet-wide at once, so append the `working: BROWSER WAIT` line and wait for firstmate's go-ahead before you drive a browser.
+Announce the browser use (Rule 10): append the `working: BROWSER START` line before you drive a browser and `working: BROWSER END` when it finishes, so the shared-machine log shows browser activity - a non-blocking announce, never a wait.
 EOF
 )
     ;;
@@ -428,10 +428,9 @@ The report is the only thing that survives, so anything worth keeping must be in
 9. Announce every test run in the status file: \`working: TEST START - {what is running, rough scale}\`
    before it, \`working: TEST END - {outcome}\` after it. Firstmate coordinates the shared machine
    from those two lines, so a silent suite is a defect.
-10. At most TWO live browser reproductions may run across the whole fleet at once.
-   Before you start one, append \`working: BROWSER WAIT - {what you will drive}\` and STOP until
-   firstmate replies with a go-ahead - the one line in this brief you do wait on.
-   Append \`working: BROWSER END - {outcome}\` the moment it finishes so the slot is released.
+10. Announce live browser use in the status file so the shared-machine log shows browser activity:
+   \`working: BROWSER START - {what you will drive}\` before it, \`working: BROWSER END - {outcome}\`
+   after it. This is a non-blocking coordination announce only - never wait on firstmate for a slot.
 
 $CAPTAIN_RULES
 
@@ -643,10 +642,9 @@ $RULE1
 9. Announce every test run in the status file: \`working: TEST START - {what is running, rough scale}\`
    before it, \`working: TEST END - {outcome}\` after it. Firstmate coordinates the shared machine
    from those two lines, so a silent suite is a defect.
-10. At most TWO live browser reproductions may run across the whole fleet at once.
-   Before you start one, append \`working: BROWSER WAIT - {what you will drive}\` and STOP until
-   firstmate replies with a go-ahead - the one line in this brief you do wait on.
-   Append \`working: BROWSER END - {outcome}\` the moment it finishes so the slot is released.
+10. Announce live browser use in the status file so the shared-machine log shows browser activity:
+   \`working: BROWSER START - {what you will drive}\` before it, \`working: BROWSER END - {outcome}\`
+   after it. This is a non-blocking coordination announce only - never wait on firstmate for a slot.
 
 $CAPTAIN_RULES
 

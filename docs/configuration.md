@@ -498,7 +498,7 @@ The same scaffold carries three further shared-machine rules, for the same reaso
 
 - Test parallelism is capped at `VITEST_MAX_WORKERS=2`, never 4, because vitest sizes its worker pool from the CPU count and is the fleet's dominant memory consumer.
 - Every test run is announced in the status file, `working: TEST START - ...` before and `working: TEST END - ...` after, which is the signal firstmate coordinates the machine from.
-- At most TWO live browser reproductions may run across the whole fleet at once, so a crewmate announces `working: BROWSER WAIT - ...` and waits for firstmate's go-ahead before starting one, then releases the slot with `working: BROWSER END - ...`.
+- A crewmate announces live browser use in the status file, `working: BROWSER START - ...` before and `working: BROWSER END - ...` after, so the shared-machine log shows browser activity. This is a non-blocking coordination announce, and a worker never waits on firstmate for a browser slot.
 
 For the same reason, every ship and scout scaffold also generates the standing captain rules as a labelled `C1`-`C6` block, and the secondmate charter generates the supervising subset under the same stable labels; [`bin/fm-brief.sh`](../bin/fm-brief.sh)'s header and `--help` own their exact wording and scope.
 
