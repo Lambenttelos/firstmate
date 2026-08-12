@@ -377,8 +377,8 @@ test_bitbucket_merge_refuses_without_credentials() {
   FM_ROOT_OVERRIDE="$ROOT" \
   FM_STATE_OVERRIDE="$case_dir/state" \
   FM_TEST_BB_LOG="$case_dir/bb.log" \
-  NO_MISTAKES_BITBUCKET_EMAIL= \
-  NO_MISTAKES_BITBUCKET_API_TOKEN= \
+  NO_MISTAKES_BITBUCKET_EMAIL='' \
+  NO_MISTAKES_BITBUCKET_API_TOKEN='' \
   PATH="$case_dir/fakebin:$PATH" \
     "$PR_MERGE" task-x1 https://bitbucket.org/dashnow/hyfin/pull-requests/9 \
     > "$case_dir/stdout" 2> "$case_dir/stderr"

@@ -88,7 +88,7 @@ test_ready_guard_requires_credentials() {
   make_fakebin "$case_dir/fakebin"
   run_lib "$case_dir" 'fm_bitbucket_ready' >/dev/null 2>&1 \
     || fail "ready: should pass when tools and creds present"
-  if NO_MISTAKES_BITBUCKET_API_TOKEN= run_lib "$case_dir" 'fm_bitbucket_ready' >/dev/null 2>&1; then
+  if NO_MISTAKES_BITBUCKET_API_TOKEN='' run_lib "$case_dir" 'fm_bitbucket_ready' >/dev/null 2>&1; then
     fail "ready: should fail with an empty token"
   fi
   pass "fm_bitbucket_ready requires both credential parts"
@@ -98,6 +98,7 @@ test_open_pr_records_url_and_number() {
   local case_dir; case_dir="$TMP_ROOT/open"; mkdir -p "$case_dir/fakebin"
   make_fakebin "$case_dir/fakebin"
   local out
+  # shellcheck disable=SC2016  # The snippet is executed by run_lib's inner bash, not expanded here.
   out=$(FM_TEST_BB_BODY='{"id":42,"state":"OPEN"}' FM_TEST_BB_STATUS=201 \
     run_lib "$case_dir" 'fm_bitbucket_open_pr dashnow hyfin fm/x1 dev "Title" "Body" && printf "N=%s\n" "$FM_BITBUCKET_PR_NUMBER"')
   printf '%s\n' "$out" | grep -qxF 'https://bitbucket.org/dashnow/hyfin/pull-requests/42' \
@@ -124,6 +125,7 @@ test_pr_state_reads_state() {
   local case_dir; case_dir="$TMP_ROOT/state"; mkdir -p "$case_dir/fakebin"
   make_fakebin "$case_dir/fakebin"
   local out
+  # shellcheck disable=SC2016  # The snippet is executed by run_lib's inner bash, not expanded here.
   out=$(FM_TEST_BB_BODY='{"id":7,"state":"MERGED"}' FM_TEST_BB_STATUS=200 \
     run_lib "$case_dir" 'fm_bitbucket_pr_state dashnow hyfin 7 && printf "%s\n" "$FM_BITBUCKET_PR_STATE"')
   [ "$out" = MERGED ] || fail "state: expected MERGED, got: $out"
@@ -137,7 +139,7 @@ test_pr_state_silent_without_credentials() {
   make_fakebin "$case_dir/fakebin"
   # No creds: must return non-zero and print nothing, so a poll treats it as
   # "not known merged" rather than a merge.
-  if NO_MISTAKES_BITBUCKET_API_TOKEN= FM_TEST_BB_BODY='{"state":"MERGED"}' \
+  if NO_MISTAKES_BITBUCKET_API_TOKEN='' FM_TEST_BB_BODY='{"state":"MERGED"}' \
     run_lib "$case_dir" 'fm_bitbucket_pr_state dashnow hyfin 7' >/dev/null 2>&1; then
     fail "state-nocred: should fail without credentials"
   fi

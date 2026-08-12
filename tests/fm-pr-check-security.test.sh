@@ -821,7 +821,7 @@ test_static_poll_contract_bitbucket() {
 
   # Missing credential: silent even when the PR is merged, so a credential gap is
   # never misread as a merge.
-  out=$(NO_MISTAKES_BITBUCKET_EMAIL= NO_MISTAKES_BITBUCKET_API_TOKEN= \
+  out=$(NO_MISTAKES_BITBUCKET_EMAIL='' NO_MISTAKES_BITBUCKET_API_TOKEN='' \
     run_bitbucket_poll "$dir" MERGED)
   [ -z "$out" ] || fail "Bitbucket poll emitted without credentials"
 
