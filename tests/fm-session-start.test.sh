@@ -5,6 +5,9 @@
 #
 # Coverage:
 #   - absent-file markers vs empty-but-present files in the context digest
+#   - the cross-session stall banner: a prior session's still-open paused/blocked
+#     workers surfaced prominently (via fm-crew-state.sh) above the status tails,
+#     with the paused case age-gated by FM_SESSION_START_STALL_THRESHOLD
 #   - the lock-refusal read-only path: banner leads, every mutating step is
 #     skipped (including bootstrap's six mutating sweeps, verified by their
 #     ABSENCE), the digest still completes
@@ -306,6 +309,116 @@ write_pi_loaded_markers() {
   local home=$1 root=$2 pid=$3
   write_pi_watch_loaded_marker "$home" "$root" "$pid"
   write_pi_turnend_loaded_marker "$home" "$root" "$pid"
+}
+
+# --- cross-session stall surfacing -------------------------------------------
+
+# A scout task with a live tmux window and no no-mistakes run resolves its
+# current state from the status log's last verb (fm-crew-state.sh), so a
+# blocked:/paused: last line makes fm-crew-state.sh report blocked/paused - the
+# exact input print_cross_session_stalls scans. make_fake_tmux has no
+# capture-pane, so the pane reads not-busy and the log mapping wins.
+seed_stall_scout() {
+  local home=$1 id=$2 window=$3 last=$4 wt="$1/wt-$2"
+  git init -q -b main "$wt"
+  git -C "$wt" commit -q --allow-empty -m init
+  printf 'window=%s\nworktree=%s\nkind=scout\nbackend=tmux\n' "$window" "$wt" > "$home/state/$id.meta"
+  printf 'working: started\n%s\n' "$last" > "$home/state/$id.status"
+}
+
+test_cross_session_stall_blocked_surfaces_any_age() {
+  local rec root home fakebin out stall_section banner_line work_line
+  rec=$(new_world stall-blocked)
+  IFS='|' read -r root home fakebin <<EOF
+$rec
+EOF
+  make_fake_toolchain "$fakebin"
+  make_fake_ps_claude "$fakebin"
+  make_fake_tmux "$fakebin" "fm-sess:blk"
+  seed_stall_scout "$home" task-blk "fm-sess:blk" "blocked: shared Claude account usage-window limit"
+
+  out=$(run_session_start "$home" "$root" "$fakebin:$BASE_PATH")
+
+  assert_contains "$out" "STALLED WORKERS FROM A PRIOR SESSION (act on these first)" \
+    "blocked worker did not surface the prominent cross-session stall banner"
+  stall_section=$(printf '%s\n' "$out" | awk '/STALLED WORKERS FROM A PRIOR SESSION/{flag=1}/Work under way/{flag=0}flag')
+  assert_contains "$stall_section" "BLOCKED" "blocked worker not labeled BLOCKED in the stall banner"
+  assert_contains "$stall_section" "task-blk" "blocked worker id missing from the stall banner"
+  assert_contains "$stall_section" "needs firstmate action" "blocked worker not marked as needing firstmate action"
+
+  # The banner precedes the per-task status tails, not buried inside them.
+  banner_line=$(printf '%s\n' "$out" | grep -n 'STALLED WORKERS FROM A PRIOR SESSION' | head -1 | cut -d: -f1)
+  work_line=$(printf '%s\n' "$out" | grep -n '^Work under way' | head -1 | cut -d: -f1)
+  [ -n "$banner_line" ] && [ -n "$work_line" ] && [ "$banner_line" -lt "$work_line" ] \
+    || fail "stall banner did not precede the per-task status tails: $out"
+
+  pass "a blocked worker from a prior session surfaces prominently, regardless of age"
+}
+
+test_cross_session_stall_paused_threshold() {
+  local rec root home fakebin out banner
+  rec=$(new_world stall-paused)
+  IFS='|' read -r root home fakebin <<EOF
+$rec
+EOF
+  make_fake_toolchain "$fakebin"
+  make_fake_ps_claude "$fakebin"
+  make_fake_tmux "$fakebin" "fm-sess:old"
+
+  # An OLD pause (status mtime far in the past) must surface.
+  seed_stall_scout "$home" task-old "fm-sess:old" "paused: rate-limit reset window until 18:00"
+  touch -t 202601010000 "$home/state/task-old.status"
+
+  out=$(FM_SESSION_START_STALL_THRESHOLD=1800 run_session_start "$home" "$root" "$fakebin:$BASE_PATH")
+
+  assert_contains "$out" "STALLED WORKERS FROM A PRIOR SESSION" "old pause did not surface the stall banner"
+  banner=$(printf '%s\n' "$out" | awk '/STALLED WORKERS FROM A PRIOR SESSION/{flag=1}/Work under way/{flag=0}flag')
+  assert_contains "$banner" "PAUSED" "old pause not labeled PAUSED"
+  assert_contains "$banner" "task-old" "old paused worker id missing from banner"
+  assert_contains "$banner" "external wait" "old pause not described as an external wait"
+
+  pass "a paused worker older than the threshold surfaces in the stall banner"
+}
+
+test_cross_session_stall_fresh_pause_suppressed() {
+  local rec root home fakebin out
+  rec=$(new_world stall-fresh)
+  IFS='|' read -r root home fakebin <<EOF
+$rec
+EOF
+  make_fake_toolchain "$fakebin"
+  make_fake_ps_claude "$fakebin"
+  make_fake_tmux "$fakebin" "fm-sess:fresh"
+
+  # A pause THIS session just created (fresh mtime) with a high threshold must
+  # NOT nag - it is below the age gate.
+  seed_stall_scout "$home" task-fresh "fm-sess:fresh" "paused: waiting on a scheduled window"
+
+  out=$(FM_SESSION_START_STALL_THRESHOLD=99999 run_session_start "$home" "$root" "$fakebin:$BASE_PATH")
+
+  assert_not_contains "$out" "STALLED WORKERS FROM A PRIOR SESSION" \
+    "a fresh pause below the age threshold wrongly surfaced the stall banner"
+
+  pass "a fresh pause below the age threshold stays out of the stall banner"
+}
+
+test_cross_session_stall_none_when_all_working() {
+  local rec root home fakebin out
+  rec=$(new_world stall-none)
+  IFS='|' read -r root home fakebin <<EOF
+$rec
+EOF
+  make_fake_toolchain "$fakebin"
+  make_fake_ps_claude "$fakebin"
+  make_fake_tmux "$fakebin" "fm-sess:ok"
+  seed_stall_scout "$home" task-ok "fm-sess:ok" "working: still going"
+
+  out=$(run_session_start "$home" "$root" "$fakebin:$BASE_PATH")
+
+  assert_not_contains "$out" "STALLED WORKERS FROM A PRIOR SESSION" \
+    "a fleet with no stalled workers wrongly emitted the stall banner"
+
+  pass "a fleet with no paused/blocked workers emits no stall banner"
 }
 
 # --- context digest: absent vs empty vs present -----------------------------
@@ -1099,6 +1212,10 @@ EOF
 }
 
 test_context_digest_absent_empty_present
+test_cross_session_stall_blocked_surfaces_any_age
+test_cross_session_stall_paused_threshold
+test_cross_session_stall_fresh_pause_suppressed
+test_cross_session_stall_none_when_all_working
 test_context_digest_shape2_seam_split
 test_context_digest_shape2_missing_seam_full_cat
 test_context_digest_shape2_absent_and_full_escape_hatch
