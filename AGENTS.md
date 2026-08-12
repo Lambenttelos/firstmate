@@ -83,6 +83,7 @@ data/                personal fleet records; LOCAL, gitignored as a whole
   merge-queue.tsv    durable list of released-but-unmerged ship branches; firstmate-private, owned by fm-merge-queue-lib.sh, surfaced/swept by fm-merge-queue.sh (docs/merge-queue.md, section 7)
   session-stats.log  append-only one-line-per-session close record; firstmate-private, owned by fm-end-session.sh (docs/configuration.md)
   completions.tsv    append-only, NEVER-pruned completion ledger, one line per task that reaches teardown; firstmate-private, owned by fm-completions-lib.sh (the single owner of exact field mechanics), appended from fm-teardown.sh at the authoritative completion point so work-report can query precise ticket-completion data
+  decision-desk-ledger.md  human-readable value ledger for the decision-desk secondmate, one row per routed request with its status and optional overturned annotation; firstmate-private, owned by fm-decision-desk-ledger.sh (route/resolve/overturn/tally), created lazily on first route
   <id>/brief.md      per-task crewmate brief, or per-secondmate charter brief when kind=secondmate
   <id>/report.md     scout task deliverable, written by the crewmate; survives teardown
 projects/            cloned repos; gitignored; READ-ONLY for you
@@ -244,6 +245,7 @@ Route by the nature of the work against each registered secondmate scope, not by
 Keep `local-only` work in the main home.
 Send in-scope work to the fitting secondmate unless it is blocked or the captain explicitly redirects it; do not read the secondmate's chat because marked routed replies return through its status or referenced document.
 If no secondmate scope fits, use the main home or discuss creating an appropriate persistent secondmate.
+When routing a request to the decision-desk secondmate, log it with `bin/fm-decision-desk-ledger.sh route` at routing time and `resolve` when the ruling returns, so the desk's value is answerable on demand; that script owns the ledger format and the `tally` read.
 
 Classify the deliverable:
 
