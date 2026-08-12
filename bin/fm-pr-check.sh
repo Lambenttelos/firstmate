@@ -71,6 +71,19 @@ if [ "$PROVIDER" = gitlab ] && ! command -v glab >/dev/null 2>&1; then
   exit 1
 fi
 
+# Refuse to arm a Bitbucket watch when the poll could never confirm a merge:
+# the byte-static poll reads the Bitbucket REST API with curl and jq and
+# authenticates with the NO_MISTAKES_BITBUCKET_* credentials, and it is silent
+# on every error, so a missing tool or credential is indistinguishable from a PR
+# that is never merged. Arming is the one point where that gap can be reported,
+# so an absent tool or credential stops the watch here instead of watching
+# nothing. fm-bitbucket-lib.sh owns the specific diagnostic.
+if [ "$PROVIDER" = bitbucket ]; then
+  # shellcheck source=bin/fm-bitbucket-lib.sh
+  . "$SCRIPT_DIR/fm-bitbucket-lib.sh"
+  fm_bitbucket_ready || exit 1
+fi
+
 # Fork-target guard: a GitHub PR must target the task clone's OWN repository, not
 # a fork parent. `gh`/`glab` default a PR base to the fork parent on a fork
 # clone, so without this a worker (even with a correct brief) could arm a merge
@@ -84,6 +97,17 @@ if [ "$PROVIDER" = github ]; then
   GUARD_WT=$(grep '^worktree=' "$META" | tail -1 | cut -d= -f2- || true)
   GUARD_PROJ=$(grep '^project=' "$META" | tail -1 | cut -d= -f2- || true)
   fm_pr_refuse_unowned_github_target "$FM_PR_OWNER" "$FM_PR_REPO" "$GUARD_WT" "$GUARD_PROJ" || exit 1
+fi
+
+# Same own-repository guard for Bitbucket: the target workspace/repository must
+# be the task clone's own origin, so a poll is never armed for, and a merge never
+# fires against, a Bitbucket repository we do not own. It is silent and permissive
+# when origin does not resolve to a bitbucket.org workspace/repository, so a
+# local-only or different-forge clone is unchanged.
+if [ "$PROVIDER" = bitbucket ]; then
+  GUARD_WT=$(grep '^worktree=' "$META" | tail -1 | cut -d= -f2- || true)
+  GUARD_PROJ=$(grep '^project=' "$META" | tail -1 | cut -d= -f2- || true)
+  fm_pr_refuse_unowned_bitbucket_target "$FM_PR_WORKSPACE" "$FM_PR_REPO" "$GUARD_WT" "$GUARD_PROJ" || exit 1
 fi
 
 # Neutralize any pre-fix poll before recording or arming this task. The

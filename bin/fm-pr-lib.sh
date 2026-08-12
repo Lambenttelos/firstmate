@@ -4,13 +4,21 @@
 # constructing task paths or performing any side effect.
 #
 # The stored identity is provider-tagged: provider, url, host, path, number.
-# "path" is the full project path, which is owner/repository on GitHub and an
-# arbitrarily nested group/subgroup/project namespace on GitLab. A GitLab
-# project can sit at any depth, so no owner/repository pair can address one and
-# the sidecar carries the whole path instead. GitLab also runs on self-hosted
-# instances, so the host is part of that identity rather than a constant. Every
-# consumer re-derives the identity from the stored URL and refuses any record
-# whose parts do not reconstruct that exact URL.
+# "path" is the full project path, which is owner/repository on GitHub,
+# workspace/repository on Bitbucket Cloud, and an arbitrarily nested
+# group/subgroup/project namespace on GitLab. A GitLab project can sit at any
+# depth, so no owner/repository pair can address one and the sidecar carries the
+# whole path instead. GitLab also runs on self-hosted instances, so the host is
+# part of that identity rather than a constant. Every consumer re-derives the
+# identity from the stored URL and refuses any record whose parts do not
+# reconstruct that exact URL.
+#
+# Bitbucket Cloud is served only from the constant web host bitbucket.org and
+# addresses a repository by a two-segment workspace/repository path, exactly like
+# GitHub's owner/repository. Its PR object lives at
+# https://bitbucket.org/{workspace}/{repository}/pull-requests/{number}, and its
+# REST 2.0 API is a separate host (api.bitbucket.org by default) resolved by the
+# Bitbucket helpers in bin/fm-bitbucket-lib.sh, never stored in this identity.
 
 FM_PR_PROVIDER=
 FM_PR_URL=
@@ -18,6 +26,7 @@ FM_PR_HOST=
 FM_PR_PATH=
 FM_PR_OWNER=
 FM_PR_REPO=
+FM_PR_WORKSPACE=
 FM_PR_NUMBER=
 FM_PR_DATA_PROVIDER=
 FM_PR_DATA_URL=
@@ -124,17 +133,34 @@ fm_pr_gitlab_path_valid() {
   done
 }
 
+# Bitbucket Cloud addresses a repository by a workspace slug and a repository
+# slug. Both are Atlassian "slug" values: ASCII letters, digits, hyphen,
+# underscore, and dot, never empty. "." and ".." are refused so a slug can never
+# be a path traversal segment, matching the discipline the GitHub repo validator
+# applies. Bitbucket slugs are case-insensitive but preserved as written in the
+# URL, so the exact spelling is kept and only structural validity is checked
+# here.
+fm_pr_bitbucket_slug_valid() {
+  local slug=${1-}
+  local LC_ALL=C
+  [[ "$slug" =~ ^[A-Za-z0-9._-]{1,100}$ ]] || return 1
+  [ "$slug" != . ] && [ "$slug" != .. ]
+}
+
 # Parse a canonical PR or MR URL into the provider-tagged identity. Validation
 # is strict and per provider: the GitHub username and repository rules are
 # unchanged, and GitLab gets its own host and namespace rules rather than a
 # loosened GitHub rule.
 #
 # FM_PR_OWNER and FM_PR_REPO are additionally set for github because
-# bin/fm-pr-merge.sh addresses GitHub by owner/repository. A gitlab URL leaves
-# them empty; teaching the merge path about GitLab is a separate change, and
-# until then it refuses a GitLab URL rather than merging anything.
+# bin/fm-pr-merge.sh addresses GitHub by owner/repository. FM_PR_WORKSPACE and
+# FM_PR_REPO are set for bitbucket, which addresses a repository by
+# workspace/repository; the Bitbucket REST helpers in bin/fm-bitbucket-lib.sh
+# consume them. A gitlab URL leaves all of them empty, and its merge path is a
+# separate change, so the merge command refuses a GitLab URL rather than merging
+# anything.
 fm_pr_url_parse() {
-  local raw=${1-} pattern host path
+  local raw=${1-} pattern host path workspace repo
   local LC_ALL=C
   FM_PR_PROVIDER=
   FM_PR_URL=
@@ -142,6 +168,7 @@ fm_pr_url_parse() {
   FM_PR_PATH=
   FM_PR_OWNER=
   FM_PR_REPO=
+  FM_PR_WORKSPACE=
   FM_PR_NUMBER=
   pattern='^https://github\.com/([A-Za-z0-9]|[A-Za-z0-9][A-Za-z0-9-]{0,37}[A-Za-z0-9])/([A-Za-z0-9._-]{1,100})/pull/([1-9][0-9]*)$'
   if [[ "$raw" =~ $pattern ]]; then
@@ -157,6 +184,32 @@ fm_pr_url_parse() {
     # shellcheck disable=SC2034
     FM_PR_REPO=${BASH_REMATCH[2]}
     FM_PR_NUMBER=${BASH_REMATCH[3]}
+    return 0
+  fi
+  # Bitbucket Cloud PR URL: the web host is the constant bitbucket.org and the
+  # object path is workspace/repository/pull-requests/<number>. Both slugs are
+  # validated, and the stored URL must be exactly reconstructible from them so a
+  # doctored record cannot redirect a poll or merge at another repository.
+  pattern='^https://bitbucket\.org/([A-Za-z0-9._-]{1,100})/([A-Za-z0-9._-]{1,100})/pull-requests/([1-9][0-9]*)$'
+  if [[ "$raw" =~ $pattern ]]; then
+    workspace=${BASH_REMATCH[1]}
+    repo=${BASH_REMATCH[2]}
+    # Capture the number before the slug validators run their own regex, which
+    # would otherwise clobber BASH_REMATCH.
+    local number=${BASH_REMATCH[3]}
+    fm_pr_bitbucket_slug_valid "$workspace" || return 1
+    fm_pr_bitbucket_slug_valid "$repo" || return 1
+    FM_PR_PROVIDER=bitbucket
+    FM_PR_URL=$raw
+    FM_PR_HOST=bitbucket.org
+    FM_PR_PATH="$workspace/$repo"
+    # Consumed by bin/fm-bitbucket-lib.sh, which addresses Bitbucket by
+    # workspace/repository through the REST 2.0 API.
+    # shellcheck disable=SC2034
+    FM_PR_WORKSPACE=$workspace
+    # shellcheck disable=SC2034
+    FM_PR_REPO=$repo
+    FM_PR_NUMBER=$number
     return 0
   fi
   # The path class contains "/" and "-", so this match is greedy to the last
@@ -272,6 +325,74 @@ fm_pr_refuse_unowned_github_target() {
     fi
     printf 'error: refusing PR target %s/%s: task clone origin is %s, a repository we do not own (a fork parent defaults in here); open the PR against our own repository\n' \
       "$pr_owner" "$pr_repo" "$slug" >&2
+    return 1
+  done
+  return 0
+}
+
+# Resolve the Bitbucket workspace/repository ("workspace/repo") of <dir>'s origin
+# remote. Prints the slug and returns 0 only when origin is on the bitbucket.org
+# host in a recognized URL form with two valid slugs; returns 1 otherwise (no git
+# dir, no origin, a non-bitbucket.org host, or an unparseable/invalid slug). Like
+# the GitHub helper, the non-zero return is "cannot verify here", distinct from a
+# verified mismatch, so a caller neither refuses a local-only clone with no origin
+# nor a different forge it cannot address this way. Reading a remote URL is a
+# config read; it never touches the network.
+fm_pr_bitbucket_origin_slug() {
+  local dir=${1-} url host rest workspace repo
+  local LC_ALL=C
+  [ -n "$dir" ] && [ -d "$dir" ] || return 1
+  url=$(git -C "$dir" remote get-url origin 2>/dev/null) || return 1
+  [ -n "$url" ] || return 1
+  case "$url" in
+    *://*)
+      rest=${url#*://}
+      rest=${rest#*@}          # strip any userinfo
+      host=${rest%%/*}
+      host=${host%%:*}         # strip any port
+      rest=${rest#*/}
+      ;;
+    *:*)                       # scp-like syntax, e.g. git@bitbucket.org:workspace/repo
+      host=${url%%:*}
+      host=${host##*@}         # strip any userinfo
+      rest=${url#*:}
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+  [ "$host" = bitbucket.org ] || return 1
+  rest=${rest%.git}
+  rest=${rest%/}
+  workspace=${rest%%/*}
+  repo=${rest#*/}
+  case "$workspace" in ''|*/*) return 1 ;; esac
+  case "$repo" in ''|*/*) return 1 ;; esac
+  fm_pr_bitbucket_slug_valid "$workspace" || return 1
+  fm_pr_bitbucket_slug_valid "$repo" || return 1
+  printf '%s/%s\n' "$workspace" "$repo"
+}
+
+# Refuse a Bitbucket PR/merge whose target workspace/repository is not the task
+# clone's own origin. Same contract as fm_pr_refuse_unowned_github_target: the
+# first candidate directory whose origin resolves to a bitbucket.org
+# workspace/repository is authoritative, a case-insensitive match returns 0, a
+# resolved mismatch prints a loud message and returns 1, and no resolvable
+# bitbucket.org origin returns 0 (nothing to verify against). Bitbucket slugs are
+# case-insensitive, so the comparison is case-folded exactly as the GitHub check
+# folds owner/repository.
+fm_pr_refuse_unowned_bitbucket_target() {
+  local pr_workspace=${1-} pr_repo=${2-} dir slug
+  local LC_ALL=C
+  shift 2 || return 0
+  for dir in "$@"; do
+    [ -n "$dir" ] || continue
+    slug=$(fm_pr_bitbucket_origin_slug "$dir") || continue
+    if [ "${slug,,}" = "${pr_workspace,,}/${pr_repo,,}" ]; then
+      return 0
+    fi
+    printf 'error: refusing PR target %s/%s: task clone origin is %s, a repository we do not own; open the PR against our own repository\n' \
+      "$pr_workspace" "$pr_repo" "$slug" >&2
     return 1
   done
   return 0

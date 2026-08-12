@@ -410,6 +410,34 @@ EOF
   [ "$FM_PR_PROVIDER" = github ] || fail "parser did not tag a pull request URL as github"
   [ "$FM_PR_HOST" = github.com ] || fail "parser returned wrong GitHub host"
   [ "$FM_PR_PATH" = a/b ] || fail "parser returned wrong GitHub project path"
+  # Bitbucket Cloud pull request URLs: workspace/repository/pull-requests/number.
+  while IFS='|' read -r url workspace repo number; do
+    [ -n "$url" ] || continue
+    fm_pr_url_parse "$url" || fail "parser rejected a canonical Bitbucket PR URL"
+    [ "$FM_PR_PROVIDER" = bitbucket ] || fail "parser did not tag a Bitbucket PR URL as bitbucket"
+    [ "$FM_PR_URL" = "$url" ] || fail "parser changed a canonical Bitbucket PR URL"
+    [ "$FM_PR_HOST" = bitbucket.org ] || fail "parser returned wrong Bitbucket host"
+    [ "$FM_PR_PATH" = "$workspace/$repo" ] || fail "parser returned wrong Bitbucket path"
+    [ "$FM_PR_WORKSPACE" = "$workspace" ] || fail "parser returned wrong Bitbucket workspace"
+    [ "$FM_PR_REPO" = "$repo" ] || fail "parser returned wrong Bitbucket repository"
+    [ "$FM_PR_NUMBER" = "$number" ] || fail "parser returned wrong Bitbucket PR number"
+    [ -z "$FM_PR_OWNER" ] || fail "parser set GitHub owner for a Bitbucket PR URL"
+  done <<'EOF'
+https://bitbucket.org/dashnow/hyfin/pull-requests/1|dashnow|hyfin|1
+https://bitbucket.org/dashnow/hyfin-server/pull-requests/42|dashnow|hyfin-server|42
+https://bitbucket.org/team_ws/repo.name-2/pull-requests/123456|team_ws|repo.name-2|123456
+EOF
+  for row in \
+    'https://bitbucket.org/dashnow/hyfin/pull-requests/0' \
+    'https://bitbucket.org/dashnow/hyfin/pull-requests/01' \
+    'https://bitbucket.org/dashnow/hyfin/pull/1' \
+    'https://bitbucket.org/dashnow/hyfin/pull-requests/1/' \
+    'https://bitbucket.org/dashnow/../pull-requests/1' \
+    'https://bitbucket.org/dashnow/hyfin/extra/pull-requests/1' \
+    'https://bitbucket.org/dashnow/pull-requests/1' \
+    'http://bitbucket.org/dashnow/hyfin/pull-requests/1'; do
+    ! fm_pr_url_parse "$row" || fail "parser accepted an invalid Bitbucket URL: $row"
+  done
   for row in "${INVALID_URLS[@]}"; do
     ! fm_pr_url_parse "$row" || fail "parser accepted a rejected raw-byte URL class"
   done
@@ -749,6 +777,69 @@ test_static_poll_contract() {
   [ "$rc" -eq 0 ] || fail "watcher did not surface merged poll"
   [ "$(grep -c '^check: .*: merged$' "$dir/watch.out")" -eq 1 ] || fail "watcher did not convert merged output into exactly one wake"
   pass "static poll is silent except for one merged line and remains watcher-bounded"
+}
+
+# Bitbucket static-poll contract: the poll reads the Bitbucket REST API through
+# curl+jq, emits exactly one merged line for a MERGED PR, and stays silent on
+# every other state, on a missing credential, and on a URL that does not
+# reconstruct from its parts. jq is a real dependency; the test skips cleanly if
+# it is absent on the host.
+run_bitbucket_poll() {
+  local dir=$1 state=$2
+  local fakebin="$dir/bbfakebin"
+  mkdir -p "$fakebin"
+  cat > "$fakebin/curl" <<SH
+#!/usr/bin/env bash
+printf '{"state":"$state"}'
+SH
+  chmod +x "$fakebin/curl"
+  # Credentials are inherited from the caller's environment so a caller can vary
+  # them (present vs absent) per assertion.
+  FM_STATE_OVERRIDE="$dir/home/state" \
+  PATH="$fakebin:$BASE_PATH" \
+    "$POLL" --validated bitbucket \
+    https://bitbucket.org/dashnow/hyfin/pull-requests/7 bitbucket.org dashnow/hyfin 7
+}
+
+test_static_poll_contract_bitbucket() {
+  local dir out
+  if ! command -v jq >/dev/null 2>&1; then
+    pass "Bitbucket static poll skipped: jq not installed on this host"
+    return
+  fi
+  dir=$(make_case poll-contract-bitbucket)
+
+  out=$(NO_MISTAKES_BITBUCKET_EMAIL=me@example.com NO_MISTAKES_BITBUCKET_API_TOKEN=tok \
+    run_bitbucket_poll "$dir" MERGED)
+  [ "$out" = merged ] || fail "Bitbucket poll did not emit merged for a MERGED PR: '$out'"
+
+  for state in OPEN DECLINED SUPERSEDED; do
+    out=$(NO_MISTAKES_BITBUCKET_EMAIL=me@example.com NO_MISTAKES_BITBUCKET_API_TOKEN=tok \
+      run_bitbucket_poll "$dir" "$state")
+    [ -z "$out" ] || fail "Bitbucket poll emitted for non-merged state $state"
+  done
+
+  # Missing credential: silent even when the PR is merged, so a credential gap is
+  # never misread as a merge.
+  out=$(NO_MISTAKES_BITBUCKET_EMAIL= NO_MISTAKES_BITBUCKET_API_TOKEN= \
+    run_bitbucket_poll "$dir" MERGED)
+  [ -z "$out" ] || fail "Bitbucket poll emitted without credentials"
+
+  # A sidecar whose stored URL does not reconstruct from host/path/number is
+  # refused before any network call.
+  local fakebin="$dir/bbfakebin2"; mkdir -p "$fakebin"
+  cat > "$fakebin/curl" <<'SH'
+#!/usr/bin/env bash
+printf '{"state":"MERGED"}'
+SH
+  chmod +x "$fakebin/curl"
+  out=$(FM_STATE_OVERRIDE="$dir/home/state" \
+    NO_MISTAKES_BITBUCKET_EMAIL=me@example.com NO_MISTAKES_BITBUCKET_API_TOKEN=tok \
+    PATH="$fakebin:$BASE_PATH" \
+    "$POLL" --validated bitbucket \
+    https://bitbucket.org/dashnow/hyfin/pull-requests/7 bitbucket.org dashnow/other 7)
+  [ -z "$out" ] || fail "Bitbucket poll emitted when the URL did not reconstruct from its parts"
+  pass "Bitbucket static poll emits merged only for a MERGED PR and is silent on every other case"
 }
 
 test_atomic_interruption_leaves_no_partial_artifact() {
@@ -2845,6 +2936,7 @@ test_invalid_entrypoints_have_zero_side_effects
 test_valid_recording_and_merge_derivation
 test_rejected_metacharacter_bytes_are_inert
 test_static_poll_contract
+test_static_poll_contract_bitbucket
 test_atomic_interruption_leaves_no_partial_artifact
 test_concurrent_watcher_sees_only_complete_publication
 test_postrename_poll_validation_revokes_and_retries

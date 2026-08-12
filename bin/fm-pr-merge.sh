@@ -1,13 +1,20 @@
 #!/usr/bin/env bash
 # Merge a task's PR after recording pr= and any available pr_head= through
 # bin/fm-pr-check.sh, so teardown can verify landed work after squash merges.
-# The full canonical GitHub PR URL is parsed by bin/fm-pr-lib.sh and the derived
-# owner/repository and PR number are passed to gh-axi as separate arguments.
+# GitHub PR URLs are parsed by bin/fm-pr-lib.sh and the derived owner/repository
+# and PR number are passed to gh-axi as separate arguments. Bitbucket Cloud PR
+# URLs are also accepted: they merge by workspace/repository through the REST 2.0
+# API in bin/fm-bitbucket-lib.sh (which requires curl, jq, and the
+# NO_MISTAKES_BITBUCKET_* credentials). A GitLab merge request URL is still
+# refused here until its merge path lands.
 #
 # Merge method defaults to --squash when the caller passes none of --squash,
-# --merge, --rebase, or --method after the optional -- separator. Extra args
-# must not include --repo or -R because the repository comes only from the URL.
-# Usage: fm-pr-merge.sh <task-id> <pr-url> [-- <extra gh-axi pr merge args>]
+# --merge, --rebase, or --method after the optional -- separator. For a Bitbucket
+# PR those same flags translate to a Bitbucket merge strategy (squash,
+# merge_commit, fast_forward) and any other extra argument is refused; for a
+# GitHub PR they are forwarded to gh-axi, and extra args must not include --repo
+# or -R because the repository comes only from the URL.
+# Usage: fm-pr-merge.sh <task-id> <pr-url> [-- <extra merge args>]
 #
 # Orphan mode merges a PR whose task metadata state/<id>.meta is already gone
 # (the worker was torn down), for example a branch drained from the durable
@@ -104,17 +111,21 @@ if [ "$#" -lt 2 ]; then
 fi
 ID=$1
 RAW_URL=$2
-# bin/fm-pr-lib.sh parses GitLab merge request URLs so the watcher can follow
-# them, but this path still addresses only GitHub by owner/repository. The
-# provider check holds that refusal exactly as it was until merge parity lands.
+# bin/fm-pr-lib.sh parses GitHub, Bitbucket, and GitLab PR/MR URLs. This path
+# merges GitHub (by owner/repository through gh-axi) and Bitbucket Cloud (by
+# workspace/repository through the REST API). A GitLab merge request is still
+# refused here until its merge path lands, so the watcher can follow it but this
+# command will not merge it.
 if ! fm_pr_task_id_valid "$ID" || ! fm_pr_url_parse "$RAW_URL" \
-  || [ "$FM_PR_PROVIDER" != github ]; then
+  || { [ "$FM_PR_PROVIDER" != github ] && [ "$FM_PR_PROVIDER" != bitbucket ]; }; then
   echo "error: invalid PR merge request" >&2
   exit 2
 fi
 URL=$FM_PR_URL
+PROVIDER=$FM_PR_PROVIDER
 PR_OWNER=$FM_PR_OWNER
 PR_REPO=$FM_PR_REPO
+PR_WORKSPACE=$FM_PR_WORKSPACE
 PR_NUMBER=$FM_PR_NUMBER
 shift 2
 [ "${1:-}" = "--" ] && shift
@@ -133,6 +144,40 @@ grep -qxF "pr=$URL" "$META" || {
   echo "error: PR metadata recording failed" >&2
   exit 1
 }
+
+if [ "$PROVIDER" = bitbucket ]; then
+  # Bitbucket merges through the REST API, not gh-axi. Extra gh-axi flags do not
+  # apply, so only an explicit merge method (translated to a Bitbucket merge
+  # strategy) is accepted and any other extra argument is refused loudly rather
+  # than silently ignored. The default is a squash merge, matching the GitHub
+  # default below.
+  # shellcheck source=bin/fm-bitbucket-lib.sh
+  . "$SCRIPT_DIR/fm-bitbucket-lib.sh"
+  BB_STRATEGY=squash
+  bb_translate_method() {
+    case "$1" in
+      --squash|--method=squash) BB_STRATEGY=squash ;;
+      --merge|--method=merge) BB_STRATEGY=merge_commit ;;
+      --rebase|--method=rebase|--method=fast_forward) BB_STRATEGY=fast_forward ;;
+      *) return 1 ;;
+    esac
+  }
+  while [ "$#" -gt 0 ]; do
+    if [ "$1" = --method ]; then
+      shift
+      bb_translate_method "--method=${1:-}" || {
+        echo "error: unsupported Bitbucket merge method: ${1:-}" >&2
+        exit 1
+      }
+    elif ! bb_translate_method "$1"; then
+      echo "error: unsupported Bitbucket merge argument: $1" >&2
+      exit 1
+    fi
+    shift
+  done
+  fm_bitbucket_merge_pr "$PR_WORKSPACE" "$PR_REPO" "$PR_NUMBER" "$BB_STRATEGY"
+  exit $?
+fi
 
 merge_args=()
 if ! caller_has_merge_method "$@"; then
