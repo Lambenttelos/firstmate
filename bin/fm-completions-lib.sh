@@ -72,3 +72,28 @@ fm_completions_record() {
   printf '%s\n' "$line" >> "$file" || return 1
   return 0
 }
+
+# Look up every recorded completion for an exact task id. Args: data_dir id.
+# Prints one matching ledger line per completion (verbatim, tab-separated), in
+# file order, and returns 0 when at least one match exists. Returns 1 without
+# printing when the id has never reached teardown or the ledger is absent. The
+# id is matched against the first tab-separated field only, so a substring of
+# another id or a field value elsewhere on the line is never a false hit.
+# Comment lines are skipped. This is the single read path for the pre-spawn
+# duplicate-dispatch guard, so callers never hand-parse columns.
+fm_completions_lookup() {
+  local data_dir=$1 id=$2 file found=1 rec_id line
+  file=$(fm_completions_file "$data_dir")
+  [ -f "$file" ] || return 1
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      ''|'#'*) continue ;;
+    esac
+    rec_id=${line%%$'\t'*}
+    if [ "$rec_id" = "$id" ]; then
+      printf '%s\n' "$line"
+      found=0
+    fi
+  done < "$file"
+  return "$found"
+}

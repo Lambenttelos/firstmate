@@ -598,6 +598,10 @@ test_guard_backstops_retention_loss() {
   run_decisions "$home" guard --restore > "$home/restore.out" 2>&1 \
     || fail "guard --restore must recover an active-backlog offender"
   assert_grep "restored: $hold_id" "$home/restore.out" "restore must report the recovered hold"
+  # A reopened hold fed one duplicate build in the double-build incident, so
+  # restore must annotate the reopen with a 'verify not already shipped' warning.
+  assert_grep "verify not already shipped" "$home/restore.out" \
+    "restore must warn to verify the work was not already shipped before re-dispatch"
   show=$(tasks_in "$home" show "$hold_id" --full)
   assert_contains "$show" "state: queued" "restored hold must return to queued"
   assert_contains "$show" "held: yes" "restored hold must be held again"

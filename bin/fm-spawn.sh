@@ -141,6 +141,14 @@
 # Before dispatching it prints the host-resource reading from bin/fm-resource-check.sh
 # to stderr as a `warning:` advisory when the host is degraded or critical; that
 # is a report, never a refusal, and nothing is stopped automatically.
+# Pre-spawn duplicate-dispatch guard: for a crewmate or scout (never a persistent
+# secondmate), the spawn is refused loudly, before any backend mutation, when the
+# task id already appears in data/completions.tsv (read through
+# fm_completions_lib.sh's fm_completions_lookup) or when the task's recorded PR
+# (state/<id>.meta pr=) is already merged to origin. The merged-PR probe degrades
+# gracefully: an unreachable forge or missing tooling leaves the state unknown,
+# which never refuses, so offline dispatch keeps working. Set
+# FM_SPAWN_ALLOW_DUPLICATE=1 to override the refusal deliberately.
 # On success prints: spawned <id> harness=<name> kind=<ship|scout|secondmate> mode=<mode> yolo=<on|off> window=<backend-target> worktree=<path>
 # mode/yolo are resolved per-project from data/projects.md for ship/scout tasks;
 # secondmate spawns record mode=secondmate, yolo=off, home=, and projects=.
@@ -178,6 +186,8 @@ SUB_HOME_MARKER=".fm-secondmate-home"
 . "$SCRIPT_DIR/fm-gate-refuse-lib.sh"
 # shellcheck source=bin/fm-pr-lib.sh
 . "$SCRIPT_DIR/fm-pr-lib.sh"
+# shellcheck source=bin/fm-completions-lib.sh
+. "$SCRIPT_DIR/fm-completions-lib.sh"
 # Fail closed before any fleet mutation: a no-mistakes gate agent must never spawn
 # a direct report (see bin/fm-gate-refuse-lib.sh).
 fm_refuse_if_gate_agent
@@ -488,6 +498,45 @@ if ! fm_lock_try_acquire "$SPAWN_TASK_LOCK"; then
   exit 1
 fi
 SPAWN_TASK_LOCK_HELD=1
+
+# Pre-spawn duplicate-dispatch guard (warn-and-STOP, fail closed): a worker must
+# never be spawned onto work that already landed. The close side of the
+# build-batch-doclint-pass double-build incident was fixed by PR #85; this is the
+# dispatch side. Two independent checks, both refuse loudly rather than skipping:
+#   1. The task id already appears in data/completions.tsv (the append-only,
+#      never-pruned completion ledger). Read through fm_completions_lookup, the
+#      single owner of field mechanics, never by hand-parsing columns.
+#   2. The task's recorded PR/MR (state/<id>.meta pr=) is already merged to the
+#      forge default branch. This probe degrades gracefully: an unreachable forge
+#      or missing tooling leaves the merge state unknown, which never refuses -
+#      only a confirmed merge refuses - so offline dispatch keeps working.
+# A secondmate is persistent and legitimately respawns for recovery and updates,
+# so this guard is scoped to crewmate/scout ship-or-scout spawns only. The
+# operator can override deliberately with FM_SPAWN_ALLOW_DUPLICATE=1.
+if [ "$KIND" != secondmate ] && [ "${FM_SPAWN_ALLOW_DUPLICATE:-}" != 1 ]; then
+  if dup_hit=$(fm_completions_lookup "$DATA" "$ID"); then
+    echo "error: refusing to spawn '$ID' - it already reached completion (data/completions.tsv):" >&2
+    printf '%s\n' "$dup_hit" | while IFS= read -r dup_line; do
+      printf '  %s\n' "$dup_line" >&2
+    done
+    echo "This work already landed. Re-run with FM_SPAWN_ALLOW_DUPLICATE=1 to override deliberately." >&2
+    exit 1
+  fi
+  dup_meta="$STATE/$ID.meta"
+  if [ -f "$dup_meta" ]; then
+    dup_pr=$(fm_meta_get "$dup_meta" pr)
+    if [ -n "$dup_pr" ] && fm_pr_url_parse "$dup_pr"; then
+      dup_state=$("$SCRIPT_DIR/fm-pr-poll.sh" --validated \
+        "$FM_PR_PROVIDER" "$FM_PR_URL" "$FM_PR_HOST" "$FM_PR_PATH" "$FM_PR_NUMBER" 2>/dev/null || true)
+      if [ "$dup_state" = merged ]; then
+        echo "error: refusing to spawn '$ID' - its recorded PR is already merged to origin: $dup_pr" >&2
+        echo "This work already shipped. Re-run with FM_SPAWN_ALLOW_DUPLICATE=1 to override deliberately." >&2
+        exit 1
+      fi
+    fi
+  fi
+fi
+
 PROJ=
 ARG3=
 FIRSTMATE_HOME=

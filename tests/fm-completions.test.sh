@@ -200,6 +200,69 @@ EOF
   pass "teardown appends one correct ledger line with the landing sha"
 }
 
+# fm_completions_lookup is the single read path for the pre-spawn
+# duplicate-dispatch guard (bin/fm-spawn.sh). It must: return 0 and print every
+# matching line for a hit, return 1 without printing for a miss or an absent
+# ledger, match the id against the first field only (no substring false hit),
+# and skip comment lines.
+test_lookup_hit_prints_line_and_succeeds() {
+  local data="$TMP_ROOT/lk-hit/data" out
+  mkdir -p "$data"
+  fm_completions_record "$data" task-lk 2026-08-06 ship proj cafef00d || fail "record failed"
+  out=$(fm_completions_lookup "$data" task-lk) || fail "lookup returned non-zero on a hit"
+  case "$out" in
+    "task-lk	2026-08-06	ship	proj	cafef00d") : ;;
+    *) fail "lookup printed wrong line: $out" ;;
+  esac
+  pass "lookup returns 0 and prints the matching line on a hit"
+}
+
+test_lookup_miss_is_silent_and_fails() {
+  local data="$TMP_ROOT/lk-miss/data" out status
+  mkdir -p "$data"
+  fm_completions_record "$data" task-present 2026-08-06 ship proj "" || fail "record failed"
+  out=$(fm_completions_lookup "$data" task-absent)
+  status=$?
+  [ "$status" -ne 0 ] || fail "lookup returned 0 on a miss"
+  [ -z "$out" ] || fail "lookup printed on a miss: $out"
+  pass "lookup returns non-zero and prints nothing on a miss"
+}
+
+test_lookup_absent_ledger_fails() {
+  local data="$TMP_ROOT/lk-none/data" status
+  mkdir -p "$data"
+  fm_completions_lookup "$data" anything
+  status=$?
+  [ "$status" -ne 0 ] || fail "lookup returned 0 with no ledger file"
+  pass "lookup returns non-zero when the ledger is absent"
+}
+
+test_lookup_matches_first_field_only() {
+  local data="$TMP_ROOT/lk-field/data" out status
+  mkdir -p "$data"
+  # The date field 'ship' would substring-match a naive scan; the id is exact.
+  fm_completions_record "$data" build-batch 2026-08-06 ship build-batch-repo abc || fail "record failed"
+  # A different id whose value appears in another column must not match.
+  out=$(fm_completions_lookup "$data" build-batch-repo)
+  status=$?
+  [ "$status" -ne 0 ] || fail "lookup false-matched a value from a non-id column"
+  [ -z "$out" ] || fail "lookup printed on a non-id-column match: $out"
+  # The real id still matches.
+  fm_completions_lookup "$data" build-batch >/dev/null || fail "lookup missed the exact id"
+  pass "lookup matches the id field only, never a value from another column"
+}
+
+test_lookup_returns_all_matches() {
+  local data="$TMP_ROOT/lk-multi/data" out count
+  mkdir -p "$data"
+  fm_completions_record "$data" task-multi 2026-08-06 ship proj aaa || fail "record 1 failed"
+  fm_completions_record "$data" task-multi 2026-08-07 ship proj bbb || fail "record 2 failed"
+  out=$(fm_completions_lookup "$data" task-multi) || fail "lookup failed on a multi-hit"
+  count=$(printf '%s\n' "$out" | grep -c '^task-multi	')
+  [ "$count" = 2 ] || fail "lookup returned $count matches, expected 2"
+  pass "lookup returns every matching completion line"
+}
+
 test_ship_appends_one_line
 test_second_completion_appends_without_disturbing_first
 test_idempotent_no_double_append
@@ -207,3 +270,8 @@ test_unknown_landing_sha_leaves_column_empty
 test_unsafe_field_refused
 test_idempotency_only_on_trailing_entry
 test_teardown_appends_ledger_line
+test_lookup_hit_prints_line_and_succeeds
+test_lookup_miss_is_silent_and_fails
+test_lookup_absent_ledger_fails
+test_lookup_matches_first_field_only
+test_lookup_returns_all_matches
