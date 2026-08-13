@@ -364,6 +364,13 @@ Arming it would mean writing `[hooks] turn_end` into the captain's global jcode 
 Consequence, accepted by the captain: a jcode crewmate produces NO per-turn wake, and `fm-spawn` deliberately installs no turn-end token or hook for it.
 Its supervision is the watcher's stale-pane detection alone, which is why the busy signature above has to be right.
 
+**Steer vs queue: queue mode is ON by default, so a plain `fm-send` steer does NOT interrupt.**
+jcode has a queue-mode config (captain has it ON, verified 2026-08-12): a message sent to a session that is mid-turn is QUEUED and processed after the current turn ends, not injected into the running turn.
+So `bin/fm-send.sh <id> 'msg'` on a busy jcode worker is a QUEUED steer - correct for an ordinary course-correction that can wait for the turn boundary, and it wastes no in-flight work.
+To steer IMMEDIATELY (the worker is actively going down a wrong path and must stop now), interrupt first, then send: `bin/fm-send.sh <id> --key Escape` (single Escape, prints `Interrupted`, composer returns to `N>`) and then `bin/fm-send.sh <id> 'msg'`, which now lands into an idle composer instead of queuing behind the running turn.
+On an already-idle worker there is no difference: the message is delivered and submitted either way.
+Do not reflexively Escape every steer - an unnecessary interrupt discards the turn's progress; reserve it for genuine stop-now redirection.
+
 **Shared background server: never stop or restart it.**
 Every jcode session on the machine, including firstmate's own if it is running on jcode, is served by one daemon.
 `jcode server stop` and `jcode server reload` drop or interrupt every live session, so neither belongs in any spawn, steer, teardown, or recovery step.
