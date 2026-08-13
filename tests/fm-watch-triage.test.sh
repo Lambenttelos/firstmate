@@ -275,6 +275,41 @@ test_status_is_paused_classifier() {
     || fail "captain-held transfer not recognized by the bounded-idle classifier"
   status_is_paused_or_captain_held 'resolved [key=route]: captain answered' \
     && fail "resolved decision remained classed as captain-held"
+  # Auth/quota/token exhaustion is captain-fixable, not a benign wait: a paused:
+  # line carrying that vocabulary must NOT class as paused, and MUST surface as
+  # captain-relevant, so the 2026 shared-account usage-window stall cannot idle for
+  # hours on the benign pause cadence.
+  status_is_auth_exhaustion_pause 'paused: hit the Claude usage limit, resets 18:00' \
+    || fail "usage-limit pause not recognized as auth exhaustion"
+  status_is_paused 'paused: hit the Claude usage limit, resets 18:00' \
+    && fail "usage-limit pause still classed as a benign paused wait"
+  status_is_captain_relevant 'paused: hit the Claude usage limit, resets 18:00' \
+    || fail "usage-limit pause not surfaced as captain-relevant"
+  status_is_auth_exhaustion_pause 'paused: shared account usage-window exhausted' \
+    || fail "usage-window exhaustion not recognized"
+  status_is_auth_exhaustion_pause 'paused: session limit reached, waiting for reset' \
+    || fail "session-limit pause not recognized"
+  status_is_auth_exhaustion_pause 'paused: token revoked, need to relogin' \
+    || fail "revoked-token pause not recognized"
+  status_is_auth_exhaustion_pause 'paused: auth token expired, switch account' \
+    || fail "expired-token pause not recognized"
+  status_is_auth_exhaustion_pause 'paused: over quota on the shared key' \
+    || fail "quota pause not recognized"
+  # Regression guard: an ordinary bounded external wait stays paused, including a
+  # bare vendor rate-limit reset (the canonical benign pause), and non-paused verbs
+  # never match the exhaustion predicate even when their prose mentions a token.
+  status_is_auth_exhaustion_pause 'paused: holding for the upstream release' \
+    && fail "an ordinary external-wait pause false-matched auth exhaustion"
+  status_is_paused 'paused: holding for the upstream release' \
+    || fail "ordinary external-wait pause regressed off the paused cadence"
+  status_is_auth_exhaustion_pause 'paused: waiting on a vendor rate-limit reset' \
+    && fail "a vendor rate-limit reset pause false-matched auth exhaustion"
+  status_is_paused 'paused: waiting on a vendor rate-limit reset' \
+    || fail "vendor rate-limit reset pause regressed off the paused cadence"
+  status_is_auth_exhaustion_pause 'working: wiring the token refresh path' \
+    && fail "a working line about auth code false-matched auth exhaustion"
+  status_is_auth_exhaustion_pause 'blocked: usage limit hit' \
+    && fail "a blocked line matched the paused-only auth-exhaustion predicate"
   pass "status_is_paused: only the leading paused verb matches, and paused is not captain-relevant"
 }
 

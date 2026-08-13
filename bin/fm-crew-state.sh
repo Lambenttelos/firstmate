@@ -114,8 +114,15 @@ log_last_line() {
 # the deliberate-external-wait verb (fm-classify-lib.sh's FM_CLASSIFY_PAUSED_VERB):
 # a crew with no active run and an idle pane that declared a known external wait
 # reports `paused` distinctly, so a supervisor reading this sees a declared pause
-# and its reason rather than a wedge-suspect idle.
+# and its reason rather than a wedge-suspect idle. An auth/quota/token-exhaustion
+# `paused:` line is the exception: it is a captain-fixable stall wrongly dressed as
+# a benign wait, so fm-classify-lib.sh excludes it from status_is_paused and it maps
+# to `blocked` here, surfacing to firstmate instead of idling on the pause cadence.
 map_log_state() {  # <line>
+  if status_is_auth_exhaustion_pause "$1"; then
+    echo blocked
+    return
+  fi
   if status_is_paused "$1"; then
     echo paused
     return

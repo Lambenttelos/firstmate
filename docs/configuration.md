@@ -836,6 +836,7 @@ FM_WATCHER_STALE_GRACE=900   # defaults to FM_GUARD_GRACE, which itself defaults
 FM_SIGNAL_GRACE=30      # seconds to coalesce nearby status and turn-end signals into one wake
 FM_CAPTAIN_RE='done:|needs-decision:|blocked:|failed:|PR ready|checks green|ready in branch|merged'   # captain-relevant status regex; nonterminal progress verbs remain excluded even when their prose matches
 FM_CLASSIFY_PAUSED_VERB=paused     # leading status verb for a declared external wait; excluded from FM_CAPTAIN_RE and distinct from blocked
+FM_CLASSIFY_AUTH_EXHAUSTION_RE='usage[ _-]?limit|usage[ _-]?window|session[ _-]?limit|quota|revoked|...'   # a paused: reason matching this is a captain-fixable auth/quota/token exhaustion, reclassified to blocked (surfaces) rather than absorbed as a benign wait; bin/fm-classify-lib.sh owns the full default
 FM_STALE_ESCALATE_SECS=240         # idle seconds before a provably-working stale pane escalates; stale panes whose crew is not provably working surface immediately unless they declare the pause verb
 FM_PAUSE_RESURFACE_SECS=3600       # seconds before an idle declared external wait re-surfaces for a recheck in the watcher or away-mode daemon
 FM_WEDGE_DEMAND_INSPECT_COUNT=3    # consecutive provably-working stale escalations on the same unchanged pane before demand-deep-inspection is added
