@@ -40,6 +40,15 @@
 # re-sending a recovery request for an already-open expectation so a second
 # record is not created. Direct unmarked captain input never creates one.
 #
+# One-way secondmate messages: a nudge or control message that expects no
+# correlated reply (a re-read-your-AGENTS nudge, a config-reread pointer) must
+# not open a pending-reply expectation, or the parent keeps re-escalating a
+# message that was actually delivered. Set FM_SEND_NO_REPLY_EXPECTED=1 to keep
+# the from-firstmate reply-routing marker (so the secondmate still routes any
+# volunteered reply through its status channel) while creating no correlation id
+# and no durable pending record. Ordinary reply-expected secondmate requests
+# leave the variable unset and keep the correlation and expectation unchanged.
+#
 # After a successful text submit fm-send pauses FM_SEND_SETTLE seconds (default 1,
 # 0 disables) before returning: submit confirmation only proves the text was
 # accepted, but the harness needs a beat to spin up the turn before its busy
@@ -219,6 +228,10 @@ PENDING_REPLY_CORR=
 PENDING_REPLY_CREATED=0
 TARGET_TASK_ID=
 MESSAGE_IS_SLASH_COMMAND=0
+MARK_NO_REPLY_EXPECTED=0
+case "${FM_SEND_NO_REPLY_EXPECTED:-}" in
+  1|true|yes) MARK_NO_REPLY_EXPECTED=1 ;;
+esac
 case "$*" in
   /*) MESSAGE_IS_SLASH_COMMAND=1 ;;
 esac
@@ -248,7 +261,14 @@ if [ "${1:-}" = "--key" ]; then
   fi
 else
   MESSAGE=$*
-  if [ "$MARK_FROM_FIRSTMATE" = 1 ]; then
+  if [ "$MARK_FROM_FIRSTMATE" = 1 ] && [ "$MARK_NO_REPLY_EXPECTED" = 1 ]; then
+    # One-way secondmate message (nudge / control pointer): keep the
+    # from-firstmate reply-routing marker so a volunteered reply still lands on
+    # the status channel, but open no correlation id and no pending record - the
+    # message expects no correlated report, so an expectation could never resolve
+    # and would falsely trip recovery/escalation (see header).
+    fm_message_mark_from_firstmate "$MESSAGE" MESSAGE
+  elif [ "$MARK_FROM_FIRSTMATE" = 1 ]; then
     # Reuse an existing correlation id for recovery resends; otherwise create a
     # durable parent expectation before delivery. Transport success never
     # resolves that expectation (see fm-pending-reply-lib.sh).

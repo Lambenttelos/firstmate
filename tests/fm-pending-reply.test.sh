@@ -19,6 +19,8 @@
 #  10. fm-send secondmate path embeds corr and creates durable pending records
 #  11. Backend busy/idle observation works through the shared busy abstraction
 #      used by Pi/Claude secondmate backends (no conversation scrape)
+#  12. A one-way (no-reply-expected) marked send opens no pending record, while
+#      a reply-expected send still tracks and resolves exactly as before
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -870,6 +872,51 @@ test_failed_send_discards_undelivered_expectation() {
   pass "failed transport discards undelivered expectation only"
 }
 
+test_fm_send_no_reply_expected_marks_without_pending() {
+  local dir fb log home rc got pending_count
+  dir="$TMP_ROOT/send-no-reply"; mkdir -p "$dir"
+  fb=$(make_stubs "$dir"); log="$dir/send.log"
+  home=$(setup_parent send-no-reply)
+  fm_write_secondmate_meta "$home/state/hibit.meta" "$home/sm" "sess:fm-hibit"
+  # One-way nudge: keeps the from-firstmate marker but opens no expectation.
+  FM_SEND_NO_REPLY_EXPECTED=1 run_send "$fb" "$home" "$log" "hibit" "re-read your AGENTS.md"; rc=$?
+  expect_code 0 "$rc" "no-reply secondmate send should succeed"
+  got=$(cat "$log")
+  case "$got" in
+    "$FM_FROMFIRST_MARK"corr=*) fail "no-reply send must not embed a corr token"$'\n'"$(printf '%s' "$got" | od -An -c)" ;;
+    "$FM_FROMFIRST_MARK"*) : ;;
+    *) fail "no-reply send must still carry the from-firstmate marker"$'\n'"$(printf '%s' "$got" | od -An -c)" ;;
+  esac
+  pending_count=$(find "$home/state/pending-replies" -type f 2>/dev/null | wc -l | tr -d ' ')
+  [ "$pending_count" = 0 ] \
+    || fail "no-reply secondmate send must create no pending-reply records (got $pending_count)"
+  pass "no-reply secondmate send marks from-firstmate but opens no expectation"
+}
+
+test_fm_send_reply_expected_still_tracks_and_resolves() {
+  local dir fb log home state rc got corr rec
+  dir="$TMP_ROOT/send-reply-tracks"; mkdir -p "$dir"
+  fb=$(make_stubs "$dir"); log="$dir/send.log"
+  home=$(setup_parent send-reply-tracks)
+  state="$home/state"
+  fm_write_secondmate_meta "$state/hibit.meta" "$home/sm" "sess:fm-hibit"
+  # Reply-expected send: unchanged - embeds corr and opens a durable record.
+  run_send "$fb" "$home" "$log" "hibit" "audit the ledger"; rc=$?
+  expect_code 0 "$rc" "reply-expected secondmate send should succeed"
+  got=$(cat "$log")
+  corr=$(fm_pending_reply_extract_corr "$got")
+  [ "${#corr}" -eq 16 ] || fail "reply-expected send must embed a 16 hex corr, got '$corr'"
+  rec=$(fm_pending_reply_path "$state" "$corr")
+  [ -f "$rec" ] || fail "reply-expected send must open a pending record"
+  [ "$(fm_pending_reply_get "$rec" phase)" = awaiting_report ] \
+    || fail "reply-expected send should await report after delivery"
+  # Correlated parent report still resolves it exactly as before.
+  printf 'done [corr=%s]: ledger clean\n' "$corr" > "$state/hibit.status"
+  fm_pending_reply_try_resolve "$state" "$corr" || fail "correlated report should resolve reply-expected send"
+  [ "$(phase_of "$state" "$corr")" = resolved ] || fail "reply-expected send should reach resolved"
+  pass "reply-expected secondmate send still tracks and resolves"
+}
+
 # --- run --------------------------------------------------------------------
 
 test_normal_correlated_reply_resolves_once
@@ -894,5 +941,8 @@ test_tick_skips_terminal_and_reuses_target_observation
 test_correlations_reuse_only_for_matching_open_task
 test_tick_end_to_end_missed_then_escalate
 test_failed_send_discards_undelivered_expectation
+
+test_fm_send_no_reply_expected_marks_without_pending
+test_fm_send_reply_expected_still_tracks_and_resolves
 
 printf 'ok - all pending-reply tests passed\n'
