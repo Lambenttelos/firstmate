@@ -1,6 +1,7 @@
 # cswap usage-call audit
 
 Label: wayfinder:research (AFK)
+Phase: 2
 Blocked by: none
 
 ## Question

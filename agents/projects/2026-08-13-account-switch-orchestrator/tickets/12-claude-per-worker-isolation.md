@@ -1,6 +1,7 @@
 # claude per-worker account isolation investigation
 
 Label: wayfinder:research (AFK)
+Phase: 2
 Blocked by: none
 
 ## Question

@@ -1,6 +1,7 @@
 # quota-axi opencode provider
 
 Label: wayfinder:task (AFK)
+Phase: 2
 Blocked by: none
 
 ## Question

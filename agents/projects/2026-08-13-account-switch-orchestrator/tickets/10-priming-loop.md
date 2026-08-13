@@ -1,6 +1,7 @@
 # priming loop
 
 Label: wayfinder:task (AFK)
+Phase: 2
 Blocked by: 09-quota-axi-switch.md
 
 ## Question

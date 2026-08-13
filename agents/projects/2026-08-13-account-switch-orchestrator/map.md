@@ -18,6 +18,10 @@ Design decisions are locked in ADR 0031 (`docs/adr/0031-account-switch-orchestra
 
 - [Grilling session 2026-08-13](../../../docs/adr/0031-account-switch-orchestrator.md) - full design locked: quota-axi owns orchestration with fenced mutation; observation-driven limits; declarative tier policy with external policy authors; harness-first precedence; jcode control surface for actuation; drain semantics; shared single-flight usage cache; priming as auth+telemetry freshness.
 
+## Phase boundary
+
+Phase 1 ships the smallest end-to-end loop: jcode-only, one provider (Claude) with mixed plan accounts (Pro, Max, Team seats), rotation without model switching. The boundary is safe because the registry/policy schemas stay provider-general (phase 2 adds content and the model map, not breaking changes), and the claude-harness, opencode, and qoder actuation paths are additive. Claude-harness switching, cross-provider moves, the model map, priming, and new telemetry providers are phase 2.
+
 ## Not yet specified
 
 - Exact policy-file schema (field names, tier syntax, model-map syntax): sharpens inside the registry/policy ticket.
@@ -34,17 +38,24 @@ Design decisions are locked in ADR 0031 (`docs/adr/0031-account-switch-orchestra
 
 ## Tickets
 
+Phase 1 (MVP: jcode harness only, mixed Claude plan accounts, no model switching):
+
 | Ticket | Blocked by |
 |---|---|
 | [quota-axi shared usage cache](tickets/01-quota-axi-shared-cache.md) | none |
-| [quota-axi opencode provider](tickets/02-quota-axi-opencode-provider.md) | none |
-| [quota-axi qoder provider](tickets/03-quota-axi-qoder-provider.md) | none |
 | [quota-axi account registry and policy](tickets/04-quota-axi-registry-policy.md) | none |
 | [jcode session control surface](tickets/05-jcode-control-surface.md) | none |
-| [cswap usage-call audit](tickets/06-cswap-usage-audit.md) | none |
-| [quota-axi decide](tickets/07-quota-axi-decide.md) | 01, 02, 03, 04 |
+| [quota-axi decide](tickets/07-quota-axi-decide.md) | 01, 04 |
 | [jcode converge on shared usage cache](tickets/08-jcode-shared-cache-convergence.md) | 01 |
 | [quota-axi fenced switch subcommand](tickets/09-quota-axi-switch.md) | 05, 07 |
-| [priming loop](tickets/10-priming-loop.md) | 09 |
 | [firstmate integration](tickets/11-firstmate-integration.md) | 09 |
+
+Phase 2 (cross-provider, cross-harness, priming):
+
+| Ticket | Blocked by |
+|---|---|
+| [quota-axi opencode provider](tickets/02-quota-axi-opencode-provider.md) | none |
+| [quota-axi qoder provider](tickets/03-quota-axi-qoder-provider.md) | none |
+| [cswap usage-call audit](tickets/06-cswap-usage-audit.md) | none |
+| [priming loop](tickets/10-priming-loop.md) | 09 |
 | [claude per-worker account isolation investigation](tickets/12-claude-per-worker-isolation.md) | none |
