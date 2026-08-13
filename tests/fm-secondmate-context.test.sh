@@ -230,6 +230,68 @@ test_context_stow_threshold_default_and_config() {
   pass "stow threshold reads config/context-stow-threshold, trims noise, and fails safe on bad values"
 }
 
+# The shared crossing/marker/hysteresis state machine both supervision paths use
+# (the away-mode daemon's context_stow_check and the watcher's context_stow_sweep).
+# Proving it here once means the two callers cannot fork this logic.
+test_context_stow_should_nudge_state_machine() {
+  local dir marker
+  dir=$(mktemp -d "$TMP_ROOT/should-nudge.XXXXXX")
+  marker="$dir/.context-stow-nudged"
+  # Below threshold: no nudge, no marker.
+  fm_context_stow_should_nudge 100000 200000 20000 "$marker" \
+    && fail "below threshold must not nudge"
+  [ -e "$marker" ] && fail "below threshold must record no marker"
+  # First crossing: nudge once and record the marker.
+  fm_context_stow_should_nudge 250000 200000 20000 "$marker" \
+    || fail "first crossing must nudge"
+  [ -e "$marker" ] || fail "first crossing must record the marker"
+  # Second poll still over: deduped, no re-nudge, marker stays.
+  fm_context_stow_should_nudge 250000 200000 20000 "$marker" \
+    && fail "a still-over-threshold poll must not re-nudge"
+  [ -e "$marker" ] || fail "dedupe must keep the marker"
+  # Dip into the hysteresis band (below 200000 but above 180000): stay armed.
+  fm_context_stow_should_nudge 190000 200000 20000 "$marker" \
+    && fail "a hysteresis-band dip must not nudge"
+  [ -e "$marker" ] || fail "a hysteresis-band dip must keep the marker armed"
+  # Drop below (threshold - hysteresis)=180000: re-arm (clear the marker).
+  fm_context_stow_should_nudge 100000 200000 20000 "$marker" \
+    && fail "a below-hysteresis poll must not nudge"
+  [ -e "$marker" ] && fail "dropping below the hysteresis band must clear the marker"
+  # Re-crossing after re-arm nudges again.
+  fm_context_stow_should_nudge 250000 200000 20000 "$marker" \
+    || fail "re-crossing after re-arm must nudge again"
+  [ -e "$marker" ] || fail "re-crossing must re-record the marker"
+  pass "shared should-nudge helper drives crossing, dedupe, hysteresis, and re-arm"
+}
+
+# The single canonical directive both paths deliver. It must be self-executing
+# (stow -> compact -> re-arm) and keep the substrings callers and tests key on.
+test_context_stow_directive_is_self_executing() {
+  local out
+  out=$(fm_context_stow_directive 250000 200000)
+  case "$out" in
+    *"/stow now"*) : ;;
+    *) fail "directive must tell firstmate to /stow now, got: $out" ;;
+  esac
+  case "$out" in
+    *"/compact"*) : ;;
+    *) fail "directive must tell firstmate to /compact, got: $out" ;;
+  esac
+  case "$out" in
+    *"re-arm supervision"*) : ;;
+    *) fail "directive must tell firstmate to re-arm supervision, got: $out" ;;
+  esac
+  case "$out" in
+    *"stow threshold 200000"*) : ;;
+    *) fail "directive must carry the 'stow threshold <n>' substring, got: $out" ;;
+  esac
+  case "$out" in
+    *"250000 tokens"*) : ;;
+    *) fail "directive must carry the live token count, got: $out" ;;
+  esac
+  pass "shared directive is self-executing (stow -> compact -> re-arm) and keeps its key substrings"
+}
+
 test_threshold_default_and_config
 test_munge_matches_claude
 test_claude_read_sums_last_mainthread_usage
@@ -242,5 +304,7 @@ test_jcode_reads_journal_token_usage
 test_jcode_ignores_stale_same_home_session
 test_jcode_fails_closed
 test_context_stow_threshold_default_and_config
+test_context_stow_should_nudge_state_machine
+test_context_stow_directive_is_self_executing
 
 echo "# all fm-secondmate-context tests passed"

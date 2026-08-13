@@ -1299,13 +1299,18 @@ afk_driver_tick() {  # <state>
 
 # --- firstmate own-context stow nudge ---------------------------------------
 # Read firstmate's OWN live context occupancy and, when it first crosses the stow
-# threshold, buffer ONE operational nudge telling firstmate to /stow now (and
-# /compact if the session cannot auto-compact). Stow+compact is firstmate's own
-# responsibility but depends on the agent remembering mid-flurry, and a long-lived
-# session cannot auto-compact, so knowledge can be lost to a context reset with no
-# enforcement. This is the structural, daemon-side half of that enforcement; the
-# turn-end-hook half is separate (enforce-stow-at-turnend-guard).
+# threshold, buffer ONE operational directive telling firstmate to /stow now, then
+# /compact, then re-arm supervision, before auto-compaction can discard un-stowed
+# knowledge. Stow+compact is firstmate's own responsibility but depends on the
+# agent remembering mid-flurry, and a long-lived session cannot auto-compact, so
+# knowledge can be lost to a context reset with no enforcement. This is the
+# structural, daemon-side half of that enforcement; the turn-end-hook half is
+# separate (enforce-stow-at-turnend-guard).
 #
+# The crossing/marker/hysteresis state machine and the directive text are both
+# owned by fm-secondmate-context-lib.sh (fm_context_stow_should_nudge,
+# fm_context_stow_directive), shared byte-for-byte with the always-on watcher's
+# context_stow_sweep, so the two supervision paths can never fork.
 # The read is claude/jcode-capable (fm_sm_context_tokens) and fails CLOSED: any
 # unreadable or unsupported harness, or a non-numeric count, yields no nudge -
 # the check never nudges on a bad read. The nudge reuses the same operational
@@ -1336,7 +1341,7 @@ firstmate_own_context_tokens() {
 # the gate is the daemon running (context fills in normal mode too), and delivery
 # itself stays afk-gated in inject_msg.
 context_stow_check() {  # <state>
-  local state=$1 config threshold hysteresis tokens marker rearm
+  local state=$1 config threshold hysteresis tokens marker
   config="${FM_CONFIG_OVERRIDE:-$FM_HOME/config}"
   tokens=$(firstmate_own_context_tokens 2>/dev/null || true)
   # Fail closed: never nudge on an unreadable or non-numeric count.
@@ -1345,19 +1350,13 @@ context_stow_check() {  # <state>
   hysteresis=${FM_CONTEXT_STOW_HYSTERESIS:-$CONTEXT_STOW_HYSTERESIS_DEFAULT}
   case "$hysteresis" in ''|*[!0-9]*) hysteresis=$CONTEXT_STOW_HYSTERESIS_DEFAULT ;; esac
   marker="$state/.context-stow-nudged"
-  if [ "$tokens" -ge "$threshold" ]; then
-    # Already nudged for this crossing: stay silent until the count re-arms.
-    [ -e "$marker" ] && return 0
-    _now > "$marker"
-    escalate_add "$state" "firstmate context ${tokens} tokens >= stow threshold ${threshold}: /stow now to persist knowledge before a context reset, and /compact if this session cannot auto-compact"
+  # Shared crossing/marker/hysteresis owner (fm-secondmate-context-lib.sh), the
+  # SAME state machine the always-on watcher's context_stow_sweep drives, so the
+  # two paths can never fork. It returns 0 only on the first crossing per arming.
+  if fm_context_stow_should_nudge "$tokens" "$threshold" "$hysteresis" "$marker"; then
+    escalate_add "$state" "$(fm_context_stow_directive "$tokens" "$threshold")"
     log "context-stow nudge buffered: ${tokens} tokens >= threshold ${threshold}"
-    return 0
   fi
-  rearm=$(( threshold - hysteresis ))
-  [ "$rearm" -ge 0 ] || rearm=0
-  # Dropped back below the hysteresis band (a fresh/compacted session): re-arm so
-  # the next crossing nudges again.
-  [ "$tokens" -lt "$rearm" ] && rm -f "$marker"
   return 0
 }
 
