@@ -479,17 +479,21 @@ EOF
 # auto-fired bare compact would summarize away un-stowed knowledge.
 #
 # When firstmate's own live context first crosses the stow threshold, wake once
-# with a firstmate-facing "check: context-stow-nudge" telling it to /stow now
-# (and /compact when the session cannot auto-compact). Idempotent via the SAME
-# durable marker the daemon check uses (state/.context-stow-nudged), so the two
-# supervision paths never double-nudge across a mode switch: the wake fires once
-# per crossing and re-arms only after the count drops back below
-# (threshold - hysteresis), which a fresh or compacted session does. Fails CLOSED:
-# an unreadable, non-numeric, or unsupported-harness count leaves the marker
-# untouched and wakes nobody, exactly like secondmate_context_sweep. Runs only on
-# the CHECK_INTERVAL cadence, and never while a live away-mode daemon owns triage
-# (the daemon's own check owns the nudge then, through its injection path). The
-# harness is FM_SUPERVISOR_HARNESS when set (testing) else this process's own
+# with a firstmate-facing "check: context-stow-nudge" carrying the shared
+# self-executing directive: /stow now, then /compact, then re-arm supervision,
+# before auto-compaction can discard un-stowed knowledge. The crossing/marker/
+# hysteresis state machine and the directive text are both owned by
+# fm-secondmate-context-lib.sh (fm_context_stow_should_nudge,
+# fm_context_stow_directive) and shared byte-for-byte with the away-mode daemon's
+# context_stow_check, through the SAME durable marker (state/.context-stow-nudged),
+# so the two supervision paths never double-nudge or drift across a mode switch:
+# the wake fires once per crossing and re-arms only after the count drops back
+# below (threshold - hysteresis), which a fresh or compacted session does. Fails
+# CLOSED: an unreadable, non-numeric, or unsupported-harness count leaves the
+# marker untouched and wakes nobody, exactly like secondmate_context_sweep. Runs
+# only on the CHECK_INTERVAL cadence, and never while a live away-mode daemon owns
+# triage (the daemon's own check owns the nudge then, through its injection path).
+# The harness is FM_SUPERVISOR_HARNESS when set (testing) else this process's own
 # detected harness; the transcript cwd is FM_CONTEXT_STOW_CWD when set (testing)
 # else FM_HOME - identical resolution to the daemon so both read the same count.
 _own_stow_harness_memo=""
@@ -501,7 +505,7 @@ own_stow_harness() {
   printf '%s' "$_own_stow_harness_memo"
 }
 context_stow_sweep() {
-  local harness cwd threshold hysteresis tokens marker rearm reason
+  local harness cwd threshold hysteresis tokens marker reason
   afk_daemon_owns_triage && return 0
   harness=$(own_stow_harness)
   cwd=${FM_CONTEXT_STOW_CWD:-${FM_HOME:-}}
@@ -514,25 +518,17 @@ context_stow_sweep() {
   hysteresis=${FM_CONTEXT_STOW_HYSTERESIS:-$FM_CONTEXT_STOW_HYSTERESIS_DEFAULT}
   case "$hysteresis" in ''|*[!0-9]*) hysteresis=$FM_CONTEXT_STOW_HYSTERESIS_DEFAULT ;; esac
   marker="$STATE/.context-stow-nudged"
-  if [ "$tokens" -ge "$threshold" ]; then
-    # Already nudged for this crossing: stay silent until the count re-arms.
-    [ -e "$marker" ] && return 0
-    _now_stamp > "$marker"
-    reason="check: context-stow-nudge firstmate context ${tokens} tokens >= stow threshold ${threshold}: /stow now to persist knowledge before a context reset, and /compact if this session cannot auto-compact"
+  # Shared crossing/marker/hysteresis owner (fm-secondmate-context-lib.sh), the
+  # SAME state machine the away-mode daemon's context_stow_check drives, so the
+  # two paths can never fork. It returns 0 only on the first crossing per arming.
+  if fm_context_stow_should_nudge "$tokens" "$threshold" "$hysteresis" "$marker"; then
+    reason="check: context-stow-nudge $(fm_context_stow_directive "$tokens" "$threshold")"
     fm_wake_append check context-stow-nudge "$reason" || exit 1
     touch "$STATE/.last-check"
     wake "$reason"
   fi
-  rearm=$(( threshold - hysteresis ))
-  [ "$rearm" -ge 0 ] || rearm=0
-  # Dropped back below the hysteresis band (a fresh/compacted session): re-arm so
-  # the next crossing nudges again.
-  [ "$tokens" -lt "$rearm" ] && rm -f "$marker"
   return 0
 }
-
-# Epoch seconds, for the stow-nudge marker; matches the daemon's _now helper.
-_now_stamp() { date +%s; }
 
 # The slow-poll HOST monitor, split into a probe CYCLE and a surface DECISION so
 # the crew-liveness probe never runs on this loop. The probe (kernel-wide CPU,

@@ -366,7 +366,7 @@ Handle actionable wakes as follows:
 
 1. For `signal:`, read the listed event lines first, then reconcile current state only where action depends on it.
 2. For `stale:`, inspect the recorded endpoint and load `stuck-crewmate-recovery` for a stopped, looping, confused, or unresponsive worker; a deep-inspection reason also requires current-state and validation-log inspection.
-3. For `check:`, act on the named poll result, including merges, X-mode events, a `host-resources` reading, and the hourly `session-review` and `session-cleanup` passes.
+3. For `check:`, act on the named poll result, including merges, X-mode events, a `host-resources` reading, the hourly `session-review` and `session-cleanup` passes, and a `context-stow-nudge` (firstmate's own context crossed the stow threshold: `/stow`, then `/compact`, then re-arm supervision, before auto-compaction discards un-stowed knowledge; owned by `docs/configuration.md` "Firstmate own-context stow threshold").
 4. For `heartbeat:`, review the whole fleet from the structured fleet view, reconcile suspicious tasks and PR state, update the backlog, and never report an unchanged fleet as progress.
 
 A `host-resources` wake, a heartbeat's host-pressure annotation, and a spawn's resource advisory all report that the machine itself is overloaded, never that a crew misbehaved.

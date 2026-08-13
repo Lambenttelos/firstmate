@@ -242,3 +242,43 @@ fm_context_stow_threshold() {  # <config-dir>
   done < "$file"
   printf '%s' "$FM_CONTEXT_STOW_THRESHOLD_DEFAULT"
 }
+
+# fm_context_stow_directive: the single canonical own-context stow directive both
+# supervision paths deliver, so the away-mode daemon nudge and the normal-mode
+# watcher wake read identically and can never drift apart. It is a self-executing
+# instruction, not an FYI: firstmate should /stow now (persist each durable fact
+# to its right home), then /compact, then re-arm supervision, and it must do this
+# BEFORE auto-compaction discards un-stowed knowledge - the threshold is tuned
+# (config/context-stow-threshold) to leave that window. Keeps the "/stow now" and
+# "stow threshold <n>" substrings the callers and tests key on.
+fm_context_stow_directive() {  # <tokens> <threshold>
+  local tokens=$1 threshold=$2
+  printf 'firstmate context %s tokens >= stow threshold %s: /stow now to persist knowledge, then /compact, then re-arm supervision - do this BEFORE auto-compaction can discard un-stowed knowledge' \
+    "$tokens" "$threshold"
+}
+
+# fm_context_stow_should_nudge: the single owner of the crossing/marker/hysteresis
+# state machine both paths share, so neither the daemon nor the watcher forks its
+# own copy. Given the live token count, the configured threshold, the hysteresis
+# band, and the durable marker path, it decides whether THIS poll should nudge and
+# manages the marker atomically:
+#   - at/above threshold with no marker: record the marker, return 0 (nudge now)
+#   - at/above threshold with a marker already set: return 1 (already nudged this
+#     crossing, stay silent)
+#   - below (threshold - hysteresis): clear the marker so the next crossing nudges
+#     again (a fresh or compacted session), return 1
+#   - inside the hysteresis band: leave the marker as-is, return 1
+# The caller is responsible for failing closed on an unreadable/non-numeric count
+# BEFORE calling this (it assumes numeric inputs); it never reads context itself.
+fm_context_stow_should_nudge() {  # <tokens> <threshold> <hysteresis> <marker>
+  local tokens=$1 threshold=$2 hysteresis=$3 marker=$4 rearm
+  if [ "$tokens" -ge "$threshold" ]; then
+    [ -e "$marker" ] && return 1
+    date +%s > "$marker"
+    return 0
+  fi
+  rearm=$(( threshold - hysteresis ))
+  [ "$rearm" -ge 0 ] || rearm=0
+  [ "$tokens" -lt "$rearm" ] && rm -f "$marker"
+  return 1
+}
