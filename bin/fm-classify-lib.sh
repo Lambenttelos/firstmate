@@ -57,6 +57,23 @@ FM_CLASSIFY_CAPTAIN_RE_DEFAULT='done:|needs-decision:|blocked:|failed:|PR ready|
 # drift between the two consumers. FM_CLASSIFY_PAUSED_VERB overrides it.
 FM_CLASSIFY_PAUSED_VERB_DEFAULT='paused'
 
+# The credential/quota/token-exhaustion vocabulary that a `paused:` reason must
+# NOT be allowed to bury. A declared pause is the deliberate no-escalation state
+# for a KNOWN external wait that clears on its OWN (a vendor rate-limit reset, an
+# upstream release, a scheduled window). Credential/quota/token exhaustion is a
+# different animal: it is CAPTAIN-FIXABLE (switch the account or relog in), so it
+# is a blocker, not a bounded self-healing wait. In the 2026 incident three
+# no-mistakes pipelines stalled for HOURS on the SHARED Claude account
+# usage-window limit because each recorded `paused: ...` with a scheduled
+# auto-resume - the deliberate no-escalation state - and the watcher absorbed
+# them on the long pause cadence. status_is_auth_exhaustion_pause below matches a
+# `paused:` reason carrying any of these signals so it is reclassified to the
+# blocked/surface side. Deliberately does NOT include bare "rate limit": a vendor
+# rate-limit reset is the canonical benign pause and must stay one. This constant
+# is the ONE owner of the exhaustion vocabulary; FM_CLASSIFY_AUTH_EXHAUSTION_RE
+# overrides it for a home with a custom worker vocabulary.
+FM_CLASSIFY_AUTH_EXHAUSTION_RE_DEFAULT='usage[ _-]?limit|usage[ _-]?window|session[ _-]?limit|quota|revoked|(token|credential|session|login|auth)[ _-]?expired|expired[ _-]?(token|credential|session|login|auth)|re-?login|/login|log ?in again|reauth|switch[a-z ]*account|credit balance|not authenticated|unauthenticated|invalid_grant'
+
 # Bounded re-surface cadence for a declared pause or a dead-agent captain hold.
 # Far longer than the wedge threshold (FM_STALE_ESCALATE_SECS, default 240s), it
 # avoids nagging a deliberate wait while ensuring a forgotten hold cannot rot
@@ -97,10 +114,13 @@ status_is_terminal_verb() {
 # Verb-aware by default: terminal verbs always match; nonterminal progress verbs
 # (working, resolved, captain-held) and paused never match from free-text prose;
 # only lines without those leading verbs may still match free-text tokens for
-# legacy bare lines such as "merged" or "PR ready".
+# legacy bare lines such as "merged" or "PR ready". The one exception is an
+# auth/quota/token-exhaustion pause, which is captain-fixable rather than a benign
+# wait and so is surfaced explicitly.
 status_is_captain_relevant() {
   local line=$1 verb
   [ -n "$line" ] || return 1
+  status_is_auth_exhaustion_pause "$line" && return 0
   status_is_paused "$line" && return 1
   verb=$(status_line_verb "$line")
   case "$verb" in
@@ -120,11 +140,33 @@ status_is_captain_relevant() {
 # read of the line itself, so the daemon's classify_stale can reuse the last line
 # it already read without a fm-crew-state.sh call. Matches only the verb before the
 # first colon, so a reason mentioning "paused" elsewhere does not false-match.
+#
+# An auth/quota/token-exhaustion pause is deliberately EXCLUDED here: such a stall
+# is captain-fixable, not a self-healing external wait, so it must NOT be absorbed
+# on the benign pause cadence. status_is_auth_exhaustion_pause carries the
+# exhaustion vocabulary; a `paused:` line whose reason matches it fails this test
+# and therefore stays captain-relevant and surfaces as a blocker.
 status_is_paused() {  # <status-line>
   local line=$1 verb
   [ -n "$line" ] || return 1
   verb=$(status_line_verb "$line")
-  [ "$verb" = "${FM_CLASSIFY_PAUSED_VERB:-$FM_CLASSIFY_PAUSED_VERB_DEFAULT}" ]
+  [ "$verb" = "${FM_CLASSIFY_PAUSED_VERB:-$FM_CLASSIFY_PAUSED_VERB_DEFAULT}" ] || return 1
+  ! status_is_auth_exhaustion_pause "$line"
+}
+
+# 0 if a status line is a `paused:` line whose reason declares credential, quota,
+# session-limit, or token exhaustion - a captain-fixable stall wrongly dressed as a
+# benign external wait. Pure read of the line: it matches only when the leading
+# verb is the pause verb AND the reason carries the exhaustion vocabulary, so a
+# genuine rate-limit-reset pause, or a working/blocked line mentioning a token,
+# never matches. FM_CLASSIFY_AUTH_EXHAUSTION_RE overrides the vocabulary.
+status_is_auth_exhaustion_pause() {  # <status-line>
+  local line=$1 verb note
+  [ -n "$line" ] || return 1
+  verb=$(status_line_verb "$line")
+  [ "$verb" = "${FM_CLASSIFY_PAUSED_VERB:-$FM_CLASSIFY_PAUSED_VERB_DEFAULT}" ] || return 1
+  note=$(status_line_note "$line")
+  printf '%s' "$note" | grep -qiE "${FM_CLASSIFY_AUTH_EXHAUSTION_RE:-$FM_CLASSIFY_AUTH_EXHAUSTION_RE_DEFAULT}"
 }
 
 # 0 if a status line declares either an external-wait pause or a verified
