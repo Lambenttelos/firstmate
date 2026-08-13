@@ -59,6 +59,12 @@ fm_hourly_reset_findings
 # The in-flight count is taken from this same walk, so state/*.meta is read once
 # under one secondmate filter.
 INFLIGHT=0
+# Fleet rollup of shared-credential exhaustion: one TAB-separated
+# "<account>\t<id>\t<reset>" line per task whose CURRENT status is an
+# auth/quota/token-exhaustion pause (bin/fm-classify-lib.sh's per-task detector).
+# Grouped by account after the walk so 2+ tasks stalled on the SAME shared
+# credential raise ONE aggregated escalation instead of N silent local waits.
+AUTH_EXHAUSTION=
 for meta in "$STATE"/*.meta; do
   [ -f "$meta" ] || continue
   fm_hourly_meta_is_secondmate "$meta" && continue
@@ -68,6 +74,19 @@ for meta in "$STATE"/*.meta; do
   if [ -f "$status" ]; then
     age=$(fm_hourly_age_of "$status")
     open=$(status_open_decisions "$status")
+    # Collect this task for the shared-credential rollup when its CURRENT status
+    # is an auth/quota/token-exhaustion pause. The per-task detection and the
+    # account/reset identity are all owned by bin/fm-classify-lib.sh; this pass
+    # only groups them. The single-task case is deliberately NOT reported here -
+    # classify-auth-limit already surfaces one exhaustion pause as its own
+    # blocker; this rollup fires only for the N>=2 same-account cluster.
+    last=$(last_status_line "$status")
+    if status_is_auth_exhaustion_pause "$last"; then
+      acct=$(status_auth_exhaustion_account "$last")
+      reset=$(status_auth_exhaustion_reset "$last")
+      AUTH_EXHAUSTION="$AUTH_EXHAUSTION$acct	$id	$reset
+"
+    fi
   else
     # A worker that wedged before writing its first status line is the worst
     # stall there is, so age it from its own record instead of skipping it.
@@ -113,6 +132,63 @@ EOF
       "$id has reported nothing for $(fm_hourly_human_age "$age"); check its current state before assuming it is working"
   fi
 done
+
+# --- shared-credential exhaustion rollup -------------------------------------
+# The incident this closes: three no-mistakes pipelines stalled for HOURS on the
+# ONE shared Claude account limit, each recorded as an independent benign wait,
+# never aggregated into the single fleet-wide blocker it actually was. Group the
+# collected exhaustion tasks by account and raise ONE actionable escalation per
+# account with 2+ tasks - "N pipelines stalled on account X". A single task on an
+# account is intentionally NOT re-reported here: classify-auth-limit already
+# surfaces one exhaustion pause as its own blocker, so this is purely the N>=2
+# aggregation on top. Grouped strictly by same account: precision matters both
+# ways - a false aggregation spams a fleet-wide blocker on unrelated waits, a
+# missed one recreates the original silent-for-hours bug. Portable bash 3.2, so
+# the accounts are tracked in a newline list rather than an associative array.
+if [ -n "$AUTH_EXHAUSTION" ]; then
+  seen_accounts=
+  while IFS=$(printf '\t') read -r acct id reset; do
+    [ -n "$acct" ] || continue
+    case "
+$seen_accounts" in *"
+$acct
+"*) continue ;; esac
+    seen_accounts="$seen_accounts
+$acct
+"
+    # Count tasks on this account, collect their ids, and take the first
+    # non-empty reset hint any of them recorded (all share one credential, so any
+    # one reset time describes the whole cluster).
+    count=0
+    ids=
+    reset_hint=
+    while IFS=$(printf '\t') read -r a i r; do
+      [ "$a" = "$acct" ] || continue
+      count=$(( count + 1 ))
+      [ -n "$ids" ] && ids="$ids, "
+      ids="$ids$i"
+      [ -z "$reset_hint" ] && [ -n "$r" ] && reset_hint="$r"
+    done <<EOF
+$AUTH_EXHAUSTION
+EOF
+    [ "$count" -ge 2 ] || continue
+    if [ -n "$reset_hint" ]; then
+      when=" - switch the account or wait for $reset_hint"
+    else
+      when=" - switch the account or wait for the usage window to reset"
+    fi
+    if [ "$acct" = "shared" ]; then
+      headline="$count pipelines stalled on the shared account"
+      detail="$count pipelines stalled on the same shared credential$when; stalled: $ids"
+    else
+      headline="$count pipelines stalled on account $acct"
+      detail="$count pipelines stalled on the same shared credential (account $acct)$when; stalled: $ids"
+    fi
+    fm_hourly_add_finding "auth-exhaustion:$acct" "$headline" "$detail"
+  done <<EOF
+$AUTH_EXHAUSTION
+EOF
+fi
 
 # --- idle capacity: queued work with nothing running -------------------------
 # The captain's standing rule is that an idle slot while work is queued is a
