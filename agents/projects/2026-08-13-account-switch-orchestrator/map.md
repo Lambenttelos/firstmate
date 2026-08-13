@@ -16,6 +16,7 @@ Design decisions are locked in ADR 0031 (`docs/adr/0031-account-switch-orchestra
 
 ## Decisions so far
 
+- [claude harness actuation via claude-swap](tickets/06-cswap-audit-claude-harness-actuation.md) - depend on claude-swap as the store's single owner (shell out, never write the store natively); scriptability verification folded into the phase 2 ticket.
 - [Grilling session 2026-08-13](../../../docs/adr/0031-account-switch-orchestrator.md) - full design locked: quota-axi owns orchestration with fenced mutation; observation-driven limits; declarative tier policy with external policy authors; harness-first precedence; jcode control surface for actuation; drain semantics; shared single-flight usage cache; priming as auth+telemetry freshness.
 
 ## Phase boundary
@@ -56,6 +57,6 @@ Phase 2 (cross-provider, cross-harness, priming):
 |---|---|
 | [quota-axi opencode provider](tickets/02-quota-axi-opencode-provider.md) | none |
 | [quota-axi qoder provider](tickets/03-quota-axi-qoder-provider.md) | none |
-| [cswap usage-call audit](tickets/06-cswap-usage-audit.md) | none |
+| [claude harness actuation via claude-swap](tickets/06-cswap-audit-claude-harness-actuation.md) | 09 |
 | [priming loop](tickets/10-priming-loop.md) | 09 |
 | [claude per-worker account isolation investigation](tickets/12-claude-per-worker-isolation.md) | none |
