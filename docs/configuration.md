@@ -802,6 +802,7 @@ FM_CREW_STATE_RUNS_LIMIT=200  # recent no-mistakes run rows scanned when axi sta
 FM_CREW_STATE_BIN=bin/fm-crew-state.sh   # test override for the current-state reader used by working/paused watcher triage and by fm-wake-brief.sh
 FM_WAKE_BRIEF_TAIL=5    # state/*.status lines printed per task in the fm-wake-brief.sh wake-handling brief
 FM_WAKE_DRAIN_BIN=bin/fm-wake-drain.sh   # test override for the drain fm-wake-brief.sh composes, mainly to exercise its failed-drain path
+FM_SPAWN_ALLOW_DUPLICATE=   # deliberate override for fm-spawn.sh's pre-spawn duplicate-dispatch guard; truthy 1 spawns a crewmate/scout even if the task id is already in data/completions.tsv or its recorded pr= is already merged
 FMX_PAIRING_TOKEN=      # X mode pairing token; .env opt-in authorizes replies and eligible lifecycle actions
 FMX_RELAY_URL=https://myfirstmate.io   # optional X relay override, mainly for local relay development
 FMX_ENV_FILE=           # optional alternate .env file for direct X client invocations; bootstrap still checks $FM_HOME/.env
