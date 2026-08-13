@@ -151,9 +151,11 @@ if [ -n "$AUTH_EXHAUSTION" ]; then
     [ -n "$acct" ] || continue
     case "
 $seen_accounts" in *"
-$acct"*) continue ;; esac
+$acct
+"*) continue ;; esac
     seen_accounts="$seen_accounts
-$acct"
+$acct
+"
     # Count tasks on this account, collect their ids, and take the first
     # non-empty reset hint any of them recorded (all share one credential, so any
     # one reset time describes the whole cluster).
