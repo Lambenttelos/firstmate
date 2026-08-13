@@ -25,6 +25,7 @@ It never tears down a task, merges a PR, dispatches new work, or mutates any tas
    If the command is unavailable, fall back to `bin/fm-fleet-snapshot.sh --json` and `bin/fm-crew-state.sh <id>`; never infer current state from a raw `tail` of `state/<id>.status`, which is append-only wake-event history whose last line goes stale.
    For registered secondmates, use the snapshot's structured-home classification and provenance; a parent event or bounded terminal contradiction is fallback evidence, never authority over readable structured home state.
    Structured captain-held decisions come from `decision-hold-lifecycle` and appear under `decisions_open`; do not scrape reports or visual-review artifacts to supplement them.
+   The snapshot already sorts `decisions_open` blocking-first, then oldest-first within each group, so render them in that order and surface the blocking ones ahead of review-when-convenient holds; a hold carries `blocking: true` when created with `fm-decision-hold.sh hold ... --blocking` (priority 0).
    A queued item under `gates` only becomes "next work" when its blocker is gone and its time/date gate has arrived; until then it stays queued with the reason.
    The `(main-inventory)` gate is an action-free integrity warning rather than queued work: render it under Charted Next with the related `omitted` disclosure, never invent an Underway row from backlog-only state, and never move it into Captain's Call.
 

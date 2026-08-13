@@ -655,7 +655,47 @@ EOF
   pass "guard backstops the retention-loss bug across active and archived captain holds"
 }
 
+test_blocking_flag_marks_priority_and_sorts_first() {
+  local home conv_hold block_hold conv_show block_show json ids
+  home=$(make_home blocking-holds)
+  write_origin_meta "$home" conv-origin
+  write_origin_meta "$home" block-origin
+
+  # A convenience hold created without --blocking must leave priority untouched.
+  conv_hold=$(run_decisions "$home" hold conv-origin conv \
+    --title "Convenience decision" --reason "review when convenient") \
+    || fail "could not create convenience hold"
+  conv_show=$(tasks_in "$home" show "$conv_hold" --full) \
+    || fail "could not show convenience hold"
+  printf '%s\n' "$conv_show" | grep -Eq '^  priority: "-"' \
+    || fail "convenience hold must not set a priority: $conv_show"
+
+  # A blocking hold created with --blocking must record priority 0.
+  block_hold=$(run_decisions "$home" hold block-origin block \
+    --title "Blocking decision" --reason "blocks live money-path work" --blocking) \
+    || fail "could not create blocking hold"
+  block_show=$(tasks_in "$home" show "$block_hold" --full) \
+    || fail "could not show blocking hold"
+  printf '%s\n' "$block_show" | grep -Eq '^  priority: 0' \
+    || fail "blocking hold must set priority 0: $block_show"
+
+  # Bearings must surface the blocking hold ahead of the convenience one even though
+  # the convenience hold was created first (blocking-first, then oldest-first).
+  json=$(run_bearings "$home") || fail "Bearings failed for blocking-holds fixture"
+  ids=$(printf '%s' "$json" | jq -r '[.decisions_open[] | .id] | join(",")')
+  [ "$ids" = "block-origin-decision-block,conv-origin-decision-conv" ] \
+    || fail "blocking hold must sort first: $ids"
+  printf '%s' "$json" | jq -e '
+    (.decisions_open[0].blocking == true)
+      and (.decisions_open[1].blocking == false)
+  ' >/dev/null || fail "decisions_open must carry the blocking marker: $json"
+
+  pass "the --blocking flag sets priority 0 and sorts blocking holds first in Bearings"
+}
+
 test_uninventoried_report_decision_refuses_completion
+
+test_blocking_flag_marks_priority_and_sorts_first
 
 test_guard_backstops_retention_loss
 test_scout_teardown_always_requires_inventory_verification
