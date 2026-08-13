@@ -489,6 +489,31 @@ unit_tmux_absence_distinguishes_probe_failure() {
   rm -rf "$st"
 }
 
+unit_tmux_absence_dead_server_confirmed() {
+  local st
+  st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-tmux-dead.XXXXXX")
+  if FM_HOME="$st" FM_STATE_OVERRIDE="$st/state" bash -c '
+    . "$1"
+    # Session gone, server live: existing signal must still map to absent.
+    tmux() { printf "%s" "can'\''t find session: exact-session" >&2; return 1; }
+    fm_afk_launch_terminal_absent tmux exact-session
+    # Server fully dead: different stderr, still absent (the wedge fix).
+    tmux() { printf "%s" "no server running on /tmp/tmux-0/default" >&2; return 1; }
+    fm_afk_launch_terminal_absent tmux exact-session
+    # Different socket path in the dead-server message: prefix still matches.
+    tmux() { printf "%s" "no server running on /tmp/tmux-1000/other" >&2; return 1; }
+    fm_afk_launch_terminal_absent tmux exact-session
+    # Live session with a live server: NOT absent (no regression).
+    tmux() { return 0; }
+    ! fm_afk_launch_terminal_absent tmux exact-session
+  ' _ "$LAUNCH"; then
+    pass "tmux absence: dead server and missing session both confirm absent, live session does not"
+  else
+    fail "tmux absence: dead-server signal or live-session case handled wrong"
+  fi
+  rm -rf "$st"
+}
+
 unit_native_lifecycle() {
   local st
   st=$(mktemp -d "${TMPDIR:-/tmp}/fm-afk-native.XXXXXX")
@@ -1341,6 +1366,7 @@ unit_record_failure_closes_terminal
 unit_readiness_failure_rolls_back_terminal
 unit_readiness_failure_preserves_unconfirmed_record
 unit_tmux_absence_distinguishes_probe_failure
+unit_tmux_absence_dead_server_confirmed
 unit_native_lifecycle
 unit_daemonless_lifecycle
 unit_daemonless_refuses_live_daemon
