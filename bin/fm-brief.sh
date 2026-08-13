@@ -503,7 +503,7 @@ EOF
       RULE1='1. Push only your `fm/'"$ID"'` branch to origin while you work, and NEVER force-push. After the pipeline is green you self-land that branch onto the default branch through the guarded steps in the Definition of done - land only your own branch, never any other lane, and never merge a PR.'
       DOD=$(cat <<EOF
 # Definition of done
-This project ships **direct-push +autoland**: an owned Bitbucket repo firstmate cannot open PRs on, and green work SELF-LANDS - after the pipeline is green you merge your own branch onto the shared default branch yourself, without waiting for the captain.
+This project ships **direct-push +autoland**: an owned Bitbucket repo, and green work SELF-LANDS - after the pipeline is green you merge your own branch onto the shared default branch yourself, without waiting for the captain.
 
 $DP_BODY
 
@@ -533,7 +533,7 @@ EOF
       RULE1='1. Never push to the default branch (push only your `fm/'"$ID"'` branch to origin). Never merge a PR.'
       DOD=$(cat <<EOF
 # Definition of done
-This project ships **direct-push**: the forge cannot host firstmate-opened PRs (e.g. Bitbucket), so there is no PR and no CI to wait on.
+This project ships **direct-push**: your pipeline's own PR and CI steps do not apply on the forge (e.g. Bitbucket), so YOU open no PR and wait on no CI - firstmate opens the Bitbucket PR itself after your validated branch is pushed.
 $DP_BODY
 
 After the pipeline reports \`passed\`, push your validated branch explicitly - a pipeline "push" only reaches the local internal gate:
