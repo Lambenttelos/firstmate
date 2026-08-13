@@ -56,9 +56,12 @@
 # it); claude and grok stay on the silent-re-arm path unless the flag forces it.
 # Supported supervisor backends are tmux and herdr only; anything else, or a pane
 # that does not positively resolve, degrades silently to the silent-re-arm
-# behavior. Pane-wake never runs in away mode - the away daemon owns the pane
-# then - which the existing away-mode interlock already guarantees. See
-# docs/configuration.md.
+# behavior. On herdr the pane id is NOT stable - herdr can reassign it under the
+# same live tab (HERDR_PANE_ID drift) - so the daemon captures the stable owning
+# tab identity at resolve time and re-resolves the current pane by that tab before
+# each inject, waking the drifted-to pane instead of skipping forever. Pane-wake
+# never runs in away mode - the away daemon owns the pane then - which the
+# existing away-mode interlock already guarantees. See docs/configuration.md.
 #
 # Away-mode interlock: while state/.afk exists the away daemon owns supervision,
 # so the two never supervise concurrently. `start` refuses under the flag,
@@ -190,13 +193,22 @@ away_mode_active() {
   [ -e "$AFK" ]
 }
 
-# --- pane-wake (resolve once at startup, inject on actionable cycles) --------
-# Resolved once in run_main and read by the injector. Empty target means
+# --- pane-wake (resolve once at startup, re-resolve on drift each cycle) ------
+# Resolved in run_main and read/refreshed by the injector. Empty target means
 # pane-wake degraded silently to the silent-re-arm behavior (no pane, unsupported
 # backend, or feature off).
+#
+# Herdr reassigns a session's pane id under the same live tab (the HERDR_PANE_ID
+# drift), so a target frozen at startup goes stale and every inject then logs
+# "target gone; skipping" forever while never waking the model - the blind-but-
+# healthy-looking failure this daemon must not have. PANE_WAKE_TAB_IDENTITY holds
+# the STABLE "<session>\t<tab_id>" of firstmate's own tab (herdr only) captured at
+# resolve time, so inject can re-resolve the CURRENT pane for that tab whenever
+# the recorded pane id has drifted, and wake the new pane instead of skipping.
 PANE_WAKE_ACTIVE=0
 PANE_WAKE_TARGET=
 PANE_WAKE_BACKEND=
+PANE_WAKE_TAB_IDENTITY=
 
 # pane_wake_resolve: at startup, decide whether pane-wake is active for this run
 # and, if so, resolve firstmate's own supervisor pane ONCE using the shared owner
@@ -205,10 +217,11 @@ PANE_WAKE_BACKEND=
 # or no real pane resolves (only the firstmate:0 / FALLBACK guess remained). Never
 # runs under away mode - the away daemon owns the pane then.
 pane_wake_resolve() {
-  local target backend rc=0
+  local target backend rc=0 identity
   PANE_WAKE_ACTIVE=0
   PANE_WAKE_TARGET=
   PANE_WAKE_BACKEND=
+  PANE_WAKE_TAB_IDENTITY=
   if ! pane_wake_enabled; then
     log_line "pane-wake: disabled (silent re-arm only)"
     return 0
@@ -232,7 +245,51 @@ pane_wake_resolve() {
   PANE_WAKE_TARGET=$target
   PANE_WAKE_BACKEND=$backend
   PANE_WAKE_ACTIVE=1
+  # Herdr only: capture the STABLE owning tab identity of the resolved pane, so a
+  # later pane-id reassignment (HERDR_PANE_ID drift) is recoverable by re-resolve
+  # rather than freezing the target dead. Best-effort - an empty identity just
+  # means no drift recovery is available and inject falls back to the recorded
+  # target exactly as before. tmux pane ids are stable, so it needs none of this.
+  if [ "$backend" = herdr ]; then
+    if identity=$(fm_backend_herdr_pane_tab_identity "$target" 2>/dev/null) && [ -n "$identity" ]; then
+      PANE_WAKE_TAB_IDENTITY=$identity
+      log_line "pane-wake: active (backend=$backend target=$target tab=${identity#*$'\t'})"
+      return 0
+    fi
+    log_line "pane-wake: active (backend=$backend target=$target; no stable tab identity, drift recovery unavailable)"
+    return 0
+  fi
   log_line "pane-wake: active (backend=$backend target=$target)"
+}
+
+# pane_wake_refresh_target: before an inject, re-resolve firstmate's own pane if
+# the recorded target has drifted. Herdr can reassign a session's pane id under
+# the same live tab, so a target frozen at startup silently goes stale. When the
+# recorded pane still exists, keep it. When it is gone but a stable tab identity
+# was captured at resolve time, re-resolve the CURRENT pane for that tab and adopt
+# it, so the daemon wakes the NEW pane instead of logging "gone; skipping" for the
+# life of the run. Returns 0 when PANE_WAKE_TARGET is usable, 1 when no live pane
+# resolves (inject then skips this cycle, wake already durably queued). tmux never
+# drifts, so its target passes straight through.
+pane_wake_refresh_target() {
+  local backend=$PANE_WAKE_BACKEND session tab_id fresh
+  fm_backend_target_exists "$backend" "$PANE_WAKE_TARGET" && return 0
+  # Recorded target is gone. Only herdr with a captured tab identity can recover.
+  if [ "$backend" != herdr ] || [ -z "$PANE_WAKE_TAB_IDENTITY" ]; then
+    return 1
+  fi
+  session=${PANE_WAKE_TAB_IDENTITY%%$'\t'*}
+  tab_id=${PANE_WAKE_TAB_IDENTITY#*$'\t'}
+  fresh=$(fm_backend_herdr_target_for_tab_identity "$session" "$tab_id" 2>/dev/null) || fresh=
+  if [ -z "$fresh" ]; then
+    # The tab itself is gone (firstmate's own pane genuinely closed), not a drift.
+    return 1
+  fi
+  if [ "$fresh" != "$PANE_WAKE_TARGET" ]; then
+    log_line "pane-wake: target drifted $PANE_WAKE_TARGET -> $fresh (re-resolved by tab $tab_id)"
+    PANE_WAKE_TARGET=$fresh
+  fi
+  fm_backend_target_exists "$backend" "$PANE_WAKE_TARGET"
 }
 
 # pane_wake_inject: nudge firstmate's own pane to read the already-queued wake.
@@ -245,15 +302,19 @@ pane_wake_resolve() {
 # and the next actionable cycle retries. Best-effort: always returns 0 so a
 # failed nudge can never break the re-arm loop.
 pane_wake_inject() {
-  local target=$PANE_WAKE_TARGET backend=$PANE_WAKE_BACKEND msg verdict tail40
+  local target backend=$PANE_WAKE_BACKEND msg verdict tail40
   [ "$PANE_WAKE_ACTIVE" -eq 1 ] || return 0
   # Away mode may have been entered mid-run; the loop breaks on it separately, but
   # guard here too so a race never injects while the away daemon owns the pane.
   away_mode_active && return 0
-  fm_backend_target_exists "$backend" "$target" || {
-    log_line "pane-wake: target '$target' gone; skipping nudge (wake already queued)"
+  # Re-resolve the target before every inject so a herdr pane-id reassignment
+  # (HERDR_PANE_ID drift) recovers to the CURRENT pane instead of skipping forever.
+  # It may update PANE_WAKE_TARGET, so read the local copy only AFTER it returns.
+  if ! pane_wake_refresh_target; then
+    log_line "pane-wake: target '$PANE_WAKE_TARGET' gone and unrecoverable; skipping nudge (wake already queued)"
     return 0
-  }
+  fi
+  target=$PANE_WAKE_TARGET
   # Busy-guard: never inject into a pane whose agent is mid-turn.
   case "$(fm_backend_busy_state "$backend" "$target" 2>/dev/null)" in
     busy)
@@ -389,9 +450,24 @@ run_main() {
     return 0
   fi
   # Bind the lock to this home and this process's identity before any cycle runs,
-  # so a recycled pid can never read as a live daemon.
+  # so a recycled pid can never read as a live daemon. The identity MUST be
+  # computed for THIS shell's own pid taken directly from $BASHPID, never via a
+  # command substitution: $(fm_current_pid) runs in a subshell and prints that
+  # already-exited subshell's pid, whose /proc entry is gone by the time
+  # fm_pid_identity reads it, so the write produced a ZERO-BYTE pid-identity and
+  # daemon_lock_matches_pid then reported every live daemon as "not running"
+  # (task fix-present-daemon-stale-pane-wake-target). Write atomically through a
+  # temp file so a reader never observes a half-written identity, and only after
+  # the identity is present is the lock considered a live daemon's.
+  local mypid identity
+  mypid=${BASHPID:-$$}
   printf '%s\n' "$FM_HOME" > "$DAEMON_LOCK/fm-home" 2>/dev/null || true
-  fm_pid_identity "$(fm_current_pid)" > "$DAEMON_LOCK/pid-identity" 2>/dev/null || true
+  if identity=$(fm_pid_identity "$mypid") && [ -n "$identity" ]; then
+    if printf '%s\n' "$identity" > "$DAEMON_LOCK/pid-identity.tmp" 2>/dev/null; then
+      mv -f "$DAEMON_LOCK/pid-identity.tmp" "$DAEMON_LOCK/pid-identity" 2>/dev/null \
+        || rm -f "$DAEMON_LOCK/pid-identity.tmp" 2>/dev/null || true
+    fi
+  fi
 
   trap on_exit EXIT
   trap handle_signal HUP TERM INT
@@ -539,7 +615,7 @@ stop_main() {
 }
 
 usage() {
-  sed -n '2,79p' "$SELF" | sed 's/^# \{0,1\}//'
+  sed -n '2,82p' "$SELF" | sed 's/^# \{0,1\}//'
 }
 
 # Everything above is source-safe: the pane-wake decision and injection helpers

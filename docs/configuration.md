@@ -196,6 +196,10 @@ Pane-wake closes that gap: when enabled, the daemon ALSO injects one short wake 
 It reuses that daemon's shared primitives: `bin/fm-supervisor-target-lib.sh` resolves the pane once at startup, and `bin/fm-backend.sh` supplies the busy-guard, the confirmed-empty-composer guard, and the verify-retry submit, so a nudge never lands in a busy pane mid-turn, in a non-empty composer, or in a dead shell.
 The wake is already durably queued by the watcher, so a deferred nudge is fine and the next actionable cycle retries.
 
+On herdr the resolved pane target is not stable: herdr can reassign a session's pane id under the same live tab (the `HERDR_PANE_ID` drift), which silently froze a startup-resolved target so every cycle logged `target gone; skipping` and never woke the model while the watcher stayed armed and the beacon stayed fresh (incident: `data/fix-present-daemon-stale-pane-wake-target`).
+The daemon therefore captures the stable owning tab identity (`fm_backend_herdr_pane_tab_identity`) at resolve time and, before each inject, re-resolves the current pane for that tab when the recorded pane has gone (`fm_backend_herdr_target_for_tab_identity`), waking the new pane instead of skipping.
+Only a genuinely closed tab (firstmate's own pane gone) makes an inject skip, and tmux pane ids are stable so they pass through unchanged.
+
 Pane-wake is enabled when the local, gitignored `config/present-daemon-pane-wake` flag is present (its contents are ignored unless the first non-empty, non-comment line is `off`, which force-disables it), OR automatically when firstmate's own harness is jcode.
 claude and grok stay on the silent-re-arm path unless the flag forces pane-wake on.
 Supported supervisor backends are tmux and herdr only; an unsupported backend, or a pane that does not positively resolve (only the legacy `firstmate:0` fallback remained), degrades silently to today's silent-re-arm behavior rather than blocking supervision or typing into an unrelated pane.

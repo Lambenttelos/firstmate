@@ -21,6 +21,21 @@ set -u
 
 # shellcheck source=tests/lib.sh
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+# fm_pid_alive is the daemon's OWN liveness definition (zombie-aware): a stopped
+# daemon that this container's init has not reaped lingers as a defunct/Z process
+# that a bare `kill -0` still reports as alive, exactly the false positive the pid
+# lib exists to reject. The stop/detach assertions below check liveness through
+# it, not through raw `kill -0`, so they match how the daemon itself decides a
+# daemon is gone.
+# shellcheck source=bin/fm-pid-lib.sh
+. "$ROOT/bin/fm-pid-lib.sh"
+
+# pid_is_dead: true when <pid> is not a live process by the daemon's own
+# zombie-aware definition. A reaped or never-existent pid is dead; an un-reaped
+# zombie is dead too (fm_pid_alive rejects state Z).
+pid_is_dead() {  # <pid>
+  ! fm_pid_alive "$1"
+}
 
 TMP_ROOT=$(fm_test_tmproot fm-present-daemon)
 STARTED_PIDS=()
@@ -159,7 +174,7 @@ exit 0'
   [ "$(lock_pid "$home")" = "$pid" ] || fail "the running loop did not record its own pid in the daemon lock"
 
   kill -TERM "$pid" 2>/dev/null || true
-  wait_until 10 eval '! kill -0 '"$pid"' 2>/dev/null' || fail "loop did not exit on SIGTERM"
+  wait_until 10 pid_is_dead "$pid" || fail "loop did not exit on SIGTERM"
   [ ! -e "$home/state/.present-daemon.lock" ] || fail "a clean shutdown left the daemon lock behind"
   pass "re-arm loop runs a fresh arm after each watcher cycle and releases its lock on SIGTERM"
 }
@@ -180,7 +195,7 @@ exit 0'
   pid=$RUN_PID
   wait_until 10 arm_calls_at_least "$home" 2 || fail "loop never armed"
   kill -TERM "$pid" 2>/dev/null || true
-  wait_until 10 eval '! kill -0 '"$pid"' 2>/dev/null' || fail "loop did not exit on SIGTERM"
+  wait_until 10 pid_is_dead "$pid" || fail "loop did not exit on SIGTERM"
 
   after=$(cat "$home/state/.lock")
   [ "$after" = "$before" ] || fail "the daemon modified the session lock: $after"
@@ -236,7 +251,7 @@ test_start_detaches_from_its_parent() {
   kill -0 "$pid" 2>/dev/null || fail "daemon died with the parent shell that started it"
 
   daemon "$home" stop >/dev/null || fail "stop failed"
-  wait_until 10 eval '! kill -0 '"$pid"' 2>/dev/null' || fail "stop did not end the daemon"
+  wait_until 10 pid_is_dead "$pid" || fail "stop did not end the daemon"
   pass "start detaches into its own session and survives the parent that launched it"
 }
 
@@ -261,7 +276,7 @@ exit 0'
   pid=$RUN_PID
   wait_until 10 arm_calls_at_least "$home" 2 || fail "loop never armed before away mode"
   date '+%s' > "$home/state/.afk"
-  wait_until 10 eval '! kill -0 '"$pid"' 2>/dev/null' \
+  wait_until 10 pid_is_dead "$pid" \
     || fail "running loop kept supervising after away mode took over"
   pass "present and away supervision never run concurrently"
 }
@@ -294,7 +309,7 @@ exit 1'
   [ "$calls" -lt 30 ] || fail "failing arm was retried $calls times; backoff did not engage"
 
   kill -TERM "$pid" 2>/dev/null || true
-  wait_until 10 eval '! kill -0 '"$pid"' 2>/dev/null' || fail "loop did not exit on SIGTERM during backoff"
+  wait_until 10 pid_is_dead "$pid" || fail "loop did not exit on SIGTERM during backoff"
   pass "crash-looping arm backs off and surfaces exactly one durable check wake"
 }
 
@@ -371,8 +386,46 @@ test_supervision_block_reports_a_live_daemon() {
   esac
 
   kill -TERM "$pid" 2>/dev/null || true
-  wait_until 10 eval '! kill -0 '"$pid"' 2>/dev/null' || fail "loop did not exit on SIGTERM"
+  wait_until 10 pid_is_dead "$pid" || fail "loop did not exit on SIGTERM"
   pass "supervision instructions defer re-arming to a live present daemon and never to a dead one"
+}
+
+# --- status/stop see a live daemon (non-empty pid-identity) ------------------
+
+test_status_and_stop_see_a_live_daemon() {
+  # Regression: the daemon wrote a ZERO-BYTE pid-identity because it computed the
+  # identity from $(fm_current_pid) - a command substitution whose subshell pid is
+  # already dead by the time fm_pid_identity reads /proc - so daemon_lock_matches_pid
+  # always failed and status/stop reported a live daemon as "not running", leaving
+  # the stale daemon invisible and letting a restart spawn a duplicate. This pins
+  # that a running daemon writes a real pid-identity and that status/stop see it.
+  local home="$TMP_ROOT/status-live" pid out identity_bytes
+  make_home "$home" 'sleep 30'
+  enable_flag "$home"
+
+  start_run_loop "$home"
+  pid=$RUN_PID
+  wait_until 10 daemon_is_up "$home" || fail "daemon never took the lock"
+
+  # The pid-identity must be real, non-empty content - the exact thing the bug
+  # got wrong.
+  [ -s "$home/state/.present-daemon.lock/pid-identity" ] \
+    || fail "running daemon wrote an empty pid-identity (the status/stop blindness bug)"
+  identity_bytes=$(wc -c < "$home/state/.present-daemon.lock/pid-identity" | tr -d ' ')
+  [ "${identity_bytes:-0}" -gt 0 ] || fail "pid-identity is zero bytes"
+
+  out=$(daemon "$home" status) || fail "status must exit 0 for a live daemon"
+  [ "$out" = "present-daemon: running pid=$pid" ] \
+    || fail "status must report the live daemon, got: $out"
+
+  # stop must actually end THIS live daemon (no duplicate-daemon hazard).
+  out=$(daemon "$home" stop) || fail "stop must exit 0 when it stops a live daemon"
+  [ "$out" = "present-daemon: stopped pid=$pid" ] \
+    || fail "stop must report stopping the live daemon, got: $out"
+  wait_until 10 pid_is_dead "$pid" || fail "stop did not actually end the live daemon"
+
+  daemon "$home" status >/dev/null 2>&1 && fail "status still reports a daemon after stop"
+  pass "status and stop correctly see and end a live daemon (non-empty pid-identity)"
 }
 
 # --- pane-wake decision + guard reuse (sourced-function tests) ---------------
@@ -544,6 +597,94 @@ test_pane_wake_inject_noop_when_inactive() {
   pass "pane_wake_inject is a no-op when pane-wake did not resolve active"
 }
 
+# --- herdr pane-id drift recovery (the never-blind fix) ----------------------
+# Herdr reassigns a session's pane id under the same live tab, silently freezing
+# a startup-resolved pane-wake target. These tests drive pane_wake_refresh_target
+# and pane_wake_inject with fake herdr primitives to pin that a drifted target is
+# re-resolved by its stable tab identity and the NEW pane is woken, instead of
+# logging "gone; skipping" forever.
+
+test_pane_wake_refresh_keeps_a_live_target() {
+  # When the recorded target still exists, keep it verbatim - no re-resolve.
+  local home="$TMP_ROOT/pw-refresh-live" out
+  # shellcheck disable=SC2016 # $PANE_WAKE_*/$'...' must expand inside the sourced subshell, not here.
+  out=$(pane_wake_eval "$home" '
+    PANE_WAKE_ACTIVE=1; PANE_WAKE_BACKEND=herdr
+    PANE_WAKE_TARGET=default:w19:pA; PANE_WAKE_TAB_IDENTITY=$'"'"'default\tt5'"'"'
+    fm_backend_target_exists() { [ "$2" = default:w19:pA ]; }
+    fm_backend_herdr_target_for_tab_identity() { echo "SHOULD-NOT-RESOLVE"; }
+    if pane_wake_refresh_target; then echo "OK|$PANE_WAKE_TARGET"; else echo "FAIL"; fi')
+  [ "$out" = "OK|default:w19:pA" ] || fail "a live target must pass through unchanged, got: $out"
+  pass "pane_wake_refresh_target keeps a still-live target without re-resolving"
+}
+
+test_pane_wake_refresh_reresolves_drifted_target() {
+  # The recorded pane is gone but its tab survived and now owns a NEW pane id.
+  local home="$TMP_ROOT/pw-refresh-drift" out
+  # shellcheck disable=SC2016 # $PANE_WAKE_*/$'...' must expand inside the sourced subshell, not here.
+  out=$(pane_wake_eval "$home" '
+    PANE_WAKE_ACTIVE=1; PANE_WAKE_BACKEND=herdr
+    PANE_WAKE_TARGET=default:w19:pA; PANE_WAKE_TAB_IDENTITY=$'"'"'default\tt5'"'"'
+    # Old pane gone; new pane present.
+    fm_backend_target_exists() { [ "$2" = default:w19:p9 ]; }
+    fm_backend_herdr_target_for_tab_identity() {
+      [ "$1" = default ] && [ "$2" = t5 ] && echo default:w19:p9; }
+    if pane_wake_refresh_target; then echo "OK|$PANE_WAKE_TARGET"; else echo "FAIL|$PANE_WAKE_TARGET"; fi')
+  [ "$out" = "OK|default:w19:p9" ] \
+    || fail "a drifted target must re-resolve to the new pane, got: $out"
+  pass "pane_wake_refresh_target re-resolves a drifted pane id via its stable tab identity"
+}
+
+test_pane_wake_refresh_fails_when_tab_gone() {
+  # Both the recorded pane AND its tab are gone: firstmate's own pane genuinely
+  # closed, so refresh must fail (no wake into an unrelated pane).
+  local home="$TMP_ROOT/pw-refresh-gone" out
+  # shellcheck disable=SC2016 # $PANE_WAKE_*/$'...' must expand inside the sourced subshell, not here.
+  out=$(pane_wake_eval "$home" '
+    PANE_WAKE_ACTIVE=1; PANE_WAKE_BACKEND=herdr
+    PANE_WAKE_TARGET=default:w19:pA; PANE_WAKE_TAB_IDENTITY=$'"'"'default\tt5'"'"'
+    fm_backend_target_exists() { return 1; }
+    fm_backend_herdr_target_for_tab_identity() { return 1; }
+    if pane_wake_refresh_target; then echo "RESOLVED"; else echo "REFUSED"; fi')
+  [ "$out" = REFUSED ] || fail "refresh must refuse when the tab itself is gone, got: $out"
+  pass "pane_wake_refresh_target refuses when firstmate's own tab is genuinely gone"
+}
+
+test_pane_wake_refresh_no_identity_cannot_recover() {
+  # No captured tab identity (e.g. tmux, or a herdr resolve that could not read
+  # the tab): a gone target cannot be recovered, so refresh fails cleanly.
+  local home="$TMP_ROOT/pw-refresh-noid" out
+  out=$(pane_wake_eval "$home" '
+    PANE_WAKE_ACTIVE=1; PANE_WAKE_BACKEND=herdr
+    PANE_WAKE_TARGET=default:w19:pA; PANE_WAKE_TAB_IDENTITY=
+    fm_backend_target_exists() { return 1; }
+    fm_backend_herdr_target_for_tab_identity() { echo "SHOULD-NOT-BE-CALLED"; }
+    if pane_wake_refresh_target; then echo "RESOLVED"; else echo "REFUSED"; fi')
+  [ "$out" = REFUSED ] || fail "refresh must refuse a gone target with no tab identity, got: $out"
+  pass "pane_wake_refresh_target cannot recover a gone target without a captured tab identity"
+}
+
+test_pane_wake_inject_wakes_the_drifted_pane() {
+  # End to end through pane_wake_inject: the recorded pane drifted, so inject must
+  # re-resolve and submit into the NEW pane, not skip.
+  local home="$TMP_ROOT/pw-inject-drift" out
+  # shellcheck disable=SC2016 # $PANE_WAKE_*/$'...'/$(cat) must expand inside the sourced subshell, not here.
+  out=$(pane_wake_eval "$home" '
+    PANE_WAKE_ACTIVE=1; PANE_WAKE_BACKEND=herdr
+    PANE_WAKE_TARGET=default:w19:pA; PANE_WAKE_TAB_IDENTITY=$'"'"'default\tt5'"'"'
+    fm_backend_target_exists() { [ "$2" = default:w19:p9 ]; }
+    fm_backend_herdr_target_for_tab_identity() { echo default:w19:p9; }
+    fm_backend_busy_state() { printf idle; }
+    fm_backend_capture() { printf "an idle prompt\n"; }
+    fm_backend_composer_state() { printf empty; }
+    fm_backend_send_text_submit() { printf "%s" "$2" > "'"$home"'/submit-target"; printf empty; }
+    pane_wake_inject
+    if [ -e "'"$home"'/submit-target" ]; then echo "SUBMITTED|$(cat "'"$home"'/submit-target")"; else echo NOSUBMIT; fi')
+  [ "$out" = "SUBMITTED|default:w19:p9" ] \
+    || fail "inject must re-resolve the drifted target and wake the NEW pane, got: $out"
+  pass "pane_wake_inject wakes the re-resolved pane after a pane-id drift"
+}
+
 test_inert_without_flag
 test_loop_rearms_after_each_cycle
 test_session_lock_is_never_touched
@@ -554,6 +695,7 @@ test_crash_loop_backs_off_and_surfaces_one_wake
 test_degraded_wake_is_reported_not_acted_on
 test_daemon_death_leaves_turnend_alarm_intact
 test_supervision_block_reports_a_live_daemon
+test_status_and_stop_see_a_live_daemon
 test_pane_wake_disabled_by_default_on_claude
 test_pane_wake_auto_on_for_jcode
 test_pane_wake_flag_forces_on_for_claude
@@ -566,3 +708,8 @@ test_pane_wake_inject_submits_on_idle_empty_pane
 test_pane_wake_inject_defers_on_busy_pane
 test_pane_wake_inject_defers_on_pending_composer
 test_pane_wake_inject_noop_when_inactive
+test_pane_wake_refresh_keeps_a_live_target
+test_pane_wake_refresh_reresolves_drifted_target
+test_pane_wake_refresh_fails_when_tab_gone
+test_pane_wake_refresh_no_identity_cannot_recover
+test_pane_wake_inject_wakes_the_drifted_pane
