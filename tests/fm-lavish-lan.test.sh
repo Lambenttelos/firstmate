@@ -204,9 +204,54 @@ test_url_and_status_without_a_running_relay() {
   pass "url and status refuse cleanly when nothing is running"
 }
 
+# A defunct (STAT Z) relay pid must read as dead through the swept liveness
+# helpers, mirroring the shared pid lib's zombie guard (PR #84). A bare kill -0
+# would let a lingering <defunct> relay read as a running relay and refuse a
+# restart forever, so relay_alive_pid and pid_stopped must both treat Z as dead.
+# Fake /proc/<pid>/stat via FM_PROC_ROOT_OVERRIDE rather than spawning a real
+# unreapable zombie.
+test_swept_liveness_reads_zombie_as_dead() {
+  local home proc_root live_pid
+  home=$(new_home zombie)
+  proc_root="$TMP_ROOT/proc.zombie"
+  mkdir -p "$proc_root"
+
+  # A live pid recorded in the pidfile reads as running through pid_stopped.
+  sleep 30 &
+  live_pid=$!
+  STRAYS+=("$live_pid")
+  printf '%s\n' "$live_pid" > "$home/state/.lavish-lan.pid"
+  mkdir -p "$proc_root/$live_pid"
+  printf '%s (node) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22\n' \
+    "$live_pid" > "$proc_root/$live_pid/stat"
+
+  if FM_PROC_ROOT_OVERRIDE="$proc_root" FM_HOME="$home" bash -c '
+    . "$1"; pid_stopped "$2"' _ "$MGR" "$live_pid"; then
+    fail "pid_stopped treated a genuinely live relay $live_pid as stopped"
+  fi
+
+  # Same live pid, but /proc now marks it defunct (STAT Z): both liveness helpers
+  # must read it as dead even though kill -0 still succeeds. relay_alive_pid's
+  # zombie check runs before its identity check, so a Z-state pid is dead
+  # regardless of the recorded command line.
+  printf '%s (node) Z 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22\n' \
+    "$live_pid" > "$proc_root/$live_pid/stat"
+  if FM_PROC_ROOT_OVERRIDE="$proc_root" FM_HOME="$home" bash -c '
+    . "$1"; relay_alive_pid >/dev/null' _ "$MGR" "$live_pid"; then
+    fail "relay_alive_pid treated a defunct STAT Z relay $live_pid as alive"
+  fi
+  FM_PROC_ROOT_OVERRIDE="$proc_root" FM_HOME="$home" bash -c '
+    . "$1"; pid_stopped "$2"' _ "$MGR" "$live_pid" \
+    || fail "pid_stopped treated a defunct STAT Z relay $live_pid as still running"
+
+  kill "$live_pid" 2>/dev/null || true
+  pass "swept liveness helpers read a defunct STAT Z relay as dead"
+}
+
 test_start_is_idempotent_and_passes_bytes_through
 test_stop_is_clean_and_status_reflects_it
 test_port_in_use_by_non_relay_is_reported
 test_url_and_status_without_a_running_relay
+test_swept_liveness_reads_zombie_as_dead
 
 echo "# all fm-lavish-lan tests passed"
