@@ -62,6 +62,9 @@ FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 
+# shellcheck source=bin/fm-pid-lib.sh
+. "$SCRIPT_DIR/fm-pid-lib.sh"
+
 RELAY="$SCRIPT_DIR/fm-lavish-lan-relay.js"
 PIDFILE="$STATE/.lavish-lan.pid"
 METAFILE="$STATE/.lavish-lan.meta"
@@ -100,18 +103,13 @@ require_port() {  # <name> <value>
 # lingers as <defunct> and kill -0 still succeeds on it, so an exit-state check is
 # what actually proves the relay is gone after stop.
 relay_alive_pid() {
-  local pid cmd state
+  local pid cmd
   [ -f "$PIDFILE" ] || return 1
   pid=$(head -n1 "$PIDFILE" 2>/dev/null || true)
   case "$pid" in ''|*[!0-9]*) return 1 ;; esac
-  kill -0 "$pid" 2>/dev/null || return 1
-  # A zombie has exited; treat it as dead. Field 3 of /proc/<pid>/stat is the
-  # process state; 'Z' is a zombie. The comm field can contain spaces and
-  # parentheses, so read state as the first token after the final ')'.
-  if [ -r "/proc/$pid/stat" ]; then
-    state=$(sed -e 's/.*) //' "/proc/$pid/stat" 2>/dev/null | cut -d' ' -f1)
-    [ "$state" = "Z" ] && return 1
-  fi
+  # Route liveness (including the zombie STAT Z check) through the shared pid lib
+  # so a defunct relay reads as dead exactly as every other holder check does.
+  fm_pid_alive "$pid" || return 1
   # Confirm identity where /proc is available; where it is not, a live recorded
   # pid plus our own pidfile is the best signal and is accepted.
   if [ -r "/proc/$pid/cmdline" ]; then
@@ -292,13 +290,12 @@ cmd_status() {
 # an init that does not reap). Either way the relay has stopped serving, so the
 # stop wait must not spin the full timeout on a <defunct> process.
 pid_stopped() {  # <pid>
-  local pid=$1 state
-  kill -0 "$pid" 2>/dev/null || return 0
-  if [ -r "/proc/$pid/stat" ]; then
-    state=$(sed -e 's/.*) //' "/proc/$pid/stat" 2>/dev/null | cut -d' ' -f1)
-    [ "$state" = "Z" ] && return 0
-  fi
-  return 1
+  local pid=$1
+  # Stopped means the shared reader no longer sees a live process: a gone pid or
+  # a defunct STAT Z both read as dead, so the stop wait never spins the full
+  # timeout on a lingering <defunct>.
+  fm_pid_alive "$pid" && return 1
+  return 0
 }
 
 cmd_stop() {
@@ -324,14 +321,18 @@ cmd_stop() {
   return 0
 }
 
-[ "$#" -ge 1 ] || { usage; exit 2; }
-SUB=$1
-shift
-case "$SUB" in
-  start) cmd_start "$@" ;;
-  url) cmd_url "$@" ;;
-  status) cmd_status "$@" ;;
-  stop) cmd_stop "$@" ;;
-  -h|--help) usage ;;
-  *) die "unknown subcommand '$SUB' (see --help)" ;;
-esac
+# When sourced (e.g. by a colocated test exercising the liveness helpers), define
+# functions only and run no subcommand dispatch.
+if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
+  [ "$#" -ge 1 ] || { usage; exit 2; }
+  SUB=$1
+  shift
+  case "$SUB" in
+    start) cmd_start "$@" ;;
+    url) cmd_url "$@" ;;
+    status) cmd_status "$@" ;;
+    stop) cmd_stop "$@" ;;
+    -h|--help) usage ;;
+    *) die "unknown subcommand '$SUB' (see --help)" ;;
+  esac
+fi
