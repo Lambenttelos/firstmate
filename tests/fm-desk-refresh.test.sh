@@ -21,21 +21,30 @@ TMP_ROOT=$(fm_test_tmproot fm-desk)
 
 command -v jq >/dev/null 2>&1 || { echo "skip: jq not found"; exit 0; }
 
-# A populated projection: two open decisions, two in-flight rows (one with an
-# OBJECT-valued .doing to exercise the scalarize hardening), one landed row.
+# A populated projection: two open decisions, three in-flight rows (one with an
+# OBJECT-valued .doing to exercise the scalarize hardening, one blocked to drive
+# section 2), one landed row, one recorded PR, two second mates (one idle).
 POPULATED=$(cat <<'JSON'
 {
   "decisions_open": [
     {"id":"decide-alpha","summary":"pick a data store","owner":"scout"},
-    {"id":"decide-beta","summary":"confirm the rename","owner":"scout"}
+    {"id":"decide-pay-rename","summary":"confirm the pricing rename","owner":"scout"}
   ],
   "in_flight": [
-    {"id":"ship-one","state":"working","doing":"editing the parser"},
-    {"id":"ship-two","state":"working","doing":{"weird":"object"}}
+    {"id":"ship-one","kind":"ship","state":"working","doing":"editing the parser"},
+    {"id":"ship-two","kind":"ship","state":"working","doing":{"weird":"object"}},
+    {"id":"ship-stuck","kind":"ship","state":"blocked","doing":"waiting on a credential"}
   ],
   "gates": [],
   "landed": [
     {"id":"ship-old","what":"landed the migration"}
+  ],
+  "recorded_prs": [
+    {"id":"pr-one","url":"https://github.com/acme/repo/pull/9"}
+  ],
+  "secondmates": [
+    {"id":"decision-desk","state":"working","doing":"ruling on a schema question"},
+    {"id":"mirror-desk","state":"no_active_work","doing":"No active child work"}
   ]
 }
 JSON
@@ -77,17 +86,59 @@ SH
 run_desk() {  # <home> <out>
   local home="$1" out="$2" fakebin
   fakebin=$(fm_fakebin "$home")
-  # tasks-axi: the ticket-band probe must exit 0; show/list return nothing so the
-  # desk falls back to the snapshot's own field values.
+  # tasks-axi stub: the ticket-band probe must exit 0. It also answers the desk's
+  # backlog reads for sections 8 (captain-held) and 9 (four ranked queue lists),
+  # emitting tasks-axi's two-space-indented, comma-separated row shape. show --full
+  # returns nothing so cards fall back to the id-derived title.
   cat > "$fakebin/tasks-axi" <<'SH'
 #!/usr/bin/env bash
+# Args carry the query; branch on the flags the desk uses.
+args="$*"
+case "$args" in
+  *"show "*) exit 0 ;;  # full-record read: fall back to snapshot/id
+esac
+case "$args" in
+  *"--state done"*"--limit 1"*) exit 0 ;;  # the collect_tickets probe
+esac
+case "$args" in
+  *"--state held"*)
+    # id,state,kind,repo,priority,title,hold_kind
+    printf '  held-money-thing,queued,ship,hyfin,1,"rotate a pricing key",captain\n'
+    printf '  held-other,queued,task,firstmate,2,"tooling note",captain\n'
+    exit 0 ;;
+  *"--state queued"*)
+    # id,state,kind,repo,priority,title
+    printf '  ship-hyfin-a,queued,ship,hyfin,1,"add a pricing column"\n'
+    printf '  scout-hyfin-b,queued,scout,hyfin-server,2,"investigate a charge bug"\n'
+    printf '  tool-fm-c,queued,ship,firstmate,1,"speed up the watcher"\n'
+    printf '  ship-hyfin-d,queued,ship,hyfin,3,"tweak a label"\n'
+    exit 0 ;;
+  *"--state in_flight"*) exit 0 ;;
+  *"--blocked"*) exit 0 ;;
+esac
 exit 0
 SH
   chmod +x "$fakebin/tasks-axi"
+  # A completion ledger for the progress windows (5, 6) and stats (10). Dates are
+  # relative to the injected epoch's calendar day so the windows are deterministic.
+  local today yesterday
+  today=$(date -d "@${FAKE_EPOCH:-1785225600}" '+%Y-%m-%d' 2>/dev/null || date '+%Y-%m-%d')
+  yesterday=$(date -d "@$(( ${FAKE_EPOCH:-1785225600} - 86400 ))" '+%Y-%m-%d' 2>/dev/null || date '+%Y-%m-%d')
+  if [ "${FAKE_NO_COMPLETIONS:-0}" != 1 ]; then
+    mkdir -p "$home/data"
+    {
+      printf '# ledger\n'
+      printf 'done-a\t%s\tship\thyfin\tabc123\n' "$today"
+      printf 'done-b\t%s\tship\tfirstmate\tdef456\n' "$today"
+      printf 'done-c\t%s\tscout\thyfin-server\t\n' "$yesterday"
+    } > "$home/data/completions.tsv"
+  fi
   PATH="$fakebin:$PATH" \
   FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" \
   FM_DESK_SNAPSHOT_BIN="$SNAP" SEEN_HOME="$home/seen-home" \
   SEEN_SKIP="$home/seen-skip" \
+  FM_DESK_CI_BUDGET=0 \
+  FM_DESK_NOW_EPOCH="${FAKE_EPOCH:-1785225600}" \
   FM_DESK_OUT="$out" FM_DESK_NOW='2026-07-28 09:00' \
     bash "$DESK"
 }
@@ -101,12 +152,53 @@ FAKE_MODE=json FAKE_JSON="$POPULATED" run_desk "$HOME1" "$OUT1"
 
 # Record ids are rendered as human titles: "decide-alpha" -> "Decide alpha".
 assert_grep 'Decide alpha' "$OUT1" 'populated: first open decision reaches the page'
-assert_grep 'Decide beta' "$OUT1" 'populated: second open decision reaches the page'
+assert_grep 'Decide pay rename' "$OUT1" 'populated: second open decision reaches the page'
 assert_grep 'Ship one' "$OUT1" 'populated: an in-flight row reaches the page'
 assert_grep 'Ship two' "$OUT1" 'populated: the object-valued row still renders (scalarize)'
-assert_grep 'Ship old' "$OUT1" 'populated: a landed row reaches the page'
-assert_no_grep 'Nothing is running' "$OUT1" 'populated: running section is not confident-empty'
+assert_no_grep 'No slots are occupied' "$OUT1" 'populated: slots section is not confident-empty'
 assert_no_grep 'Nothing is waiting on you' "$OUT1" 'populated: decisions section is not confident-empty'
+
+# The sticky KPI strip and its jump links to sections 11 and 12 exist.
+assert_grep 'sticky top-0' "$OUT1" 'sticky strip: the pinned KPI strip is present'
+assert_grep 'href="#sec-questions"' "$OUT1" 'sticky strip: jump link to section 11'
+assert_grep 'href="#sec-conversation"' "$OUT1" 'sticky strip: jump link to section 12'
+
+# All twelve spec sections render in order.
+for n in \
+  '1. Decisions needed' '2. Blockers and failures' '3. Ready to merge' \
+  '4. Slots and host' '5. Progress - last 3 hours' '6. Progress - last 12 hours' \
+  '7. Most important upcoming progress' '8. Captain-held tickets' \
+  '9. Next queue tickets' '10. Stats' '11. Recent questions' '12. Recent conversation'; do
+  assert_grep "$n" "$OUT1" "section present: $n"
+done
+
+# Section 2 draws the blocked in-flight row and a fleet-health line.
+assert_grep 'Ship stuck' "$OUT1" 'blockers: the blocked in-flight row reaches section 2'
+assert_grep 'Monitoring' "$OUT1" 'blockers: a fleet-health line is shown'
+
+# Section 4 lists BOTH crew and second mates, and marks an idle second mate.
+assert_grep 'Decision desk' "$OUT1" 'slots: a working second mate is listed'
+assert_grep 'Mirror desk' "$OUT1" 'slots: an idle second mate is listed'
+assert_grep 'second mate' "$OUT1" 'slots: second mates are labeled'
+
+# Sections 5 and 6 render throughput from the completion ledger.
+assert_grep '5. Progress - last 3 hours' "$OUT1" 'progress: 3h heading present'
+assert_grep 'landed.' "$OUT1" 'progress: a landed count is shown'
+
+# Section 8 shows the captain-held list, money item flagged.
+assert_grep 'Held money thing' "$OUT1" 'captain-held: a captain hold is listed'
+
+# Section 9 renders the four ranked cards.
+assert_grep 'Top product ship' "$OUT1" 'queue: product-ship card present'
+assert_grep 'Top product scout' "$OUT1" 'queue: product-scout card present'
+assert_grep 'Top tooling' "$OUT1" 'queue: tooling card present'
+assert_grep 'Quick and cheap wins' "$OUT1" 'queue: quick-wins card present'
+
+# Sections 11 and 12 render as marked gaps naming the missing transcript source.
+assert_grep 'no local transcript source' "$OUT1" '11/12: the transcript gap note is shown'
+
+# NEVER WAKES holds: the builder must not reference any wake/steer/status-write path.
+assert_no_grep 'fm_wake_append' "$OUT1" 'never wakes: no wake call leaked into output'
 
 # Both open decisions must appear (acceptance: captain holds reach the page).
 n_dec=$(grep -c 'your call' "$OUT1")
@@ -131,7 +223,7 @@ SNAP=$(make_snapshot "$HOME2")
 OUT2="$HOME2/desk.html"
 FAKE_MODE=broken run_desk "$HOME2" "$OUT2"
 
-assert_no_grep 'Nothing is running' "$OUT2" 'broken: running section must not claim empty'
+assert_no_grep 'No slots are occupied' "$OUT2" 'broken: slots section must not claim empty'
 assert_grep 'could not be read' "$OUT2" 'broken: a visible section gap is shown instead'
 
 # --- absent projection: the global gap banner shows and no dependent section
@@ -142,8 +234,15 @@ OUT3="$HOME3/desk.html"
 FAKE_MODE=fail run_desk "$HOME3" "$OUT3"
 
 assert_grep 'Some of this page is missing' "$OUT3" 'absent: the global gap banner is shown'
-assert_no_grep 'Nothing is running' "$OUT3" 'absent: running section must not claim empty'
+assert_no_grep 'No slots are occupied' "$OUT3" 'absent: slots section must not claim empty'
 assert_no_grep 'Nothing is waiting on you' "$OUT3" 'absent: decisions section must not claim empty'
+
+# Even with the projection gone, the twelve section headings still render (each
+# degrades to a gap independently) and the sticky strip is still present.
+assert_grep 'sticky top-0' "$OUT3" 'absent: the sticky strip still renders'
+for n in '1. Decisions needed' '4. Slots and host' '9. Next queue tickets' '12. Recent conversation'; do
+  assert_grep "$n" "$OUT3" "absent: section heading still present: $n"
+done
 
 # The count band is always present, even with the projection gone.
 assert_grep 'Ticket count' "$OUT3" 'absent: the required count band is still rendered'
@@ -161,10 +260,10 @@ FAKE_MODE=json FAKE_JSON="$POPULATED" FAKE_AFK=1 run_desk "$HOME4" "$OUT4"
 
 assert_grep 'Ship one' "$OUT4" 'away: an in-flight row still reaches the page'
 assert_grep 'Decide alpha' "$OUT4" 'away: an open decision still reaches the page'
-assert_grep 'Ship old' "$OUT4" 'away: a landed row still reaches the page'
+assert_grep 'Decision desk' "$OUT4" 'away: a second-mate slot still reaches the page'
 assert_no_grep 'could not be read' "$OUT4" 'away: no fleet-state gap banner while away'
 assert_no_grep 'Some of this page is missing' "$OUT4" 'away: no global gap banner while away'
-assert_no_grep 'Nothing is running' "$OUT4" 'away: running section is not confident-empty'
+assert_no_grep 'No slots are occupied' "$OUT4" 'away: slots section is not confident-empty'
 
 # The desk must have passed the read-only bypass to the snapshot.
 seen_skip=$(cat "$HOME4/seen-skip" 2>/dev/null || printf '')
