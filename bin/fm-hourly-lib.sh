@@ -181,12 +181,25 @@ fm_hourly_should_surface() {  # <state> <pass> <signature>
   return 0
 }
 
+# mtime reader, detected once for the running OS. BSD/macOS stat uses -f %m; GNU
+# stat uses -c %Y. This must NOT be written as `stat -f %m ... || stat -c %Y ...`
+# inside a command substitution: on GNU, `stat -f` is --file-system and prints a
+# filesystem block to STDOUT with a nonzero exit, so the `||` form concatenates
+# that block with the fallback's real value and corrupts the mtime. Mirrors
+# bin/fm-watch.sh's stat_mtime, which detects the flavor for the same reason.
+if stat -f %m . >/dev/null 2>&1; then
+  _fm_hourly_stat_mtime() { stat -f %m "$1" 2>/dev/null; }
+else
+  _fm_hourly_stat_mtime() { stat -c %Y "$1" 2>/dev/null; }
+fi
+
 # Age of a file in whole seconds, or a very large number when it does not
 # exist. Mirrors bin/fm-watch.sh's age_of so a missing stamp reads as overdue.
 fm_hourly_age_of() {  # <path>
   local f=$1 mtime now
   [ -e "$f" ] || { printf '999999999'; return 0; }
-  mtime=$(stat -f %m "$f" 2>/dev/null || stat -c %Y "$f" 2>/dev/null || printf 0)
+  mtime=$(_fm_hourly_stat_mtime "$f")
+  case "$mtime" in ''|*[!0-9]*) mtime=0 ;; esac
   now=$(date +%s)
   printf '%s' $(( now - mtime ))
 }

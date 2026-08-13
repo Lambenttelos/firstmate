@@ -169,6 +169,46 @@ status_is_auth_exhaustion_pause() {  # <status-line>
   printf '%s' "$note" | grep -qiE "${FM_CLASSIFY_AUTH_EXHAUSTION_RE:-$FM_CLASSIFY_AUTH_EXHAUSTION_RE_DEFAULT}"
 }
 
+# The credential/account IDENTITY carried by an auth-exhaustion status line, used
+# to GROUP tasks that stalled on the SAME shared credential so a fleet review can
+# raise one aggregated escalation instead of N. Pure read of the line, and the
+# companion to the fleet rollup in bin/fm-session-review.sh. Identity, taking only
+# what the signal actually carries (no fabricated account names):
+#   1. an explicit "account=<slug>" or "account:<slug>" token when a worker
+#      records one - the exact identity, so two workers naming DIFFERENT accounts
+#      never merge into one false escalation;
+#   2. otherwise "shared". Within one firstmate home every worker runs on the ONE
+#      shared account, so any auth/quota/token stall that does not name a
+#      different account IS the same shared credential. Grouping them under one
+#      identity is the whole point of this rollup: the 2026 incident split into N
+#      silent waits precisely because the same shared-account exhaustion was
+#      phrased differently each time (usage limit vs usage window vs session
+#      limit), so keying on the wording would recreate the miss. Only an explicit,
+#      DIFFERENT account token is a reliable "not the same credential" signal.
+status_auth_exhaustion_account() {  # <status-line> -> identity slug
+  local line=$1 note acct
+  note=$(status_line_note "$line")
+  acct=$(printf '%s' "$note" | grep -oiE 'account[=:][[:space:]]*[A-Za-z0-9._@-]+' | head -1)
+  if [ -n "$acct" ]; then
+    acct=${acct#*[=:]}
+    acct=${acct#"${acct%%[![:space:]]*}"}
+    printf '%s' "$acct" | tr '[:upper:]' '[:lower:]'
+    return 0
+  fi
+  printf 'shared'
+}
+
+# The reset-time hint carried by an auth-exhaustion status line, or empty when
+# the line does not name one. Pure read: captures the "reset..." clause the
+# worker wrote (e.g. "resets ~5pm") up to the next separator, so the fleet rollup
+# can name a reset when it is reliably present and escalate WITHOUT one otherwise
+# rather than fabricating a time. Never invents a field the signal lacks.
+status_auth_exhaustion_reset() {  # <status-line> -> reset text or empty
+  local line=$1 note
+  note=$(status_line_note "$line")
+  printf '%s' "$note" | grep -oiE 'reset[a-z]*[^,;.]*' | head -1
+}
+
 # 0 if a status line declares either an external-wait pause or a verified
 # captain-held transfer.
 # Both declarations can intentionally leave an exited crew's endpoint idle, so

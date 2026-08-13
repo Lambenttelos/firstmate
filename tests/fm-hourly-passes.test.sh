@@ -505,11 +505,78 @@ t_passes_start_nothing() {
   pass "the hourly passes start no rival supervision cycle and run no teardown"
 }
 
+# --- review: shared-credential exhaustion rollup ------------------------------
+# Two or more workers stalled on the same shared account (an auth/quota/token
+# exhaustion pause) must aggregate into ONE fleet-wide escalation, not N silent
+# local waits. A single such task, or two workers naming DIFFERENT accounts, must
+# NOT aggregate.
+t_review_auth_exhaustion_rollup() {
+  local home out
+  home=$(new_home review-auth-rollup)
+  fm_write_meta "$home/state/a.meta" "window=firstmate:fm-a" "kind=ship"
+  fm_write_meta "$home/state/b.meta" "window=firstmate:fm-b" "kind=ship"
+  fm_write_meta "$home/state/c.meta" "window=firstmate:fm-c" "kind=ship"
+  # a and b are the SAME shared account phrased differently; c is a benign wait.
+  printf 'working: started\npaused: hit Claude usage limit, resets ~5pm\n' > "$home/state/a.status"
+  printf 'working: go\npaused: Claude usage window limit reached\n' > "$home/state/b.status"
+  printf 'working: go\npaused: waiting on upstream release\n' > "$home/state/c.status"
+
+  out=$(run_review "$home")
+  assert_contains "$out" "2 pipelines stalled on the shared account" "2+ same-account exhaustion tasks must raise one aggregated escalation"
+  assert_grep "same shared credential" "$home/state/.hourly-review.latest" "the report must name the shared credential"
+  assert_grep "resets ~5pm" "$home/state/.hourly-review.latest" "the report must carry the reset hint the worker recorded"
+  assert_grep "stalled: a, b" "$home/state/.hourly-review.latest" "the report must list the stalled tasks"
+  # The benign upstream-release pause must never join the cluster.
+  assert_no_grep "stalled: a, b, c" "$home/state/.hourly-review.latest" "a benign pause must not be aggregated as an exhaustion stall"
+
+  # Unchanged an hour later: silent.
+  out=$(run_review "$home")
+  [ -z "$out" ] || fail "an unchanged aggregated escalation must not surface again, got: $out"
+  pass "review aggregates 2+ same-account exhaustion stalls into one escalation, once"
+}
+
+# --- review: a single exhaustion pause is NOT aggregated ----------------------
+# classify-auth-limit already surfaces one exhaustion pause as its own blocker;
+# this rollup is purely the N>=2 aggregation and must not fire for N=1.
+t_review_auth_exhaustion_single_not_aggregated() {
+  local home out
+  home=$(new_home review-auth-single)
+  fm_write_meta "$home/state/a.meta" "window=firstmate:fm-a" "kind=ship"
+  fm_write_meta "$home/state/b.meta" "window=firstmate:fm-b" "kind=ship"
+  printf 'working: go\npaused: hit Claude usage limit\n' > "$home/state/a.status"
+  printf 'working: still going\n' > "$home/state/b.status"
+
+  out=$(run_review "$home")
+  assert_not_contains "$out" "stalled on the shared account" "a single exhaustion task must not raise the fleet rollup"
+  assert_not_contains "$out" "stalled on account" "a single exhaustion task must not raise the fleet rollup"
+  pass "review does not aggregate a single exhaustion stall"
+}
+
+# --- review: two DIFFERENT named accounts do NOT aggregate --------------------
+# Grouping is strict: only an explicit different account token proves the stalls
+# are on distinct credentials, and those must stay separate.
+t_review_auth_exhaustion_distinct_accounts_not_aggregated() {
+  local home out
+  home=$(new_home review-auth-distinct)
+  fm_write_meta "$home/state/a.meta" "window=firstmate:fm-a" "kind=ship"
+  fm_write_meta "$home/state/b.meta" "window=firstmate:fm-b" "kind=ship"
+  printf 'working: go\npaused: account=claude-1 hit usage limit\n' > "$home/state/a.status"
+  printf 'working: go\npaused: account=claude-2 hit usage limit\n' > "$home/state/b.status"
+
+  out=$(run_review "$home")
+  assert_not_contains "$out" "stalled on the shared account" "distinct named accounts must not aggregate together"
+  assert_not_contains "$out" "2 pipelines" "distinct named accounts must not aggregate into a count of 2"
+  pass "review keeps distinct named accounts as separate credentials, no false aggregation"
+}
+
 t_review_silent_when_clean
 t_review_aging_decision
 t_review_silent_worker
 t_review_idle_capacity
 t_review_merge_batch
+t_review_auth_exhaustion_rollup
+t_review_auth_exhaustion_single_not_aggregated
+t_review_auth_exhaustion_distinct_accounts_not_aggregated
 t_cleanup_reclaims_quietly
 t_cleanup_keeps_markers_in_flight
 t_cleanup_reports_orphan_worktree
