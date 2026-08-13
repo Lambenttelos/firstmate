@@ -278,7 +278,12 @@ fm_afk_launch_terminal_absent() {  # <backend> <target>
       out=$(tmux has-session -t "$target" 2>&1)
       result=$?
       [ "$result" -eq 1 ] || return 1
-      printf '%s' "$out" | grep -Eq "can't find session"
+      # tmux reports absence two ways: "can't find session" when the server is
+      # live but this session is gone, and "no server running on <socket>" when
+      # the whole server is dead. Both mean the daemon terminal is absent, so a
+      # fully-dead server confirms teardown instead of wedging afk-return. Match
+      # the stable "no server running" prefix (the socket path varies).
+      printf '%s' "$out" | grep -Eq "can't find session|no server running"
       ;;
     none)
       return 0
