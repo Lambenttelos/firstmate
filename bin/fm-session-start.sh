@@ -493,6 +493,25 @@ else
   printf 'HOURLY_PASSES: could not arm (state directory not writable) - the hourly review and cleanup will not run this session.\n'
 fi
 
+# --- 3c. session-stats backfill -----------------------------------------
+# Detect an unclean turnover: a predecessor session that reloaded without a
+# clean /endsession close left no ended= record in data/session-stats.log. The
+# missing-record backfill (bin/fm-end-session.sh session-open, the owner of that
+# ledger and its format) appends exactly one reconstructed stub for it, then
+# stamps the session-open marker with this session's identity. Mutating and
+# lock-guarded like every other sweep, so it is skipped on the read-only path.
+subsection "SESSION STATS"
+if [ "$READ_ONLY" -eq 1 ]; then
+  printf 'skipped (read-only session) - the session holding the lock owns the ledger.\n'
+else
+  STATS_OUT=$("$SCRIPT_DIR/fm-end-session.sh" session-open 2>&1)
+  if [ -n "$STATS_OUT" ]; then
+    printf '%s\n' "$STATS_OUT"
+  else
+    printf '(predecessor closed cleanly - nothing to backfill)\n'
+  fi
+fi
+
 # --- 4. supervision operating instructions ----------------------------------
 # Watcher ownership moves to the away-mode daemon only while one is actually live
 # for this home; away mode with no daemon is the away posture only and keeps the

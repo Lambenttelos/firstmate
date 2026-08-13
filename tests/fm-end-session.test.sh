@@ -213,6 +213,104 @@ test_report_without_record_fails() {
   pass "report refuses rather than printing an empty session report"
 }
 
+# --- unclean-turnover backfill (session-open) --------------------------------
+
+# run_open <home> <session-id> - run the session-open backfill as a specific
+# session identity, so a test can simulate a successor different from the
+# predecessor deterministically without depending on the lock/pid path.
+run_open() {
+  local home=$1 id=$2
+  FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$home/state" FM_DATA_OVERRIDE="$home/data" \
+    FM_END_SESSION_CURRENT_ID="$id" "$CLI" session-open
+}
+
+test_unclean_turnover_backfills_one_reconstructed_stub() {
+  local home; home=$(make_home unclean)
+  # A predecessor session opened but never closed: its open marker survives.
+  printf 'pid=111 identity=predecessor\n2026-08-13T09:00:00Z\n' > "$home/state/.session-open"
+
+  local out
+  out=$(run_open "$home" "pid=222 identity=successor")
+  assert_contains "$out" 'backfilled one reconstructed stub' 'the successor must announce the backfill'
+  assert_contains "$out" 'opened 2026-08-13T09:00:00Z' 'the backfill must relay the predecessor open time'
+
+  local count
+  count=$(grep -c '^ended=' "$home/data/session-stats.log")
+  [ "$count" = 1 ] || fail "expected exactly one reconstructed stub, got $count"
+  assert_grep 'reconstructed=1' "$home/data/session-stats.log" 'the stub must carry the reconstructed marker'
+  assert_grep 'session_opened=2026-08-13T09:00:00Z' "$home/data/session-stats.log" 'the stub must record the predecessor open time'
+
+  # The marker is now stamped with the successor identity.
+  assert_grep 'pid=222 identity=successor' "$home/state/.session-open" 'the marker must be re-stamped with the successor identity'
+  pass "an unclean turnover backfills exactly one reconstructed stub for the predecessor"
+}
+
+test_clean_close_leaves_no_stub_for_successor() {
+  local home; home=$(make_home cleanclose)
+  fake_teardown "$home" >/dev/null
+  # A session opens...
+  run_open "$home" "pid=111 identity=first" >/dev/null
+  assert_absent "$home/data/session-stats.log" 'session-open alone writes no ended= record'
+  # ...then closes cleanly, which writes its ended= record AND clears the marker.
+  run_cli "$home" record --model m --effort low >/dev/null
+  assert_absent "$home/state/.session-open" 'a clean close must clear the session-open marker'
+
+  # The successor session opens: it finds no surviving marker, so it adds no stub.
+  local out
+  out=$(run_open "$home" "pid=222 identity=second")
+  assert_not_contains "$out" 'backfilled' 'a clean predecessor must not trigger a backfill'
+
+  local ended reconstructed
+  ended=$(grep -c '^ended=' "$home/data/session-stats.log")
+  [ "$ended" = 1 ] || fail "expected exactly one (clean) record, got $ended"
+  reconstructed=$(grep -c 'reconstructed=1' "$home/data/session-stats.log" || true)
+  [ "$reconstructed" = 0 ] || fail "a clean close must not produce a reconstructed stub, got $reconstructed"
+  pass "a clean close writes its ended= record and the successor adds no stub"
+}
+
+test_no_duplicate_stub_on_repeated_session_start() {
+  local home; home=$(make_home nodup)
+  printf 'pid=111 identity=predecessor\n2026-08-13T09:00:00Z\n' > "$home/state/.session-open"
+
+  # Same successor session runs session-open twice (e.g. a re-run start).
+  run_open "$home" "pid=222 identity=successor" >/dev/null
+  local out
+  out=$(run_open "$home" "pid=222 identity=successor")
+  assert_not_contains "$out" 'backfilled' 'a repeated session-open in the same session must not backfill again'
+
+  local count
+  count=$(grep -c '^ended=' "$home/data/session-stats.log")
+  [ "$count" = 1 ] || fail "expected exactly one stub across two same-session opens, got $count"
+  pass "repeated session starts for the same predecessor produce no duplicate stub"
+}
+
+test_first_ever_session_open_writes_marker_no_stub() {
+  local home; home=$(make_home firstever)
+  # No marker at all: the very first session in this home.
+  local out
+  out=$(run_open "$home" "pid=111 identity=first")
+  assert_not_contains "$out" 'backfilled' 'the first-ever session has no predecessor to backfill'
+  assert_absent "$home/data/session-stats.log" 'the first-ever session-open writes no record'
+  assert_grep 'pid=111 identity=first' "$home/state/.session-open" 'the first-ever session-open still stamps the marker'
+  pass "the first-ever session-open stamps the marker and backfills nothing"
+}
+
+test_reconstructed_stub_distinct_from_clean_record() {
+  local home; home=$(make_home distinct)
+  printf 'pid=111 identity=predecessor\n2026-08-13T09:00:00Z\n' > "$home/state/.session-open"
+  run_open "$home" "pid=222 identity=successor" >/dev/null
+
+  # A genuine clean record never carries the reconstructed marker.
+  local record
+  record=$(grep '^ended=' "$home/data/session-stats.log" | tail -1)
+  case "$record" in
+    *reconstructed=1*) : ;;
+    *) fail "the stub must be marked reconstructed=1: $record" ;;
+  esac
+  assert_no_grep 'model=claude' "$home/data/session-stats.log" 'a reconstructed stub records no invented model'
+  pass "a reconstructed stub is marked and never mistaken for a clean close"
+}
+
 test_refusal_is_reported_and_never_forced
 test_all_clean_exits_zero
 test_secondmate_is_left_running
@@ -224,3 +322,8 @@ test_record_leaves_workers_running
 test_record_reports_away_and_appends
 test_record_renders_in_report
 test_report_without_record_fails
+test_unclean_turnover_backfills_one_reconstructed_stub
+test_clean_close_leaves_no_stub_for_successor
+test_no_duplicate_stub_on_repeated_session_start
+test_first_ever_session_open_writes_marker_no_stub
+test_reconstructed_stub_distinct_from_clean_record
