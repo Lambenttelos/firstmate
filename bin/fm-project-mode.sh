@@ -15,9 +15,9 @@
 # mode = how a finished change reaches main:
 #   no-mistakes  full pipeline -> PR -> captain merge (default)
 #   direct-PR    push + PR via gh-axi, no pipeline -> captain merge
-#   direct-push  full pipeline (PR/CI steps skipped) -> push validated branch to
-#                origin -> configured merge authority lands it on the forge. For
-#                forges firstmate cannot open PRs on (e.g. Bitbucket); no PR, no CI wait.
+#   direct-push  full pipeline (its PR/CI steps skipped) -> push validated branch to
+#                origin -> firstmate opens the PR itself on forges such as Bitbucket
+#                (sourcing .env creds) -> configured merge authority lands it.
 #   local-only   local branch, no remote/PR -> captain approve -> guarded local merge
 # yolo (orthogonal) = when on, firstmate makes approval decisions itself (PR merges,
 #   ask-user findings, local-only merge approval) without checking the captain - except

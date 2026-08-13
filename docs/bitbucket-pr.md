@@ -71,9 +71,9 @@ $ jq --version
 jq-1.6
 ```
 
-No Bitbucket credential is configured anywhere in this fleet (`NO_MISTAKES_BITBUCKET_EMAIL`, `NO_MISTAKES_BITBUCKET_API_TOKEN`, and `NO_MISTAKES_BITBUCKET_API_BASE_URL` are all unset in the environment, the `.env`, `config/`, and the `no-mistakes` config).
-The live open-PR path therefore could not be exercised against a real Bitbucket repository.
-The evidence below drives the code against a mock `curl` that returns canned Bitbucket JSON, so it verifies request construction, endpoint selection, credential handling, and the poll's merge-detection and silence contract without a network call.
+The `NO_MISTAKES_BITBUCKET_EMAIL` and `NO_MISTAKES_BITBUCKET_API_TOKEN` credentials are now configured in firstmate's `.env` (`NO_MISTAKES_BITBUCKET_API_BASE_URL` stays unset and defaults to `https://api.bitbucket.org`).
+The mock evidence below was captured on 2026-08-12 before the credentials were configured, driving the code against a mock `curl` that returns canned Bitbucket JSON, so it verifies request construction, endpoint selection, credential handling, and the poll's merge-detection and silence contract without a network call.
+The live proof against a real Bitbucket repository followed on 2026-08-13 (see "Proven live" below).
 
 The static poll emits exactly one `merged` line for a `MERGED` pull request and stays silent for an open one (mock `curl` returning the canned state):
 
@@ -102,7 +102,23 @@ $ echo $?
 
 The automated coverage lives in `tests/fm-bitbucket-lib.test.sh` (library open/state/merge and the credential, API-base, and target guards), the Bitbucket cases in `tests/fm-pr-merge.test.sh` (the merge path records `pr=` and hits the merge endpoint, and refuses without credentials), and the Bitbucket cases in `tests/fm-pr-check-security.test.sh` (URL parse matrix and the static-poll merged-only-and-silent contract).
 
-## What must happen before the registry flip
+## Proven live
 
-`hyfin` and `hyfin-server` stay `direct-push` in `data/projects.md` until the open-PR path is proven live against a real Bitbucket repository, because a registry flip with an unproven path would break live product delivery.
-Proving it live needs the `NO_MISTAKES_BITBUCKET_*` credentials configured and a safe way to open and close a real test pull request without disrupting product work; both are captain decisions.
+The open-PR path was exercised against a real Bitbucket repository on 2026-08-13.
+With the credentials sourced from firstmate's `.env`, firstmate opened a real pull request on `dashnow/hyfin`:
+
+```
+$ set -a && . ./.env && set +a && bin/fm-bitbucket-pr.sh open --source fix/dual-pricing-paid-invoice-reconcile --dest dev -C <worktree>
+https://bitbucket.org/dashnow/hyfin/pull-requests/3613
+```
+
+`bin/fm-pr-check.sh` then armed the merge watch with the same credentials.
+So firstmate opening a Bitbucket pull request itself is proven, not theoretical.
+
+In `direct-push` delivery the no-mistakes pipeline itself still opens no PR, and the crew env does not carry the Bitbucket credentials, so a crew `missing NO_MISTAKES_BITBUCKET_EMAIL` report is expected rather than a failure.
+Firstmate opens the pull request itself after the crew's validated branch is pushed, sourcing the `.env` credentials, so this is not a captain-side-only step.
+
+## Registry flip is a separate captain decision
+
+The live open-PR path is now proven, which removes the technical precondition that kept `hyfin` and `hyfin-server` on `direct-push`.
+Whether to flip either project's registry mode (`direct-push` to `no-mistakes` or `direct-PR`) is a separate captain decision and is not made by proving the path live, because it changes the delivery contract for live product work.

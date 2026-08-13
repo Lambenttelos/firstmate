@@ -34,7 +34,7 @@ Choose the delivery mode when adding or creating the project:
 
 - `no-mistakes` runs the full validation pipeline before a PR and is the default when the captain does not specify a mode.
 - `direct-PR` pushes and opens a PR without the no-mistakes pipeline.
-- `direct-push` runs the full no-mistakes pipeline on a forge firstmate cannot open PRs on (e.g. Bitbucket), then the worker pushes the validated branch to `origin`; the configured merge authority lands it on the forge and there is no PR or CI to wait on. See AGENTS.md section 7 for the full contract.
+- `direct-push` runs the full no-mistakes pipeline whose own PR and CI steps do not apply on the forge (e.g. Bitbucket), then the worker pushes the validated branch to `origin` and firstmate opens the Bitbucket pull request itself by sourcing the `.env` credentials; the configured merge authority lands it on the forge. See AGENTS.md section 7 for the full contract.
 - `local-only` has no required remote or PR and lands only through the approved local fast-forward path.
 
 The optional `+yolo` posture changes routine approval authority but does not change the delivery mode.
