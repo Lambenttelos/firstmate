@@ -2,7 +2,7 @@
 name: bootstrap-diagnostics
 description: >-
   Agent-only handling playbook for session-start bootstrap diagnostics.
-  Use whenever the session-start digest's bootstrap section prints an actionable diagnostic line - MISSING, MISSING_MANUAL, BACKEND_INVALID, NEEDS_GH_AUTH, TANGLE, CONFIG_DRIFT, CREW_DISPATCH invalid, FLEET_SYNC, PRESENT_DAEMON, LIVENESS_WATCHDOG, LIVENESS_ESCALATION, PR_CHECK_MIGRATION, SECONDMATE_SYNC, SECONDMATE_LIVENESS, AFK_DAEMON, AFK_READER, NUDGE_SECONDMATES, or FMX - or when a standalone bin/fm-bootstrap.sh run prints one of those lines.
+  Use whenever the session-start digest's bootstrap section prints an actionable diagnostic line - MISSING, MISSING_MANUAL, BACKEND_INVALID, NEEDS_GH_AUTH, TANGLE, CONFIG_DRIFT, NM_SANDBOX, CREW_DISPATCH invalid, FLEET_SYNC, PRESENT_DAEMON, LIVENESS_WATCHDOG, LIVENESS_ESCALATION, PR_CHECK_MIGRATION, SECONDMATE_SYNC, SECONDMATE_LIVENESS, AFK_DAEMON, AFK_READER, NUDGE_SECONDMATES, or FMX - or when a standalone bin/fm-bootstrap.sh run prints one of those lines.
   A silent bootstrap section, or a BOOTSTRAP_INFO fact, means no skill load.
 user-invocable: false
 metadata:
@@ -31,6 +31,10 @@ When any diagnostic needs captain attention, report the plain consequence and re
   It surfaces in both read-only and full modes because a silent drift matters regardless of the lock, and it never blocks the session.
   Decide which value is right rather than reflexively reconciling: if the live value is a leftover a prior session left behind, set `config/watcher-cadence` back to the recorded value so the config owner reads correctly (`docs/configuration.md` "Watcher cadence" and "Captain-owned value drift alarm" own the mechanism); if the change is intended and standing, update `config/captain-preferences` to the new value so the preference is the current truth.
   When the right value is genuinely a captain call, surface the plain drift and ask, using `AGENTS.md` section 9's translation contract, rather than silently picking one.
+- `NM_SANDBOX: no-mistakes daemon (pid <N>) is running under root without IS_SANDBOX=1 (...)` - the shared no-mistakes daemon came up under root without `IS_SANDBOX=1`, which makes claude refuse `--dangerously-skip-permissions` and instant-fails the review step of every claude lane fleet-wide until the daemon is relaunched with the flag.
+  It fires only on a confident reading (root, a live daemon pid, its environment readable, the flag absent) and stays silent on every uncertainty, so a printed line is real.
+  `bin/fm-nm-daemon.sh restart` reinjects the flag durably (`bin/fm-nm-daemon.sh` owns the injection), but a restart kills every lane's in-flight pipeline run, so this is a firstmate decision under the same never-restart-the-shared-daemon rule the briefs carry, not an automatic fix: relaunch through the wrapper when no run is mid-flight, or wait for a safe window, and never bare-restart the daemon around the wrapper.
+  Surface the consequence and the restart cost to the captain per `AGENTS.md` section 9 when a lane is actually blocked on it.
 - `CREW_DISPATCH: invalid config/crew-dispatch.json - <reason>` - the optional dispatch profile file exists but failed low-cost bootstrap validation; continue with the normal fallback chain, resolve and pass the chosen fallback harness explicitly while the file remains present, fix the malformed schema, unverified harness name, unknown selector, or invalid harness/effort pair when convenient, and do not select a bad profile.
 - `FLEET_SYNC: <repo>: skipped: <reason>` - a benign one-off skip (no origin, local-only, an unreadable ref); bootstrap continued, investigate only if it blocks work.
   A skip can also report the bounded fleet-refresh timeout (`FM_FLEET_SYNC_BOOTSTRAP_TIMEOUT`, or a fleet-size-aware default with a 20 second floor); a timeout never blocks startup.

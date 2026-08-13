@@ -16,6 +16,7 @@
 #                 "PR_CHECK_MIGRATION: <private remediation>",
 #                 "TANGLE: <remediation>",
 #                 "CONFIG_DRIFT: <value> is <live> but the captain's recorded preference is <recorded> (...)",
+#                 "NM_SANDBOX: no-mistakes daemon (pid <N>) is running under root without IS_SANDBOX=1 (...)",
 #                 "SECONDMATE_SYNC: secondmate <id>: skipped: <reason>",
 #                 "NUDGE_SECONDMATES: secondmate <id>: send failed: <reason>",
 #                 "BOOTSTRAP_INFO: nudged fm-<id> with '<message>'",
@@ -999,6 +1000,13 @@ fi
 # read-only session must still see that a captain-owned value silently drifted.
 # bin/fm-drift-check.sh owns the mechanism and the generalized owned-value list.
 "$SCRIPT_DIR/fm-drift-check.sh" || true
+# Root no-mistakes daemon sandbox alarm: SHOUT an NM_SANDBOX line when a live
+# daemon is running under root without IS_SANDBOX=1, which instant-fails every
+# claude review lane fleet-wide. Detect-only and confident-only, so it runs in
+# BOTH modes like TANGLE and CONFIG_DRIFT; a read-only session must still see it.
+# bin/fm-nm-sandbox-check.sh owns the mechanism; bin/fm-nm-daemon.sh owns the
+# durable injection this alarms about the absence of.
+"$SCRIPT_DIR/fm-nm-sandbox-check.sh" || true
 crew=
 [ -f "$CONFIG/crew-harness" ] && crew=$(tr -d '[:space:]' < "$CONFIG/crew-harness" || true)
 if [ "${FM_BOOTSTRAP_VERBOSE_FACTS:-0}" = 1 ] && [ -n "$crew" ] && [ "$crew" != "default" ]; then
