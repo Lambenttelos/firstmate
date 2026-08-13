@@ -583,11 +583,15 @@ command_guard() {
   fi
 
   # Restore recovers active-backlog offenders deterministically through tasks-axi.
+  # The re-hold reason carries a 'verify not already shipped' warning because a
+  # reopened hold fed one duplicate build in the double-build incident: reopening
+  # a hold whose work already landed is exactly how a worker gets dispatched onto
+  # finished work, so the operator is reminded to check before re-dispatching.
   for id in $active_ids; do
     tasks_axi reopen "$id" >/dev/null || { echo "guard: could not reopen $id" >&2; rc=1; continue; }
-    tasks_axi hold "$id" --reason "reopened by guard: closed while awaiting a captain decision" --kind captain >/dev/null \
+    tasks_axi hold "$id" --reason "reopened by guard: closed while awaiting a captain decision - verify not already shipped before re-dispatching" --kind captain >/dev/null \
       || { echo "guard: could not re-hold $id" >&2; rc=1; continue; }
-    printf 'restored: %s\n' "$id"
+    printf 'restored: %s (verify not already shipped before re-dispatching)\n' "$id"
   done
   # Archived offenders are outside tasks-axi's reach; report them for un-archiving.
   for id in $archive_ids; do
