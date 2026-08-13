@@ -1,6 +1,6 @@
 ---
 name: jcode-switch-account
-description: Rotate the whole fleet's active Claude sub-account across every live jcode worker by wrapping bin/fm-switch-account.sh. Use when the captain invokes /jcode-switch-account, says "switch the fleet account", "switch to claude-1"/"switch to claude-2", "rotate the claude account", "change which claude account the workers use", or names an account by email (e.g. "switch to cyuan" / "dev1").
+description: Rebroadcast a Claude sub-account switch into every live jcode worker session by wrapping bin/fm-switch-account.sh. Use when the captain invokes /jcode-switch-account, says "switch the fleet account", "switch to claude-1"/"switch to claude-2", "rotate the claude account", "change which claude account the workers use", or names an account by email (e.g. "switch to cyuan" / "dev1").
 user-invocable: true
 metadata:
   internal: true
@@ -9,19 +9,25 @@ metadata:
 # jcode-switch-account
 
 Wrap `bin/fm-switch-account.sh`; never reimplement its mechanics.
-The script owns everything: it sends jcode's per-session `/account claude switch <label>` into every live worker pane, validates the label against `auth.json`, and refuses to garble a half-typed composer.
+jcode's `/account claude switch <label>` is a PER-SESSION slash command.
+There is no single fleet-wide active account: each live worker session carries its own account, so a switch must be rebroadcast into every live pane individually.
+The script owns everything: it sends the per-session command into every live worker pane, validates the label against `auth.json`, and refuses to garble a half-typed composer.
 This skill only drives that script and reports the outcome.
 
 ## Procedure
 
-1. Run `bin/fm-switch-account.sh --status` first to show the active account and the known labels.
+1. Run `bin/fm-switch-account.sh --status` first to show the known labels.
+   `--status` reads one best-effort probe field from `auth.json`; it is NOT fleet-wide truth about what each live worker is on, so never treat its label as proof any pane is already switched.
 2. Resolve the requested label.
    - A bare label like `claude-1` or `claude-2` is used directly.
    - A captain phrasing by person or email (e.g. "cyuan", "dev1") maps to its label via the email shown in the `--status` output.
    - Ask one concise question only if the target is genuinely ambiguous.
 3. Run `bin/fm-switch-account.sh <label>` to broadcast the switch to every live worker.
+   ALWAYS run this broadcast, even when the `--status` probe already reports the target label.
+   Never short-circuit or skip the broadcast as an "already on X, no switch needed" no-op: a probe label does not mean every live pane is on it.
+   The only panes the script itself skips are ones with genuine pending human input or a dead/unknown composer; that is not a no-op and is correct.
 4. Confirm the switch landed by reading the per-pane tails the script prints for the live workers.
-5. Report to the captain in plain outcome language which account the fleet is now on.
+5. Report to the captain in plain outcome language which account the workers are now on.
 
 ## Safety
 
