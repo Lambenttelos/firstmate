@@ -175,6 +175,7 @@ family_for_basename() {
       printf '%s\n' pr-forge
       ;;
     fm-afk-driver.test.sh|fm-afk-inbox.test.sh|fm-afk-inbox-arm.test.sh|\
+    fm-afk-inbox-arm-singleton.test.sh|\
     fm-afk-inject-e2e.test.sh|fm-afk-return.test.sh)
       printf '%s\n' afk
       ;;
