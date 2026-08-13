@@ -375,7 +375,7 @@ Relay the pressure and the crew count the host supports, and ask the captain bef
 When the pressure is memory and the question becomes which processes are consuming it and who owns them, `bin/fm-memory-report.sh` answers that separately; never judge memory by resident size, which understates a swapping process badly.
 When a parked or dead lane is holding a language server whose memory you want back, `bin/fm-release-lsp.sh` releases only those servers safely, never a live lane's and never the agent or worktree.
 
-A `session-review` wake reports only work that has not moved - an unanswered decision, a silent worker, queued work with nothing running, a batch of finished-but-unmerged branches - so act on the named item rather than re-reviewing the fleet, and read the full report behind the headline when the one line is not enough.
+A `session-review` wake reports only work that has not moved - an unanswered decision, a silent worker, queued work with nothing running, a batch of finished-but-unmerged branches, 2+ pipelines stalled on the same shared credential - so act on the named item rather than re-reviewing the fleet, and read the full report behind the headline when the one line is not enough.
 A `session-cleanup` wake reports only accumulated material the sweep deliberately did not remove because it could hold unlanded work; investigate it under the ordinary teardown rules and never discard it on the strength of that report.
 `docs/configuration.md` owns both cadences, and the two pass scripts own their thresholds.
 
