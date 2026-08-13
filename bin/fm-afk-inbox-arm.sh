@@ -52,6 +52,34 @@
 # tears the reader child down with it, so no orphan reader survives to consume
 # escalations to a stdout nobody reads.
 #
+# SINGLETON PER HOME. On arm this wrapper guarantees exactly one live reader for
+# this home, reusing the shared portable mutex (bin/fm-mutex-lib.sh, via
+# bin/fm-wake-lib.sh) rather than inventing a second locking scheme, the same
+# primitive bin/fm-watch-arm.sh / bin/fm-watch.sh use for the watcher singleton.
+# It holds this home's state/.afk-inbox-arm.lock for its whole armed lifetime.
+# Before it claims that lock it RETIRES any pre-existing reader for this home, so
+# a stale reader from a dead session cannot survive and keep draining the outbox
+# to a stdout nobody reads (evidence 2026-08-06: three stale fm-afk-inbox.sh
+# readers acknowledged the outbox while the captain got no wakes). Retiring is
+# unconditional on arm, exactly like bin/fm-watch-arm.sh --restart: the fresh arm
+# always wins and becomes the sole reader, whether the predecessor was live or
+# stale. Two things get retired, both home-scoped, zombie/dead-pid safe (a
+# Z/defunct holder counts as dead, per fm_pid_alive) and gated on a captured
+# process-identity match (fm_pid_identity), so a reused pid or another home's
+# reader is NEVER signalled:
+#   1. A predecessor WRAPPER recorded as this home's arm-lock holder. Signalling
+#      it fires its own trap, which tears down its reader child and releases the
+#      lock; a wrapper killed hard (SIGKILL, its trap never ran) leaves a dead-pid
+#      stale lock the mutex reclaims on the fresh claim.
+#   2. An orphan READER recorded in state/.afk-inbox-reader.pid by a wrapper that
+#      died WITHOUT running its trap, so no live wrapper is left to tear it down.
+#      This wrapper writes that record on every reader launch and clears it on
+#      exit, and it is retired directly once the fresh arm owns the lock.
+# All of that state lives in this home's own state/ directory, so the retire can
+# never reach a reader belonging to another firstmate home. Only the arm-lock
+# holder is signalled as a wrapper and only the sidecar pid is signalled as a
+# reader, both under an identity match, so nothing else on the host is touched.
+#
 # Usage: fm-afk-inbox-arm.sh
 #   Runs in the foreground (it IS the tracked background task). Blocks until the
 #   resident reader produces a genuine outcome, then prints that outcome and
@@ -87,6 +115,18 @@ STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 . "$SCRIPT_DIR/fm-afk-outbox-lib.sh"
 
 READER="$SCRIPT_DIR/fm-afk-inbox.sh"
+
+# The home-scoped singleton lock, held for the whole armed lifetime, and the
+# home-local record of the reader child so a wrapper that was SIGKILLed (its trap
+# never ran) still leaves a trail for the next arm to retire its orphan reader.
+ARM_LOCK="$STATE/.afk-inbox-arm.lock"
+READER_RECORD_PID="$STATE/.afk-inbox-reader.pid"
+READER_RECORD_ID="$STATE/.afk-inbox-reader.id"
+LOCK_HELD=0
+# How long to wait for a signalled predecessor or orphan to actually exit before
+# escalating TERM to KILL, in 0.1s steps (mirrors bin/fm-watch-arm.sh --restart).
+RETIRE_WAIT_STEPS=${FM_AFK_INBOX_ARM_RETIRE_WAIT_STEPS:-50}
+case "$RETIRE_WAIT_STEPS" in ''|*[!0-9]*|0) RETIRE_WAIT_STEPS=50 ;; esac
 
 RAPID_SECONDS=${FM_AFK_INBOX_ARM_RAPID_SECONDS:-5}
 FAILURE_THRESHOLD=${FM_AFK_INBOX_ARM_FAILURE_THRESHOLD:-5}
@@ -130,6 +170,108 @@ remove_reader_out() {
   READER_OUT=
 }
 
+# Record this home's live reader child so a wrapper that is later SIGKILLed
+# (trap never runs) still leaves the next arm a home-local trail to retire the
+# orphan. The identity pins it to THIS process, so a reused pid is a mismatch.
+record_reader() {  # <pid>
+  local pid=$1
+  printf '%s\n' "$pid" > "$READER_RECORD_PID" 2>/dev/null || true
+  fm_pid_identity "$pid" > "$READER_RECORD_ID" 2>/dev/null || true
+}
+
+clear_reader_record() {
+  rm -f "$READER_RECORD_PID" "$READER_RECORD_ID" 2>/dev/null || true
+}
+
+# Signal a recorded pid down home-scoped and identity-verified: TERM, wait for
+# it to exit, then KILL if it will not. NEVER acts on a pid whose captured
+# identity no longer matches (a reused pid) or that is already dead/zombie, so
+# this can only ever reach the exact process this home recorded. The identity is
+# re-checked immediately before every kill to close the reuse race.
+retire_recorded_pid() {  # <pid> <expected-identity>
+  local pid=$1 want=$2 i=0
+  case "$pid" in ''|*[!0-9]*) return 0 ;; esac
+  fm_pid_alive "$pid" || return 0
+  [ -n "$want" ] || return 0
+  [ "$(fm_pid_identity "$pid" 2>/dev/null)" = "$want" ] || return 0
+  kill -TERM "$pid" 2>/dev/null || true
+  while [ "$i" -lt "$RETIRE_WAIT_STEPS" ] && fm_pid_alive "$pid"; do
+    sleep 0.1
+    i=$((i + 1))
+  done
+  if fm_pid_alive "$pid" && [ "$(fm_pid_identity "$pid" 2>/dev/null)" = "$want" ]; then
+    kill -KILL "$pid" 2>/dev/null || true
+    i=0
+    while [ "$i" -lt "$RETIRE_WAIT_STEPS" ] && fm_pid_alive "$pid"; do
+      sleep 0.1
+      i=$((i + 1))
+    done
+  fi
+}
+
+# Retire a reader ORPHANED by a wrapper that died without running its trap. The
+# predecessor wrapper itself is retired by the singleton lock (its own trap tears
+# its reader down); this covers only the reader left with no live parent. The
+# record is home-local, so this can never signal another home's reader, and the
+# identity match makes a reused pid or an already-recycled record a no-op.
+retire_orphan_reader() {
+  local pid identity
+  [ -f "$READER_RECORD_PID" ] || return 0
+  pid=$(cat "$READER_RECORD_PID" 2>/dev/null || true)
+  identity=$(cat "$READER_RECORD_ID" 2>/dev/null || true)
+  retire_recorded_pid "$pid" "$identity"
+  clear_reader_record
+}
+
+# Retire a predecessor WRAPPER still holding this home's arm lock, exactly the
+# way bin/fm-watch-arm.sh --restart stops the recorded watcher: read the holder
+# pid straight from the lock, and signal it down only when it is this home's own
+# arm wrapper (the fm-home field it wrote matches) AND its captured identity
+# still matches (never a reused pid). Signalling it fires its trap, which tears
+# down its reader child and releases the lock; a wrapper already gone leaves a
+# dead-pid lock the mutex reclaims on the claim below. A holder that will not die
+# is escalated TERM -> KILL. The lock lives in this home's state/, so this can
+# never reach another home's wrapper.
+retire_predecessor_wrapper() {
+  local pid lock_home lock_identity i=0
+  pid=$(cat "$ARM_LOCK/pid" 2>/dev/null || true)
+  case "$pid" in ''|*[!0-9]*) return 0 ;; esac
+  lock_home=$(cat "$ARM_LOCK/fm-home" 2>/dev/null || true)
+  lock_identity=$(cat "$ARM_LOCK/pid-identity" 2>/dev/null || true)
+  [ "$lock_home" = "$FM_HOME" ] || return 0
+  fm_pid_alive "$pid" || return 0
+  [ -n "$lock_identity" ] || return 0
+  [ "$(fm_pid_identity "$pid" 2>/dev/null)" = "$lock_identity" ] || return 0
+  kill -TERM "$pid" 2>/dev/null || true
+  while [ "$i" -lt "$RETIRE_WAIT_STEPS" ] && fm_pid_alive "$pid"; do
+    sleep 0.1
+    i=$((i + 1))
+  done
+  if fm_pid_alive "$pid" && [ "$(fm_pid_identity "$pid" 2>/dev/null)" = "$lock_identity" ]; then
+    kill -KILL "$pid" 2>/dev/null || true
+    i=0
+    while [ "$i" -lt "$RETIRE_WAIT_STEPS" ] && fm_pid_alive "$pid"; do
+      sleep 0.1
+      i=$((i + 1))
+    done
+  fi
+}
+
+# Stamp this wrapper's ownership into the held lock so a later arm can recognise
+# it as this home's arm wrapper and retire it, mirroring how bin/fm-watch.sh
+# records fm-home and pid-identity in the watcher lock. Best-effort: the fields
+# are only used to make the retire MORE selective, never less safe.
+record_arm_lock_identity() {
+  printf '%s\n' "$FM_HOME" > "$ARM_LOCK/fm-home" 2>/dev/null || true
+  fm_pid_identity "${BASHPID:-$$}" > "$ARM_LOCK/pid-identity" 2>/dev/null || true
+}
+
+release_arm_lock() {
+  [ "$LOCK_HELD" -eq 1 ] || return 0
+  fm_lock_release "$ARM_LOCK"
+  LOCK_HELD=0
+}
+
 # shellcheck disable=SC2329 # Invoked indirectly by the signal traps below.
 handle_signal() {
   local rc=$1
@@ -137,7 +279,9 @@ handle_signal() {
   RUNNING=0
   [ -n "$SLEEP_PID" ] && kill -TERM "$SLEEP_PID" 2>/dev/null
   cleanup_reader
+  clear_reader_record
   remove_reader_out
+  release_arm_lock
   exit "$rc"
 }
 
@@ -176,11 +320,36 @@ pass_through_and_exit() {  # <output-file> <reader-rc>
   local out=$1 rc=$2
   [ -s "$out" ] && cat "$out"
   remove_reader_out
+  clear_reader_record
+  release_arm_lock
   exit "$rc"
 }
 
 main() {
   local started rc elapsed failures=0 backoff
+
+  # Singleton per home. Retire any pre-existing reader for this home first, so a
+  # stale reader from a dead session cannot survive this arm: signal the recorded
+  # arm-lock holder (a predecessor wrapper), whose trap tears down its own reader
+  # child and releases the lock. Retiring is unconditional, like
+  # bin/fm-watch-arm.sh --restart - the fresh arm always wins.
+  retire_predecessor_wrapper
+
+  # Now claim this home's arm lock and hold it for the whole armed lifetime. A
+  # predecessor that exited (its trap released the lock) or was killed hard (a
+  # dead-pid stale lock the mutex reclaims) yields it here. A failure to acquire
+  # now means a GENUINELY concurrent fresh peer beat us to the empty lock; stand
+  # down with a do-not-re-arm line rather than starting a rival reader.
+  if ! fm_lock_try_acquire "$ARM_LOCK"; then
+    echo "afk-inbox-arm: another away-mode reader is already arming for this home (pid ${FM_LOCK_HELD_PID:-unknown}); not starting a second - do not re-arm"
+    return 0
+  fi
+  LOCK_HELD=1
+  record_arm_lock_identity
+  # Sole owner now. A reader still recorded in the sidecar was orphaned by a
+  # wrapper that died WITHOUT running its trap (a SIGKILL, an OOM), leaving no
+  # live parent to tear it down; retire it before arming a fresh one.
+  retire_orphan_reader
 
   # A run started with away mode already over, or in a home the daemon put into
   # pane delivery, has no pull channel to keep alive. Do not launch a reader just
@@ -206,6 +375,9 @@ main() {
     # condition, or an operational failure, and never idle-exits.
     "$READER" --timeout 0 > "$READER_OUT" 2>&1 &
     READER_PID=$!
+    # Record the live reader so a wrapper SIGKILLed before its trap runs still
+    # leaves the next arm a trail to retire this orphan.
+    record_reader "$READER_PID"
     rc=0
     wait "$READER_PID" 2>/dev/null || rc=$?
     # A signal handled mid-wait already exited through the trap; guard anyway.
@@ -214,6 +386,7 @@ main() {
       cleanup_reader
     fi
     READER_PID=
+    clear_reader_record
     elapsed=$(( $(date +%s) - started ))
 
     if reader_output_has_verdict "$READER_OUT"; then
@@ -262,3 +435,14 @@ main() {
 }
 
 main "$@"
+# Every return path out of main() releases the singleton lock and clears the
+# reader record here (the exit-via-exit paths pass_through_and_exit and
+# handle_signal already released before exiting). This is the one drain point so
+# a stand-down or crash-loop return never leaves the lock or an orphan record
+# behind for the next arm.
+rc=$?
+if [ "$LOCK_HELD" -eq 1 ]; then
+  clear_reader_record
+  release_arm_lock
+fi
+exit "$rc"
