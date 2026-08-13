@@ -34,12 +34,14 @@ This touches only the firstmate repo and its own worktrees, never anything under
    **Read `AGENTS.md` now** (CLAUDE.md is a symlink to it) to refresh your operating instructions before doing anything else, so you are acting on the new instructions rather than the stale ones you were started with.
    When it printed `reread-firstmate: no`, nothing changed for you - skip the re-read.
 
-3. **Nudge each updated live secondmate.**
-   For every target listed on the `nudge-secondmates:` line (do nothing when it says `none`), send a one-line re-read nudge so that secondmate picks up its new instructions too:
+3. **Nudge each updated live secondmate, at most once per session.**
+   Pass every window on the `nudge-secondmates:` line (do nothing when it says `none`) to the nudge helper in one call:
    ```sh
-   FM_HOME=<this-firstmate-home> bin/fm-send.sh <id> 'firstmate was updated to the latest - please re-read your AGENTS.md to pick up the new instructions.'
+   FM_HOME=<this-firstmate-home> bin/fm-update-nudge.sh <window> [<window> ...]
    ```
    Include `FM_HOME=<this-firstmate-home>` unless `FM_HOME` is already set to the active firstmate home.
+   The helper owns two properties so you do not have to: it sends each nudge as a one-way, no-reply-expected message that opens no pending-reply expectation (the desk acknowledges with at most one line and nothing re-escalates), and it dedups per session so a second `/updatefirstmate` in the same session does not re-nudge a secondmate it already nudged.
+   The nudge carries the latest commit id and summary, so a new session (a new commit pulled later) nudges again.
    This is a gentle steer, not an interruption: the secondmate already got a safe tracked-files fast-forward, and the nudge never forces, tears down, or discards its work.
    A secondmate that was skipped, already current, or has no live metadata is not on the list and needs no nudge.
 
