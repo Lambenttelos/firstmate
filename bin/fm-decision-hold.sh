@@ -19,7 +19,7 @@
 # Usage:
 #   fm-decision-hold.sh id <origin-id> <decision-key>
 #   fm-decision-hold.sh hold <origin-id> <decision-key> \
-#     --title <title> --reason <reason> [--repo <repo>]
+#     --title <title> --reason <reason> [--repo <repo>] [--blocking]
 #   fm-decision-hold.sh complete <origin-id> (--none | <decision-key>...)
 #   fm-decision-hold.sh verify <origin-id>
 #   fm-decision-hold.sh resolve <origin-id> <decision-key> \
@@ -47,6 +47,13 @@
 # It writes the captain decision and routed identities into the hold body, clears
 # those dependency edges, and only then marks the hold Done. A failure before the
 # final step leaves the captain hold open.
+#
+# `hold --blocking` marks a decision that blocks live work, as distinct from a
+# review-when-convenient one. It maps onto the tasks-axi priority field (priority 0,
+# the highest band; the field runs 0 highest to 4 lowest) so the existing backlog
+# ordering already surfaces it ahead of convenience holds, and downstream renderers
+# (bearings) sort blocking holds first, then oldest-first within each band. Omitting
+# --blocking leaves the priority field untouched, the unchanged default behavior.
 set -eu
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -253,7 +260,7 @@ command_id() {
 }
 
 command_hold() {
-  local origin=${1:-} key=${2:-} title='' reason='' repo='' id show state kind existing_title body
+  local origin=${1:-} key=${2:-} title='' reason='' repo='' blocking=0 id show state kind existing_title body
   [ "$#" -ge 2 ] || { usage >&2; exit 2; }
   shift 2
   while [ "$#" -gt 0 ]; do
@@ -261,6 +268,7 @@ command_hold() {
       --title) shift; title=${1:-} ;;
       --reason) shift; reason=${1:-} ;;
       --repo) shift; repo=${1:-} ;;
+      --blocking) blocking=1 ;;
       *) usage >&2; exit 2 ;;
     esac
     shift
@@ -305,6 +313,13 @@ command_hold() {
   fi
   tasks_axi hold "$id" --reason "$reason" --kind captain >/dev/null \
     || fail "could not activate captain hold $id"
+  # A blocking decision maps onto priority 0 (highest band) so the existing backlog
+  # and bearings ordering surface it ahead of convenience holds. Without --blocking the
+  # priority field is left untouched, preserving the unchanged default behavior.
+  if [ "$blocking" = 1 ]; then
+    tasks_axi update "$id" --priority 0 >/dev/null \
+      || fail "could not mark captain hold $id blocking"
+  fi
   verify_hold_active "$id"
   printf '%s\n' "$id"
 }
