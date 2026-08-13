@@ -441,6 +441,8 @@ main "$@"
 # a stand-down or crash-loop return never leaves the lock or an orphan record
 # behind for the next arm.
 rc=$?
-clear_reader_record
-release_arm_lock
+if [ "$LOCK_HELD" -eq 1 ]; then
+  clear_reader_record
+  release_arm_lock
+fi
 exit "$rc"
