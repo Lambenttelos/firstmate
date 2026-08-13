@@ -1976,6 +1976,43 @@ fm_backend_herdr_pane_for_tab() {  # <session> <workspace_id> <tab_id>
     '.result.panes[]? | select(.tab_id == $tab) | .pane_id' 2>/dev/null | head -1
 }
 
+# fm_backend_herdr_pane_tab_identity: the STABLE "<session>\t<tab_id>" identity
+# of the tab that currently owns pane <target> ("<session>:<pane_id>"), or empty
+# on any failure. Herdr pane ids are NOT stable - herdr can reassign a session's
+# pane id under the same live tab (the HERDR_PANE_ID drift that silently froze
+# the present-daemon's pane-wake target - task
+# fix-present-daemon-stale-pane-wake-target), while the tab id and label survive
+# a reassignment. Capturing the owning tab id from a KNOWN-GOOD pane lets a later
+# re-resolve recover the current pane by tab id (fm_backend_herdr_pane_for_tab)
+# instead of clinging to a dead pane id. Read-only.
+fm_backend_herdr_pane_tab_identity() {  # <target> -> <session>\t<tab_id>
+  local target=$1 session pane out tab_id wsid
+  fm_backend_herdr_parse_target "$target" || return 1
+  session=$FM_BACKEND_HERDR_SESSION
+  pane=$FM_BACKEND_HERDR_PANE
+  out=$(fm_backend_herdr_cli "$session" pane get "$pane" 2>/dev/null) || return 1
+  tab_id=$(printf '%s' "$out" | jq -r '.result.pane.tab_id // empty' 2>/dev/null)
+  [ -n "$tab_id" ] || return 1
+  printf '%s\t%s' "$session" "$tab_id"
+}
+
+# fm_backend_herdr_target_for_tab_identity: re-resolve the CURRENT
+# "<session>:<pane_id>" target for a tab identity captured earlier by
+# fm_backend_herdr_pane_tab_identity, or empty if the tab is gone. This is the
+# drift-recovery half: given the surviving tab id, find the tab's current
+# workspace and its live root pane id, which may differ from the one first
+# resolved. Read-only, best-effort.
+fm_backend_herdr_target_for_tab_identity() {  # <session> <tab_id> -> <session>:<pane_id>
+  local session=$1 tab_id=$2 info wsid pane
+  [ -n "$session" ] && [ -n "$tab_id" ] || return 1
+  info=$(fm_backend_herdr_cli "$session" tab get "$tab_id" 2>/dev/null) || return 1
+  wsid=$(printf '%s' "$info" | jq -r '.result.tab.workspace_id // empty' 2>/dev/null)
+  [ -n "$wsid" ] || return 1
+  pane=$(fm_backend_herdr_pane_for_tab "$session" "$wsid" "$tab_id") || return 1
+  [ -n "$pane" ] || return 1
+  printf '%s:%s' "$session" "$pane"
+}
+
 # fm_backend_herdr_resolve_bare_selector: the live-tab-listing fallback for an
 # ad hoc selector with no meta (mirrors tmux's list-windows grep). Searches
 # every RUNNING named herdr session (herdr session list) for a tab whose label

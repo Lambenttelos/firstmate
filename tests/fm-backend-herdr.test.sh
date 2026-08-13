@@ -1363,6 +1363,66 @@ test_list_live_scoped_to_this_homes_workspace_only() {
 
 # --- target parsing, key normalization ---------------------------------------
 
+# --- pane-id drift recovery: stable tab identity + re-resolve ----------------
+# Herdr can reassign a session's pane id under the same live tab (the
+# HERDR_PANE_ID drift that silently froze the present-daemon's pane-wake target).
+# fm_backend_herdr_pane_tab_identity captures the surviving tab id from a live
+# pane; fm_backend_herdr_target_for_tab_identity re-resolves the CURRENT pane for
+# that tab. These pin both halves against the fake herdr CLI.
+
+test_pane_tab_identity_reads_owning_tab() {
+  local dir log resp fb out
+  dir="$TMP_ROOT/pane-tab-identity"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
+  # pane get w19:pA -> owning tab t5
+  printf '{"result":{"pane":{"pane_id":"w19:pA","tab_id":"t5","workspace_id":"w19"}}}\n' > "$resp/1.out"
+  fb=$(make_herdr_fakebin "$dir")
+  out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_pane_tab_identity default:w19:pA' "$ROOT" )
+  [ "$out" = $'default\tt5' ] || fail "pane_tab_identity should return '<session>\\t<tab_id>', got '$out'"
+  assert_contains "$(cat "$log")" $'\x1f''pane'$'\x1f''get'$'\x1f''w19:pA' \
+    "pane_tab_identity did not read the pane's owning tab from pane get"
+  pass "fm_backend_herdr_pane_tab_identity: captures the stable owning tab id from a live pane"
+}
+
+test_pane_tab_identity_empty_on_missing_tab() {
+  local dir log resp fb out
+  dir="$TMP_ROOT/pane-tab-identity-miss"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
+  # pane get returns an error body (pane gone): no tab id, empty output.
+  printf '{"error":{"code":"pane_not_found"}}\n' > "$resp/1.out"
+  fb=$(make_herdr_fakebin "$dir")
+  out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_pane_tab_identity default:w19:pA' "$ROOT" )
+  [ -z "$out" ] || fail "pane_tab_identity must be empty when no tab id resolves, got '$out'"
+  pass "fm_backend_herdr_pane_tab_identity: empty when the pane has no resolvable tab"
+}
+
+test_target_for_tab_identity_reresolves_current_pane() {
+  local dir log resp fb out
+  dir="$TMP_ROOT/target-for-tab"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
+  # 1: tab get t5 -> workspace w19
+  printf '{"result":{"tab":{"tab_id":"t5","workspace_id":"w19"}}}\n' > "$resp/1.out"
+  # 2: pane list --workspace w19 -> tab t5 now owns pane w19:p9 (drifted from pA)
+  printf '{"result":{"panes":[{"pane_id":"w19:p9","tab_id":"t5"}]}}\n' > "$resp/2.out"
+  fb=$(make_herdr_fakebin "$dir")
+  out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_target_for_tab_identity default t5' "$ROOT" )
+  [ "$out" = "default:w19:p9" ] \
+    || fail "target_for_tab_identity should re-resolve to the tab's CURRENT pane, got '$out'"
+  pass "fm_backend_herdr_target_for_tab_identity: re-resolves a tab's current pane after a pane-id drift"
+}
+
+test_target_for_tab_identity_empty_when_tab_gone() {
+  local dir log resp fb out
+  dir="$TMP_ROOT/target-for-tab-gone"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
+  # tab get returns an error body (tab gone): no workspace, empty output.
+  printf '{"error":{"code":"tab_not_found"}}\n' > "$resp/1.out"
+  fb=$(make_herdr_fakebin "$dir")
+  out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_target_for_tab_identity default t5' "$ROOT" )
+  [ -z "$out" ] || fail "target_for_tab_identity must be empty when the tab is gone, got '$out'"
+  pass "fm_backend_herdr_target_for_tab_identity: empty when the tab itself is gone"
+}
+
 test_parse_target() {
   ( . "$ROOT/bin/backends/herdr.sh"
     fm_backend_herdr_parse_target "default:w1:p2" || exit 1
@@ -3020,6 +3080,10 @@ test_projected_abort_cleanup_holds_presentation_lock
 test_projection_recovery_is_read_only_and_refuses_live_duplicate_risk
 test_workspace_find_matches_only_this_homes_own_label
 test_list_live_scoped_to_this_homes_workspace_only
+test_pane_tab_identity_reads_owning_tab
+test_pane_tab_identity_empty_on_missing_tab
+test_target_for_tab_identity_reresolves_current_pane
+test_target_for_tab_identity_empty_when_tab_gone
 test_parse_target
 test_normalize_key
 test_capture_calls_pane_read
