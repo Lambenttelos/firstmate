@@ -531,6 +531,7 @@ The default ledger therefore lives at a fixed path outside any home, `${TMPDIR:-
 Every home's runs share that one running count, and each record carries its owning home for attribution.
 `FM_HEAVY_RUN_DIR` still overrides the path, which is how the tests isolate and how a queue can deliberately be scoped to something other than the whole host.
 So that the homes sharing the ledger also share one ceiling, set `FM_HEAVY_SLOTS_FILE` to the authoritative `config/heavy-run-slots` (the primary home's); when it is unset or unreadable the resolver falls back to this home's own `config/heavy-run-slots`, then to `1`.
+[`bin/fm-spawn.sh`](../bin/fm-spawn.sh) exports that pointer into every crew and secondmate it launches - propagating an already-inherited authoritative pointer down the chain, otherwise rooting it at the spawning primary home's `config/heavy-run-slots` - so a child home's waiter resolves the one host-global ceiling rather than its own default `1`.
 [ADR 0002](adr/0002-heavy-run-host-global-ledger.md) records this deliberate, contained exception to home isolation, and [ADR 0001](adr/0001-heavy-run-refuse-by-default-admission.md) records why admission refuses by default through a lease wrapper.
 
 Admission also reads the host-resource monitor's cached verdict as a second gate.

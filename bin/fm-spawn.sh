@@ -1725,6 +1725,25 @@ fi
 # process (go build, go test, ...) inherit it. Sent before the launch command so
 # the env is set when the agent starts; the brief sleep lets the export land.
 spawn_send_text_line "$T" "export GOTMPDIR=$TASK_TMP/gotmp"
+# Point every spawned crew and secondmate at ONE host-global heavy-run ceiling.
+# The ledger is host-global (docs/configuration.md "Heavy-run serialization"),
+# so every home must resolve the same cap through FM_HEAVY_SLOTS_FILE; without
+# this export a waiter in a child home falls back to its own (usually absent =
+# default 1) config/heavy-run-slots and starves its lane while the real ceiling
+# is higher. An already-set FM_HEAVY_SLOTS_FILE is the authoritative primary
+# pointer this process inherited (this spawn is itself running inside a
+# secondmate that the primary already pointed at the primary's file), so
+# propagate it verbatim to keep the whole chain on the primary's ceiling.
+# Otherwise this process is the primary home, so its own $CONFIG/heavy-run-slots
+# IS the authoritative file. The path is made absolute because the child reads
+# it from inside its worktree, where a relative path would resolve wrong.
+if [ -n "${FM_HEAVY_SLOTS_FILE:-}" ]; then
+  HEAVY_SLOTS_FILE=$FM_HEAVY_SLOTS_FILE
+else
+  CONFIG_ABS=$(cd "$CONFIG" 2>/dev/null && pwd -P) || CONFIG_ABS=$CONFIG
+  HEAVY_SLOTS_FILE="$CONFIG_ABS/heavy-run-slots"
+fi
+spawn_send_text_line "$T" "export FM_HEAVY_SLOTS_FILE=$(shell_quote "$HEAVY_SLOTS_FILE")"
 # Apply any per-spawn --env KEY=VAL overrides into the pane shell env through
 # the same channel the GOTMPDIR export uses, so the agent and its children
 # inherit the swapped token. Last --env for the same KEY wins (shell `export`
