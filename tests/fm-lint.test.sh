@@ -593,14 +593,14 @@ SH
   # single-file: wrapper must NOT be called
   : > "$calls"
   PATH="$fakebin:$PATH" FM_LINT_CACHE_ROOT="$tmp/c1" FM_LINT_HEAVY_RUN="$spy" \
-    FM_LINT_NO_HEAVY_GATE= FM_HEAVY_RUN_ACTIVE= "$LINT" "$a" >/dev/null 2>&1 || true
+    FM_LINT_NO_HEAVY_GATE='' FM_HEAVY_RUN_ACTIVE='' "$LINT" "$a" >/dev/null 2>&1 || true
   [ ! -s "$calls" ] || fail "a single-file lint must NOT go through heavy-run admission"
 
   # full-tree (no args): wrapper MUST be called exactly once. Clear the gate
   # seams the surrounding suite may set so this exercises real admission.
   : > "$calls"
   ( cd "$ROOT" && PATH="$fakebin:$PATH" FM_LINT_CACHE_ROOT="$tmp/c2" FM_LINT_HEAVY_RUN="$spy" \
-      FM_LINT_NO_HEAVY_GATE= FM_HEAVY_RUN_ACTIVE= "$LINT" >/dev/null 2>&1 ) || true
+      FM_LINT_NO_HEAVY_GATE='' FM_HEAVY_RUN_ACTIVE='' "$LINT" >/dev/null 2>&1 ) || true
   [ "$(wc -l < "$calls")" -eq 1 ] || fail "a full-tree sweep must go through heavy-run admission exactly once (got $(wc -l < "$calls"))"
   pass "full-tree sweep routes through heavy-run; single-file call does not"
 }
