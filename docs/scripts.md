@@ -46,6 +46,7 @@ The shared no-mistakes gate refusal for fleet lifecycle entrypoints is summarize
 | `fm-secondmate-handoff.sh` | Hand a context-full secondmate to a fresh agent (stow + continuation doc + respawn) instead of `/compact`; idempotent, fail-closed |
 | `fm-spawn.sh`            | Spawn crewmates, scouts, `id=repo` batches, and secondmates on the resolved harness and runtime backend; refuses crewmate/scout spawns onto already-completed or already-merged work unless `FM_SPAWN_ALLOW_DUPLICATE=1` |
 | `fm-dispatch-select.sh`  | Resolve a dispatch rule/default to one profile, owning quota-aware arrays and random fallback |
+| `fm-account-orchestrator.sh` | Firstmate's thin caller of the quota-axi account-switch orchestrator (`decide` at spawn, `decide`+`switch` on a tripwire); owns the jcode/Claude limit-error recognizer (see `docs/account-orchestrator.md`) |
 | `fm-backend.sh`          | Runtime-backend selection, meta helpers, selector resolution, and operation dispatch |
 | `fm-backend-hometag-lib.sh` | Shared per-installation home-tag derivation for zellij tab and cmux workspace titles |
 | `fm-composer-lib.sh`     | Single fleet-wide owner of composer-content classification for all backends          |

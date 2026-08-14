@@ -664,8 +664,8 @@ launch_template() {
 # receives it as a structurally typed launch brief exactly like every other
 # harness. It is submitted through jcode_submit_brief_verified, which confirms
 # the composer actually cleared and re-submits Enter if it did not.
-jcode_post_launch_delivery() {  # <target> <brief-path> <model> <effort>
-  local target=$1 brief=$2 model=$3 effort=$4 i=0 state=unknown verdict line
+jcode_post_launch_delivery() {  # <target> <brief-path> <model> <effort> [<account>]
+  local target=$1 brief=$2 model=$3 effort=$4 account=${5:-} i=0 state=unknown verdict line
   local slash_lines=()
   # Wait for the TUI: until its composer row exists there is nothing to type
   # into, and a message typed into the still-starting client is lost.
@@ -678,6 +678,16 @@ jcode_post_launch_delivery() {  # <target> <brief-path> <model> <effort>
   if [ "$state" = unknown ]; then
     echo "warning: jcode composer did not appear within ${FM_SPAWN_JCODE_READY_POLLS}s on $target; the launch profile and brief were not delivered" >&2
     return 1
+  fi
+  # Account pin FIRST: the orchestrator (quota-axi decide, consulted before
+  # launch) chose a non-exhausted Claude account for this jcode worker, applied
+  # here through jcode's own per-session `/account claude switch <label>` slash
+  # command - the same reversible control surface bin/fm-switch-account.sh drives,
+  # so the worker's first real turn already runs on the intended account. Empty
+  # (orchestrator unavailable/keep decision) leaves the session on its default
+  # account, the fail-soft path.
+  if [ -n "$account" ]; then
+    slash_lines+=("/account claude switch $account")
   fi
   if [ -n "$model" ] && [ "$model" != default ]; then
     slash_lines+=("/model $model")
@@ -1741,7 +1751,18 @@ spawn_send_key "$T" Enter
 # recovers this pane through the ordinary stuck-worker path rather than being
 # left with a half-torn-down task.
 if [ "$HARNESS" = jcode ]; then
-  jcode_post_launch_delivery "$T" "$BRIEF" "${MODEL:-}" "${EFFORT:-}" || true
+  # Consult the account-switch orchestrator (quota-axi decide) for a jcode/Claude
+  # worker so it lands on a non-exhausted Claude account, never one decide reports
+  # exhausted. Scope: jcode + a claude-* model only (the same route that draws down
+  # the shared Claude OAuth window). FAIL-SOFT: an unavailable/erroring/keep
+  # orchestrator prints nothing, leaving the session on its default account.
+  SPAWN_ACCOUNT=
+  case "${MODEL:-}" in
+    claude-*)
+      SPAWN_ACCOUNT=$("$SCRIPT_DIR/fm-account-orchestrator.sh" resolve-account 2>/dev/null || true)
+      ;;
+  esac
+  jcode_post_launch_delivery "$T" "$BRIEF" "${MODEL:-}" "${EFFORT:-}" "${SPAWN_ACCOUNT:-}" || true
 fi
 if [ "$KIND" = secondmate ]; then
   if ! fm_config_reread_discard_pending "$PROJ_ABS" "$ID" "$FM_HOME"; then

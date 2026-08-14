@@ -1,6 +1,18 @@
 #!/bin/bash
 # fm-switch-account.sh - switch the Claude sub-account for live jcode worker sessions.
 #
+# STATUS: MANUAL FALLBACK. The ROUTINE account switch now goes through the
+# account-switch orchestrator (ADR 0031, Phase 1): bin/fm-spawn.sh consults
+# quota-axi `decide` at spawn so a jcode/Claude worker lands on a non-exhausted
+# account, and the watcher (bin/fm-watch.sh) calls quota-axi `decide`+`switch` on
+# a live limit-error (tripwire) wake to auto-rotate the fleet WITHOUT captain
+# intervention. Both paths run through bin/fm-account-orchestrator.sh, firstmate's
+# thin caller of the orchestrator. This script is KEPT as the documented manual
+# fallback for when the orchestrator is unavailable, the installed quota-axi lacks
+# the merged verbs, or the captain wants to force a specific account by hand; it
+# is not deleted (deletion is a later confidence step and a captain call). See
+# docs/account-orchestrator.md for the full routine path and the tripwire catalog.
+#
 # jcode's `/account claude switch <label>` is a PER-SESSION slash command, not a
 # server-global setting. To move the whole fleet you must send it into every live
 # worker's jcode session individually. This script does exactly that.

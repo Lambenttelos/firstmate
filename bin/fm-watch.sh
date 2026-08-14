@@ -781,6 +781,66 @@ clear_pause_tracking() {  # <window>
   rm -f "$STATE/.stale-$key" "$STATE/.stale-since-$key" "$STATE/.wedge-escalations-$key" "$STATE/.stale-verdict-$key"
 }
 
+# --- account-switch orchestrator tripwire rotation ---------------------------
+#
+# On a live limit-error (tripwire) wake for a jcode/Claude worker, rotate the
+# fleet's live jcode sessions onto the next non-exhausted Claude account by
+# calling the account-switch orchestrator (quota-axi decide+switch, via
+# bin/fm-account-orchestrator.sh). firstmate is a CALLER only: the orchestrator's
+# `switch` verb re-runs decide, actuates the jcode live-session surface itself,
+# and records the durable tripwire so the exhausted account stays out. This
+# happens WITHOUT captain intervention, in addition to (never instead of) the
+# ordinary captain-relevant surfacing of the blocking status.
+#
+# A per-window idempotence marker (.orch-rotated-<key>) makes the rotation fire
+# once per recovery window, so a burst of limit errors on the same worker does
+# not thrash the fleet with repeated switches. It is cleared after
+# FM_ORCH_ROTATE_COOLDOWN seconds (default one hour, matching the pause
+# re-surface cadence) so a later exhaustion rotates again. FAIL-SOFT throughout:
+# an unavailable/old/erroring orchestrator logs and returns without blocking
+# supervision - the manual bin/fm-switch-account.sh broadcast remains the fallback.
+FM_ORCH_ROTATE_COOLDOWN=${FM_ORCH_ROTATE_COOLDOWN:-3600}
+
+# 0 when this status line reports a live Claude account-exhaustion (tripwire)
+# limit error. Reuses the shared status classifier's auth-exhaustion test (the
+# worker's own self-report vocabulary) OR the orchestrator's raw-provider-error
+# recognizer, so either phrasing trips a rotation. Cheap pure read of the line.
+status_is_tripwire() {  # <status-line>
+  local line=$1
+  [ -n "$line" ] || return 1
+  status_is_auth_exhaustion_pause "$line" && return 0
+  "$SCRIPT_DIR/fm-account-orchestrator.sh" recognize-tripwire "$line" 2>/dev/null
+}
+
+# Rotate accounts for a tripped jcode/Claude worker. Idempotent per task within
+# the cooldown window. Never fatal: every failure fails soft.
+orchestrator_rotate_on_tripwire() {  # <task>
+  local task=$1 meta harness key marker age
+  meta="$STATE/$task.meta"
+  [ -f "$meta" ] || return 0
+  harness=$(fm_meta_get "$meta" harness); [ -n "$harness" ] || harness=$(fm_backend_of_meta "$meta")
+  # Phase 1 scope: only a jcode worker rotates through this path.
+  [ "$harness" = jcode ] || return 0
+  # Only when the orchestrator actually exposes the merged verbs; otherwise the
+  # manual fallback owns the switch and this stays inert.
+  "$SCRIPT_DIR/fm-account-orchestrator.sh" supports >/dev/null 2>&1 || return 0
+
+  key=$(printf '%s' "$task" | tr ':/.' '___')
+  marker="$STATE/.orch-rotated-$key"
+  if [ -e "$marker" ]; then
+    age=$(age_of "$marker")
+    [ "$age" -lt "$FM_ORCH_ROTATE_COOLDOWN" ] && return 0
+    rm -f "$marker"
+  fi
+  : > "$marker"
+  if "$SCRIPT_DIR/fm-account-orchestrator.sh" rotate >/dev/null 2>&1; then
+    triage_log "orchestrator rotated accounts on tripwire for $task"
+  else
+    triage_log "orchestrator rotation failed on tripwire for $task; manual fallback available"
+  fi
+  return 0
+}
+
 # Reconcile a declared pause or captain-held status with authoritative crew state.
 # Only a confidently dead ordinary crew may recover paused classification after
 # fm-crew-state has fallen back to stopped or unknown.
@@ -1383,6 +1443,27 @@ EOF
         [ -n "$sf" ] || continue
         printf '%s' "$sig" > "$sf"
         mark_surfaced "$f"
+      done <<EOF
+$pending
+EOF
+      # Live tripwire (Claude account-exhaustion limit error) rotation: for any
+      # surfaced status file whose last line is a recognized limit error on a
+      # jcode/Claude worker, call the account-switch orchestrator to rotate the
+      # fleet onto the next non-exhausted account WITHOUT captain intervention.
+      # This runs IN ADDITION to surfacing the blocking status (the captain still
+      # sees the block); the rotation is idempotent and fail-soft, so it never
+      # blocks the wake.
+      while IFS=$(printf '\t') read -r sf sig f; do
+        [ -n "$sf" ] || continue
+        case "$f" in
+          *.status) ;;
+          *) continue ;;
+        esac
+        _orch_task=$(basename "$f"); _orch_task="${_orch_task%.status}"
+        _orch_last=$(last_status_line "$f")
+        if status_is_tripwire "$_orch_last"; then
+          orchestrator_rotate_on_tripwire "$_orch_task"
+        fi
       done <<EOF
 $pending
 EOF
