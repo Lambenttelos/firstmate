@@ -1496,7 +1496,7 @@ render_recent_conversation() {
     case "$who" in
       captain) who_label="You" ;;
       firstmate) who_label="Firstmate" ;;
-      *) who_label=$(desk_text "$who") ;;
+      *) who_label="$who" ;;
     esac
     # An unread turn carries the spec's orange left-border (#eb760f).
     if [ "$unread" = "1" ]; then
