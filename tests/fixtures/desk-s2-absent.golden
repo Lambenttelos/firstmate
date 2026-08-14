@@ -1,0 +1,15 @@
+  <section id="sec-blockers" class="mb-10">
+    <h2 class="text-lg font-semibold mb-3">2. Blockers and failures</h2>
+    <p class="text-sm opacity-70 mb-3">Monitoring status is unknown; no recent check was recorded. You are present. Background daemon liveness and clone drift are not checked by this read-only page.</p>
+    <div class="grid gap-3 md:grid-cols-2">
+      <div class="card bg-base-200 rail" style="--rail: oklch(0.6 0.2 25)">
+        <div class="card-body py-4 gap-1">
+          <div class="flex items-start justify-between gap-2">
+            <h3 class="font-medium text-sm">Ship stuck</h3>
+            <span class="badge badge-warning badge-sm shrink-0">stuck</span>
+          </div>
+          <p class="text-sm opacity-70">waiting on a credential</p>
+        </div>
+      </div>
+    </div>
+  </section>

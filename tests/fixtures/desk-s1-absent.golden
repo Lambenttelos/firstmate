@@ -1,0 +1,25 @@
+  <section id="sec-decisions" class="mb-10">
+    <h2 class="text-lg font-semibold mb-3">1. Decisions needed</h2>
+    <div class="grid gap-4 md:grid-cols-2">
+      <div class="card bg-base-200 rail" style="--rail: oklch(0.75 0.16 70)">
+        <div class="card-body gap-2">
+          <div class="flex items-start justify-between gap-2">
+            <h3 class="card-title text-base">Decide alpha</h3>
+            <span class="flex gap-1 shrink-0"><span class="badge badge-warning badge-sm">your call</span></span>
+          </div>
+          <p class="text-sm opacity-80">pick a data store</p>
+          <div class="text-xs opacity-50">scout</div>
+        </div>
+      </div>
+      <div class="card bg-base-200 rail" style="--rail: oklch(0.75 0.16 70)">
+        <div class="card-body gap-2">
+          <div class="flex items-start justify-between gap-2">
+            <h3 class="card-title text-base">Decide pay rename</h3>
+            <span class="flex gap-1 shrink-0"><span class="badge badge-error badge-sm">money</span><span class="badge badge-warning badge-sm">your call</span></span>
+          </div>
+          <p class="text-sm opacity-80">confirm the pricing rename</p>
+          <div class="text-xs opacity-50">scout</div>
+        </div>
+      </div>
+    </div>
+  </section>
