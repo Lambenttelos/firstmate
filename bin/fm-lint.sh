@@ -63,6 +63,27 @@
 #      via a portable `xargs -P` fan-out (no GNU parallel required), each file
 #      still linted independently with the identical `--norc -x` invocation, so
 #      the combined pass/fail verdict is identical to the old serial full run.
+#      The fan-out width is sized to the host's cores but CLAMPED to at most 4
+#      concurrent ShellCheck processes, so a many-core box never spawns dozens of
+#      linters that starve interactive and test work.
+#
+# HOST GENTLENESS. Three controls keep a lint sweep from ever freezing the host,
+# the failure mode that appears when several no-mistakes runs lint at once:
+#   - Low priority. Every ShellCheck process runs behind `nice -n 15` (when nice
+#     is present; omitted, not fatal, when it is not), so lint always yields CPU
+#     to interactive and test work.
+#   - Concurrency cap. The `-P` fan-out is capped at 4 (see optimization 2).
+#   - Fleet admission. A FULL-TREE sweep (no file arguments) is a HEAVY run like
+#     a suite or a build, so it routes through the one host-global heavy-run queue
+#     (bin/fm-heavy-run.sh), capping how many full-tree sweeps run at once across
+#     ALL homes. An explicit single/some-file call (`fm-lint.sh <path>...`) is
+#     cheap and stays UN-gated. When the sweep is already running inside a
+#     heavy-run slot (fm-heavy-run exports FM_HEAVY_RUN_ACTIVE), it does NOT
+#     re-admit - that would deadlock against the very lease it holds - and runs
+#     inline. A heavy-run admission refusal degrades to an ungated inline sweep
+#     (still nice-throttled and core-capped) rather than failing the lint.
+#     N/A here: the captain's related request to nice rustc/cargo does not apply
+#     to this pure-bash repo, which launches no Rust toolchain.
 #
 # Usage:
 #   fm-lint.sh                    lint the canonical file set (what both gates run)
@@ -95,6 +116,22 @@ LINT_CACHE_FORMAT=${FM_LINT_CACHE_FORMAT_OVERRIDE:-1}
 # context and the actual invocation cannot drift apart. `-x` is required for
 # per-file parity with the old single-batch run (see the header).
 LINT_FLAGS=(--norc -x)
+
+# Every ShellCheck process runs behind a low-priority prefix so lint always
+# yields CPU to interactive and test work and can never freeze the host, even
+# when several sweeps and suites contend at once. `nice -n 15` is used when
+# available and simply omitted when it is not (the lint still runs, just at
+# normal priority), so the tool being absent never fails a lint. Named once here
+# and consumed by both the per-file worker and, indirectly, every fan-out child.
+LINT_NICE=()
+if command -v nice >/dev/null 2>&1; then
+  LINT_NICE=(nice -n 15)
+fi
+
+# The hard ceiling on concurrent ShellCheck processes. Parallelism is sized to
+# the host's cores below but clamped to this cap, so a many-core machine never
+# fans out into dozens of concurrent linters that starve everything else.
+LINT_MAX_JOBS=4
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT" || exit 1
@@ -185,7 +222,7 @@ if [ "${1:-}" = "--lint-one" ]; then
   fi
 
   rc=0
-  shellcheck "${LINT_FLAGS[@]}" -- "$file" > "$out" 2>&1 || rc=$?
+  "${LINT_NICE[@]}" shellcheck "${LINT_FLAGS[@]}" -- "$file" > "$out" 2>&1 || rc=$?
   if [ "$rc" -eq 0 ] && [ ! -s "$out" ]; then
     # Clean pass: record it so an unchanged tree re-lints nothing next time.
     rm -f -- "$out"
@@ -208,9 +245,44 @@ if [ "${1:-}" = "--required-version" ]; then
 fi
 
 use_cache=1
+nocache_flag=()
 if [ "${1:-}" = "--no-cache" ]; then
   use_cache=0
+  nocache_flag=(--no-cache)
   shift
+fi
+
+# Full-tree sweep admission. A full-tree sweep (no file arguments) is a HEAVY
+# run just like a suite or a build, so route it through the fleet's one heavy-run
+# queue exactly as tests are, capping how many full-tree lint sweeps run at once
+# across ALL homes and never freezing the host under concurrent no-mistakes runs.
+# An explicit single/some-file call (fm-lint.sh <path>...) is cheap and stays
+# UN-gated. Self-deadlock guard: when this sweep is ALREADY running inside a
+# heavy-run slot, fm-heavy-run has exported FM_HEAVY_RUN_ACTIVE into this process,
+# so we must NOT re-admit against the very lease we hold - detect it and run
+# inline instead. A heavy-run admission REFUSAL (nothing ran: exit 69/75/76,
+# codes fm-lint itself never uses) degrades to an ungated inline sweep rather
+# than turning a lint into a spurious failure; that sweep is still nice-throttled
+# and core-capped, so it stays gentle. FM_LINT_NO_HEAVY_GATE is a test/ops seam.
+if [ "$#" -eq 0 ] && [ -z "${FM_HEAVY_RUN_ACTIVE:-}" ] && [ -z "${FM_LINT_NO_HEAVY_GATE:-}" ]; then
+  # FM_LINT_HEAVY_RUN is a test/ops seam for the heavy-run wrapper path; the
+  # gates never set it, so both resolve the one canonical repo wrapper.
+  heavy="${FM_LINT_HEAVY_RUN:-$ROOT/bin/fm-heavy-run.sh}"
+  if [ -x "$heavy" ]; then
+    rc=0
+    "$heavy" --label "fm-lint full-tree" -- bash "${BASH_SOURCE[0]}" "${nocache_flag[@]+"${nocache_flag[@]}"}" || rc=$?
+    case "$rc" in
+      69|75|76)
+        printf 'fm-lint.sh: heavy-run admission refused (exit %s); running an ungated sweep (still nice-throttled and core-capped).\n' \
+          "$rc" >&2
+        # fall through to the inline sweep below
+        ;;
+      *)
+        exit "$rc"
+        ;;
+    esac
+  fi
+  # A non-executable heavy-run wrapper simply means an ungated sweep here.
 fi
 
 # Enforce the pin so local and CI resolve the identical rule set.
@@ -264,9 +336,12 @@ if [ "$use_cache" -eq 1 ] && [ -n "$hash_cmd" ]; then
   # An uncreatable or unwritable cache leaves cache_dir empty: full lint.
 fi
 
-# Parallelism width: one worker per core, floored at 1.
+# Parallelism width: one worker per core, floored at 1, then clamped to the hard
+# cap (LINT_MAX_JOBS) so a many-core host never runs more than that many
+# ShellCheck processes at once and cannot be starved by a single lint sweep.
 jobs=$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)
 [ "$jobs" -ge 1 ] 2>/dev/null || jobs=1
+[ "$jobs" -le "$LINT_MAX_JOBS" ] || jobs=$LINT_MAX_JOBS
 
 outdir=$(mktemp -d "${TMPDIR:-/tmp}/fm-lint.XXXXXX")
 trap 'rm -rf "$outdir"' EXIT

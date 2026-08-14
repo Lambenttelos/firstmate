@@ -484,6 +484,160 @@ test_verdict_parity_serial_vs_parallel() {
   pass "parallel cached verdict matches serial: clean passes, any defect fails"
 }
 
+# --- host gentleness: nice, the -P 4 cap, and heavy-run admission -----------
+#
+# These prove the sweep can never freeze the host: every ShellCheck runs at low
+# priority, no more than 4 run at once, and a full-tree sweep is admitted through
+# the fleet's heavy-run queue while a single-file call stays fast and un-gated,
+# with no nested double-admission that could deadlock.
+
+test_shellcheck_runs_under_nice() {
+  # The per-file worker must invoke shellcheck behind `nice -n 15`. Assert the
+  # wiring at the source (the definition and its use), and confirm behaviorally
+  # that a lint still succeeds when nice is present.
+  assert_grep 'LINT_NICE=(nice -n 15)' "$LINT" "fm-lint.sh must define a nice -n 15 prefix"
+  # shellcheck disable=SC2016  # literal source-text pattern, not a shell expansion
+  assert_grep '"${LINT_NICE[@]}" shellcheck' "$LINT" "the per-file worker must run shellcheck behind the nice prefix"
+
+  # Behavioral: a spy `nice` records that it was asked for -n 15 wrapping the
+  # linter, and forwards to a spy checker. Both on PATH via fakebin.
+  local tmp fakebin calls niced a
+  tmp=$(fm_test_tmproot fm-lint-nice)
+  fakebin=$(fm_fakebin "$tmp")
+  calls="$tmp/calls"
+  niced="$tmp/niced"
+  fm_lint_spy_shellcheck "$fakebin" "$calls"
+  cat > "$fakebin/nice" <<SH
+#!/usr/bin/env bash
+# Expect: nice -n 15 shellcheck ...; record the priority, then exec the rest.
+if [ "\$1" = "-n" ]; then
+  printf '%s\n' "\$2" >> "$niced"
+  shift 2
+fi
+exec "\$@"
+SH
+  chmod +x "$fakebin/nice"
+  a="$tmp/a.sh"
+  printf '#!/usr/bin/env bash\necho hi\n' > "$a"
+  PATH="$fakebin:$PATH" FM_LINT_CACHE_ROOT="$tmp/c" FM_LINT_NO_HEAVY_GATE=1 "$LINT" "$a" >/dev/null 2>&1 || true
+  [ -s "$niced" ] || fail "shellcheck was not run behind nice"
+  grep -Fqx 15 "$niced" || fail "shellcheck must run at nice -n 15, got: $(cat "$niced")"
+  pass "every shellcheck runs behind nice -n 15"
+}
+
+test_jobs_capped_at_four() {
+  # The clamp must hold on a many-core host: no more than 4 concurrent workers.
+  # Assert the cap constant and clamp exist, then observe the real cap by having
+  # a spy shellcheck record peak concurrency across a set larger than 4.
+  assert_grep 'LINT_MAX_JOBS=4' "$LINT" "fm-lint.sh must cap concurrency at 4"
+  # shellcheck disable=SC2016  # literal source-text pattern
+  assert_grep 'jobs=$LINT_MAX_JOBS' "$LINT" "fm-lint.sh must clamp computed jobs to the cap"
+
+  local tmp fakebin peakdir a i
+  tmp=$(fm_test_tmproot fm-lint-cap)
+  fakebin=$(fm_fakebin "$tmp")
+  peakdir="$tmp/peak"
+  mkdir -p "$peakdir"
+  # A spy shellcheck that marks itself in-flight, records the live count, then
+  # sleeps briefly so overlaps actually happen, then clears. The max directory
+  # size seen is the peak concurrency.
+  cat > "$fakebin/shellcheck" <<SH
+#!/usr/bin/env bash
+[ "\$1" = "--version" ] && { printf 'version: $REQUIRED\n'; exit 0; }
+me="$peakdir/\$\$"
+: > "\$me"
+ls "$peakdir" | wc -l >> "$tmp/counts"
+sleep 0.3
+rm -f "\$me"
+exit 0
+SH
+  chmod +x "$fakebin/shellcheck"
+  # 10 distinct files, well above the cap of 4.
+  : > "$tmp/counts"
+  local -a files=()
+  for i in $(seq 1 10); do
+    printf '#!/usr/bin/env bash\necho %s\n' "$i" > "$tmp/f$i.sh"
+    files+=("$tmp/f$i.sh")
+  done
+  PATH="$fakebin:$PATH" FM_LINT_CACHE_ROOT="$tmp/c" FM_LINT_NO_HEAVY_GATE=1 "$LINT" "${files[@]}" >/dev/null 2>&1 || true
+  local peak
+  peak=$(sort -n "$tmp/counts" | tail -n 1)
+  [ -n "$peak" ] || fail "no concurrency was recorded"
+  [ "$peak" -le 4 ] || fail "concurrency exceeded the cap of 4 (peak $peak)"
+  pass "concurrent shellcheck processes never exceed 4 (peak $peak)"
+}
+
+test_full_tree_routes_through_heavy_run() {
+  # A full-tree sweep (no file args) must be admitted through the heavy-run
+  # wrapper; a single-file call must not. A spy wrapper records each invocation.
+  local tmp fakebin spy calls a
+  tmp=$(fm_test_tmproot fm-lint-heavy)
+  fakebin=$(fm_fakebin "$tmp")
+  spy="$tmp/heavy-spy.sh"
+  calls="$tmp/heavy-calls"
+  fm_lint_spy_shellcheck "$fakebin" "$tmp/sc-calls"
+  # The spy heavy-run records that it was called, marks the slot active (as the
+  # real one does via FM_HEAVY_RUN_ACTIVE), then runs the wrapped command.
+  cat > "$spy" <<SH
+#!/usr/bin/env bash
+printf 'called\n' >> "$calls"
+# skip past flags to the -- command
+while [ "\$#" -gt 0 ]; do [ "\$1" = "--" ] && { shift; break; }; shift; done
+export FM_HEAVY_RUN_ACTIVE=1
+exec "\$@"
+SH
+  chmod +x "$spy"
+  a="$tmp/a.sh"
+  printf '#!/usr/bin/env bash\necho hi\n' > "$a"
+
+  # single-file: wrapper must NOT be called
+  : > "$calls"
+  PATH="$fakebin:$PATH" FM_LINT_CACHE_ROOT="$tmp/c1" FM_LINT_HEAVY_RUN="$spy" \
+    FM_LINT_NO_HEAVY_GATE= FM_HEAVY_RUN_ACTIVE= "$LINT" "$a" >/dev/null 2>&1 || true
+  [ ! -s "$calls" ] || fail "a single-file lint must NOT go through heavy-run admission"
+
+  # full-tree (no args): wrapper MUST be called exactly once. Clear the gate
+  # seams the surrounding suite may set so this exercises real admission.
+  : > "$calls"
+  ( cd "$ROOT" && PATH="$fakebin:$PATH" FM_LINT_CACHE_ROOT="$tmp/c2" FM_LINT_HEAVY_RUN="$spy" \
+      FM_LINT_NO_HEAVY_GATE= FM_HEAVY_RUN_ACTIVE= "$LINT" >/dev/null 2>&1 ) || true
+  [ "$(wc -l < "$calls")" -eq 1 ] || fail "a full-tree sweep must go through heavy-run admission exactly once (got $(wc -l < "$calls"))"
+  pass "full-tree sweep routes through heavy-run; single-file call does not"
+}
+
+test_no_nested_heavy_run_admission() {
+  # When already inside a heavy-run slot (FM_HEAVY_RUN_ACTIVE set), a full-tree
+  # sweep must NOT re-admit - that would deadlock against the held lease. The
+  # spy wrapper must never be called in that case.
+  local tmp fakebin spy calls
+  tmp=$(fm_test_tmproot fm-lint-nested)
+  fakebin=$(fm_fakebin "$tmp")
+  spy="$tmp/heavy-spy.sh"
+  calls="$tmp/heavy-calls"
+  fm_lint_spy_shellcheck "$fakebin" "$tmp/sc-calls"
+  cat > "$spy" <<SH
+#!/usr/bin/env bash
+printf 'called\n' >> "$calls"
+while [ "\$#" -gt 0 ]; do [ "\$1" = "--" ] && { shift; break; }; shift; done
+exec "\$@"
+SH
+  chmod +x "$spy"
+
+  : > "$calls"
+  ( cd "$ROOT" && PATH="$fakebin:$PATH" FM_HEAVY_RUN_ACTIVE=1 \
+      FM_LINT_CACHE_ROOT="$tmp/c" FM_LINT_HEAVY_RUN="$spy" "$LINT" >/dev/null 2>&1 ) || true
+  [ ! -s "$calls" ] || fail "a full-tree sweep already inside a heavy-run slot must NOT re-admit (nested double-admission)"
+  pass "no nested heavy-run admission when already inside a slot"
+}
+
+test_heavy_run_exports_active_marker() {
+  # The self-deadlock guard depends on fm-heavy-run exporting FM_HEAVY_RUN_ACTIVE
+  # to its child; assert the wrapper does so.
+  local heavy="$ROOT/bin/fm-heavy-run.sh"
+  assert_grep 'export FM_HEAVY_RUN_ACTIVE=1' "$heavy" "fm-heavy-run.sh must mark its child as inside a slot"
+  pass "fm-heavy-run exports the in-slot marker its children self-gate on"
+}
+
 test_owner_exists_and_executable
 test_owner_defines_canonical_set
 test_ci_invokes_the_owner
@@ -503,3 +657,8 @@ test_version_axis_in_key
 test_cache_miss_degrades_to_full_lint
 test_findings_are_never_cached
 test_verdict_parity_serial_vs_parallel
+test_shellcheck_runs_under_nice
+test_jobs_capped_at_four
+test_full_tree_routes_through_heavy_run
+test_no_nested_heavy_run_admission
+test_heavy_run_exports_active_marker

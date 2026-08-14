@@ -587,6 +587,12 @@ trap 'forward INT' INT
 trap 'forward HUP' HUP
 
 exec 9<&0
+# Mark the child (and its whole descendant tree) as running INSIDE a heavy-run
+# slot, so a heavy command that itself knows how to self-gate (e.g. bin/fm-lint.sh
+# routing its full-tree sweep through this queue) can detect it is already
+# admitted and skip a nested re-admission that would deadlock against this very
+# lease. Attribution/among-equals only: it never changes admission arithmetic.
+export FM_HEAVY_RUN_ACTIVE=1
 "$@" <&9 &
 CHILD=$!
 exec 9<&-
