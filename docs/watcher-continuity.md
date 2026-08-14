@@ -35,6 +35,11 @@ An actionable child output returns that reason normally.
 A zero/empty child return rechecks the home lock and beacon, attaches to a verified healthy successor when one exists, or emits `watcher: FAILED - cycle ended without an actionable reason` and exits nonzero.
 An attached arm follows verified identity-matched successors and reports the same typed failure if that chain ends without one.
 
+`bin/fm-watch-arm.sh --drain` folds the mandatory pre-arm wake drain into the arm invocation so one logical supervision step is a single call rather than a drain, an arm, and a forced re-arm each time a wake lands inside the arm's confirmation window on a busy fleet.
+It shells out to `bin/fm-wake-drain.sh` (the single owner of the drain and of the liveness assertion it makes), prints the drained records under a `=== WAKE QUEUE (drained) ===` header, then runs the unchanged arm or `--restart` logic, which still leaves exactly one live watcher.
+A drain failure is surfaced loudly but never aborts the arm, because an un-armed turn is the more dangerous outcome.
+`--drain` composes with `--restart` and does not relax the continuity or turn-end guard: a home with tasks in flight and no live watcher still fails the turn-end guard, and once `--drain` arms a watcher that guard passes.
+
 A started child may instead close with a `tick:` line, the env-gated proof-of-life exit described under [Absorbed-wake proof-of-life tick](#absorbed-wake-proof-of-life-tick).
 The arm layer classifies that close as a benign completion: it prints the line, records `reason=tick` in the cycle ledger, and returns success, distinct from both an actionable wake and the empty-cycle failure.
 A tick only ever reaches the session through the owning arm that captured the child's output; an arm merely attached to another home's watcher cannot read that output and just follows the cycle boundary as usual.
