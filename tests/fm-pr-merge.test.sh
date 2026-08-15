@@ -481,19 +481,114 @@ test_orphan_malformed_url_refuses() {
   : > "$case_dir/gh-axi.log"
 
   set +e
-  run_pr_merge_orphan "$case_dir" --orphan example/repo 'https://gitlab.com/example/repo/-/merge_requests/1' \
+  run_pr_merge_orphan "$case_dir" --orphan example/repo 'https://example.com/not/a/pr' \
     > "$case_dir/stdout" 2> "$case_dir/stderr"
   rc=$?
   set -e
 
-  expect_code 2 "$rc" "orphan-malformed-url: fm-pr-merge --orphan should refuse a non-GitHub PR URL"
+  expect_code 2 "$rc" "orphan-malformed-url: fm-pr-merge --orphan should refuse an unparseable PR URL"
   assert_grep 'error: invalid PR merge request' "$case_dir/stderr" \
     "orphan-malformed-url: refusal was not fixed and non-probing"
   assert_no_grep 'pr merge' "$case_dir/gh-axi.log" \
     "orphan-malformed-url: gh-axi pr merge was invoked for a malformed URL"
   [ ! -f "$case_dir/data/orphan-merges.log" ] \
     || fail "orphan-malformed-url: evidence was recorded for a malformed URL"
-  pass "fm-pr-merge --orphan refuses malformed PR URLs before calling gh-axi"
+  pass "fm-pr-merge --orphan refuses an unparseable PR URL before calling gh-axi"
+}
+
+# Run fm-pr-merge in orphan mode on a Bitbucket URL: curl mock on PATH, DATA to a
+# case-local dir for the orphan-merge log, and the Bitbucket credentials set.
+run_pr_merge_orphan_bitbucket() {
+  local case_dir=$1 rc; shift
+  FM_ROOT_OVERRIDE="$ROOT" \
+  FM_STATE_OVERRIDE="$case_dir/state" \
+  FM_DATA_OVERRIDE="$case_dir/data" \
+  FM_TEST_BB_LOG="$case_dir/bb.log" \
+  NO_MISTAKES_BITBUCKET_EMAIL=me@example.com \
+  NO_MISTAKES_BITBUCKET_API_TOKEN=tok-secret \
+  PATH="$case_dir/fakebin:$PATH" \
+    "$PR_MERGE" "$@"
+  rc=$?
+  return "$rc"
+}
+
+test_orphan_bitbucket_merges_and_records_evidence() {
+  if ! command -v jq >/dev/null 2>&1; then
+    pass "fm-pr-merge --orphan Bitbucket path skipped: jq not installed on this host"
+    return
+  fi
+  local case_dir rc
+  case_dir="$TMP_ROOT/orphan-bitbucket"
+  mkdir -p "$case_dir/fakebin"
+  add_bitbucket_curl_mock "$case_dir"
+  : > "$case_dir/bb.log"
+
+  set +e
+  run_pr_merge_orphan_bitbucket "$case_dir" --orphan dashnow/hyfin \
+    https://bitbucket.org/dashnow/hyfin/pull-requests/3613 \
+    > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 0 "$rc" "orphan-bitbucket: fm-pr-merge --orphan should merge a Bitbucket PR with no meta"
+  [ ! -d "$case_dir/state" ] || [ -z "$(ls -A "$case_dir/state" 2>/dev/null)" ] \
+    || fail "orphan-bitbucket: orphan mode should not create task state"
+  grep -qxF 'POST https://api.bitbucket.org/2.0/repositories/dashnow/hyfin/pullrequests/3613/merge' "$case_dir/bb.log" \
+    || fail "orphan-bitbucket: the Bitbucket merge endpoint was not hit: $(cat "$case_dir/bb.log")"
+  assert_grep 'orphan-merge	dashnow/hyfin	https://bitbucket.org/dashnow/hyfin/pull-requests/3613' \
+    "$case_dir/data/orphan-merges.log" \
+    "orphan-bitbucket: merge evidence was not recorded to data/orphan-merges.log"
+  pass "fm-pr-merge --orphan merges a Bitbucket PR and records evidence with no task meta"
+}
+
+test_orphan_bitbucket_repo_mismatch_refuses() {
+  local case_dir rc
+  case_dir="$TMP_ROOT/orphan-bitbucket-mismatch"
+  mkdir -p "$case_dir/fakebin"
+  add_bitbucket_curl_mock "$case_dir"
+  : > "$case_dir/bb.log"
+
+  set +e
+  run_pr_merge_orphan_bitbucket "$case_dir" --orphan wrong/repo \
+    https://bitbucket.org/dashnow/hyfin/pull-requests/3613 \
+    > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 1 "$rc" "orphan-bitbucket-mismatch: fm-pr-merge --orphan should refuse a mismatched repo argument"
+  assert_grep 'repository argument does not match the PR URL' "$case_dir/stderr" \
+    "orphan-bitbucket-mismatch: refusal did not explain the repo mismatch"
+  assert_no_grep 'merge' "$case_dir/bb.log" \
+    "orphan-bitbucket-mismatch: the Bitbucket merge endpoint was hit despite the mismatch"
+  [ ! -f "$case_dir/data/orphan-merges.log" ] \
+    || fail "orphan-bitbucket-mismatch: evidence was recorded despite the mismatch"
+  pass "fm-pr-merge --orphan refuses a Bitbucket PR when the repo argument does not match the URL"
+}
+
+test_orphan_gitlab_parsed_but_not_supported() {
+  local case_dir rc
+  case_dir="$TMP_ROOT/orphan-gitlab"
+  mkdir -p "$case_dir/fakebin"
+  add_gh_mocks "$case_dir" eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+  : > "$case_dir/gh-axi.log"
+
+  set +e
+  run_pr_merge_orphan "$case_dir" --orphan example/repo \
+    'https://gitlab.com/example/repo/-/merge_requests/1' \
+    > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 3 "$rc" "orphan-gitlab: fm-pr-merge --orphan should fail with a provider-specific not-supported code"
+  assert_grep 'GitLab orphan merge not yet supported' "$case_dir/stderr" \
+    "orphan-gitlab: refusal was not the provider-specific not-supported message"
+  assert_no_grep 'invalid PR merge request' "$case_dir/stderr" \
+    "orphan-gitlab: a parsed GitLab URL was rejected with the generic invalid-request error"
+  assert_no_grep 'pr merge' "$case_dir/gh-axi.log" \
+    "orphan-gitlab: gh-axi pr merge was invoked for a GitLab URL"
+  [ ! -f "$case_dir/data/orphan-merges.log" ] \
+    || fail "orphan-gitlab: evidence was recorded for an unmerged GitLab URL"
+  pass "fm-pr-merge --orphan parses a GitLab MR URL and refuses it with a provider-specific message"
 }
 
 test_records_pr_and_head_before_merging
@@ -512,3 +607,6 @@ test_orphan_merges_and_records_evidence_without_meta
 test_orphan_repo_mismatch_refuses
 test_orphan_repo_override_args_refuse
 test_orphan_malformed_url_refuses
+test_orphan_bitbucket_merges_and_records_evidence
+test_orphan_bitbucket_repo_mismatch_refuses
+test_orphan_gitlab_parsed_but_not_supported
