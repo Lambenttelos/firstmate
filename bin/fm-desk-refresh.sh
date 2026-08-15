@@ -66,6 +66,16 @@
 # sourced by design and render as marked gaps when no local transcript source is
 # available to this read-only builder.
 #
+# A dedicated per-secondmate panel (id sec-secondmates) sits between section 4
+# (crew slots) and section 5. It is a re-layout of the same fleet projection: the
+# per-secondmate state/doing/freshness the snapshot already carries, plus each
+# second mate's home and scope parsed from data/secondmates.md and its own
+# backlog queue depth from that home's data/backlog.md. It keeps the twelve
+# numbered sections and their ids stable rather than renumbering them. The
+# captain-desk spec (data/captain-desk-spec.md) is captain-private and lives
+# outside version control, so this header is the tracked one-owner description of
+# the panel; the spec mirror is updated by firstmate in the same change set.
+#
 # LANGUAGE. The page is captain-facing, so AGENTS.md section 9 applies in full.
 # Free text lifted from fleet records is passed through desk_plain(), which
 # rewrites internal vocabulary into the captain's nouns; DESK_TERMS below is the
@@ -163,7 +173,7 @@ DESK_MAX_DECISIONS=${FM_DESK_MAX_DECISIONS:-12}
 # The header comment IS the help text: from the description line down to the
 # last comment line before the first executable line.
 usage() {
-  sed -n '2,135p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '2,145p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 # --- internal-vocabulary translation ----------------------------------------
@@ -983,17 +993,17 @@ HTML
 }
 
 # --- section 4: slots and host ----------------------------------------------
-# Per the spec, list EVERY occupied slot with what it is doing right now: crew
-# and second mate, each naming the agent, its repo, and its current activity.
-# The snapshot already carries the live per-item .doing/.state for in-flight
-# crew work and a per-secondmate .doing/.state, so the desk draws the per-slot
-# activity from that single projection rather than N slow fm-crew-state calls,
-# which keeps the section inside the wall-clock bound. Idle second mates are
-# listed and marked idle (idle is healthy).
+# Per the spec, list EVERY occupied crew slot with what it is doing right now,
+# each naming the agent, its kind, and its current activity. The snapshot
+# already carries the live per-item .doing/.state for in-flight crew work, so
+# the desk draws the per-slot activity from that single projection rather than N
+# slow fm-crew-state calls, which keeps the section inside the wall-clock bound.
+# Second mates are NOT listed here: they have their own dedicated panel
+# (render_secondmates, section sec-secondmates) so they get proper alive/idle
+# state, home, scope, and queue-depth columns instead of a folded-in slots row.
 render_slots() {
-  local crew crew_st sm sm_st
+  local crew crew_st
   crew=$(desk_json '[.in_flight[] | select(.state != "done")][] | [.id, (.kind|z), (.state|z), (.doing|z)] | @tsv'); crew_st=$?
-  sm=$(desk_json '.secondmates[]? | [.id, (.state|z), (.doing|z)] | @tsv'); sm_st=$?
   echo '  <section id="sec-slots" class="mb-10">'
   echo '    <h2 class="text-lg font-semibold mb-3">4. Slots and host</h2>'
   render_machine_card
@@ -1022,27 +1032,152 @@ render_slots() {
 HTML
     done
   fi
-  if [ "$sm_st" -eq 0 ] && [ -n "$sm" ]; then
-    printf '%s\n' "$sm" | while IFS=$'\t' read -r id state doing; do
-      [ -n "$id" ] || continue
-      cat <<HTML
-          <tr>
-            <td class="font-medium align-top">$(desk_title "$id") <span class="badge badge-ghost badge-xs">second mate</span></td>
-            <td class="align-top text-sm opacity-70">standing</td>
-            <td class="align-top"><span class="badge $(desk_state_badge "$state") badge-sm">$(desk_text "$(desk_state "$state")")</span></td>
-            <td class="text-sm opacity-80">$(desk_text "$doing")</td>
-          </tr>
-HTML
-    done
-  fi
   echo '        </tbody>'
   echo '      </table>'
   echo '    </div>'
-  if [ "$crew_st" -ne 0 ] || [ "$sm_st" -ne 0 ]; then
+  if [ "$crew_st" -ne 0 ]; then
     desk_section_gap "Part of the live per-slot activity could not be read, so this list may be incomplete."
-  elif [ -z "$crew" ] && [ -z "$sm" ]; then
-    echo '    <p class="text-sm opacity-60">No slots are occupied right now.</p>'
+  elif [ -z "$crew" ]; then
+    echo '    <p class="text-sm opacity-60">No crew slots are occupied right now.</p>'
   fi
+  echo '  </section>'
+}
+
+# --- section sec-secondmates: per-secondmate panel --------------------------
+# A dedicated panel for the standing second mates, split out of section 4 so
+# each second mate gets a proper row instead of a folded-in slots entry. It is a
+# pure RE-LAYOUT of data the snapshot already carries: the per-secondmate
+# {id,state,doing,freshness,age_seconds,contradiction} comes from the same
+# fm-bearings-snapshot.sh projection every other panel reads, so no new fleet
+# read is added. Two cheap local reads enrich each row:
+#   home + scope    one line parsed out of this home's data/secondmates.md
+#                   registry (the file fm-home-seed.sh maintains)
+#   queue depth     the count of open (unchecked) items in that second mate's
+#                   OWN data/backlog.md - a single-file line count per home, NOT
+#                   an N-spawn tasks-axi call per home, and routed through the
+#                   desk_bound self-degrade wrapper like every other source
+# Idle second mates are listed and marked idle (idle is healthy). The
+# freshness/age/contradiction fields are surfaced so a stale or contradicted
+# reading is visible, never hidden behind a confident row. When the registry is
+# present but unreadable the panel renders a gap, never a confident-empty list.
+SM_REG=""
+SM_REG_STATUS="ok"      # ok | absent | unreadable
+# desk_file_mode: the octal permission bits of a file, empty when they cannot be
+# read. Mirrors fm-fleet-snapshot.sh so the readability check does not depend on
+# whether the caller is root (root's cat ignores a 000 mode, but the mode bits
+# still say unreadable).
+if stat -c '%a' / >/dev/null 2>&1; then
+  desk_file_mode() { stat -c '%a' "$1" 2>/dev/null || true; }
+else
+  desk_file_mode() { stat -f '%Lp' "$1" 2>/dev/null || true; }
+fi
+if [ -e "$FM_HOME/data/secondmates.md" ]; then
+  _sm_mode=$(desk_file_mode "$FM_HOME/data/secondmates.md")
+  if [ -n "$_sm_mode" ] && [ $((8#$_sm_mode & 0444)) -ne 0 ] \
+    && SM_REG=$(cat "$FM_HOME/data/secondmates.md" 2>/dev/null); then
+    SM_REG_STATUS="ok"
+  else
+    SM_REG=""
+    SM_REG_STATUS="unreadable"
+  fi
+else
+  SM_REG_STATUS="absent"
+fi
+
+# desk_sm_reg_field <id> <home|scope>: the named registry field for one second
+# mate id, parsed from the single matching registry line. Empty when the id is
+# absent from the registry or the field is not recorded. The id is anchored with
+# a trailing space so a prefix id ("mirror") never matches a longer one
+# ("mirror-desk"); ids are slugs with no sed-special characters.
+desk_sm_reg_field() {  # <id> <field>
+  local id="$1" field="$2"
+  printf '%s\n' "$SM_REG" \
+    | sed -n "s/^- ${id} .*${field}:[[:space:]]*\\([^;)]*\\).*/\\1/p" \
+    | head -n 1 \
+    | sed -e 's/[[:space:]]*$//'
+}
+
+# desk_sm_queue_depth <home>: the number of open (unchecked) backlog items in a
+# second mate's own home, read as a single cheap line count of that home's
+# data/backlog.md through desk_bound. Prints nothing and returns non-zero when
+# the home is unknown or its backlog cannot be read, so the caller shows "-"
+# rather than a confident zero.
+desk_sm_queue_depth() {  # <home>
+  local home="$1" bl n
+  [ -n "$home" ] || return 1
+  bl="$home/data/backlog.md"
+  [ -f "$bl" ] || return 1
+  n=$(desk_bound grep -c '^- \[ \]' "$bl" 2>/dev/null) || return 1
+  case "$n" in ''|*[!0-9]*) return 1 ;; esac
+  printf '%s' "$n"
+}
+
+render_secondmates() {
+  local rows st
+  rows=$(desk_json '.secondmates[]? | [.id, (.state|z), (.doing|z), (.freshness|z), (.age_seconds|z), (.contradiction|z)] | @tsv'); st=$?
+  echo '  <section id="sec-secondmates" class="mb-10">'
+  echo '    <h2 class="text-lg font-semibold mb-3">Second mates</h2>'
+  if [ "$st" -ne 0 ]; then
+    desk_section_gap "The list of second mates could not be read, so this panel is unknown right now."
+    echo '  </section>'
+    return 0
+  fi
+  if [ "$SM_REG_STATUS" = "unreadable" ]; then
+    desk_section_gap "The second-mate registry could not be read, so home and scope may be missing below."
+  fi
+  if [ -z "$rows" ]; then
+    echo '    <p class="text-sm opacity-60">No second mates are standing right now.</p>'
+    echo '  </section>'
+    return 0
+  fi
+  echo '    <p class="text-sm opacity-70 mb-3">Standing helpers. An idle second mate is healthy - it waits for work routed to it.</p>'
+  echo '    <div class="overflow-x-auto">'
+  echo '      <table class="table table-sm">'
+  echo '        <thead><tr class="text-xs uppercase tracking-wide opacity-60">'
+  echo '          <th class="w-48">Second mate</th><th class="w-24">State</th><th>What it is doing</th><th class="w-56">Scope</th><th class="w-20">Queued</th><th class="w-24">Reading</th>'
+  echo '        </tr></thead>'
+  echo '        <tbody>'
+  printf '%s\n' "$rows" | while IFS=$'\t' read -r id state doing freshness age contradiction; do
+    [ -n "$id" ] || continue
+    local home scope depth depth_cell fresh_cell home_line
+    home=$(desk_sm_reg_field "$id" home)
+    scope=$(desk_sm_reg_field "$id" scope)
+    if depth=$(desk_sm_queue_depth "$home"); then
+      depth_cell="$depth"
+    else
+      depth_cell='<span class="opacity-50">-</span>'
+    fi
+    # Freshness cell: an unresponsive or contradicted reading is flagged so a
+    # stale second-mate row is never shown as current truth.
+    if [ "$contradiction" = "true" ]; then
+      fresh_cell='<span class="badge badge-warning badge-xs">contradicted</span>'
+    elif [ -n "$freshness" ] && [ "$freshness" != "fresh" ] && [ "$freshness" != "-" ]; then
+      fresh_cell="<span class=\"badge badge-warning badge-xs\">$(desk_text "$(desk_state "$freshness")")</span>"
+    elif [ -n "$age" ] && [ "$age" != "-" ] && [ "$age" != "null" ]; then
+      fresh_cell="<span class=\"opacity-60\">$(desk_text "${age}s ago")</span>"
+    else
+      fresh_cell='<span class="opacity-50">-</span>'
+    fi
+    if [ -n "$home" ]; then
+      home_line="<div class=\"text-xs opacity-40\">$(desk_text "$home")</div>"
+    else
+      home_line=''
+    fi
+    [ -n "$scope" ] || scope='-'
+    cat <<HTML
+          <tr>
+            <td class="font-medium align-top">$(desk_title "$id") <span class="badge badge-ghost badge-xs">second mate</span>${home_line}</td>
+            <td class="align-top"><span class="badge $(desk_state_badge "$state") badge-sm">$(desk_text "$(desk_state "$state")")</span></td>
+            <td class="text-sm opacity-80 align-top">$(desk_text "$doing")</td>
+            <td class="text-sm opacity-70 align-top">$(desk_text "$scope")</td>
+            <td class="text-sm align-top">${depth_cell}</td>
+            <td class="align-top">${fresh_cell}</td>
+          </tr>
+HTML
+  done
+  echo '        </tbody>'
+  echo '      </table>'
+  echo '    </div>'
   echo '  </section>'
 }
 
@@ -1573,6 +1708,7 @@ render_sticky_strip() {
       <a class="link link-hover" href="#sec-blockers">2 Blockers</a>
       <a class="link link-hover" href="#sec-merge">3 Merge</a>
       <a class="link link-hover" href="#sec-slots">4 Slots</a>
+      <a class="link link-hover" href="#sec-secondmates">Second mates</a>
       <a class="link link-hover" href="#sec-progress-3h">5 Last 3h</a>
       <a class="link link-hover" href="#sec-progress-12h">6 Last 12h</a>
       <a class="link link-hover" href="#sec-upcoming">7 Upcoming</a>
@@ -1619,6 +1755,7 @@ HTML
   render_blockers
   render_ready_merge
   render_slots
+  render_secondmates
   render_progress_3h
   render_progress_12h
   render_upcoming
