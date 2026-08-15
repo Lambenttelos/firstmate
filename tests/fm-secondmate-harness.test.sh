@@ -121,6 +121,51 @@ ROWS
 }
 
 # ===========================================================================
+# D) Per-secondmate pins: config/secondmate-harness may carry per-id lines
+#    "<id>: <harness> [<model>] [<effort>]" alongside a single default line.
+#    A matching per-id line wins for that id; every other id uses the default
+#    line; with neither the crew->own fallback chain still applies. An explicit
+#    "default" harness token (per-id or default) defers to crew resolution.
+# ===========================================================================
+# The multi-line file is expressed with \n (expanded via printf '%b'). Each row
+# asserts the resolved harness/model/effort for one <query-id>.
+#   <label>^<file-body-or-ABSENT>^<query-id>^<crew>^<exp-harness>^<exp-model>^<exp-effort>
+test_secondmate_per_id_pins() {
+  local label body qid crew exp_h exp_m exp_e case_dir cfg got_h got_m got_e n
+  n=0
+  while IFS='^' read -r label body qid crew exp_h exp_m exp_e; do
+    [ -n "$label" ] || continue
+    n=$((n + 1))
+    case_dir="$TMP_ROOT/perid-$n"
+    cfg="$case_dir/config"
+    mkdir -p "$cfg"
+    [ "$body" = ABSENT ] || printf '%b\n' "$body" > "$cfg/secondmate-harness"
+    [ "$crew" = "-" ] || printf '%s\n' "$crew" > "$cfg/crew-harness"
+    got_h=$(CLAUDECODE=1 FM_CONFIG_OVERRIDE="$cfg" "$ROOT/bin/fm-harness.sh" secondmate "$qid")
+    got_m=$(CLAUDECODE=1 FM_CONFIG_OVERRIDE="$cfg" "$ROOT/bin/fm-harness.sh" secondmate-model "$qid")
+    got_e=$(CLAUDECODE=1 FM_CONFIG_OVERRIDE="$cfg" "$ROOT/bin/fm-harness.sh" secondmate-effort "$qid")
+    [ "$got_h" = "$exp_h" ] || fail "$label: harness resolved '$got_h', expected '$exp_h'"
+    [ "$got_m" = "$exp_m" ] || fail "$label: model resolved '$got_m', expected '$exp_m'"
+    [ "$got_e" = "$exp_e" ] || fail "$label: effort resolved '$got_e', expected '$exp_e'"
+  done <<'ROWS'
+per-id pin binds for its id^desk: claude opus high^desk^-^claude^opus^high
+per-id pin does not leak to another id (no default) -> crew fallback^desk: claude opus high^other^codex^codex^^
+per-id pin loses to none; falls to default line^desk: claude opus high\ngrok grok-4 low^other^-^grok^grok-4^low
+per-id wins over default line for its id^grok grok-4 low\ndesk: claude opus high^desk^-^claude^opus^high
+default line applies to an unpinned id^grok grok-4 low\ndesk: claude opus high^plain^-^grok^grok-4^low
+neither pin nor default -> crew fallback^ABSENT^desk^codex^codex^^
+neither pin nor default, no crew -> own^ABSENT^desk^-^claude^^
+per-id default token defers to crew^desk: default^desk^codex^codex^^
+per-id harness-only pin -> empty model/effort^desk: pi^desk^-^pi^^
+first matching per-id line wins^desk: claude opus high\ndesk: grok grok-4 low^desk^-^claude^opus^high
+unqualified query uses the default line only^grok grok-4 low\ndesk: claude opus high^^-^grok^grok-4^low
+comment and blank lines skipped around per-id pins^# c\n\ndesk: claude opus high\n^desk^-^claude^opus^high
+ROWS
+  pass "D1 fm-harness.sh resolves per-id pins with precedence per-id -> default -> crew/own fallback"
+}
+
+
+# ===========================================================================
 # B) propagate_inheritable_config unit behavior
 # ===========================================================================
 test_propagate_lib() {
@@ -685,6 +730,41 @@ test_spawn_fallback_chain_and_crew_scout_unaffected() {
   assert_not_contains "$launch" "--effort" "crew-unaffected: crew launch must not carry an --effort flag"
   pass "C9 spawn: the harness fallback chain still resolves with no tokens; crew/scout launches are unaffected by this feature"
 }
+
+# D integration: a per-id pin binds at --secondmate spawn for its own id (durably,
+# re-resolved every spawn), while a different secondmate spawned from the same file
+# gets the default line - proving the pin is per-id at the spawn boundary.
+test_spawn_per_id_pin_binds_and_isolates() {
+  local w desk plain meta launchlog launch
+  w="$TMP_ROOT/spawn-per-id"
+  desk="$w/desk"
+  plain="$w/plain"
+  launchlog="$w/launch.log"
+  mkdir -p "$w/home/config"
+  # Per-id pin for "desk" (claude/opus/high) plus a default line (grok/grok-4/low).
+  printf 'grok grok-4 low\ndesk: claude opus high\n' > "$w/home/config/secondmate-harness"
+  make_seeded_home "$desk" desk
+  make_seeded_home "$plain" plain
+
+  spawn_secondmate_capture "$w" desk "$desk" "$launchlog" >/dev/null 2>&1
+  meta="$w/home/state/desk.meta"
+  [ "$(meta_field "$meta" harness)" = claude ] \
+    || fail "per-id: desk launched on '$(meta_field "$meta" harness)', expected pinned claude"
+  [ "$(meta_field "$meta" model)" = opus ] || fail "per-id: desk model not opus (got '$(meta_field "$meta" model)')"
+  [ "$(meta_field "$meta" effort)" = high ] || fail "per-id: desk effort not high (got '$(meta_field "$meta" effort)')"
+  launch=$(cat "$launchlog")
+  assert_contains "$launch" "claude --dangerously-skip-permissions --model 'opus' --effort 'high'" \
+    "per-id: desk launch did not carry the pinned claude/opus/high"
+
+  spawn_secondmate_capture "$w" plain "$plain" "$launchlog" >/dev/null 2>&1
+  meta="$w/home/state/plain.meta"
+  [ "$(meta_field "$meta" harness)" = grok ] \
+    || fail "per-id: plain launched on '$(meta_field "$meta" harness)', expected the default-line grok"
+  [ "$(meta_field "$meta" model)" = grok-4 ] || fail "per-id: plain model not grok-4 (got '$(meta_field "$meta" model)')"
+  [ "$(meta_field "$meta" effort)" = low ] || fail "per-id: plain effort not low (got '$(meta_field "$meta" effort)')"
+  pass "D2 spawn: a per-id pin binds for its own secondmate id; another id gets the default line"
+}
+
 
 # ===========================================================================
 # B integration: spawn, bootstrap, and config push propagate inherited local
@@ -2052,6 +2132,7 @@ SH
 
 test_harness_resolution
 test_secondmate_model_effort_tokens
+test_secondmate_per_id_pins
 test_propagate_lib
 test_spawn_split_and_inherit
 test_spawn_backward_compat_crew_fallback
@@ -2066,6 +2147,7 @@ test_spawn_explicit_effort_overrides_secondmate_harness_token
 test_spawn_explicit_harness_does_not_inherit_secondmate_harness_tokens
 test_spawn_explicit_harness_uses_explicit_profile_axes
 test_spawn_fallback_chain_and_crew_scout_unaffected
+test_spawn_per_id_pin_binds_and_isolates
 test_bootstrap_sweep_propagates_and_reconverges
 test_bootstrap_sweep_propagates_when_tracked_current
 test_bootstrap_sweep_defers_dispatch_on_stale_unignored_home

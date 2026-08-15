@@ -317,10 +317,14 @@ Claude and Grok use background-notify cycles, Codex uses bounded foreground chec
 `config/crew-harness` is a local, gitignored file containing one adapter name for crewmate and scout launches.
 When it is absent or contains `default`, crewmates mirror the firstmate's own harness.
 `config/secondmate-harness` is a separate local, gitignored file containing the adapter the primary uses to launch secondmate agents, optionally followed by model and effort tokens on the same line.
-The first non-empty, non-comment line is parsed as `<harness> [<model>] [<effort>]`.
-A bare `<harness>` preserves the previous behavior: harness only, with no model or effort launch flag.
-When the harness token is absent or `default`, secondmate launch falls back through `config/crew-harness` and then the primary's own harness, and no model or effort is read from that file.
-`fm-harness.sh secondmate-model` and `fm-harness.sh secondmate-effort` expose only the optional tokens from `config/secondmate-harness`; `config/crew-harness` remains a bare adapter-name file.
+Each non-empty, non-comment line is either a single-line default `<harness> [<model>] [<effort>]` or a per-id pin `<id>: <harness> [<model>] [<effort>]` that binds one secondmate id, letting different secondmates run on different harness, model, and effort.
+A per-id line's first token is the secondmate id followed by a colon; every other line is the default line.
+Resolution for a given secondmate is line-level: the first matching per-id line wins, otherwise the single default line applies, otherwise the fallback chain below.
+A bare `<harness>` default line preserves the previous behavior: harness only, with no model or effort launch flag, applied to every secondmate that has no per-id line.
+When the resolved harness token is absent or `default`, secondmate launch falls back through `config/crew-harness` and then the primary's own harness, and no model or effort is read from that file.
+`fm-harness.sh secondmate`, `fm-harness.sh secondmate-model`, and `fm-harness.sh secondmate-effort` each take an optional secondmate id and resolve the per-id pin before the default line; the resolver header owns the exact line grammar and precedence.
+`fm-spawn.sh --secondmate` passes the spawning secondmate's id so a pin binds at launch and re-resolves on every respawn.
+`config/crew-harness` remains a bare adapter-name file.
 An explicit harness argument to `fm-spawn.sh` still overrides either config file for that spawn only.
 An explicit `--model` or `--effort` overrides the matching token from `config/secondmate-harness`; an explicit harness or raw launch command starts with clean model and effort defaults unless those flags are also passed.
 When `config/crew-dispatch.json` exists, crewmate and scout spawns require an explicit resolved harness instead of automatically falling back to `config/crew-harness`.
