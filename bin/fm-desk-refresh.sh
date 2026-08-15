@@ -1107,7 +1107,10 @@ desk_sm_queue_depth() {  # <home>
   [ -n "$home" ] || return 1
   bl="$home/data/backlog.md"
   [ -f "$bl" ] || return 1
-  n=$(desk_bound grep -c '^- \[ \]' "$bl" 2>/dev/null) || return 1
+  local rc
+  n=$(desk_bound grep -c '^- \[ \]' "$bl" 2>/dev/null); rc=$?
+  [ "$rc" -le 1 ] || return 1
+  [ "$rc" -eq 1 ] && n=0
   case "$n" in ''|*[!0-9]*) return 1 ;; esac
   printf '%s' "$n"
 }

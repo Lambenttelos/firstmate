@@ -44,7 +44,8 @@ POPULATED=$(cat <<'JSON'
   ],
   "secondmates": [
     {"id":"decision-desk","state":"working","doing":"ruling on a schema question"},
-    {"id":"mirror-desk","state":"no_active_work","doing":"No active child work"}
+    {"id":"mirror-desk","state":"no_active_work","doing":"No active child work"},
+    {"id":"empty-desk","state":"no_active_work","doing":"No active child work"}
   ]
 }
 JSON
@@ -140,10 +141,11 @@ SH
   # unreadable (registry-unreadable gap path).
   if [ "${FAKE_NO_SECONDMATE_REG:-0}" != 1 ]; then
     mkdir -p "$home/data"
-    local ddhome mmhome
+    local ddhome mmhome mthome
     ddhome="$home/sm-decision-desk"
     mmhome="$home/sm-mirror-desk"
-    mkdir -p "$ddhome/data" "$mmhome/data"
+    mthome="$home/sm-empty-desk"
+    mkdir -p "$ddhome/data" "$mmhome/data" "$mthome/data"
     # decision-desk: two open items + one done, so the open count is exactly 2.
     {
       printf '## Queued\n'
@@ -153,9 +155,16 @@ SH
       printf -- '- [x] d-one - already landed (repo: alpha)\n'
     } > "$ddhome/data/backlog.md"
     # mirror-desk: no backlog file, so its queue depth reads as a gap ("-").
+    # empty-desk: a readable backlog with zero open items, so its queue depth is
+    # a confident "0" (a read file with no open work), not a gap.
+    {
+      printf '## Done\n'
+      printf -- '- [x] d-only - already landed (repo: alpha)\n'
+    } > "$mthome/data/backlog.md"
     {
       printf -- '- decision-desk - rules on schema questions (home: %s; scope: schema rulings; projects: hyfin; added 2026-07-01)\n' "$ddhome"
       printf -- '- mirror-desk - audits the mirror (home: %s; scope: mirror audits; projects: hyfin; added 2026-07-02)\n' "$mmhome"
+      printf -- '- empty-desk - drains a quiet queue (home: %s; scope: quiet queue; projects: hyfin; added 2026-07-03)\n' "$mthome"
     } > "$home/data/secondmates.md"
     if [ "${FAKE_SM_REG_UNREADABLE:-0}" = 1 ]; then
       chmod 000 "$home/data/secondmates.md"
@@ -220,6 +229,8 @@ assert_grep 'schema rulings' "$OUT1" 'secondmates: registry scope reaches the pa
 assert_grep 'mirror audits' "$OUT1" 'secondmates: second registry scope reaches the panel'
 # Queue depth: the fixture decision-desk home has a two-item open backlog.
 assert_grep '<td class="text-sm align-top">2</td>' "$OUT1" 'secondmates: queue depth from the home backlog reaches the panel'
+# A readable backlog with zero open items is a confident "0", not a gap "-".
+assert_grep '<td class="text-sm align-top">0</td>' "$OUT1" 'secondmates: a readable empty backlog renders a confident 0'
 # The panel must not fold back into the slots section.
 assert_no_grep 'No second mates are standing' "$OUT1" 'secondmates: panel is not confident-empty when populated'
 
