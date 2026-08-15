@@ -44,7 +44,8 @@ POPULATED=$(cat <<'JSON'
   ],
   "secondmates": [
     {"id":"decision-desk","state":"working","doing":"ruling on a schema question"},
-    {"id":"mirror-desk","state":"no_active_work","doing":"No active child work"}
+    {"id":"mirror-desk","state":"no_active_work","doing":"No active child work"},
+    {"id":"empty-desk","state":"no_active_work","doing":"No active child work"}
   ]
 }
 JSON
@@ -133,6 +134,42 @@ SH
       printf 'done-c\t%s\tscout\thyfin-server\t\n' "$yesterday"
     } > "$home/data/completions.tsv"
   fi
+  # The second-mate registry the per-secondmate panel parses for home + scope,
+  # and a real second-mate home with its own two-item open backlog so the panel's
+  # queue-depth read has a file to count. FAKE_NO_SECONDMATE_REG=1 omits the
+  # registry entirely (registry-absent path); FAKE_SM_REG_UNREADABLE=1 writes it
+  # unreadable (registry-unreadable gap path).
+  if [ "${FAKE_NO_SECONDMATE_REG:-0}" != 1 ]; then
+    mkdir -p "$home/data"
+    local ddhome mmhome mthome
+    ddhome="$home/sm-decision-desk"
+    mmhome="$home/sm-mirror-desk"
+    mthome="$home/sm-empty-desk"
+    mkdir -p "$ddhome/data" "$mmhome/data" "$mthome/data"
+    # decision-desk: two open items + one done, so the open count is exactly 2.
+    {
+      printf '## Queued\n'
+      printf -- '- [ ] q-one - first open item (repo: alpha)\n'
+      printf -- '- [ ] q-two - second open item (repo: beta)\n'
+      printf '## Done\n'
+      printf -- '- [x] d-one - already landed (repo: alpha)\n'
+    } > "$ddhome/data/backlog.md"
+    # mirror-desk: no backlog file, so its queue depth reads as a gap ("-").
+    # empty-desk: a readable backlog with zero open items, so its queue depth is
+    # a confident "0" (a read file with no open work), not a gap.
+    {
+      printf '## Done\n'
+      printf -- '- [x] d-only - already landed (repo: alpha)\n'
+    } > "$mthome/data/backlog.md"
+    {
+      printf -- '- decision-desk - rules on schema questions (home: %s; scope: schema rulings; projects: hyfin; added 2026-07-01)\n' "$ddhome"
+      printf -- '- mirror-desk - audits the mirror (home: %s; scope: mirror audits; projects: hyfin; added 2026-07-02)\n' "$mmhome"
+      printf -- '- empty-desk - drains a quiet queue (home: %s; scope: quiet queue; projects: hyfin; added 2026-07-03)\n' "$mthome"
+    } > "$home/data/secondmates.md"
+    if [ "${FAKE_SM_REG_UNREADABLE:-0}" = 1 ]; then
+      chmod 000 "$home/data/secondmates.md"
+    fi
+  fi
   PATH="$fakebin:$PATH" \
   FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" \
   FM_DESK_SNAPSHOT_BIN="$SNAP" SEEN_HOME="$home/seen-home" \
@@ -176,10 +213,26 @@ done
 assert_grep 'Ship stuck' "$OUT1" 'blockers: the blocked in-flight row reaches section 2'
 assert_grep 'Monitoring' "$OUT1" 'blockers: a fleet-health line is shown'
 
-# Section 4 lists BOTH crew and second mates, and marks an idle second mate.
-assert_grep 'Decision desk' "$OUT1" 'slots: a working second mate is listed'
-assert_grep 'Mirror desk' "$OUT1" 'slots: an idle second mate is listed'
-assert_grep 'second mate' "$OUT1" 'slots: second mates are labeled'
+# Section 4 lists crew only now (second mates have their own panel).
+assert_grep 'Ship one' "$OUT1" 'slots: an in-flight crew row reaches section 4'
+
+# The dedicated per-secondmate panel lists BOTH second mates, marks the idle one
+# idle, and carries the registry-derived scope + this-home queue depth.
+assert_grep 'id="sec-secondmates"' "$OUT1" 'secondmates: the dedicated panel renders'
+assert_grep 'Decision desk' "$OUT1" 'secondmates: a working second mate is listed'
+assert_grep 'Mirror desk' "$OUT1" 'secondmates: an idle second mate is listed'
+assert_grep 'second mate' "$OUT1" 'secondmates: second mates are labeled'
+# Idle is marked idle (state no_active_work -> "idle").
+assert_grep 'idle' "$OUT1" 'secondmates: an idle second mate is marked idle'
+# Scope one-liner parsed out of the fixture registry reaches the panel.
+assert_grep 'schema rulings' "$OUT1" 'secondmates: registry scope reaches the panel'
+assert_grep 'mirror audits' "$OUT1" 'secondmates: second registry scope reaches the panel'
+# Queue depth: the fixture decision-desk home has a two-item open backlog.
+assert_grep '<td class="text-sm align-top">2</td>' "$OUT1" 'secondmates: queue depth from the home backlog reaches the panel'
+# A readable backlog with zero open items is a confident "0", not a gap "-".
+assert_grep '<td class="text-sm align-top">0</td>' "$OUT1" 'secondmates: a readable empty backlog renders a confident 0'
+# The panel must not fold back into the slots section.
+assert_no_grep 'No second mates are standing' "$OUT1" 'secondmates: panel is not confident-empty when populated'
 
 # Sections 5 and 6 render throughput from the completion ledger.
 assert_grep '5. Progress - last 3 hours' "$OUT1" 'progress: 3h heading present'
@@ -285,6 +338,56 @@ if diff -q "$OUT5A" "$OUT5B" >/dev/null 2>&1; then
   pass 'non-away: desk render is byte-unchanged with the bypass in play'
 else
   fail 'non-away: desk render differs when the bypass path is exercised'
+fi
+
+# --- per-secondmate panel: registry UNREADABLE renders a GAP, not a confident
+#     empty, and the rows still render from the snapshot -------------------------
+HOME6="$TMP_ROOT/home6"; mkdir -p "$HOME6"
+SNAP=$(make_snapshot "$HOME6")
+OUT6="$HOME6/desk.html"
+FAKE_MODE=json FAKE_JSON="$POPULATED" FAKE_SM_REG_UNREADABLE=1 run_desk "$HOME6" "$OUT6"
+
+assert_grep 'id="sec-secondmates"' "$OUT6" 'sm-unreadable: the panel still renders'
+assert_grep 'Decision desk' "$OUT6" 'sm-unreadable: snapshot rows still reach the panel'
+assert_grep 'registry could not be read' "$OUT6" 'sm-unreadable: a visible registry gap is shown, not a confident empty'
+assert_no_grep 'No second mates are standing' "$OUT6" 'sm-unreadable: panel is not confident-empty'
+
+# --- per-secondmate panel: registry ABSENT still renders rows from the snapshot,
+#     with scope shown as "-" and no confident-empty claim ----------------------
+HOME7="$TMP_ROOT/home7"; mkdir -p "$HOME7"
+SNAP=$(make_snapshot "$HOME7")
+OUT7="$HOME7/desk.html"
+FAKE_MODE=json FAKE_JSON="$POPULATED" FAKE_NO_SECONDMATE_REG=1 run_desk "$HOME7" "$OUT7"
+
+assert_grep 'Decision desk' "$OUT7" 'sm-absent: snapshot rows still reach the panel'
+assert_no_grep 'No second mates are standing' "$OUT7" 'sm-absent: panel is not confident-empty'
+# An absent registry is not an unreadable registry: no unreadable-gap line.
+assert_no_grep 'registry could not be read' "$OUT7" 'sm-absent: absence is not reported as an unreadable registry'
+
+# --- per-secondmate panel: NO second mates in the snapshot is a confident empty,
+#     not a gap ---------------------------------------------------------------
+NO_SM=$(printf '%s' "$POPULATED" | jq -c '.secondmates = []')
+HOME8="$TMP_ROOT/home8"; mkdir -p "$HOME8"
+SNAP=$(make_snapshot "$HOME8")
+OUT8="$HOME8/desk.html"
+FAKE_MODE=json FAKE_JSON="$NO_SM" run_desk "$HOME8" "$OUT8"
+assert_grep 'No second mates are standing' "$OUT8" 'sm-empty: an empty second-mate list is a confident empty'
+
+# --- read-only invariant: building the desk must not mutate the fixture second-
+#     mate registry or the second mate's own backlog (byte-unchanged) -----------
+HOME9="$TMP_ROOT/home9"; mkdir -p "$HOME9"
+SNAP=$(make_snapshot "$HOME9")
+OUT9="$HOME9/desk.html"
+FAKE_MODE=json FAKE_JSON="$POPULATED" run_desk "$HOME9" "$OUT9"
+reg_before=$(md5sum "$HOME9/data/secondmates.md" | awk '{print $1}')
+bl_before=$(md5sum "$HOME9/sm-decision-desk/data/backlog.md" | awk '{print $1}')
+FAKE_MODE=json FAKE_JSON="$POPULATED" run_desk "$HOME9" "$OUT9"
+reg_after=$(md5sum "$HOME9/data/secondmates.md" | awk '{print $1}')
+bl_after=$(md5sum "$HOME9/sm-decision-desk/data/backlog.md" | awk '{print $1}')
+if [ "$reg_before" = "$reg_after" ] && [ "$bl_before" = "$bl_after" ]; then
+  pass 'read-only: the registry and second-mate backlog are byte-unchanged after a build'
+else
+  fail 'read-only: the desk mutated the registry or a second-mate backlog'
 fi
 
 echo "all fm-desk-refresh tests passed"
