@@ -24,6 +24,17 @@ It is read-only over fleet state, never wakes anyone, and is built fresh on requ
 
 ## Steps
 
+0. **Write the judgment file (the analysis layer for sections 1, 2, 11, and 12).**
+   Before building, publish one small bounded synthesis pass to `state/desk-judgment.json` so the builder can enrich four sections a read-only script cannot synthesize.
+   Write it atomically (a temp file in `state/` then `mv`) so the builder never reads a half-written file.
+   The **header of `bin/fm-desk-refresh.sh` (the `JUDGMENT LAYER` block) is the single owner of this file's schema and behavior** - read it and follow it; do not restate it here.
+   In short:
+   - `schema` must be `1` and `written_at` a fresh unix epoch; the builder only reads a file written within the last 900 seconds, so write it immediately before step 1.
+   - `decisions` and `blockers` ENRICH the script's own cards BY TASK `id` (the script still decides which items appear); `questions` and `transcript` are the SOLE source for sections 11 and 12.
+   - Synthesize from context this session already holds (recent captain/firstmate turns, the open decisions and live blockers, recent questions) - no new reads.
+   - Everything you write must already be in the captain's vocabulary; the builder still escapes and translates defensively.
+   If you skip this step the desk still renders correctly: every section degrades to its mechanical or gap form, and the page shows a "no fresh analysis" stamp. The judgment layer only ever ADDS.
+
 1. **Build the desk.**
    ```sh
    FM_HOME="$FM_HOME" bin/fm-desk-refresh.sh

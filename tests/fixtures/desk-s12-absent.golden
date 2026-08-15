@@ -1,0 +1,4 @@
+  <section id="sec-conversation" class="mb-10">
+    <h2 class="text-lg font-semibold mb-3">12. Recent conversation</h2>
+    <p class="text-sm text-warning">The last ten exchanges are not available: this page has no local transcript source to read the live session from. This panel is transcript-sourced by design, so it needs a source hook the builder does not yet have. See the note below.</p>
+  </section>

@@ -71,6 +71,62 @@
 # rewrites internal vocabulary into the captain's nouns; DESK_TERMS below is the
 # single owner of that mapping.
 #
+# JUDGMENT LAYER. Four sections need judgment a read-only script cannot
+# synthesize: 1 (decisions needed) and 2 (blockers/failures) are thin, and 11
+# (recent questions) and 12 (recent conversation) have NO local source at all.
+# The running firstmate session writes ONE small bounded file, and this builder
+# splices it in when present and fresh. This comment is the SINGLE OWNER of that
+# file's schema; the /desk skill and AGENTS.md point here, they do not restate
+# it.
+#
+#   Path:    $FM_HOME/state/desk-judgment.json (override: FM_DESK_JUDGMENT)
+#   Freshness: read only when written within FM_DESK_JUDGMENT_MAX_AGE seconds
+#              (default 900). A present-but-stale file degrades exactly like an
+#              absent one, per section.
+#   Written:  by the /desk skill, atomically (temp file + mv), one model pass at
+#              build time, immediately BEFORE this builder runs. The builder
+#              NEVER writes it and NEVER calls a model.
+#
+#   {
+#     "schema": 1,                         REQUIRED integer; any other value is ignored
+#     "written_at": 1734127200,            REQUIRED unix epoch the session wrote it; drives freshness
+#     "decisions": [                       ENRICHES section 1 by task id (union, never replace)
+#       { "id": "task-id",                 join key: matches a script decision card by id
+#         "ask": "the decision in one captain-facing line",
+#         "options": ["option a", "option b"],
+#         "recommendation": "firstmate's recommended call",
+#         "unblocks": "what landing this unblocks",
+#         "money": false }                 optional; forces the money badge on
+#     ],
+#     "blockers": [                        ENRICHES section 2 by task id (union, never replace)
+#       { "id": "task-id",                 join key: matches a script blocker card by id
+#         "diagnosis": "what is actually stuck and why",
+#         "needs": "what would unblock it" }
+#     ],
+#     "questions": [                       SOLE source for section 11
+#       { "q": "question firstmate asked", "a": "captain's short answer, or empty" }
+#     ],
+#     "transcript": [                      SOLE source for section 12; newest LAST in array
+#       { "who": "captain"|"firstmate", "text": "turn text", "unread": true }
+#     ]
+#   }
+#
+#   MERGE/UNION for sections 1 and 2 (captain directive): the SCRIPT stays
+#   authoritative for WHICH items appear (backlog-derived open decisions for 1,
+#   live blocked/failed in-flight work for 2). The judgment file only ENRICHES a
+#   matching script card BY ID; a script card with no match renders as-is with a
+#   subtle "no analysis" marker; a judgment id with no script match renders in a
+#   clearly-labeled "firstmate also flags" sub-block. It ADDS, never suppresses,
+#   and is keyed strictly by id so there are never duplicate cards.
+#
+#   SOLE-SOURCE for sections 11 and 12: the script has no data for these, so the
+#   judgment file is the only source. Absent or stale degrades to today's exact
+#   gap note.
+#
+#   Every array is optional and independently degradable, so one missing array
+#   degrades ONLY its section. Every value still passes through desk_text()
+#   (translate + HTML-escape) defensively, and every id through desk_title().
+#
 # Test seams: FM_DESK_OUT overrides the output path, FM_DESK_TIMEOUT bounds each
 # source command, FM_DESK_NOW injects the rendered timestamp, and
 # FM_DESK_SNAPSHOT_BIN overrides the fleet-projection command (the canonical
@@ -107,7 +163,7 @@ DESK_MAX_DECISIONS=${FM_DESK_MAX_DECISIONS:-12}
 # The header comment IS the help text: from the description line down to the
 # last comment line before the first executable line.
 usage() {
-  sed -n '2,79p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '2,135p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 # --- internal-vocabulary translation ----------------------------------------
@@ -349,6 +405,44 @@ COMPLETIONS="${FM_DESK_COMPLETIONS:-$FM_HOME/data/completions.tsv}"
 NOW_EPOCH=${FM_DESK_NOW_EPOCH:-$(date +%s)}
 case "$NOW_EPOCH" in ''|*[!0-9]*) NOW_EPOCH=$(date +%s) ;; esac
 
+# --- judgment layer (the model-written enrichment file) ---------------------
+#
+# The running firstmate session writes state/desk-judgment.json through the
+# /desk skill's step 0, one small model pass, immediately BEFORE this builder
+# runs. This read-only builder only READS it, and only when it is present,
+# well-formed, schema-1, and FRESH (written within JUDGMENT_MAX_AGE). See the
+# JUDGMENT LAYER block in the header for the full schema; that comment is the
+# single schema owner and the skill points to it.
+#
+# The load is fail-safe by construction: any failure - jq absent, file absent,
+# unreadable, not valid JSON, wrong schema, missing/zero/non-numeric written_at,
+# or stale - leaves JUDGMENT empty and JUDGMENT_PRESENT at 0, and every render
+# function then degrades to EXACTLY today's mechanical/gap behavior. The
+# judgment layer can only ADD to the page, never subtract from it, so a
+# read-only builder never depends on a model to produce a complete section.
+JUDGMENT=""
+JUDGMENT_PRESENT=0
+JUDGMENT_STAMP=""
+JUDGMENT_PATH="${FM_DESK_JUDGMENT:-$STATE/desk-judgment.json}"
+JUDGMENT_MAX_AGE=${FM_DESK_JUDGMENT_MAX_AGE:-900}
+case "$JUDGMENT_MAX_AGE" in ''|*[!0-9]*) JUDGMENT_MAX_AGE=900 ;; esac
+if [ "$HAVE_JQ" -eq 1 ] && [ -f "$JUDGMENT_PATH" ]; then
+  _j=$(cat "$JUDGMENT_PATH" 2>/dev/null)
+  if [ -n "$_j" ] && printf '%s' "$_j" | jq -e '.schema == 1' >/dev/null 2>&1; then
+    _wa=$(printf '%s' "$_j" | jq -r '.written_at // 0' 2>/dev/null)
+    case "$_wa" in ''|*[!0-9]*) _wa=0 ;; esac
+    if [ "$_wa" -gt 0 ] && [ $(( NOW_EPOCH - _wa )) -le "$JUDGMENT_MAX_AGE" ] \
+      && [ $(( NOW_EPOCH - _wa )) -ge 0 ]; then
+      JUDGMENT="$_j"
+      JUDGMENT_PRESENT=1
+      # A human generated-at stamp from written_at, so a stale-but-present desk
+      # is obvious. Falls back to the raw epoch when date cannot format it.
+      JUDGMENT_STAMP=$(date -d "@$_wa" '+%Y-%m-%d %H:%M' 2>/dev/null \
+        || date -r "$_wa" '+%Y-%m-%d %H:%M' 2>/dev/null || printf '%s' "$_wa")
+    fi
+  fi
+fi
+
 # The monitoring liveness beacon, read for the fleet-health line in section 2.
 # The watcher touches it every poll, so a beacon older than a generous bound
 # means the supervision cycle has lapsed. Empty when the beacon is absent.
@@ -469,6 +563,49 @@ desk_json() {
 # empty state.
 desk_section_gap() {
   printf '    <p class="text-sm text-warning">%s</p>\n' "$(desk_text "$1")"
+}
+
+# --- judgment accessors ------------------------------------------------------
+#
+# All four judgment sections read through these. Each returns non-empty ONLY
+# when a fresh judgment file supplied that array, so a caller can branch on
+# emptiness and degrade to today's behavior with no separate freshness check.
+
+# desk_judgment_field <jq-expr>: run one jq query against the loaded judgment.
+# Prints nothing when no fresh judgment is loaded or the query fails, so the
+# whole judgment layer is a no-op unless a valid fresh file exists.
+desk_judgment_field() {  # <jq filter>
+  [ "$JUDGMENT_PRESENT" -eq 1 ] || return 0
+  printf '%s' "$JUDGMENT" | jq -r "$DESK_JQ_PRELUDE $1" 2>/dev/null
+}
+
+# desk_judgment_ids <array>: the set of task ids the judgment carries for an
+# enrichment array (decisions or blockers), one per line. Used to find the
+# judgment-only ids that have no matching script card.
+desk_judgment_ids() {  # <decisions|blockers>
+  desk_judgment_field ".${1}[]? | .id | select(. != null and . != \"\")"
+}
+
+# desk_generated_stamp: the visible generated-at line. States the judgment
+# freshness explicitly so a stale-but-present desk cannot masquerade as live -
+# the judgment layer is time-sensitive and the page must say when it was
+# synthesized. Renders a plain "no analysis layer" line when absent/stale.
+render_generated_stamp() {
+  if [ "$JUDGMENT_PRESENT" -eq 1 ]; then
+    printf '    <p class="text-xs opacity-50 mb-6">Firstmate analysis for sections 1, 2, 11, and 12 was written %s (within the last %s minutes).</p>\n' \
+      "$(desk_esc <<<"$JUDGMENT_STAMP")" "$(( JUDGMENT_MAX_AGE / 60 ))"
+  else
+    printf '    <p class="text-xs opacity-50 mb-6">No fresh firstmate analysis layer for sections 1, 2, 11, and 12; those show the mechanical view only.</p>\n'
+  fi
+}
+
+# desk_no_analysis_marker: the subtle marker on a script card that has no
+# matching judgment enrichment, so an un-analyzed item is honestly flagged
+# rather than looking analyzed. Only shown when a judgment IS loaded (otherwise
+# the whole page is mechanical and the marker would be noise).
+desk_no_analysis_marker() {
+  [ "$JUDGMENT_PRESENT" -eq 1 ] || return 0
+  printf '          <p class="text-xs opacity-40">No firstmate analysis for this item.</p>\n'
 }
 
 # --- render -----------------------------------------------------------------
@@ -601,8 +738,56 @@ desk_is_money() {  # <free text...>
 }
 
 # --- section 1: decisions needed --------------------------------------------
+# The SCRIPT is authoritative for WHICH decisions appear (backlog-derived
+# decisions_open). The judgment file, when fresh, ENRICHES a matching card BY
+# ID with the captain-facing ask, options, recommendation, and what it unblocks;
+# a script card with no match shows a subtle no-analysis marker; a judgment id
+# with no script card appears in a labeled "firstmate also flags" sub-block. It
+# ADDS, never suppresses, and is keyed strictly by id so there are no duplicates.
+# With no fresh judgment the section is byte-identical to its old mechanical form.
+
+# desk_decision_enrich <id>: print the enrichment HTML for a matched decision id
+# and return 0; return 1 when no fresh judgment carries this id.
+desk_decision_enrich() {  # <id>
+  [ "$JUDGMENT_PRESENT" -eq 1 ] || return 1
+  local row ask options rec unblocks
+  row=$(printf '%s' "$JUDGMENT" | jq -r --arg id "$1" "$DESK_JQ_PRELUDE"'
+    first(.decisions[]? | select(.id == $id)) as $d
+    | if $d == null then empty
+      else [ (($d.ask // "")|z), (($d.options // [])|map(tostring)|join("\u001f")),
+             (($d.recommendation // "")|z), (($d.unblocks // "")|z) ] | @tsv
+      end' 2>/dev/null)
+  [ -n "$row" ] || return 1
+  IFS=$'\t' read -r ask options rec unblocks <<EOF
+$row
+EOF
+  [ -n "$ask" ] && printf '          <p class="text-sm opacity-90">%s</p>\n' "$(desk_text "$ask")"
+  if [ -n "$options" ]; then
+    printf '          <ul class="text-xs opacity-70 list-disc pl-5">\n'
+    printf '%s' "$options" | tr '\037' '\n' | while IFS= read -r opt; do
+      [ -n "$opt" ] || continue
+      printf '            <li>%s</li>\n' "$(desk_text "$opt")"
+    done
+    printf '          </ul>\n'
+  fi
+  [ -n "$rec" ] && printf '          <p class="text-xs opacity-70"><span class="font-medium">Recommend:</span> %s</p>\n' "$(desk_text "$rec")"
+  [ -n "$unblocks" ] && printf '          <p class="text-xs opacity-50">Unblocks: %s</p>\n' "$(desk_text "$unblocks")"
+  return 0
+}
+
+# desk_decisions_only <script-rows-tsv>: judgment decision ids with no matching
+# script card, one per line. Empty unless a fresh judgment is loaded.
+desk_decisions_only() {  # <script-rows-tsv>
+  [ "$JUDGMENT_PRESENT" -eq 1 ] || return 0
+  local scriptids jids
+  scriptids=$(printf '%s\n' "$1" | awk -F'\t' 'NF{print $1}' | sort -u)
+  jids=$(desk_judgment_ids decisions | awk 'NF' | sort -u)
+  [ -n "$jids" ] || return 0
+  comm -23 <(printf '%s\n' "$jids") <(printf '%s\n' "$scriptids" | awk 'NF')
+}
+
 render_decisions() {
-  local rows st
+  local rows st jonly
   rows=$(desk_json ".decisions_open[:${DESK_MAX_DECISIONS}][] | [.id, (.summary|z), (.owner|z)] | @tsv"); st=$?
   echo '  <section id="sec-decisions" class="mb-10">'
   echo '    <h2 class="text-lg font-semibold mb-3">1. Decisions needed</h2>'
@@ -611,17 +796,24 @@ render_decisions() {
     echo '  </section>'
     return 0
   fi
-  if [ -z "$rows" ]; then
+  jonly=$(desk_decisions_only "$rows")
+  if [ -z "$rows" ] && [ -z "$jonly" ]; then
     echo '    <p class="text-sm opacity-60">Nothing is waiting on you.</p>'
     echo '  </section>'
     return 0
   fi
-  echo '    <div class="grid gap-4 md:grid-cols-2">'
-  printf '%s\n' "$rows" | while IFS=$'\t' read -r id summary owner; do
-    [ -n "$id" ] || continue
-    local money=''
-    desk_is_money "$id $summary" && money='<span class="badge badge-error badge-sm">money</span>'
-    cat <<HTML
+  if [ -n "$rows" ]; then
+    echo '    <div class="grid gap-4 md:grid-cols-2">'
+    printf '%s\n' "$rows" | while IFS=$'\t' read -r id summary owner; do
+      [ -n "$id" ] || continue
+      local money=''
+      desk_is_money "$id $summary" && money='<span class="badge badge-error badge-sm">money</span>'
+      if [ "$JUDGMENT_PRESENT" -eq 1 ] && [ -z "$money" ]; then
+        local jmoney
+        jmoney=$(printf '%s' "$JUDGMENT" | jq -r --arg id "$id" '(first(.decisions[]? | select(.id == $id)) | .money) // false' 2>/dev/null)
+        [ "$jmoney" = "true" ] && money='<span class="badge badge-error badge-sm">money</span>'
+      fi
+      cat <<HTML
       <div class="card bg-base-200 rail" style="--rail: oklch(0.75 0.16 70)">
         <div class="card-body gap-2">
           <div class="flex items-start justify-between gap-2">
@@ -629,12 +821,43 @@ render_decisions() {
             <span class="flex gap-1 shrink-0">${money}<span class="badge badge-warning badge-sm">your call</span></span>
           </div>
           <p class="text-sm opacity-80">$(desk_full_reason "$id" "$summary")</p>
+HTML
+      desk_decision_enrich "$id" || desk_no_analysis_marker
+      cat <<HTML
           <div class="text-xs opacity-50">$(desk_text "$owner")</div>
         </div>
       </div>
 HTML
-  done
-  echo '    </div>'
+    done
+    echo '    </div>'
+  fi
+  if [ -n "$jonly" ]; then
+    echo '    <div class="mt-4">'
+    echo '      <h3 class="text-sm font-medium opacity-70 mb-2">Firstmate also flags</h3>'
+    echo '      <div class="grid gap-4 md:grid-cols-2">'
+    printf '%s\n' "$jonly" | while IFS= read -r id; do
+      [ -n "$id" ] || continue
+      local money=''
+      local jmoney
+      jmoney=$(printf '%s' "$JUDGMENT" | jq -r --arg id "$id" '(first(.decisions[]? | select(.id == $id)) | .money) // false' 2>/dev/null)
+      { [ "$jmoney" = "true" ] || desk_is_money "$id"; } && money='<span class="badge badge-error badge-sm">money</span>'
+      cat <<HTML
+      <div class="card bg-base-200/60 rail" style="--rail: oklch(0.75 0.16 70)">
+        <div class="card-body gap-2">
+          <div class="flex items-start justify-between gap-2">
+            <h3 class="card-title text-base">$(desk_title "$id")</h3>
+            <span class="flex gap-1 shrink-0">${money}<span class="badge badge-ghost badge-sm">flagged</span></span>
+          </div>
+HTML
+      desk_decision_enrich "$id"
+      cat <<HTML
+        </div>
+      </div>
+HTML
+    done
+    echo '      </div>'
+    echo '    </div>'
+  fi
   echo '  </section>'
 }
 
@@ -660,8 +883,43 @@ render_fleet_health() {
     "$(desk_text "$mon")" "$(desk_text "$away")"
 }
 
+# The SCRIPT is authoritative for WHICH blockers appear (live blocked/failed
+# in-flight work). The judgment file, when fresh, ENRICHES a matching card BY ID
+# with a diagnosis and what would unblock it; an unmatched script card shows the
+# no-analysis marker; a judgment id with no live script card appears in the
+# labeled "firstmate also flags" sub-block. ADD, never suppress; keyed by id.
+
+# desk_blocker_enrich <id>: enrichment HTML for a matched blocker id, return 0;
+# return 1 when no fresh judgment carries it.
+desk_blocker_enrich() {  # <id>
+  [ "$JUDGMENT_PRESENT" -eq 1 ] || return 1
+  local row diagnosis needs
+  row=$(printf '%s' "$JUDGMENT" | jq -r --arg id "$1" "$DESK_JQ_PRELUDE"'
+    first(.blockers[]? | select(.id == $id)) as $b
+    | if $b == null then empty
+      else [ (($b.diagnosis // "")|z), (($b.needs // "")|z) ] | @tsv end' 2>/dev/null)
+  [ -n "$row" ] || return 1
+  IFS=$'\t' read -r diagnosis needs <<EOF
+$row
+EOF
+  [ -n "$diagnosis" ] && printf '          <p class="text-xs opacity-70"><span class="font-medium">Diagnosis:</span> %s</p>\n' "$(desk_text "$diagnosis")"
+  [ -n "$needs" ] && printf '          <p class="text-xs opacity-50">Needs: %s</p>\n' "$(desk_text "$needs")"
+  return 0
+}
+
+# desk_blockers_only <script-rows-tsv>: judgment blocker ids with no live script
+# card. Empty unless a fresh judgment is loaded.
+desk_blockers_only() {  # <script-rows-tsv>
+  [ "$JUDGMENT_PRESENT" -eq 1 ] || return 0
+  local scriptids jids
+  scriptids=$(printf '%s\n' "$1" | awk -F'\t' 'NF{print $1}' | sort -u)
+  jids=$(desk_judgment_ids blockers | awk 'NF' | sort -u)
+  [ -n "$jids" ] || return 0
+  comm -23 <(printf '%s\n' "$jids") <(printf '%s\n' "$scriptids" | awk 'NF')
+}
+
 render_blockers() {
-  local rows st
+  local rows st jonly
   rows=$(desk_json '[.in_flight[] | select(.state == "blocked" or .state == "failed")][] | [.id, (.state|z), (.doing|z)] | @tsv'); st=$?
   echo '  <section id="sec-blockers" class="mb-10">'
   echo '    <h2 class="text-lg font-semibold mb-3">2. Blockers and failures</h2>'
@@ -671,15 +929,17 @@ render_blockers() {
     echo '  </section>'
     return 0
   fi
-  if [ -z "$rows" ]; then
+  jonly=$(desk_blockers_only "$rows")
+  if [ -z "$rows" ] && [ -z "$jonly" ]; then
     echo '    <p class="text-sm opacity-60">Nothing is broken or stuck right now.</p>'
     echo '  </section>'
     return 0
   fi
-  echo '    <div class="grid gap-3 md:grid-cols-2">'
-  printf '%s\n' "$rows" | while IFS=$'\t' read -r id state doing; do
-    [ -n "$id" ] || continue
-    cat <<HTML
+  if [ -n "$rows" ]; then
+    echo '    <div class="grid gap-3 md:grid-cols-2">'
+    printf '%s\n' "$rows" | while IFS=$'\t' read -r id state doing; do
+      [ -n "$id" ] || continue
+      cat <<HTML
       <div class="card bg-base-200 rail" style="--rail: oklch(0.6 0.2 25)">
         <div class="card-body py-4 gap-1">
           <div class="flex items-start justify-between gap-2">
@@ -687,11 +947,38 @@ render_blockers() {
             <span class="badge $(desk_state_badge "$state") badge-sm shrink-0">$(desk_text "$(desk_state "$state")")</span>
           </div>
           <p class="text-sm opacity-70">$(desk_text "$doing")</p>
+HTML
+      desk_blocker_enrich "$id" || desk_no_analysis_marker
+      cat <<HTML
         </div>
       </div>
 HTML
-  done
-  echo '    </div>'
+    done
+    echo '    </div>'
+  fi
+  if [ -n "$jonly" ]; then
+    echo '    <div class="mt-4">'
+    echo '      <h3 class="text-sm font-medium opacity-70 mb-2">Firstmate also flags</h3>'
+    echo '      <div class="grid gap-3 md:grid-cols-2">'
+    printf '%s\n' "$jonly" | while IFS= read -r id; do
+      [ -n "$id" ] || continue
+      cat <<HTML
+      <div class="card bg-base-200/60 rail" style="--rail: oklch(0.6 0.2 25)">
+        <div class="card-body py-4 gap-1">
+          <div class="flex items-start justify-between gap-2">
+            <h3 class="font-medium text-sm">$(desk_title "$id")</h3>
+            <span class="badge badge-ghost badge-sm shrink-0">flagged</span>
+          </div>
+HTML
+      desk_blocker_enrich "$id"
+      cat <<HTML
+        </div>
+      </div>
+HTML
+    done
+    echo '      </div>'
+    echo '    </div>'
+  fi
   echo '  </section>'
 }
 
@@ -1140,32 +1427,109 @@ render_stats() {
 
 # --- sections 11 and 12: reference catch-up panels --------------------------
 # Both are transcript-sourced by design (the sole deliberate exception to the
-# never-scraped-chat rule). This read-only builder has NO cheap, reliable local
-# source for the running session's own transcript: it is a plain script with no
-# session identity, and the harness session logs live outside FM_HOME in an
-# undocumented location that cannot be mapped to THIS captain-firstmate session
-# safely. So both render as clearly-marked gaps, and a single needs-decision
-# line (appended once at render time) names the exact source hook that would be
-# needed to wire them. The other ten sections do not depend on this.
+# never-scraped-chat rule) and the judgment file is their SOLE source: the
+# running session, which trivially holds its own last-N turns and recent
+# questions, publishes them into state/desk-judgment.json, and this read-only
+# builder only renders them. When no fresh judgment supplies them - absent,
+# stale, or an empty array - each panel degrades to EXACTLY today's gap note and
+# the transcript hook note below still explains why, so there is no regression.
+
+# desk_judgment_has_1112: 0/1 whether a fresh judgment supplied section 11 or 12
+# content. Drives suppression of the explanatory note and the terminal
+# needs-decision line, which are only meaningful while the hook is unwired.
+desk_judgment_has_1112() {
+  [ "$JUDGMENT_PRESENT" -eq 1 ] || { printf '0'; return 0; }
+  local q t
+  q=$(desk_judgment_field '.questions | length'); [ -n "$q" ] || q=0
+  t=$(desk_judgment_field '.transcript | length'); [ -n "$t" ] || t=0
+  if [ "${q:-0}" -gt 0 ] || [ "${t:-0}" -gt 0 ]; then printf '1'; else printf '0'; fi
+}
+
 render_recent_questions() {
+  local rows
   echo '  <section id="sec-questions" class="mb-10">'
   echo '    <h2 class="text-lg font-semibold mb-3">11. Recent questions</h2>'
-  desk_section_gap "Your recent questions and their short answers are not available: this page has no local transcript source to read them from. See the note below on wiring one."
+  rows=""
+  if [ "$JUDGMENT_PRESENT" -eq 1 ]; then
+    rows=$(printf '%s' "$JUDGMENT" | jq -r "$DESK_JQ_PRELUDE"'.questions[]? | [((.q // "")|z), ((.a // "")|z)] | @tsv' 2>/dev/null)
+  fi
+  if [ -z "$rows" ]; then
+    desk_section_gap "Your recent questions and their short answers are not available: this page has no local transcript source to read them from. See the note below on wiring one."
+    echo '  </section>'
+    return 0
+  fi
+  echo '    <ul class="space-y-3">'
+  printf '%s\n' "$rows" | while IFS=$'\t' read -r q a; do
+    [ -n "$q" ] || continue
+    printf '      <li class="card bg-base-200"><div class="card-body py-3 gap-1">\n'
+    printf '        <p class="text-sm font-medium">%s</p>\n' "$(desk_text "$q")"
+    if [ -n "$a" ]; then
+      printf '        <p class="text-sm opacity-70">%s</p>\n' "$(desk_text "$a")"
+    else
+      printf '        <p class="text-xs opacity-40">Not answered yet.</p>\n'
+    fi
+    printf '      </div></li>\n'
+  done
+  echo '    </ul>'
   echo '  </section>'
 }
 
 render_recent_conversation() {
+  local rows
   echo '  <section id="sec-conversation" class="mb-10">'
   echo '    <h2 class="text-lg font-semibold mb-3">12. Recent conversation</h2>'
-  desk_section_gap "The last ten exchanges are not available: this page has no local transcript source to read the live session from. This panel is transcript-sourced by design, so it needs a source hook the builder does not yet have. See the note below."
+  rows=""
+  if [ "$JUDGMENT_PRESENT" -eq 1 ]; then
+    # Newest LAST in the array, newest FIRST on the page: reverse, then emit
+    # who / unread / text per turn.
+    rows=$(printf '%s' "$JUDGMENT" | jq -r "$DESK_JQ_PRELUDE"'.transcript | reverse[]? | [((.who // "")|z), (if .unread == true then "1" else "0" end), ((.text // "")|z)] | @tsv' 2>/dev/null)
+  fi
+  if [ -z "$rows" ]; then
+    desk_section_gap "The last ten exchanges are not available: this page has no local transcript source to read the live session from. This panel is transcript-sourced by design, so it needs a source hook the builder does not yet have. See the note below."
+    echo '  </section>'
+    return 0
+  fi
+  echo '    <div class="space-y-2">'
+  printf '%s\n' "$rows" | while IFS=$'\t' read -r who unread text; do
+    [ -n "$who" ] || [ -n "$text" ] || continue
+    local who_label rail
+    case "$who" in
+      captain) who_label="You" ;;
+      firstmate) who_label="Firstmate" ;;
+      *) who_label="$who" ;;
+    esac
+    # An unread turn carries the spec's orange left-border (#eb760f).
+    if [ "$unread" = "1" ]; then
+      rail=' rail" style="--rail: #eb760f'
+    else
+      rail=''
+    fi
+    # ~3-line collapse: a <details> so a long turn expands with no JavaScript,
+    # which works over the LAN. The summary shows the speaker and a lead-in.
+    local lead
+    lead=$(printf '%s' "$text" | cut -c1-140)
+    cat <<HTML
+      <details class="card bg-base-200${rail}">
+        <summary class="card-body py-2 cursor-pointer list-none">
+          <span class="text-xs uppercase tracking-wide opacity-50">$(desk_esc <<<"$who_label")</span>
+          <span class="text-sm opacity-80">$(desk_text "$lead")</span>
+        </summary>
+        <div class="px-4 pb-3 text-sm opacity-80">$(desk_text "$text")</div>
+      </details>
+HTML
+  done
+  echo '    </div>'
   echo '  </section>'
 }
 
 # render_transcript_note: the single visible note explaining WHY sections 11 and
 # 12 are gaps and naming the exact source hook needed to wire them. Also drives
 # the machine-readable needs-decision line appended to stderr in the entry point.
+# Both are SUPPRESSED once a fresh judgment supplies the panels: the hook is then
+# wired, so the note and the terminal needs-decision line no longer apply.
 TRANSCRIPT_HOOK_NOTE='Sections 11 and 12 need a local transcript source hook: the running session must publish its own last-N captain/firstmate turns (and recent questions) to a file under this home, e.g. state/desk-transcript.jsonl, that the builder can read cheaply. Without such a hook the read-only builder has no safe way to identify and read THIS session'"'"'s transcript, so both panels stay gaps.'
 render_transcript_note() {
+  [ "$(desk_judgment_has_1112)" = "1" ] && return 0
   printf '  <div class="alert alert-info mb-8 text-sm block"><div><strong>About the two catch-up panels.</strong> %s</div></div>\n' \
     "$(desk_esc <<<"$TRANSCRIPT_HOOK_NOTE")"
 }
@@ -1248,6 +1612,7 @@ render_page() {
 HTML
   render_sticky_strip
   render_header
+  render_generated_stamp
   render_gaps
   render_tickets
   render_decisions
@@ -1303,9 +1668,13 @@ if ! mv -f "$TMP" "$OUT" 2>/dev/null; then
   exit 1
 fi
 
-# Sections 11 and 12 have no local transcript source, so surface the exact hook
-# firstmate would need to wire them as a machine-readable needs-decision line on
-# STDOUT. This is NOT a status-file write and NOT a wake: it is one printed line
-# on the manual invocation, so the NEVER WAKES invariant holds.
-printf 'needs-decision: %s\n' "$TRANSCRIPT_HOOK_NOTE"
+# Sections 11 and 12 have no local transcript source UNLESS a fresh judgment
+# file supplied them. When it did not, surface the exact hook firstmate would
+# need to wire them as a machine-readable needs-decision line on STDOUT. This is
+# NOT a status-file write and NOT a wake: it is one printed line on the manual
+# invocation, so the NEVER WAKES invariant holds. Once the judgment file supplies
+# the panels the hook is wired, so the line is suppressed.
+if [ "$(desk_judgment_has_1112)" != "1" ]; then
+  printf 'needs-decision: %s\n' "$TRANSCRIPT_HOOK_NOTE"
+fi
 exit 0

@@ -1,0 +1,4 @@
+  <section id="sec-questions" class="mb-10">
+    <h2 class="text-lg font-semibold mb-3">11. Recent questions</h2>
+    <p class="text-sm text-warning">Your recent questions and their short answers are not available: this page has no local transcript source to read them from. See the note below on wiring one.</p>
+  </section>
