@@ -59,6 +59,15 @@
 # watcher. NEVER `pkill -f
 # bin/fm-watch.sh`: that pattern matches every firstmate home's watcher
 # (secondmate homes run the same script) and would kill siblings.
+#
+# --drain: fold the mandatory pre-arm wake drain (bin/fm-wake-drain.sh) into this
+# one invocation so one logical supervision step is a single call rather than a
+# drain, an arm, and a forced re-arm each time a wake lands inside the arm's
+# confirmation window on a busy fleet. It drains first, prints the drained
+# records under a "=== WAKE QUEUE (drained) ===" header, then runs the unchanged
+# arm (or --restart) logic, which still leaves exactly one live watcher. A drain
+# failure is reported loudly on stderr but never aborts the arm, because an
+# un-armed turn is the more dangerous outcome. --drain composes with --restart.
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -334,11 +343,35 @@ print_watch_output() {
 }
 
 mode=arm
-case "${1:-}" in
-  ''|arm|--arm) mode=arm ;;
-  --restart) mode=restart ;;
-  *) echo "usage: $(basename "$0") [--restart]" >&2; exit 2 ;;
-esac
+drain_first=0
+for arg in "$@"; do
+  case "$arg" in
+    ''|arm|--arm) mode=arm ;;
+    --restart) mode=restart ;;
+    --drain) drain_first=1 ;;
+    *) echo "usage: $(basename "$0") [--drain] [--restart]" >&2; exit 2 ;;
+  esac
+done
+
+# --drain folds the mandatory pre-arm wake drain into this one invocation, so a
+# single logical supervision step is one call instead of a drain, an arm, and a
+# forced re-arm each time a wake lands inside the arm's confirmation window on a
+# busy fleet. It shells out to bin/fm-wake-drain.sh, the single owner of the
+# drain (and of the liveness assertion it makes afterward), then proceeds into
+# the unchanged arm logic below, which still leaves exactly one live watcher.
+# The drain runs BEFORE this arm forks its child, so its records print first and
+# are never confused with the arm's own status line. A drain failure is loud but
+# must not abort the arm: an un-armed turn is the more dangerous outcome, so the
+# drain's exit status is surfaced in the printed marker and the arm still runs.
+if [ "$drain_first" -eq 1 ]; then
+  echo "=== WAKE QUEUE (drained) ==="
+  drain_status=0
+  "$SCRIPT_DIR/fm-wake-drain.sh" || drain_status=$?
+  if [ "$drain_status" -ne 0 ]; then
+    echo "watch-arm: DRAIN FAILED (exit $drain_status) - queue may still hold wakes; arming anyway" >&2
+  fi
+  echo "=== ARM ==="
+fi
 
 if [ "$mode" = restart ]; then
   # Home-scoped stop: only the watcher pid recorded in THIS home's lock.
