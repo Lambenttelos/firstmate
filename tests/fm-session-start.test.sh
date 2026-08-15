@@ -708,6 +708,98 @@ SH
   pass "session start: configured and auto-detected Herdr homes never require tmux"
 }
 
+# --- Gap 3: paired current-state + event with freshness ----------------------
+
+# A scout with an idle pane and a blocked status line: current state falls to the
+# status-log source (no run, no busy pane), the event is paired with the current
+# state and its freshness age, and it is NOT marked OLD because there is no
+# fresher authoritative source than the status log itself.
+test_gap3_pairs_current_state_and_event_no_old_for_status_log_source() {
+  local rec root home fakebin out
+  rec=$(new_world gap3-paired)
+  IFS='|' read -r root home fakebin <<EOF
+$rec
+EOF
+  make_fake_toolchain "$fakebin"
+  make_fake_ps_claude "$fakebin"
+  make_fake_tmux "$fakebin" "fm-sess:g3"
+  seed_stall_scout "$home" task-g3 "fm-sess:g3" "blocked: waiting on captain access"
+  # Age the status file well past the OLD threshold; source stays status-log so
+  # OLD must NOT fire (nothing fresher than the event to trust).
+  touch -t 202601010000 "$home/state/task-g3.status"
+
+  out=$(run_session_start "$home" "$root" "$fakebin:$BASE_PATH")
+
+  assert_contains "$out" "current: blocked" "digest did not pair a reconciled current state with the task"
+  assert_contains "$out" "current: blocked · source: status-log · event(" \
+    "digest did not render the paired current-state + event shape with a freshness age"
+  # OLD marker must not appear for a status-log-sourced current state.
+  printf '%s\n' "$out" | grep -F 'current: blocked' | grep -q '(OLD)' \
+    && fail "OLD marker fired for a status-log-sourced current state: $out"
+
+  pass "Gap 3: session-start pairs current state with the event and suppresses OLD when no fresher source exists"
+}
+
+# The disagree case in the digest: a running run-step over a real worktree while
+# the event still says needs-decision, aged past the threshold. The paired line
+# must carry SUPERSEDED and OLD (current state has a fresher run-step source).
+test_gap3_digest_marks_superseded_and_old_on_disagree() {
+  local rec root home fakebin out wt head
+  rec=$(new_world gap3-superseded)
+  IFS='|' read -r root home fakebin <<EOF
+$rec
+EOF
+  make_fake_toolchain "$fakebin"
+  make_fake_ps_claude "$fakebin"
+  make_fake_tmux "$fakebin" "fm-sess:g3s"
+  # A real worktree on the crew branch so run-step attribution binds.
+  wt="$home/wt-task-g3s"
+  git init -q -b main "$wt"
+  git -C "$wt" commit -q --allow-empty -m init
+  git -C "$wt" checkout -q -b fm/task-g3s
+  head=$(git -C "$wt" rev-parse HEAD)
+  printf 'window=fm-sess:g3s\nworktree=%s\nkind=ship\nbackend=tmux\n' "$wt" > "$home/state/task-g3s.meta"
+  printf 'needs-decision: choose an API shape\n' > "$home/state/task-g3s.status"
+  touch -t 202601010000 "$home/state/task-g3s.status"
+  # Fake no-mistakes returning a running run whose head matches the worktree.
+  cat > "$fakebin/no-mistakes" <<SH
+#!/usr/bin/env bash
+set -u
+case "\${1:-}" in
+  axi)
+    shift
+    case "\${1:-}" in
+      status)
+        cat <<'RUN'
+run:
+  id: "01RUN"
+  branch: fm/task-g3s
+  status: running
+  head: "$head"
+  pr: ""
+  findings: none
+  steps[2]{step,status,findings,duration_ms}:
+    intent,completed,0,0
+    review,running,0,0
+RUN
+        ;;
+    esac
+    ;;
+esac
+exit 0
+SH
+  chmod +x "$fakebin/no-mistakes"
+
+  out=$(run_session_start "$home" "$root" "$fakebin:$BASE_PATH")
+
+  assert_contains "$out" "current: working · source: run-step · SUPERSEDED" \
+    "digest did not surface SUPERSEDED when the run-step moved past the event"
+  printf '%s\n' "$out" | grep -F 'current: working · source: run-step' | grep -q '(OLD)' \
+    || fail "digest did not mark the stale event OLD on a disagree with a fresher source: $out"
+
+  pass "Gap 3: session-start marks SUPERSEDED and OLD when the current state disagrees with a stale event"
+}
+
 # --- status tail bounding -----------------------------------------------------
 
 test_status_tail_bounding() {
@@ -763,7 +855,11 @@ EOF
 
   matched_count=$(printf '%s\n' "$out" | grep -F -c 'matched: surfaced once')
   orphan_count=$(printf '%s\n' "$out" | grep -F -c 'orphan: step 6')
-  [ "$matched_count" -eq 1 ] || fail "matched status log was printed $matched_count times: $out"
+  # A task WITH meta gets the Gap-3 paired current-state+event header line in
+  # addition to its raw status tail, so its newest event text appears exactly
+  # twice (paired header + tail), never more. An orphan status log (no meta, no
+  # current state to reconcile) is not paired, so its newest line appears once.
+  [ "$matched_count" -eq 2 ] || fail "matched status log expected twice (paired header + tail), got $matched_count: $out"
   [ "$orphan_count" -eq 1 ] || fail "orphan status log was printed $orphan_count times: $out"
 
   pass "orphan status logs are printed once with bounded tails"
@@ -1223,6 +1319,8 @@ test_lock_refusal_read_only_path
 test_output_ordering_diagnostics_lead
 test_herdr_backend_diagnostics_follow_real_session_start
 test_status_tail_bounding
+test_gap3_pairs_current_state_and_event_no_old_for_status_log_source
+test_gap3_digest_marks_superseded_and_old_on_disagree
 test_orphan_status_logs_are_printed
 test_endpoint_liveness_tmux
 test_endpoint_liveness_herdr

@@ -137,6 +137,13 @@ case "$BACKLOG_LIMIT" in ''|*[!0-9]*|0) BACKLOG_LIMIT=80 ;; esac
 STALL_THRESHOLD=${FM_SESSION_START_STALL_THRESHOLD:-1800}
 case "$STALL_THRESHOLD" in ''|*[!0-9]*) STALL_THRESHOLD=1800 ;; esac
 
+# Gap 3: a paired current-state+event line marks a status EVENT (OLD) when it is
+# older than this (seconds) AND the current state has a fresher authoritative
+# source (run-step/pane), so a stale wake event is never read as current truth.
+# Default 600s (the supervision slow-poll cadence).
+EVENT_OLD_THRESHOLD=${FM_SESSION_START_EVENT_OLD_THRESHOLD:-600}
+case "$EVENT_OLD_THRESHOLD" in ''|*[!0-9]*) EVENT_OLD_THRESHOLD=600 ;; esac
+
 # Recent-tail window for the two large consolidated context files (captain.md,
 # learnings.md): the last N lines emitted alongside the curated top so newest
 # dated rulings appended below the consolidation seam are never dropped.
@@ -330,6 +337,81 @@ file_mtime_epoch() {
   else
     stat -c %Y "$1" 2>/dev/null
   fi
+}
+
+# Human "2h10m"/"47m" age for an event; empty when age is unknown.
+human_event_age() {  # <seconds>
+  local s=${1:-}
+  case "$s" in ''|*[!0-9]*) printf ''; return 0 ;; esac
+  if [ "$s" -lt 3600 ]; then
+    printf '%dm' $(( s / 60 ))
+  else
+    printf '%dh%dm' $(( s / 3600 )) $(( (s % 3600) / 60 ))
+  fi
+}
+
+# Gap 3: pair the reconciled CURRENT state with the last wake EVENT and a
+# freshness age, so a stale status event is never read as current truth. Prints
+# one "current: <state> · source: <src>[ · SUPERSEDED] · event(<age>)[ (OLD)]:
+# <line>" line above the raw status tail. The current state comes from
+# fm-crew-state.sh (the same reconciliation the fleet uses); SUPERSEDED and OLD
+# are surfaced from values that already exist, no new collection.
+print_current_and_event() {  # <id> <status-file>
+  local id=$1 status=$2 state_line state source detail superseded now event_epoch age age_label line marker
+  state_line=$("$SCRIPT_DIR/fm-crew-state.sh" "$id" 2>/dev/null) || state_line=""
+  # Parse "state: <s> · source: <src> · <detail>" (same shape as the stall scan).
+  state=unknown
+  source=none
+  detail=""
+  case "$state_line" in
+    state:\ *"$CREW_STATE_SEP"source:\ *)
+      state=${state_line#state: }
+      state=${state%%"$CREW_STATE_SEP"*}
+      source=${state_line#*"$CREW_STATE_SEP"source: }
+      case "$source" in
+        *"$CREW_STATE_SEP"*) detail=${source#*"$CREW_STATE_SEP"}; source=${source%%"$CREW_STATE_SEP"*} ;;
+      esac
+      ;;
+  esac
+  # SUPERSEDED: fm-crew-state.sh already computed this reconciliation, surfaced in detail.
+  superseded=""
+  case "$detail" in *superseded*) superseded="${CREW_STATE_SEP}SUPERSEDED" ;; esac
+  line="current: $state${CREW_STATE_SEP}source: $source$superseded"
+  if [ -f "$status" ]; then
+    now=$(date +%s)
+    event_epoch=$(file_mtime_epoch "$status")
+    age=""
+    age_label=""
+    case "$event_epoch" in
+      ''|*[!0-9]*) : ;;
+      *)
+        age=$(( now - event_epoch ))
+        [ "$age" -lt 0 ] && age=0
+        age_label=$(human_event_age "$age")
+        ;;
+    esac
+    # OLD only when the event is older than the threshold AND current state has a
+    # fresher authoritative source (run-step/pane).
+    marker=""
+    case "$source" in
+      run-step|pane)
+        case "$age" in
+          ''|*[!0-9]*) : ;;
+          *) [ "$age" -gt "$EVENT_OLD_THRESHOLD" ] && marker=" (OLD)" ;;
+        esac
+        ;;
+    esac
+    local raw
+    raw=$(grep -v '^[[:space:]]*$' "$status" 2>/dev/null | tail -1)
+    if [ -n "$raw" ]; then
+      if [ -n "$age_label" ]; then
+        line="$line${CREW_STATE_SEP}event($age_label)$marker: $raw"
+      else
+        line="$line${CREW_STATE_SEP}event$marker: $raw"
+      fi
+    fi
+  fi
+  printf '%s\n' "$line"
 }
 
 # Cross-session stall surfacing. Scan every task's CURRENT state via
@@ -585,6 +667,9 @@ for meta in "$STATE"/*.meta; do
   fi
 
   status="$STATE/$id.status"
+  # Gap 3: pair the reconciled current state with the last event and its freshness
+  # BEFORE the raw tail, so the event is never read alone as current truth.
+  print_current_and_event "$id" "$status"
   if [ -f "$status" ]; then
     print_status_tail "$status"
   else
