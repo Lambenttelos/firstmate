@@ -37,6 +37,20 @@ printf '%s\n' "$SNAPSHOT" | jq -r '
   def endpoint_of($t):
     if $t.kind == "secondmate" then "\(endpoint_exists($t)) / \($t.endpoint.agent_alive)"
     else endpoint_exists($t) end;
+  # Gap 3: a status EVENT is never rendered alone. Pair it with the current state
+  # (already reconciled in $t.current_state) plus a freshness age, an OLD marker
+  # when the event is stale and current state has a fresher source, and a
+  # SUPERSEDED tag when the current state has provably moved past the event.
+  def current_cell($t):
+    ($t.current_state.state) + " / " + ($t.current_state.source)
+    + (if $t.current_state.superseded then " [SUPERSEDED]" else "" end)
+    + (($t.paths.status_log.last_event // {}) as $ev
+       | if ($ev.raw // "") == "" then ""
+         else " · event"
+           + (if $ev.age_label != null then "(\($ev.age_label))" else "" end)
+           + (if $ev.old == true then " (OLD)" else "" end)
+           + ": " + $ev.raw
+         end);
   def artifact($t):
     if $t.pr.url != null then $t.pr.url
     elif $t.paths.report.present then $t.paths.report.path
@@ -51,7 +65,7 @@ printf '%s\n' "$SNAPSHOT" | jq -r '
     if $t.kind == "secondmate" then "\($t.actions.send) - \($t.actions.watch)"
     else $t.actions.watch end;
   def task_row($t):
-    "| \($t.id) | \($t.current_state.state) / \($t.current_state.source) | \($t.kind) | \(dash($t.backlog.repo // $t.project)) | \($t.backend) | \(endpoint_of($t)) | \(artifact($t)) | \(path_of($t)) | \(action_of($t)) |";
+    "| \($t.id) | \(current_cell($t)) | \($t.kind) | \(dash($t.backlog.repo // $t.project)) | \($t.backend) | \(endpoint_of($t)) | \(artifact($t)) | \(path_of($t)) | \(action_of($t)) |";
   def blocker($r):
     if ($r.blocked_by // "") == "" then "-"
     elif ($r.blocked_reason // "") == "" then $r.blocked_by

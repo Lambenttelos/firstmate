@@ -526,8 +526,8 @@ EOF
       and .paths.report.present == true
   ' >/dev/null || fail "bold task did not join to override-backed backlog and report"
   view=$(PATH="$fakebin:$PATH" FM_HOME="$home" FM_DATA_OVERRIDE="$data" FM_PROJECTS_OVERRIDE="$projects" "$VIEW")
-  assert_contains "$view" "| bold-task | done / status-log | scout | alpha | tmux | present | $data/bold-task/report.md" \
-    "view should render bold in-flight row from snapshot"
+  assert_contains "$view" "| bold-task | done / status-log · event(0m): done: report ready | scout | alpha | tmux | present | $data/bold-task/report.md" \
+    "view should render bold in-flight row with paired current-state and event"
   assert_contains "$view" "| blocked-reason | Blocked Reason | beta | ship | queued-comma - waits on queued-comma | - |" \
     "view should render blocked reason without title metadata"
   assert_contains "$view" "| done-bracket-pr | Done Bracket PR | gamma | ship | - | https://github.com/kunchenguid/firstmate/pull/43 |" \
@@ -543,15 +543,15 @@ test_view_renders_snapshot() {
   write_fixture "$home"
   fakebin=$(make_fakebin "$home")
   view=$(PATH="$fakebin:$PATH" FM_HOME="$home" "$VIEW")
-  assert_contains "$view" "| ship-task | working / pane | ship | alpha | tmux | present | https://github.com/kunchenguid/firstmate/pull/9" \
-    "view should render ship row from snapshot"
+  assert_contains "$view" "| ship-task | working / pane · event(0m): needs-decision: choose an API shape | ship | alpha | tmux | present | https://github.com/kunchenguid/firstmate/pull/9" \
+    "view should render ship row with paired current-state and event"
   assert_contains "$view" "| queued-task | Queued Task | alpha | ship | ship-task | -" \
     "view should render queued backlog row"
   assert_contains "$view" "| done-task | Done Task | alpha | ship | - | https://github.com/kunchenguid/firstmate/pull/7 |" \
     "view should render done backlog row"
   assert_contains "$view" "bin/fm-send.sh fm-secondmate-task" \
     "view should show secondmate send guidance"
-  assert_contains "$view" "| secondmate-task | working / status-log | secondmate | $home/secondmate-home | tmux | present / alive |" \
+  assert_contains "$view" "| secondmate-task | working / status-log · event(0m): working: watching delegated scope | secondmate | $home/secondmate-home | tmux | present / alive |" \
     "view should show secondmate endpoint agent liveness"
   assert_not_contains "$view" "fm-peek.sh fm-secondmate-task" \
     "view must not tell firstmate to routinely peek secondmates"
@@ -572,11 +572,128 @@ test_view_renders_dead_secondmate_agent_status() {
   printf 'working: watching delegated scope\n' > "$home/state/dead-secondmate.status"
   fakebin=$(make_fakebin "$home")
   view=$(PATH="$fakebin:$PATH" FM_HOME="$home" "$VIEW")
-  assert_contains "$view" "| dead-secondmate | unknown / none | secondmate | $home/secondmate-home | tmux | present / dead |" \
+  assert_contains "$view" "| dead-secondmate | unknown / none · event(0m): working: watching delegated scope | secondmate | $home/secondmate-home | tmux | present / dead |" \
     "view should distinguish a present secondmate endpoint from a dead agent"
-  assert_contains "$view" "| dead-secondmate | unknown / none | secondmate | $home/secondmate-home | tmux | present / dead | - | $home/secondmate-home (absent) |" \
+  assert_contains "$view" "| dead-secondmate | unknown / none · event(0m): working: watching delegated scope | secondmate | $home/secondmate-home | tmux | present / dead | - | $home/secondmate-home (absent) |" \
     "view should show a recorded missing secondmate home path"
   pass "fleet view renders secondmate agent liveness"
+}
+
+# Gap 3: a running-run fakebin plus a real worktree on the crew branch, so the
+# authoritative run-step reports working while the status EVENT still says
+# needs-decision. The renderers must (a) always pair the event with the current
+# state and a freshness age, (b) mark the event OLD when it is older than the
+# threshold and the current source is fresher (run-step), and (c) tag SUPERSEDED
+# because the run-step provably moved past the needs-decision event.
+make_running_run_fakebin() {  # <dir> <branch> <head>
+  local dir=$1 branch=$2 head=$3 fb
+  fb=$(fm_fakebin "$dir")
+  cat > "$fb/no-mistakes" <<SH
+#!/usr/bin/env bash
+set -u
+case "\${1:-}" in
+  axi)
+    shift
+    case "\${1:-}" in
+      status)
+        cat <<'RUN'
+run:
+  id: "01RUN"
+  branch: $branch
+  status: running
+  head: "$head"
+  pr: ""
+  findings: none
+  steps[2]{step,status,findings,duration_ms}:
+    intent,completed,0,0
+    review,running,0,0
+RUN
+        ;;
+    esac
+    ;;
+esac
+exit 0
+SH
+  cat > "$fb/tmux" <<'SH'
+#!/usr/bin/env bash
+exit 0
+SH
+  chmod +x "$fb/no-mistakes" "$fb/tmux"
+  printf '%s\n' "$fb"
+}
+
+test_gap3_pairs_event_with_current_state_old_and_superseded() {
+  local home fakebin wt head out now old_epoch view
+  home=$(make_home gap3)
+  wt="$home/projects/gap3-worktree"
+  mkdir -p "$wt"
+  git -C "$wt" init -q
+  git -C "$wt" -c user.name=fmtest -c user.email=fmtest@example.invalid commit -q --allow-empty -m init
+  git -C "$wt" checkout -q -b fm/gap3-ship-task
+  head=$(git -C "$wt" rev-parse HEAD)
+  fm_write_meta "$home/state/gap3-ship-task.meta" \
+    "window=firstmate:fm-gap3-ship-task" \
+    "worktree=$wt" \
+    "project=alpha" \
+    "harness=codex" \
+    "kind=ship" \
+    "mode=ship"
+  # A needs-decision EVENT the run-step has moved past, aged well beyond the
+  # default 600s OLD threshold via an old mtime, with snapshot NOW pinned.
+  printf 'needs-decision: choose an API shape\n' > "$home/state/gap3-ship-task.status"
+  now=1800000000
+  old_epoch=$(( now - 2820 ))  # 47m ago
+  touch -d "@$old_epoch" "$home/state/gap3-ship-task.status" 2>/dev/null \
+    || touch -t "$(date -r "$old_epoch" +%Y%m%d%H%M.%S 2>/dev/null)" "$home/state/gap3-ship-task.status"
+  fakebin=$(make_running_run_fakebin "$home" fm/gap3-ship-task "$head")
+  out=$(PATH="$fakebin:$PATH" FM_HOME="$home" FM_SNAPSHOT_NOW_EPOCH="$now" \
+    FM_SNAPSHOT_NOW="2027-01-15T08:00:00Z" "$SNAPSHOT" --json)
+  printf '%s' "$out" | jq -e '
+    .tasks[] | select(.id == "gap3-ship-task")
+    | .current_state.state == "working"
+      and .current_state.source == "run-step"
+      and .current_state.superseded == true
+      and .paths.status_log.last_event.raw == "needs-decision: choose an API shape"
+      and .paths.status_log.last_event.age_label == "47m"
+      and .paths.status_log.last_event.age_seconds == 2820
+      and .paths.status_log.last_event.old == true
+  ' >/dev/null || fail "snapshot did not pair event with current state, age, OLD, and SUPERSEDED: $out"
+  view=$(PATH="$fakebin:$PATH" FM_HOME="$home" FM_SNAPSHOT_NOW_EPOCH="$now" \
+    FM_SNAPSHOT_NOW="2027-01-15T08:00:00Z" "$VIEW")
+  assert_contains "$view" "| gap3-ship-task | working / run-step [SUPERSEDED] · event(47m) (OLD): needs-decision: choose an API shape |" \
+    "view must render the paired shape with SUPERSEDED and OLD, never the event alone"
+  pass "Gap 3: renderers pair event with current state, freshness age, OLD, and SUPERSEDED"
+}
+
+# The complementary safety property: a FRESH event whose current source is the
+# status log itself is never marked OLD (nothing fresher to trust) and never
+# SUPERSEDED (the run-step did not move past it), but is still PAIRED.
+test_gap3_fresh_agreeing_event_is_paired_without_markers() {
+  local home fakebin out view
+  home=$(make_home gap3-fresh)
+  mkdir -p "$home/projects/fresh-wt"
+  fm_write_meta "$home/state/fresh-ship.meta" \
+    "window=firstmate:fm-fresh-ship" \
+    "worktree=$home/projects/fresh-wt" \
+    "project=alpha" \
+    "harness=codex" \
+    "kind=ship" \
+    "mode=ship"
+  printf 'blocked: waiting on access\n' > "$home/state/fresh-ship.status"
+  fakebin=$(make_fakebin "$home")
+  out=$(PATH="$fakebin:$PATH" FM_HOME="$home" "$SNAPSHOT" --json)
+  printf '%s' "$out" | jq -e '
+    .tasks[] | select(.id == "fresh-ship")
+    | .current_state.superseded == false
+      and .paths.status_log.last_event.old == false
+      and .paths.status_log.last_event.raw == "blocked: waiting on access"
+  ' >/dev/null || fail "a fresh status-log-sourced event must not be OLD or SUPERSEDED: $out"
+  view=$(PATH="$fakebin:$PATH" FM_HOME="$home" "$VIEW")
+  assert_contains "$view" "· event(0m): blocked: waiting on access |" \
+    "view must still pair a fresh event with the current state"
+  assert_not_contains "$view" "fresh-ship | blocked / status-log (OLD)" \
+    "view must not mark a fresh event OLD"
+  pass "Gap 3: a fresh agreeing event is paired without OLD or SUPERSEDED"
 }
 
 # A still-open decision must survive a LATER, UNRELATED terminal event on the same
@@ -799,3 +916,5 @@ test_scout_reports_include_teardown_reports
 test_backlog_tasks_axi_forms_and_overrides
 test_view_renders_snapshot
 test_view_renders_dead_secondmate_agent_status
+test_gap3_pairs_event_with_current_state_old_and_superseded
+test_gap3_fresh_agreeing_event_is_paired_without_markers

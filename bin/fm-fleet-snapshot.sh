@@ -94,6 +94,11 @@ FM_SNAPSHOT_REGISTRY_LINES=${FM_SNAPSHOT_REGISTRY_LINES:-256}
 FM_SNAPSHOT_REGISTRY_BYTES=${FM_SNAPSHOT_REGISTRY_BYTES:-65536}
 FM_SNAPSHOT_REGISTRY_RECORDS=${FM_SNAPSHOT_REGISTRY_RECORDS:-40}
 FM_SNAPSHOT_REGISTRY_TIMEOUT=${FM_SNAPSHOT_REGISTRY_TIMEOUT:-2}
+# Gap 3: a status EVENT older than this (seconds) is marked OLD when the current
+# state has a FRESHER authoritative source (run-step/pane), so a supervisor never
+# reads a stale wake event as current truth. Default 600s (the slow-poll cadence).
+FM_SNAPSHOT_EVENT_OLD_THRESHOLD=${FM_SNAPSHOT_EVENT_OLD_THRESHOLD:-600}
+case "$FM_SNAPSHOT_EVENT_OLD_THRESHOLD" in ''|*[!0-9]*) FM_SNAPSHOT_EVENT_OLD_THRESHOLD=600 ;; esac
 validate_positive_bound() {  # <name> <value>
   case "$2" in
     ''|*[!0-9]*|0)
@@ -195,7 +200,7 @@ last_nonempty_line() {  # <file>
 }
 
 crew_state_json() {  # <id>
-  local id=$1 raw rest state source detail sep
+  local id=$1 raw rest state source detail sep superseded
   raw=$(
     FM_ROOT_OVERRIDE="$FM_ROOT" \
       FM_HOME="$FM_HOME" \
@@ -221,25 +226,62 @@ crew_state_json() {  # <id>
       esac
       ;;
   esac
+  # Surface the superseded reconciliation fm-crew-state.sh already computes
+  # (bin/fm-crew-state.sh:38-42): a needs-decision/blocked status-log line that the
+  # authoritative run-step has moved past appends a "superseded" note to the detail.
+  # This is a pure surfacing of an existing value, not a new computation.
+  superseded=0
+  case "$detail" in *superseded*) superseded=1 ;; esac
   jq -n --arg raw "$raw" --arg state "$state" --arg source "$source" --arg detail "$detail" \
-    '{state:$state,source:$source,detail:$detail,raw:$raw}'
+    --argjson superseded "$(bool_json "$superseded")" \
+    '{state:$state,source:$source,detail:$detail,superseded:$superseded,raw:$raw}'
+}
+
+# Human "2h10m"/"47m" age for an event, used by renderers to pair a status EVENT
+# with a freshness marker. Empty input (no status file / unknown mtime) -> "".
+snapshot_event_age_label() {  # <seconds>
+  local s=${1:-}
+  case "$s" in ''|*[!0-9]*) printf ''; return 0 ;; esac
+  if [ "$s" -lt 3600 ]; then
+    printf '%dm' $(( s / 60 ))
+  else
+    printf '%dh%dm' $(( s / 3600 )) $(( (s % 3600) / 60 ))
+  fi
 }
 
 status_event_json() {  # <status-log>
-  local log=$1 present=0 raw='' verb='' note=''
+  local log=$1 present=0 raw='' verb='' note='' event_epoch='' age_seconds='' age_label=''
   if [ -f "$log" ]; then
     present=1
     raw=$(last_nonempty_line "$log" || true)
     verb=$(status_line_verb "$raw")
     note=$(status_line_note "$raw")
+    # Freshness age of the LAST wake event: its file mtime against snapshot NOW.
+    # Renderers pair this age with the current state so a stale event is never
+    # shown as if it were current truth (Gap 3). file_mtime_epoch is defined
+    # below and resolved at call time (this function only runs from the meta loop).
+    event_epoch=$(file_mtime_epoch "$log")
+    case "$event_epoch" in
+      ''|*[!0-9]*) event_epoch=''; age_seconds=''; age_label='' ;;
+      *)
+        age_seconds=$(( SNAPSHOT_EPOCH - event_epoch ))
+        [ "$age_seconds" -lt 0 ] && age_seconds=0
+        age_label=$(snapshot_event_age_label "$age_seconds")
+        ;;
+    esac
   fi
   jq -n \
     --arg path "$log" \
     --arg raw "$raw" \
     --arg verb "$verb" \
     --arg note "$note" \
+    --arg age_label "$age_label" \
+    --argjson age_seconds "$(if [ -n "$age_seconds" ]; then printf '%s' "$age_seconds"; else printf 'null'; fi)" \
     --argjson present "$(bool_json "$present")" \
-    '{path:$path,present:$present,kind:"event_history",last_event:{state:$verb,note:$note,raw:$raw}}'
+    '{path:$path,present:$present,kind:"event_history",
+      last_event:{state:$verb,note:$note,raw:$raw,
+        age_seconds:$age_seconds,
+        age_label:(if $age_label == "" then null else $age_label end)}}'
 }
 
 first_pr_url_in_file() {  # <file>
@@ -435,6 +477,23 @@ task_json_lines() {
     last_event_raw=$(printf '%s' "$event_json" | jq -r '.last_event.raw // ""')
     current_state=$(printf '%s' "$current_json" | jq -r '.state // ""')
     current_source=$(printf '%s' "$current_json" | jq -r '.source // ""')
+
+    # Gap 3 OLD marker: the last wake event is OLD only when it is older than the
+    # threshold AND the current state has a FRESHER authoritative source than the
+    # event (run-step or pane). A young event, or one whose only current-state
+    # source IS the status log, is never OLD - there is nothing fresher to trust.
+    event_age_seconds=$(printf '%s' "$event_json" | jq -r '.last_event.age_seconds // ""')
+    event_old=0
+    case "$current_source" in
+      run-step|pane)
+        case "$event_age_seconds" in
+          ''|*[!0-9]*) : ;;
+          *) [ "$event_age_seconds" -gt "$FM_SNAPSHOT_EVENT_OLD_THRESHOLD" ] && event_old=1 ;;
+        esac
+        ;;
+    esac
+    event_json=$(printf '%s' "$event_json" \
+      | jq --argjson old "$(bool_json "$event_old")" '.last_event.old = $old')
 
     # Durable keyed open-decision set: fold the WHOLE status stream
     # (fm-classify-lib.sh's status_open_decisions) so a later unrelated event can
