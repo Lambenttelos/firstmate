@@ -139,6 +139,13 @@ mkdir -p "$STATE"
 # shellcheck source=bin/fm-hourly-lib.sh
 . "$SCRIPT_DIR/fm-hourly-lib.sh"
 
+# Shared per-task telemetry writer (state/<id>.telemetry, key=value). The
+# hot-path 429 anomaly scan (quota_anomaly_scan below, Visibility Gap-2) uses
+# fm_telemetry_set to bump count_429/last_429_ts without clobbering keys sibling
+# producers own. No side effects on source.
+# shellcheck source=bin/fm-telemetry-lib.sh
+. "$SCRIPT_DIR/fm-telemetry-lib.sh"
+
 WATCH_LOCK="$STATE/.watch.lock"
 WATCH_PATH="$SCRIPT_DIR/fm-watch.sh"
 WATCHER_STALE_GRACE=${FM_WATCHER_STALE_GRACE:-${FM_GUARD_GRACE:-900}}
@@ -841,6 +848,79 @@ orchestrator_rotate_on_tripwire() {  # <task>
   return 0
 }
 
+# Visibility Gap-2: how many rolling 429/limit-error occurrences on one pane
+# cross from a self-healing transient into a real anomaly worth a proactive wake.
+# A small threshold: a single overloaded-429 self-heals (telemetry only), a rate
+# is real exhaustion. Overridable for tests; the captain rarely tunes it.
+FM_QUOTA_ANOMALY_RATE=${FM_QUOTA_ANOMALY_RATE:-3}
+
+# Resolve the SHARED tripwire regex from its single owner, once, so the hot-path
+# 429 scan reuses the exact catalog bin/fm-account-orchestrator.sh owns
+# (FM_ORCH_TRIPWIRE_RE_DEFAULT) instead of forking a second copy that would drift.
+# We read the owner's own assignment line rather than restating the pattern here.
+# Fail-soft: if the owner cannot be read, FM_WATCH_TRIPWIRE_RE stays empty and the
+# scan below is inert (never a wrong wake). Runs at load so it is cached for the
+# process lifetime, the same way every other watcher constant is fixed once.
+if [ -z "${FM_WATCH_TRIPWIRE_RE:-}" ]; then
+  _fm_orch_tw_line=$(grep -m1 '^FM_ORCH_TRIPWIRE_RE_DEFAULT=' \
+    "$SCRIPT_DIR/fm-account-orchestrator.sh" 2>/dev/null || true)
+  if [ -n "$_fm_orch_tw_line" ]; then
+    # shellcheck disable=SC2034  # FM_ORCH_TRIPWIRE_RE_DEFAULT is read on the next line.
+    eval "$_fm_orch_tw_line" && FM_WATCH_TRIPWIRE_RE=$FM_ORCH_TRIPWIRE_RE_DEFAULT
+  fi
+  unset _fm_orch_tw_line
+fi
+
+# quota_anomaly_scan: Visibility Gap-2 - detect a per-pane 429/rate-limit anomaly
+# from the 40-line pane tail the stale loop ALREADY captured, on FIRST occurrence,
+# before the worker surfaces its own blocked/paused status. ZERO extra backend
+# calls (it scans text already in hand) and no per-pane subprocess: one grep over
+# tail plus a shell int compare on the supervision hot path.
+#
+# On a tripwire match not already counted for this pane tail, bump count_429 and
+# set last_429_ts in state/<task>.telemetry (deduped by the tail hash the stale
+# loop already computes, so a 429 that sits in an idle tail counts once per burst,
+# not once per poll - the same idempotence shape as .orch-rotated-<key>). Severity
+# split: a single first 429 is telemetry-only, NO wake (a lone overloaded-429
+# self-heals); only a RATE past FM_QUOTA_ANOMALY_RATE emits a proactive
+# `check: quota-anomaly <task> <account> <count>` wake, idempotent per rotation
+# cooldown window so a storm wakes firstmate once, not every poll. Fail-soft: an
+# unresolved regex, an absent task, or a telemetry-write failure surfaces nothing.
+quota_anomaly_scan() {  # <window> <task> <tail40> <hash>
+  local w=$1 task=$2 tail=$3 h=$4 key seenf tel count marker age account reason
+  [ -n "$task" ] || return 0
+  [ -n "${FM_WATCH_TRIPWIRE_RE:-}" ] || return 0
+  printf '%s' "$tail" | grep -qiE "$FM_WATCH_TRIPWIRE_RE" || return 0
+  key=$(printf '%s' "$w" | tr ':/.' '___')
+  seenf="$STATE/.quota-429-seen-$key"
+  # One burst = one count: the same 429 line persists in an idle tail across
+  # polls, so count only when this tail hash is new (mirrors the stale loop's own
+  # per-hash dedup). A later, changed tail carrying a fresh 429 counts again.
+  [ "$(cat "$seenf" 2>/dev/null || true)" = "$h" ] && return 0
+  printf '%s' "$h" > "$seenf"
+  tel="$STATE/$task.telemetry"
+  count=$(fm_meta_get "$tel" count_429)
+  case "$count" in ''|*[!0-9]*) count=0 ;; esac
+  count=$((count + 1))
+  fm_telemetry_set "$tel" count_429 "$count" || return 0
+  fm_telemetry_set "$tel" last_429_ts "$(date +%s)" || return 0
+  # Telemetry-only until the rate crosses the threshold.
+  [ "$count" -ge "$FM_QUOTA_ANOMALY_RATE" ] || return 0
+  # One wake per cooldown window, reusing the rotation cooldown so a storm does
+  # not nag every poll (the same window rotation itself is idempotent over).
+  marker="$STATE/.quota-anomaly-$key"
+  if [ -e "$marker" ]; then
+    age=$(age_of "$marker")
+    [ "$age" -lt "$FM_ORCH_ROTATE_COOLDOWN" ] && return 0
+    rm -f "$marker"
+  fi
+  : > "$marker"
+  account=$(fm_meta_get "$tel" account); [ -n "$account" ] || account=unknown
+  reason="check: quota-anomaly $task $account $count"
+  fm_wake_append check "quota-anomaly-$key" "$reason" || exit 1
+  wake "$reason"
+}
+
 # Reconcile a declared pause or captain-held status with authoritative crew state.
 # Only a confidently dead ordinary crew may recover paused classification after
 # fm-crew-state has fallen back to stopped or unknown.
@@ -1501,6 +1581,11 @@ EOF
     fi
     tail40=$(fm_backend_capture "$(window_backend "$w")" "$w" 40 "$(window_label "$w")" 2>/dev/null) || continue
     h=$(printf '%s' "$tail40" | hash_pane)
+    # Visibility Gap-2: scan the tail we JUST captured for a 429/rate-limit
+    # tripwire before the worker surfaces its own blocked/paused status. Reuses
+    # this tail40 and hash - ZERO extra backend call. Telemetry-only on a first
+    # 429; a rate emits a proactive check: quota-anomaly wake (which exits).
+    quota_anomaly_scan "$w" "$task" "$tail40" "$h"
     key=$(printf '%s' "$w" | tr ':/.' '___')
     hf="$STATE/.hash-$key"
     cf="$STATE/.count-$key"
