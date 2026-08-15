@@ -21,8 +21,10 @@ LINT="$ROOT/bin/fm-lint.sh"
 CI="$ROOT/.github/workflows/ci.yml"
 NM="$ROOT/.no-mistakes.yaml"
 INSTALLER="$ROOT/bin/fm-install-shellcheck.sh"
-# The authoritative file set the one owner must run.
-CANON='shellcheck --norc bin/*.sh bin/backends/*.sh tests/*.sh'
+# The authoritative file set the one owner must run. It resolves this glob set
+# into an array now (for per-file caching and parallelism) rather than passing
+# it to one `shellcheck` invocation, but the set itself is unchanged.
+CANON='files=(bin/*.sh bin/backends/*.sh tests/*.sh)'
 # The pinned version, read from the single source (the one owner itself).
 REQUIRED=$("$LINT" --required-version)
 
@@ -45,7 +47,10 @@ test_owner_defines_canonical_set() {
   # that would hide findings CI fails on.
   assert_no_grep '--severity' "$LINT" "fm-lint.sh must not lower severity below the CI default"
   assert_no_grep '--exclude' "$LINT" "fm-lint.sh must not blanket-exclude checks CI enforces"
-  [ "$(grep -Fc 'exec shellcheck --norc' "$LINT")" -eq 2 ] || fail "both lint modes must ignore ambient ShellCheck configuration"
+  # Every ShellCheck invocation must ignore ambient configuration (--norc) and
+  # follow sourced files (-x) so a single-file lint matches the old whole-set
+  # batch verdict; the flags live in one array so they cannot drift.
+  assert_grep 'LINT_FLAGS=(--norc -x)' "$LINT" "fm-lint.sh must lint with --norc -x for CI/batch parity"
   pass "fm-lint.sh is the sole authoritative definition at CI-default severity"
 }
 
@@ -236,6 +241,403 @@ SH
   pass "fm-lint.sh passes a clean fixture"
 }
 
+# --- speed rework: content-hash cache + parallelism -------------------------
+#
+# These prove the cache decides WHICH files re-lint without ever changing the
+# verdict, per the approved proposal's correctness requirements. Each uses an
+# isolated FM_LINT_CACHE_ROOT so a test never touches the real repo cache, and
+# spy shellchecks that count invocations so "was this file actually linted?" is
+# directly observable rather than inferred from timing.
+
+# A counting shellcheck spy: it records each linted file into $SC_CALLS and
+# passes/fails exactly as the pinned real shellcheck would for the fixtures used
+# here (a file containing the token SC_FAIL_TOKEN fails; everything else passes).
+# This makes the cache-vs-lint decision observable without depending on the real
+# tool being installed at the pin.
+fm_lint_spy_shellcheck() {
+  local fakebin=$1 calls=$2
+  cat > "$fakebin/shellcheck" <<SH
+#!/usr/bin/env bash
+if [ "\$1" = "--version" ]; then
+  printf 'ShellCheck - shell script analysis tool\nversion: $REQUIRED\n'
+  exit 0
+fi
+# Drop leading flags; the last argument is the file (parent passes one file).
+file=""
+for a in "\$@"; do file="\$a"; done
+printf '%s\n' "\$file" >> "$calls"
+if grep -q SC_FAIL_TOKEN "\$file" 2>/dev/null; then
+  printf 'In %s: fake finding\n' "\$file"
+  exit 1
+fi
+exit 0
+SH
+  chmod +x "$fakebin/shellcheck"
+}
+
+test_cache_hit_skips_relint() {
+  local tmp fakebin calls cache a rc n1 n2
+  tmp=$(fm_test_tmproot fm-lint-cache-hit)
+  fakebin=$(fm_fakebin "$tmp")
+  calls="$tmp/calls"
+  cache="$tmp/cache"
+  fm_lint_spy_shellcheck "$fakebin" "$calls"
+  a="$tmp/a.sh"
+  printf '#!/usr/bin/env bash\necho hi\n' > "$a"
+
+  : > "$calls"
+  rc=0
+  PATH="$fakebin:$PATH" FM_LINT_CACHE_ROOT="$cache" "$LINT" "$a" >/dev/null 2>&1 || rc=$?
+  [ "$rc" -eq 0 ] || fail "first cache run failed on a clean file (exit $rc)"
+  n1=$(wc -l < "$calls")
+  [ "$n1" -eq 1 ] || fail "first run should lint the file exactly once, linted $n1"
+
+  rc=0
+  PATH="$fakebin:$PATH" FM_LINT_CACHE_ROOT="$cache" "$LINT" "$a" >/dev/null 2>&1 || rc=$?
+  [ "$rc" -eq 0 ] || fail "warm cache run failed (exit $rc)"
+  n2=$(wc -l < "$calls")
+  [ "$n2" -eq 1 ] || fail "unchanged file must not re-lint on a cache hit, total lints $n2"
+  pass "cache hit skips re-linting an unchanged file"
+}
+
+test_content_change_forces_relint() {
+  local tmp fakebin calls cache a n1 n2
+  tmp=$(fm_test_tmproot fm-lint-cache-change)
+  fakebin=$(fm_fakebin "$tmp")
+  calls="$tmp/calls"
+  cache="$tmp/cache"
+  fm_lint_spy_shellcheck "$fakebin" "$calls"
+  a="$tmp/a.sh"
+  printf '#!/usr/bin/env bash\necho one\n' > "$a"
+
+  : > "$calls"
+  PATH="$fakebin:$PATH" FM_LINT_CACHE_ROOT="$cache" "$LINT" "$a" >/dev/null 2>&1 || true
+  n1=$(wc -l < "$calls")
+  # change the file's content
+  printf '#!/usr/bin/env bash\necho two\n' > "$a"
+  PATH="$fakebin:$PATH" FM_LINT_CACHE_ROOT="$cache" "$LINT" "$a" >/dev/null 2>&1 || true
+  n2=$(wc -l < "$calls")
+  [ "$n2" -eq $((n1 + 1)) ] || fail "a changed file must re-lint (miss); lints went $n1 -> $n2"
+  pass "content change forces a re-lint (hash miss)"
+}
+
+test_sourced_lib_change_invalidates_dependent() {
+  # Under -x a sourced library can change a file's verdict, so a library edit
+  # must re-lint its dependents (cache soundness), while an unrelated file must
+  # stay cached (minimality).
+  local tmp fakebin calls cache lib a b before mid after
+  tmp=$(fm_test_tmproot fm-lint-cache-lib)
+  fakebin=$(fm_fakebin "$tmp")
+  calls="$tmp/calls"
+  cache="$tmp/cache"
+  fm_lint_spy_shellcheck "$fakebin" "$calls"
+  lib="$tmp/lib.sh"
+  a="$tmp/a.sh"
+  b="$tmp/b.sh"
+  printf '#!/usr/bin/env bash\nLIBVAR=1\n' > "$lib"
+  # a.sh sources lib.sh with an absolute source= so the closure resolves the
+  # temp lib regardless of the repo-root CWD fm-lint runs from.
+  # shellcheck disable=SC2016  # $LIBVAR is fixture source text, not for expansion here
+  printf '#!/usr/bin/env bash\n# shellcheck source=%s\n. "%s"\necho "$LIBVAR"\n' "$lib" "$lib" > "$a"
+  printf '#!/usr/bin/env bash\necho independent\n' > "$b"
+
+  : > "$calls"
+  PATH="$fakebin:$PATH" FM_LINT_CACHE_ROOT="$cache" "$LINT" "$a" "$b" >/dev/null 2>&1 || true
+  before=$(wc -l < "$calls")
+  [ "$before" -eq 2 ] || fail "cold run should lint both files once, linted $before"
+
+  # warm: both cached, nothing re-lints
+  PATH="$fakebin:$PATH" FM_LINT_CACHE_ROOT="$cache" "$LINT" "$a" "$b" >/dev/null 2>&1 || true
+  mid=$(wc -l < "$calls")
+  [ "$mid" -eq 2 ] || fail "warm run must re-lint nothing, total lints $mid"
+
+  # edit the library: a.sh (dependent) must re-lint, b.sh must not
+  printf '#!/usr/bin/env bash\nLIBVAR=2\n' > "$lib"
+  PATH="$fakebin:$PATH" FM_LINT_CACHE_ROOT="$cache" "$LINT" "$a" "$b" >/dev/null 2>&1 || true
+  after=$(wc -l < "$calls")
+  [ "$after" -eq 3 ] || fail "a library edit must re-lint exactly its dependent (a.sh), total lints $after"
+  grep -Fq "$a" <(tail -n 1 "$calls") || fail "the re-linted file after a lib edit must be the dependent a.sh"
+  pass "a sourced-library change invalidates only its dependents"
+}
+
+test_version_change_invalidates_cache() {
+  # A ShellCheck version (or lint-context) bump must invalidate every cached
+  # pass so an upgrade never serves a stale verdict. The cache key folds the
+  # resolved ShellCheck version, the flags, AND the cache-format generation into
+  # a single salt; a change to any of those must force a re-lint of unchanged
+  # files. FM_LINT_CACHE_FORMAT_OVERRIDE moves the generation, standing in for
+  # the version axis (which is pinned at runtime) through the same salt, so this
+  # exercises the real invalidation path behaviorally.
+  local tmp fakebin calls cache a n1 n2 n3
+  tmp=$(fm_test_tmproot fm-lint-cache-ver)
+  fakebin=$(fm_fakebin "$tmp")
+  calls="$tmp/calls"
+  cache="$tmp/cache"
+  fm_lint_spy_shellcheck "$fakebin" "$calls"
+  a="$tmp/a.sh"
+  printf '#!/usr/bin/env bash\necho hi\n' > "$a"
+
+  : > "$calls"
+  PATH="$fakebin:$PATH" FM_LINT_CACHE_ROOT="$cache" "$LINT" "$a" >/dev/null 2>&1 || true
+  n1=$(wc -l < "$calls")
+  [ "$n1" -eq 1 ] || fail "cold run should lint once, linted $n1"
+
+  # Same context: warm hit, no re-lint.
+  PATH="$fakebin:$PATH" FM_LINT_CACHE_ROOT="$cache" "$LINT" "$a" >/dev/null 2>&1 || true
+  n2=$(wc -l < "$calls")
+  [ "$n2" -eq 1 ] || fail "warm run with the same context must not re-lint, total lints $n2"
+
+  # Bump the lint-context generation (the version-bump-equivalent axis): the
+  # file is byte-identical but its cache key changed, so it MUST re-lint.
+  PATH="$fakebin:$PATH" FM_LINT_CACHE_ROOT="$cache" FM_LINT_CACHE_FORMAT_OVERRIDE=99 \
+    "$LINT" "$a" >/dev/null 2>&1 || true
+  n3=$(wc -l < "$calls")
+  [ "$n3" -eq 2 ] || fail "a lint-context (version) bump must invalidate the cache and re-lint, total lints $n3"
+  pass "a version/lint-context bump invalidates the cache and forces a re-lint"
+}
+
+test_version_axis_in_key() {
+  # Directly assert the salt embeds the resolved ShellCheck version, so an
+  # upgrade changes every key. This is the invalidation contract at the source
+  # level, complementing the behavioral test above.
+  # shellcheck disable=SC2016  # these are literal source-text patterns to grep for, not shell expansions
+  assert_grep 'sc=${resolved}' "$LINT" "cache salt must embed the resolved ShellCheck version"
+  # shellcheck disable=SC2016
+  assert_grep 'flags=${LINT_FLAGS[*]}' "$LINT" "cache salt must embed the exact ShellCheck flags"
+  # shellcheck disable=SC2016
+  assert_grep 'v${LINT_CACHE_FORMAT}' "$LINT" "cache salt must embed the cache-format generation"
+  pass "version, flags, and cache-format all participate in the cache key"
+}
+
+test_cache_miss_degrades_to_full_lint() {
+  # An unwritable cache location must NOT skip any file: it degrades to a full
+  # lint (every file linted), never to a silent pass.
+  local tmp fakebin calls cache a b n
+  tmp=$(fm_test_tmproot fm-lint-cache-ro)
+  fakebin=$(fm_fakebin "$tmp")
+  calls="$tmp/calls"
+  cache="$tmp/cache-ro"
+  fm_lint_spy_shellcheck "$fakebin" "$calls"
+  a="$tmp/a.sh"; b="$tmp/b.sh"
+  printf '#!/usr/bin/env bash\necho a\n' > "$a"
+  printf '#!/usr/bin/env bash\necho b\n' > "$b"
+  # Make the cache root unwritable: a file where a directory is needed.
+  : > "$cache"
+
+  : > "$calls"
+  PATH="$fakebin:$PATH" FM_LINT_CACHE_ROOT="$cache" "$LINT" "$a" "$b" >/dev/null 2>&1 || true
+  n=$(wc -l < "$calls")
+  [ "$n" -eq 2 ] || fail "an unwritable cache must lint every file (full lint), linted $n"
+  # Second run with the same unwritable cache must ALSO lint both (no stale skip)
+  PATH="$fakebin:$PATH" FM_LINT_CACHE_ROOT="$cache" "$LINT" "$a" "$b" >/dev/null 2>&1 || true
+  [ "$(wc -l < "$calls")" -eq 4 ] || fail "an unwritable cache must never serve a skip; expected a second full lint"
+  pass "an unwritable cache degrades to a full lint, never a skip"
+}
+
+test_findings_are_never_cached() {
+  # A file with findings must re-lint (and re-report) every run until fixed: a
+  # failing verdict is never recorded as a pass.
+  local tmp fakebin calls cache bad rc1 rc2 n
+  tmp=$(fm_test_tmproot fm-lint-cache-bad)
+  fakebin=$(fm_fakebin "$tmp")
+  calls="$tmp/calls"
+  cache="$tmp/cache"
+  fm_lint_spy_shellcheck "$fakebin" "$calls"
+  bad="$tmp/bad.sh"
+  printf '#!/usr/bin/env bash\n# SC_FAIL_TOKEN\necho bad\n' > "$bad"
+
+  : > "$calls"
+  rc1=0
+  PATH="$fakebin:$PATH" FM_LINT_CACHE_ROOT="$cache" "$LINT" "$bad" >/dev/null 2>&1 || rc1=$?
+  [ "$rc1" -ne 0 ] || fail "a file with a finding must make fm-lint fail"
+  rc2=0
+  PATH="$fakebin:$PATH" FM_LINT_CACHE_ROOT="$cache" "$LINT" "$bad" >/dev/null 2>&1 || rc2=$?
+  [ "$rc2" -ne 0 ] || fail "a previously-failing file must still fail on re-run (finding was cached as a pass)"
+  n=$(wc -l < "$calls")
+  [ "$n" -eq 2 ] || fail "a failing file must re-lint every run, linted $n times"
+  pass "findings are never cached; a failing file re-lints and re-fails"
+}
+
+test_verdict_parity_serial_vs_parallel() {
+  # The pass/fail verdict of the parallel cached run must equal a serial
+  # per-file lint of the same set, on both a clean set and a set with a defect.
+  local tmp fakebin calls cache a b bad rc_clean rc_defect
+  tmp=$(fm_test_tmproot fm-lint-parity)
+  fakebin=$(fm_fakebin "$tmp")
+  calls="$tmp/calls"
+  cache="$tmp/cache"
+  fm_lint_spy_shellcheck "$fakebin" "$calls"
+  a="$tmp/a.sh"; b="$tmp/b.sh"; bad="$tmp/bad.sh"
+  printf '#!/usr/bin/env bash\necho a\n' > "$a"
+  printf '#!/usr/bin/env bash\necho b\n' > "$b"
+
+  # clean set -> pass
+  rc_clean=0
+  PATH="$fakebin:$PATH" FM_LINT_CACHE_ROOT="$cache/1" "$LINT" "$a" "$b" >/dev/null 2>&1 || rc_clean=$?
+  [ "$rc_clean" -eq 0 ] || fail "clean set must pass (exit $rc_clean)"
+
+  # set with a defect -> fail, regardless of file order (parallel is unordered)
+  printf '#!/usr/bin/env bash\n# SC_FAIL_TOKEN\necho bad\n' > "$bad"
+  rc_defect=0
+  PATH="$fakebin:$PATH" FM_LINT_CACHE_ROOT="$cache/2" "$LINT" "$a" "$bad" "$b" >/dev/null 2>&1 || rc_defect=$?
+  [ "$rc_defect" -ne 0 ] || fail "a set containing a defect must fail (parallel verdict must match serial)"
+  pass "parallel cached verdict matches serial: clean passes, any defect fails"
+}
+
+# --- host gentleness: nice, the -P 4 cap, and heavy-run admission -----------
+#
+# These prove the sweep can never freeze the host: every ShellCheck runs at low
+# priority, no more than 4 run at once, and a full-tree sweep is admitted through
+# the fleet's heavy-run queue while a single-file call stays fast and un-gated,
+# with no nested double-admission that could deadlock.
+
+test_shellcheck_runs_under_nice() {
+  # The per-file worker must invoke shellcheck behind `nice -n 15`. Assert the
+  # wiring at the source (the definition and its use), and confirm behaviorally
+  # that a lint still succeeds when nice is present.
+  assert_grep 'LINT_NICE=(nice -n 15)' "$LINT" "fm-lint.sh must define a nice -n 15 prefix"
+  # shellcheck disable=SC2016  # literal source-text pattern, not a shell expansion
+  assert_grep '"${LINT_NICE[@]}" shellcheck' "$LINT" "the per-file worker must run shellcheck behind the nice prefix"
+
+  # Behavioral: a spy `nice` records that it was asked for -n 15 wrapping the
+  # linter, and forwards to a spy checker. Both on PATH via fakebin.
+  local tmp fakebin calls niced a
+  tmp=$(fm_test_tmproot fm-lint-nice)
+  fakebin=$(fm_fakebin "$tmp")
+  calls="$tmp/calls"
+  niced="$tmp/niced"
+  fm_lint_spy_shellcheck "$fakebin" "$calls"
+  cat > "$fakebin/nice" <<SH
+#!/usr/bin/env bash
+# Expect: nice -n 15 shellcheck ...; record the priority, then exec the rest.
+if [ "\$1" = "-n" ]; then
+  printf '%s\n' "\$2" >> "$niced"
+  shift 2
+fi
+exec "\$@"
+SH
+  chmod +x "$fakebin/nice"
+  a="$tmp/a.sh"
+  printf '#!/usr/bin/env bash\necho hi\n' > "$a"
+  PATH="$fakebin:$PATH" FM_LINT_CACHE_ROOT="$tmp/c" FM_LINT_NO_HEAVY_GATE=1 "$LINT" "$a" >/dev/null 2>&1 || true
+  [ -s "$niced" ] || fail "shellcheck was not run behind nice"
+  grep -Fqx 15 "$niced" || fail "shellcheck must run at nice -n 15, got: $(cat "$niced")"
+  pass "every shellcheck runs behind nice -n 15"
+}
+
+test_jobs_capped_at_four() {
+  # The clamp must hold on a many-core host: no more than 4 concurrent workers.
+  # Assert the cap constant and clamp exist, then observe the real cap by having
+  # a spy shellcheck record peak concurrency across a set larger than 4.
+  assert_grep 'LINT_MAX_JOBS=4' "$LINT" "fm-lint.sh must cap concurrency at 4"
+  # shellcheck disable=SC2016  # literal source-text pattern
+  assert_grep 'jobs=$LINT_MAX_JOBS' "$LINT" "fm-lint.sh must clamp computed jobs to the cap"
+
+  local tmp fakebin peakdir a i
+  tmp=$(fm_test_tmproot fm-lint-cap)
+  fakebin=$(fm_fakebin "$tmp")
+  peakdir="$tmp/peak"
+  mkdir -p "$peakdir"
+  # A spy shellcheck that marks itself in-flight, records the live count, then
+  # sleeps briefly so overlaps actually happen, then clears. The max directory
+  # size seen is the peak concurrency.
+  cat > "$fakebin/shellcheck" <<SH
+#!/usr/bin/env bash
+[ "\$1" = "--version" ] && { printf 'version: $REQUIRED\n'; exit 0; }
+me="$peakdir/\$\$"
+: > "\$me"
+ls "$peakdir" | wc -l >> "$tmp/counts"
+sleep 0.3
+rm -f "\$me"
+exit 0
+SH
+  chmod +x "$fakebin/shellcheck"
+  # 10 distinct files, well above the cap of 4.
+  : > "$tmp/counts"
+  local -a files=()
+  for i in $(seq 1 10); do
+    printf '#!/usr/bin/env bash\necho %s\n' "$i" > "$tmp/f$i.sh"
+    files+=("$tmp/f$i.sh")
+  done
+  PATH="$fakebin:$PATH" FM_LINT_CACHE_ROOT="$tmp/c" FM_LINT_NO_HEAVY_GATE=1 "$LINT" "${files[@]}" >/dev/null 2>&1 || true
+  local peak
+  peak=$(sort -n "$tmp/counts" | tail -n 1)
+  [ -n "$peak" ] || fail "no concurrency was recorded"
+  [ "$peak" -le 4 ] || fail "concurrency exceeded the cap of 4 (peak $peak)"
+  pass "concurrent shellcheck processes never exceed 4 (peak $peak)"
+}
+
+test_full_tree_routes_through_heavy_run() {
+  # A full-tree sweep (no file args) must be admitted through the heavy-run
+  # wrapper; a single-file call must not. A spy wrapper records each invocation.
+  local tmp fakebin spy calls a
+  tmp=$(fm_test_tmproot fm-lint-heavy)
+  fakebin=$(fm_fakebin "$tmp")
+  spy="$tmp/heavy-spy.sh"
+  calls="$tmp/heavy-calls"
+  fm_lint_spy_shellcheck "$fakebin" "$tmp/sc-calls"
+  # The spy heavy-run records that it was called, marks the slot active (as the
+  # real one does via FM_HEAVY_RUN_ACTIVE), then runs the wrapped command.
+  cat > "$spy" <<SH
+#!/usr/bin/env bash
+printf 'called\n' >> "$calls"
+# skip past flags to the -- command
+while [ "\$#" -gt 0 ]; do [ "\$1" = "--" ] && { shift; break; }; shift; done
+export FM_HEAVY_RUN_ACTIVE=1
+exec "\$@"
+SH
+  chmod +x "$spy"
+  a="$tmp/a.sh"
+  printf '#!/usr/bin/env bash\necho hi\n' > "$a"
+
+  # single-file: wrapper must NOT be called
+  : > "$calls"
+  PATH="$fakebin:$PATH" FM_LINT_CACHE_ROOT="$tmp/c1" FM_LINT_HEAVY_RUN="$spy" \
+    FM_LINT_NO_HEAVY_GATE='' FM_HEAVY_RUN_ACTIVE='' "$LINT" "$a" >/dev/null 2>&1 || true
+  [ ! -s "$calls" ] || fail "a single-file lint must NOT go through heavy-run admission"
+
+  # full-tree (no args): wrapper MUST be called exactly once. Clear the gate
+  # seams the surrounding suite may set so this exercises real admission.
+  : > "$calls"
+  ( cd "$ROOT" && PATH="$fakebin:$PATH" FM_LINT_CACHE_ROOT="$tmp/c2" FM_LINT_HEAVY_RUN="$spy" \
+      FM_LINT_NO_HEAVY_GATE='' FM_HEAVY_RUN_ACTIVE='' "$LINT" >/dev/null 2>&1 ) || true
+  [ "$(wc -l < "$calls")" -eq 1 ] || fail "a full-tree sweep must go through heavy-run admission exactly once (got $(wc -l < "$calls"))"
+  pass "full-tree sweep routes through heavy-run; single-file call does not"
+}
+
+test_no_nested_heavy_run_admission() {
+  # When already inside a heavy-run slot (FM_HEAVY_RUN_ACTIVE set), a full-tree
+  # sweep must NOT re-admit - that would deadlock against the held lease. The
+  # spy wrapper must never be called in that case.
+  local tmp fakebin spy calls
+  tmp=$(fm_test_tmproot fm-lint-nested)
+  fakebin=$(fm_fakebin "$tmp")
+  spy="$tmp/heavy-spy.sh"
+  calls="$tmp/heavy-calls"
+  fm_lint_spy_shellcheck "$fakebin" "$tmp/sc-calls"
+  cat > "$spy" <<SH
+#!/usr/bin/env bash
+printf 'called\n' >> "$calls"
+while [ "\$#" -gt 0 ]; do [ "\$1" = "--" ] && { shift; break; }; shift; done
+exec "\$@"
+SH
+  chmod +x "$spy"
+
+  : > "$calls"
+  ( cd "$ROOT" && PATH="$fakebin:$PATH" FM_HEAVY_RUN_ACTIVE=1 \
+      FM_LINT_CACHE_ROOT="$tmp/c" FM_LINT_HEAVY_RUN="$spy" "$LINT" >/dev/null 2>&1 ) || true
+  [ ! -s "$calls" ] || fail "a full-tree sweep already inside a heavy-run slot must NOT re-admit (nested double-admission)"
+  pass "no nested heavy-run admission when already inside a slot"
+}
+
+test_heavy_run_exports_active_marker() {
+  # The self-deadlock guard depends on fm-heavy-run exporting FM_HEAVY_RUN_ACTIVE
+  # to its child; assert the wrapper does so.
+  local heavy="$ROOT/bin/fm-heavy-run.sh"
+  assert_grep 'export FM_HEAVY_RUN_ACTIVE=1' "$heavy" "fm-heavy-run.sh must mark its child as inside a slot"
+  pass "fm-heavy-run exports the in-slot marker its children self-gate on"
+}
+
 test_owner_exists_and_executable
 test_owner_defines_canonical_set
 test_ci_invokes_the_owner
@@ -247,3 +649,16 @@ test_rejects_wrong_shellcheck_version
 test_catches_a_real_lint_defect
 test_ignores_ambient_shellcheck_opts
 test_clean_fixture_passes
+test_cache_hit_skips_relint
+test_content_change_forces_relint
+test_sourced_lib_change_invalidates_dependent
+test_version_change_invalidates_cache
+test_version_axis_in_key
+test_cache_miss_degrades_to_full_lint
+test_findings_are_never_cached
+test_verdict_parity_serial_vs_parallel
+test_shellcheck_runs_under_nice
+test_jobs_capped_at_four
+test_full_tree_routes_through_heavy_run
+test_no_nested_heavy_run_admission
+test_heavy_run_exports_active_marker
