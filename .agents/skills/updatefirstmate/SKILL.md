@@ -1,6 +1,6 @@
 ---
 name: updatefirstmate
-description: Self-update a running firstmate and its secondmates to the latest from origin. Use when the captain invokes /updatefirstmate (e.g. "/updatefirstmate", "update firstmate", "pull the latest firstmate"). Fast-forwards this firstmate repo's default branch and every secondmate home from origin (fast-forward only, never forced, never disruptive), then re-reads AGENTS.md and nudges each updated secondmate to do the same, so the whole tree runs the latest bin/ and instructions.
+description: Self-update a running firstmate and its secondmates to the latest from origin. Use when the captain invokes /updatefirstmate (e.g. "/updatefirstmate", "update firstmate", "pull the latest firstmate"). Fast-forwards this firstmate repo's default branch and every secondmate home from origin (fast-forward only, never forced, never disruptive), then re-reads AGENTS.md and nudges each updated secondmate that has work under way to do the same, so the whole tree runs the latest bin/ and instructions; an idle secondmate is left alone and picks the new instructions up at next routed task or respawn.
 user-invocable: true
 metadata:
   internal: true
@@ -34,7 +34,8 @@ This touches only the firstmate repo and its own worktrees, never anything under
    **Read `AGENTS.md` now** (CLAUDE.md is a symlink to it) to refresh your operating instructions before doing anything else, so you are acting on the new instructions rather than the stale ones you were started with.
    When it printed `reread-firstmate: no`, nothing changed for you - skip the re-read.
 
-3. **Nudge each updated live secondmate, at most once per session.**
+3. **Nudge each updated live secondmate with work under way, at most once per session.**
+   The `nudge-secondmates:` line already excludes idle secondmates: `fm-update.sh` lists only updated live secondmates whose own home carries in-flight work (any `state/*.meta`), and prints a per-target note for the idle ones it skips - they pick the new instructions up at next routed task or respawn (lazy nudge policy, owned in `bin/fm-ff-lib.sh`).
    Pass every window on the `nudge-secondmates:` line (do nothing when it says `none`) to the nudge helper in one call:
    ```sh
    FM_HOME=<this-firstmate-home> bin/fm-update-nudge.sh <window> [<window> ...]
@@ -58,5 +59,6 @@ This touches only the firstmate repo and its own worktrees, never anything under
 - **Only the firstmate repo and its worktrees** are touched, never `projects/`.
   It is the same sanctioned self-write as the fleet sync.
 - **Secondmates are never disrupted.**
-  A secondmate gets a tracked-files fast-forward (safe while it is mid-task, since its work lives in gitignored operational dirs and separate project worktrees) plus a gentle re-read nudge.
+  A secondmate gets a tracked-files fast-forward (safe while it is mid-task, since its work lives in gitignored operational dirs and separate project worktrees) plus a gentle re-read nudge when it has work under way.
+  An idle secondmate is not even nudged: it picks the new instructions up at next routed task or respawn.
   It is never torn down, interrupted, or forced.

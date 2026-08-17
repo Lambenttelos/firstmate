@@ -11,7 +11,10 @@
 # After a successful per-home propagation that changes any allowlisted config/*
 # item, writes a generation-specific literal-content reread instruction and
 # sends its pointer to that live secondmate via fm-config-inherit-lib.sh
-# (fm_config_send_reread_nudge).
+# (fm_config_send_reread_nudge), gated on the shared lazy nudge policy: the
+# write and propagation always happen, but the pointer SEND is skipped for an
+# idle home (noted as BOOTSTRAP_INFO, durable .pending kept) and deferred until
+# it has work under way or relaunches.
 # Unchanged config and data/captain-shared.md-only updates send no reread
 # message unless a previous send failure is pending for that home.
 # Warnings-only skips exit 0; real propagation or reread-send errors exit non-zero.
@@ -181,7 +184,11 @@ while IFS='|' read -r id home _window meta; do
     FM_STATE_OVERRIDE="$STATE" \
     fm_config_send_reread_nudge "$id" "$home_real" "$report" 2>&1); then
     if [ -n "$(fm_config_reread_changed_items "$report")" ] || [ "$reread_pending" -eq 1 ]; then
-      printf '  config-reread: sent\n'
+      if printf '%s\n' "$reread_out" | grep -q '^BOOTSTRAP_INFO: skipped CONFIG_REREAD nudge'; then
+        printf '  config-reread: skipped (idle secondmate; re-reads config fresh at next routed task or respawn)\n'
+      else
+        printf '  config-reread: sent\n'
+      fi
     fi
     [ -z "$reread_out" ] || printf '%s\n' "$reread_out"
   else

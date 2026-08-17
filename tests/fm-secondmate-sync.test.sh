@@ -14,10 +14,13 @@
 #   - No origin fetch happens in the local-HEAD sync path.
 #   - The bootstrap sweep fast-forwards every live secondmate home and sends a
 #     reread nudge ONLY for a running secondmate whose instruction surface
-#     actually changed; a successful send is reported as BOOTSTRAP_INFO:, a
-#     failed send is reported as NUDGE_SECONDMATES:, an already-current or
-#     readme-only home is never nudged, a skipped home is reported as
-#     SECONDMATE_SYNC:, and a home with no live metadata is never swept.
+#     actually changed AND whose own home carries in-flight work (any
+#     state/*.meta; lazy nudge policy); a successful send is reported as
+#     BOOTSTRAP_INFO:, a failed send is reported as NUDGE_SECONDMATES:, an
+#     already-current or readme-only home is never nudged, an idle advanced
+#     home is skipped with a BOOTSTRAP_INFO: line and still fast-forwards, a
+#     skipped home is reported as SECONDMATE_SYNC:, and a home with no live
+#     metadata is never swept.
 #   - Spawning a secondmate fast-forwards its worktree to the primary's HEAD
 #     before launch, or warns and launches unchanged when the sync is skipped.
 set -u
@@ -62,9 +65,25 @@ new_world() {
   printf '%s\n' "$w"
 }
 
+# make_sm_busy <w> <id>: give a secondmate home its own in-flight crewmate meta
+# (the durable lazy-nudge busy signal: any state/*.meta in the home).
+make_sm_busy() {
+  local w=$1 id=$2
+  mkdir -p "$w/$id/state"
+  printf 'window=firstmate:fm-w\nkind=crewmate\nhome=%s/%s\n' "$w" "$id" > "$w/$id/state/w.meta"
+}
+
+# make_sm_idle <w> <id>: drop the home's in-flight crewmate meta, making it an
+# idle secondmate with no work under way.
+make_sm_idle() {
+  local w=$1 id=$2
+  rm -rf "$w/$id/state"
+}
+
 # add_sm_worktree <w> <id> <commit>: a secondmate home as a DETACHED worktree of
 # the primary at <commit>, plus its seed marker and a LIVE kind=secondmate meta
-# (a window= makes it a running direct report).
+# (a window= makes it a running direct report). The home also gets one in-flight
+# crewmate meta in its own state/ (the busy signal) so it is nudge-eligible.
 add_sm_worktree() {
   local w=$1 id=$2 commit=$3
   git -C "$w/main" worktree add -q --detach "$w/$id" "$commit"
@@ -74,6 +93,7 @@ add_sm_worktree() {
     printf 'kind=secondmate\n'
     printf 'home=%s/%s\n' "$w" "$id"
   } > "$w/home/state/$id.meta"
+  make_sm_busy "$w" "$id"
 }
 
 # bump_primary <w> <mode>: advance the PRIMARY's main branch by one local commit.
@@ -401,6 +421,102 @@ test_bootstrap_sweep_nudges_only_instruction_change() {
   pass "T8 bootstrap sweeps live homes and sends exactly one marked nudge for the instruction change"
 }
 
+# --- T8g: an idle advanced home is skipped, not nudged, and still fast-forwards --
+# The lazy nudge policy: an instruction-advanced live secondmate with no in-flight
+# work in its own home is NOT woken to re-read AGENTS.md. It is already advanced
+# on disk and picks the new instructions up at next routed task or respawn; the
+# skip is recorded as BOOTSTRAP_INFO and the send is never attempted.
+test_bootstrap_lazy_nudge_skips_idle_advanced_home() {
+  local w c1 c2 fakebin out log info_line skip_line sent
+  w=$(new_world lazy-idle-skip)
+  c1=$(head_of "$w/main")
+  add_sm_worktree "$w" sm-busy "$c1"        # instruction-advanced, busy
+  add_sm_worktree "$w" sm-idle "$c1"        # instruction-advanced, idle
+  make_sm_idle "$w" sm-idle
+  bump_primary "$w" instr
+  c2=$(head_of "$w/main")
+
+  fakebin=$(make_fake_toolchain "$w")
+  log="$w/tmux.log"
+  out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$w/home" FM_ROOT_OVERRIDE="$w/main" \
+    FM_SEND_SETTLE=0 FM_FAKE_TMUX_LOG="$log" \
+    "$ROOT/bin/fm-bootstrap.sh" 2>/dev/null)
+
+  info_line=$(printf '%s\n' "$out" | grep '^BOOTSTRAP_INFO: nudged fm-sm-busy ' || true)
+  [ -n "$info_line" ] || fail "busy instruction-advanced home was not nudged (got: $out)"
+  skip_line=$(printf '%s\n' "$out" | grep '^BOOTSTRAP_INFO: skipped AGENTS.md re-read nudge for fm-sm-idle ' || true)
+  [ -n "$skip_line" ] || fail "idle advanced home should record the skip as BOOTSTRAP_INFO (got: $out)"
+  assert_not_contains "$out" "NUDGE_SECONDMATES:" "an idle skip is not a failed send"
+  sent=$(grep -c 're-read your AGENTS.md' "$log" || true)
+  [ "$sent" -eq 1 ] || fail "expected exactly 1 nudge send (the busy home), got $sent sends"
+  # Both homes still fast-forwarded; only the busy one was woken.
+  [ "$(head_of "$w/sm-busy")" = "$c2" ] || fail "busy home not at primary HEAD"
+  [ "$(head_of "$w/sm-idle")" = "$c2" ] || fail "idle home not at primary HEAD"
+  pass "T8g idle advanced home gets no nudge, records BOOTSTRAP_INFO skip, still fast-forwards"
+}
+
+# --- T8h: a pending retry for a home that went idle is cleared, not sent -------
+# A failed nudge leaves a pending marker; if the home has gone idle by the retry,
+# waking it is exactly the waste the lazy policy forbids. The retry clears the
+# marker and records the skip: the instruction advance is satisfied by the
+# launch-time fresh read at next routed task or respawn.
+test_bootstrap_retry_clears_marker_for_idle_home() {
+  local w c1 fakebin out out2 marker skip_line
+  w=$(new_world lazy-retry-idle)
+  c1=$(head_of "$w/main")
+  add_sm_worktree "$w" sm-instr "$c1"
+  bump_primary "$w" instr
+  fakebin=$(make_fake_toolchain "$w")
+
+  out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$w/home" FM_ROOT_OVERRIDE="$w/main" \
+    FM_SEND_SETTLE=0 FM_FAKE_TMUX_FAIL_LITERAL=1 \
+    "$ROOT/bin/fm-bootstrap.sh" 2>/dev/null)
+  assert_contains "$out" "NUDGE_SECONDMATES: secondmate sm-instr: send failed:" \
+    "precondition: first nudge should fail"
+  marker="$w/home/state/.secondmate-nudge-pending/sm-instr.pending"
+  assert_present "$marker" "precondition: failed nudge should leave a retry marker"
+
+  make_sm_idle "$w" sm-instr
+
+  out2=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$w/home" FM_ROOT_OVERRIDE="$w/main" \
+    FM_SEND_SETTLE=0 "$ROOT/bin/fm-bootstrap.sh" 2>/dev/null)
+  skip_line=$(printf '%s\n' "$out2" | grep '^BOOTSTRAP_INFO: skipped AGENTS.md re-read nudge for fm-sm-instr ' || true)
+  [ -n "$skip_line" ] || fail "idle retry should record the skip as BOOTSTRAP_INFO (got: $out2)"
+  assert_not_contains "$out2" "NUDGE_SECONDMATES:" "an idle retry is not a failed send"
+  assert_absent "$marker" "idle retry should clear the satisfied pending marker"
+  pass "T8h idle retry clears the pending marker and records the skip"
+}
+
+# --- T8i: a just-respawned home reads fresh at launch and needs no nudge ------
+# Recovery respawns run the guarded pre-launch sync (bin/fm-spawn.sh), so the
+# respawned agent launches with the home already at the primary's current HEAD
+# and reads the latest instructions at launch. The next sweep therefore sees
+# "already current" and sends no re-read nudge - exactly the acceptance case
+# "respawned secondmate -> no nudge needed".
+test_bootstrap_no_nudge_for_just_respawned_home() {
+  local w c1 c2 fakebin out log sent
+  w=$(new_world lazy-respawned)
+  c1=$(head_of "$w/main")
+  bump_primary "$w" instr
+  c2=$(head_of "$w/main")
+  [ "$c1" != "$c2" ] || fail "precondition: primary must have advanced"
+  add_sm_worktree "$w" sm-respawn "$c2"      # home at primary HEAD, as spawn leaves it
+
+  fakebin=$(make_fake_toolchain "$w")
+  log="$w/tmux.log"
+  out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$w/home" FM_ROOT_OVERRIDE="$w/main" \
+    FM_SEND_SETTLE=0 FM_FAKE_TMUX_LOG="$log" \
+    "$ROOT/bin/fm-bootstrap.sh" 2>/dev/null)
+
+  assert_not_contains "$out" "BOOTSTRAP_INFO: nudged" "respawned home needs no nudge"
+  assert_not_contains "$out" "BOOTSTRAP_INFO: skipped" "respawned home is already current, not an idle skip"
+  assert_not_contains "$out" "NUDGE_SECONDMATES:" "respawned home must not surface a failed send"
+  sent=$(grep -c 're-read your AGENTS.md' "$log" || true)
+  [ "$sent" -eq 0 ] || fail "respawned home must not attempt any nudge send, got $sent"
+  [ "$(head_of "$w/sm-respawn")" = "$c2" ] || fail "respawned home moved off the primary HEAD"
+  pass "T8i a just-respawned home reads fresh at launch and needs no nudge"
+}
+
 test_bootstrap_nudge_send_uses_state_override() {
   local w c1 fakebin out log override_state marker
   w=$(new_world nudge-state-override)
@@ -581,6 +697,14 @@ case "\$cmd \$sub" in
       printf '{"result":{"agent":{"agent_status":"idle"}}}\n'
     else
       printf '{"error":{"code":"agent_not_found","message":"gone"}}\n' >&2
+    fi
+    ;;
+  "pane read")
+    # The stale pane has no agent, so the adapter's no-agent liveness probe
+    # corroborates with a pane-content read; return bare non-composer text so
+    # the verdict resolves to dead (a real husk shell) rather than unknown.
+    if [ "\$arg" = "${stale#*:}" ]; then
+      printf 'bare shell with no agent and no composer row\n'
     fi
     ;;
   "pane send-text"|"pane run"|"pane send-keys")
@@ -849,6 +973,9 @@ test_ff_inflight_feature_branch
 test_no_fetch_in_local_path
 test_sweep_nudge_requires_instruction_change
 test_bootstrap_sweep_nudges_only_instruction_change
+test_bootstrap_lazy_nudge_skips_idle_advanced_home
+test_bootstrap_retry_clears_marker_for_idle_home
+test_bootstrap_no_nudge_for_just_respawned_home
 test_bootstrap_nudge_send_uses_state_override
 test_bootstrap_nudge_retry_rejects_malformed_marker_id
 test_bootstrap_nudge_failure_records_retry_marker

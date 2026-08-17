@@ -24,6 +24,11 @@
 #
 # The re-read nudge is a gentle steer, not an interruption: the secondmate
 # already received a safe tracked-files fast-forward from fm-update.sh.
+# The lazy-nudge policy lives one layer up: fm-update.sh's nudge-secondmates:
+# line lists only secondmates whose own home carries in-flight work, so an idle
+# secondmate never appears here and this helper is not asked to wake it. This
+# script is the raw once-per-session sender for whatever windows the caller
+# passes.
 #
 # Usage:
 #   fm-update-nudge.sh <window> [<window> ...]   nudge each listed window once

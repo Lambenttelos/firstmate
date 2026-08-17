@@ -1081,6 +1081,19 @@ EOF
     return 0
   fi
   delivery_paths=$(printf '%s\n' "$delivery_paths" | LC_ALL=C sort)
+  # Lazy nudge policy (fm-ff-lib.sh's secondmate_has_inflight_work): the file
+  # writes and publication above are always kept; only the live-agent SEND is
+  # gated on in-flight work. An idle home is already converged on disk and
+  # re-reads the config fresh at next launch, so do not wake it for zero useful
+  # work: record the skip as BOOTSTRAP_INFO and leave the published instruction
+  # and its .pending marker as the durable record, delivered when the home is
+  # busy again or discarded at launch. Fail open to the send when the predicate
+  # is unavailable, because losing convergence is worse than one extra wake.
+  if type secondmate_has_inflight_work >/dev/null 2>&1 \
+    && ! secondmate_has_inflight_work "$dest_home_abs"; then
+    printf 'BOOTSTRAP_INFO: skipped CONFIG_REREAD nudge for fm-%s (idle secondmate with no work in flight; picks up new config at next routed task or respawn)\n' "$id"
+    return 0
+  fi
   while IFS= read -r instruction_path; do
     [ -n "$instruction_path" ] || continue
     if fm_config_reread_send_pointer "$id" "$instruction_path"; then

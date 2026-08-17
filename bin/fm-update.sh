@@ -24,7 +24,9 @@
 # plus a parseable summary telling the caller what to do next:
 #   - one status line per target (updated/already current/skipped)
 #   - reread-firstmate: yes|no    (did the running firstmate's instructions change)
-#   - nudge-secondmates: fm-<id>...|none   (updated live secondmates to nudge)
+#   - nudge-secondmates: fm-<id>...|none   (updated live secondmates with in-flight
+#     work, to nudge; an idle secondmate is skipped with a per-target note because
+#     it picks the new instructions up at next routed task or respawn)
 #
 # Usage: fm-update.sh [--help]
 set -eu
@@ -56,16 +58,18 @@ if [ "$FF_STATUS" = "updated" ] && [ -n "$FF_INSTR" ]; then
 fi
 
 # --- secondmates -----------------------------------------------------------
-# An updated live secondmate is nudged whenever it advanced (nudge_requires_instr
-# is "no" here): /updatefirstmate's nudge is a gentle re-read steer, kept on the
-# same condition it has always used.
+# An updated live secondmate is nudged only when it is busy (its own home has
+# in-flight state/*.meta): nudge_requires_instr is "no" here (any advance
+# counts) and nudge_skip_idle is "yes" (lazy nudge policy, fm-ff-lib.sh). An
+# idle secondmate is left undisturbed and picks the new instructions up at next
+# routed task or respawn, when the agent reads instructions fresh at launch.
 
 FF_NUDGE_WINDOWS=""
 FF_SEEN_HOMES=""
 
 # Live direct reports first: state/<id>.meta with kind=secondmate carries the
 # authoritative home= path.
-sweep_live_secondmate_metas "$STATE" origin no
+sweep_live_secondmate_metas "$STATE" origin no "$SECONDMATES_MD" yes
 
 # Registry backstop: a secondmate registered in data/secondmates.md but without
 # a live meta (e.g. between restarts) is still its persistent on-disk home.
@@ -77,7 +81,7 @@ if [ -f "$SECONDMATES_MD" ]; then
     esac
     id=$(printf '%s\n' "$line" | sed -n 's/^- \([^ ][^ ]*\) - .*/\1/p')
     home=$(printf '%s\n' "$line" | sed -n 's/.*(home:[[:space:]]*\([^;]*\);.*/\1/p' | sed 's/[[:space:]]*$//')
-    process_secondmate "$id" "$home" "" origin no
+    process_secondmate "$id" "$home" "" origin no yes
   done < "$SECONDMATES_MD"
 fi
 

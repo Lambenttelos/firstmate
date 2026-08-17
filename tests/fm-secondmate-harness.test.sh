@@ -24,7 +24,12 @@
 #      config under an already-running home, a literal-content reread instruction
 #      is written to the secondmate home and only its pointer is sent via the
 #      routed secondmate path (exact destination bytes, no summaries); unchanged
-#      config sends nothing unless a previous send failure is pending.
+#      config sends nothing unless a previous send failure is pending. The pointer
+#      SEND follows the same lazy nudge policy as the AGENTS.md re-read: only a
+#      home with in-flight work in its own state/ is woken, the file write and
+#      publication always happen, an idle home is skipped with a BOOTSTRAP_INFO:
+#      note and its .pending instruction stays as the durable record, and a
+#      respawned home needs no nudge at all (fresh config read at launch).
 
 #   C) Model/effort pin. config/secondmate-harness may carry optional model and
 #      effort tokens after the harness ("<harness> [<model>] [<effort>]"), read by
@@ -796,7 +801,9 @@ new_world() {
 }
 
 # A live secondmate home as a DETACHED worktree of the primary at <commit>, with
-# its seed marker and a live kind=secondmate meta.
+# its seed marker and a live kind=secondmate meta. The home also gets one
+# in-flight crewmate meta in its own state/ (the lazy-nudge busy signal) so it
+# is nudge-eligible by default; an idle variant removes that state dir.
 add_sm_worktree() {
   local w=$1 id=$2 commit=$3
   git -C "$w/main" worktree add -q --detach "$w/$id" "$commit"
@@ -806,6 +813,22 @@ add_sm_worktree() {
     printf 'kind=secondmate\n'
     printf 'home=%s/%s\n' "$w" "$id"
   } > "$w/home/state/$id.meta"
+  make_sm_busy "$w" "$id"
+}
+
+# make_sm_busy <w> <id>: give a secondmate home its own in-flight crewmate meta
+# (the durable lazy-nudge busy signal: any state/*.meta in the home).
+make_sm_busy() {
+  local w=$1 id=$2
+  mkdir -p "$w/$id/state"
+  printf 'window=firstmate:fm-w\nkind=crewmate\nhome=%s/%s\n' "$w" "$id" > "$w/$id/state/w.meta"
+}
+
+# make_sm_idle <w> <id>: drop the home's in-flight crewmate meta, making it an
+# idle secondmate with no work under way.
+make_sm_idle() {
+  local w=$1 id=$2
+  rm -rf "$w/$id/state"
 }
 
 make_fake_toolchain() {
@@ -1845,6 +1868,7 @@ test_config_reread_stops_after_failed_generation() {
   local w fakebin state_real old new report log out status
   w=$(new_world config-reread-order)
   mkdir -p "$w/sm/state"
+  printf 'window=firstmate:fm-w\nkind=crewmate\nhome=%s/sm\n' "$w" > "$w/sm/state/w.meta"
   state_real=$(cd "$w/sm/state" && pwd -P)
   old="$state_real/.fm-inherited-config-reread.0000-fail"
   new="$state_real/.fm-inherited-config-reread.0001-new"
@@ -2004,6 +2028,73 @@ test_config_reread_bootstrap_path_and_spawn_flexibility() {
   assert_contains "$launch" "pi" \
     "explicit --harness pi must still win over configured codex defaults"
   pass "B18 bootstrap config reread path works; spawn flexibility remains defaults-only"
+}
+
+test_config_push_lazy_reread_skips_idle_home() {
+  local w head log out out2 err status instr pointer
+  w=$(new_world config-push-lazy-idle)
+  head=$(git -C "$w/main" rev-parse HEAD)
+  add_sm_worktree "$w" sm "$head"
+  make_sm_idle "$w" sm
+  mkdir -p "$w/sm/config"
+  printf 'old\n' > "$w/sm/config/crew-harness"
+  printf 'codex\n' > "$w/home/config/crew-harness"
+
+  # Idle push: propagation, instruction write, and publication all happen; only
+  # the live-agent pointer SEND is skipped, noted as BOOTSTRAP_INFO, and the
+  # published .pending instruction stays as the durable record.
+  log="$w/config-push-lazy-idle.tmux.log"
+  err="$w/config-push-lazy-idle.err"
+  out=$(run_config_push "$w" "$log" 2>"$err"); status=$?
+  expect_code 0 "$status" "idle-skip config push should succeed"
+  [ "$(cat "$w/sm/config/crew-harness")" = codex ] || fail "idle push did not propagate the config"
+  instr=$(reread_instruction_path "$w/sm") || fail "idle push did not write the reread instruction"
+  assert_present "$instr" "idle push should still write the instruction file"
+  assert_present "$(reread_pending_path "$w/sm")" \
+    "idle push should keep the published instruction pending as the durable record"
+  assert_contains "$out" "config-reread: skipped (idle secondmate" \
+    "config-push should report the idle skip, not a send"
+  assert_contains "$out" "BOOTSTRAP_INFO: skipped CONFIG_REREAD nudge for fm-sm " \
+    "idle skip should be noted as BOOTSTRAP_INFO"
+  assert_not_contains "$out" "config-reread: sent" "idle push must not claim a send"
+  assert_not_contains "$out" "config-reread: send failed" "idle skip is not a failure"
+  [ ! -s "$log" ] || fail "idle push must not wake the secondmate: $(cat "$log")"
+
+  # The home gets work: a busy unchanged push delivers the pending pointer.
+  make_sm_busy "$w" sm
+  : > "$log"
+  out2=$(run_config_push "$w" "$log" 2>"$err"); status=$?
+  expect_code 0 "$status" "busy unchanged push should succeed"
+  assert_contains "$out2" "config-reread: sent" \
+    "busy push should deliver the pending instruction"
+  pointer="CONFIG_REREAD: $instr"
+  assert_contains "$(cat "$log")" "$pointer" \
+    "busy push should send the durable pointer"
+  assert_no_reread_pending "$w/sm"
+  pass "B22 config-reread send is lazy: idle home keeps write+publication and skips the send; busy home gets the pending pointer"
+}
+
+test_bootstrap_lazy_config_reread_skips_idle_home() {
+  local w head log out instr skip_line
+  w=$(new_world bootstrap-lazy-config-idle)
+  head=$(git -C "$w/main" rev-parse HEAD)
+  add_sm_worktree "$w" sm "$head"
+  make_sm_idle "$w" sm
+  mkdir -p "$w/sm/config"
+  printf 'old\n' > "$w/sm/config/crew-harness"
+  printf 'codex\n' > "$w/home/config/crew-harness"
+  log="$w/bootstrap-lazy-config-idle.tmux.log"
+
+  out=$(run_bootstrap "$w" "$log")
+  [ "$(cat "$w/sm/config/crew-harness")" = codex ] \
+    || fail "bootstrap did not propagate config to the idle home"
+  instr=$(reread_instruction_path "$w/sm") || fail "bootstrap did not write the reread instruction"
+  assert_present "$instr" "bootstrap should still write the instruction file for an idle home"
+  skip_line=$(printf '%s\n' "$out" | grep '^BOOTSTRAP_INFO: skipped CONFIG_REREAD nudge for fm-sm ' || true)
+  [ -n "$skip_line" ] || fail "bootstrap should note the idle config-reread skip as BOOTSTRAP_INFO (got: $out)"
+  assert_not_contains "$(cat "$log")" "CONFIG_REREAD:" \
+    "bootstrap must not send the pointer to an idle home"
+  pass "B23 bootstrap config reread is lazy for an idle home: write kept, send skipped and noted"
 }
 
 test_bootstrap_respawns_before_config_reread() {
@@ -2169,6 +2260,8 @@ test_config_reread_cleanup_runs_after_mixed_delivery_failure
 test_config_reread_stops_after_failed_generation
 test_config_reread_skips_when_unchanged_and_reads_after_push
 test_config_reread_bootstrap_path_and_spawn_flexibility
+test_config_push_lazy_reread_skips_idle_home
+test_bootstrap_lazy_config_reread_skips_idle_home
 test_bootstrap_respawns_before_config_reread
 test_spawn_quarantines_pending_rereads_on_cleanup_failure
 test_bootstrap_detect_only_does_not_create_state
