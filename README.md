@@ -216,10 +216,7 @@ Firstmate's skills live in two separate places with different audiences:
 
 ## Fork improvements
 
-This repository is a fork with substantial additions over its upstreams.
-The two forks below carry the bulk of that work.
-
-### firstmate ([yjuyjuy/firstmate](https://github.com/yjuyjuy/firstmate), upstream [kunchenguid/firstmate](https://github.com/kunchenguid/firstmate))
+This fork of [kunchenguid/firstmate](https://github.com/kunchenguid/firstmate) carries the following improvements.
 
 - Verified jcode as a first-class primary harness, crewmate, and secondmate adapter, including a bounded-checkpoint supervision protocol and an async background-notify wake path.
 - Added daemon-free away mode: paneless pull delivery of escalations, a resilient inbox reader that self-heals, an autonomous queue driver, and persist-across-session-turnover intent.
@@ -234,15 +231,7 @@ The two forks below carry the bulk of that work.
 - Added per-secondmate harness, model, and effort pins, a crewmate dispatch-profile selector, and a decision-desk value ledger.
 - Added the caveman ultra prose rule as a structural fleet rule and baked the standing captain rules into every generated brief.
 
-### jcode ([yjuyjuy/jcode](https://github.com/yjuyjuy/jcode), upstream [1jehuang/jcode](https://github.com/1jehuang/jcode))
-
-- Added automatic account switching: cswap-aligned startup selection and reactive 429 failover with no model downgrade, plus opt-in ranked-priority account selection and poll-driven re-evaluation between turns.
-- Added an agent-callable compact_context tool so a session can reclaim its own context window mid-task.
-- Added a live-session account-switch control surface (ADR 0031 Phase 1) and surfaced which Claude credential source is actually active.
-- Converged Anthropic and OpenAI usage on a shared account-labeled cache key so /usage stops self-storming 429s.
-- Queued skill invocations and user submissions mid-turn instead of rejecting them, with an opt-in one-per-turn queue drain and submission-nonce dedup.
-- Fixed ScheduleWakeup OAuth schema and account-balancing bugs, stopped blocking Opus for Claude Pro OAuth accounts, and surfaced memory-extraction outages instead of failing silently.
-- Kept the fork synced with upstream and its CI green.
+For the jcode fork's own improvements, see the [yjuyjuy/jcode README](https://github.com/yjuyjuy/jcode).
 
 ## Contributing
 
