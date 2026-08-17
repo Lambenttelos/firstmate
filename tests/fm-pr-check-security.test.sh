@@ -427,14 +427,42 @@ https://bitbucket.org/dashnow/hyfin/pull-requests/1|dashnow|hyfin|1
 https://bitbucket.org/dashnow/hyfin-server/pull-requests/42|dashnow|hyfin-server|42
 https://bitbucket.org/team_ws/repo.name-2/pull-requests/123456|team_ws|repo.name-2|123456
 EOF
+  # Bitbucket's web UI appends a source-branch title slug to a copied PR URL and
+  # serves per-PR tabs, a bare trailing slash, and optional query or fragment.
+  # Every such browser variant of one PR must parse and canonicalize back to the
+  # bare .../pull-requests/<number> record, so a torn-down Bitbucket PR merges
+  # through --orphan from whatever URL the operator pasted.
+  while IFS='|' read -r url canon workspace repo number; do
+    [ -n "$url" ] || continue
+    fm_pr_url_parse "$url" || fail "parser rejected a browser-variant Bitbucket PR URL: $url"
+    [ "$FM_PR_PROVIDER" = bitbucket ] || fail "parser did not tag a variant Bitbucket PR URL as bitbucket: $url"
+    [ "$FM_PR_URL" = "$canon" ] || fail "parser did not canonicalize a variant Bitbucket PR URL: $url -> $FM_PR_URL"
+    [ "$FM_PR_HOST" = bitbucket.org ] || fail "parser returned wrong Bitbucket host for a variant URL: $url"
+    [ "$FM_PR_PATH" = "$workspace/$repo" ] || fail "parser returned wrong Bitbucket path for a variant URL: $url"
+    [ "$FM_PR_WORKSPACE" = "$workspace" ] || fail "parser returned wrong Bitbucket workspace for a variant URL: $url"
+    [ "$FM_PR_REPO" = "$repo" ] || fail "parser returned wrong Bitbucket repository for a variant URL: $url"
+    [ "$FM_PR_NUMBER" = "$number" ] || fail "parser returned wrong Bitbucket PR number for a variant URL: $url"
+    [ -z "$FM_PR_OWNER" ] || fail "parser set GitHub owner for a variant Bitbucket PR URL: $url"
+  done <<'EOF'
+https://bitbucket.org/dashnow/hyfin/pull-requests/3615/|https://bitbucket.org/dashnow/hyfin/pull-requests/3615|dashnow|hyfin|3615
+https://bitbucket.org/dashnow/hyfin/pull-requests/3615/some-branch-title|https://bitbucket.org/dashnow/hyfin/pull-requests/3615|dashnow|hyfin|3615
+https://bitbucket.org/dashnow/hyfin/pull-requests/3615/diff|https://bitbucket.org/dashnow/hyfin/pull-requests/3615|dashnow|hyfin|3615
+https://bitbucket.org/dashnow/hyfin/pull-requests/3615/commits|https://bitbucket.org/dashnow/hyfin/pull-requests/3615|dashnow|hyfin|3615
+https://bitbucket.org/dashnow/hyfin/pull-requests/3615?w=1|https://bitbucket.org/dashnow/hyfin/pull-requests/3615|dashnow|hyfin|3615
+https://bitbucket.org/dashnow/hyfin/pull-requests/3615#comment-1|https://bitbucket.org/dashnow/hyfin/pull-requests/3615|dashnow|hyfin|3615
+EOF
   for row in \
     'https://bitbucket.org/dashnow/hyfin/pull-requests/0' \
     'https://bitbucket.org/dashnow/hyfin/pull-requests/01' \
     'https://bitbucket.org/dashnow/hyfin/pull/1' \
-    'https://bitbucket.org/dashnow/hyfin/pull-requests/1/' \
     'https://bitbucket.org/dashnow/../pull-requests/1' \
     'https://bitbucket.org/dashnow/hyfin/extra/pull-requests/1' \
     'https://bitbucket.org/dashnow/pull-requests/1' \
+    'https://bitbucket.org/dashnow/hyfin/pull-requests/1x' \
+    'https://bitbucket.org/dashnow/hyfin/pull-requests/1/x y' \
+    $'https://bitbucket.org/dashnow/hyfin/pull-requests/1\t' \
+    $'https://bitbucket.org/dashnow/hyfin/pull-requests/1/x\r' \
+    $'https://bitbucket.org/dashnow/hyfin/pull-requests/1/x\nnext' \
     'http://bitbucket.org/dashnow/hyfin/pull-requests/1'; do
     ! fm_pr_url_parse "$row" || fail "parser accepted an invalid Bitbucket URL: $row"
   done

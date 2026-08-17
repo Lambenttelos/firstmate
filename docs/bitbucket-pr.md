@@ -29,6 +29,8 @@ A Bitbucket pull request URL lives on the web host `bitbucket.org`:
 https://bitbucket.org/{workspace}/{repository}/pull-requests/{number}
 ```
 
+`fm_pr_url_parse` (`bin/fm-pr-lib.sh`) also accepts the browser-copied variants Bitbucket's web UI produces - a trailing branch-title slug, per-PR tabs (`/diff`, `/commits`, ...), a bare trailing slash, or a query/fragment - and canonicalizes them back to this bare form before storing, so every variant of one PR resolves to the same stored record.
+
 The REST API lives on a different host, `api.bitbucket.org` by default.
 The provider-tagged PR identity (`provider`, `url`, `host`, `path`, `number`) stores only the web host and the two-segment `workspace/repository` path, exactly like GitHub's `owner/repository`.
 The API host is resolved at call time from `NO_MISTAKES_BITBUCKET_API_BASE_URL` and never stored in that identity, so a doctored record cannot redirect a call at another host.

@@ -190,7 +190,22 @@ fm_pr_url_parse() {
   # object path is workspace/repository/pull-requests/<number>. Both slugs are
   # validated, and the stored URL must be exactly reconstructible from them so a
   # doctored record cannot redirect a poll or merge at another repository.
-  pattern='^https://bitbucket\.org/([A-Za-z0-9._-]{1,100})/([A-Za-z0-9._-]{1,100})/pull-requests/([1-9][0-9]*)$'
+  #
+  # Bitbucket's own web UI appends the source branch title slug to a copied PR
+  # URL (workspace/repository/pull-requests/<number>/<branch-title>) and also
+  # serves per-PR tabs (.../<number>/diff, /commits, /activity), a bare trailing
+  # slash, and optional query or fragment. The workspace, repository, and number
+  # are fully captured by their own strict classes and the literal
+  # "/pull-requests/" before any tail, so an optional tail cannot alter the
+  # identity. The tail is [/?#] followed only by printable non-space ASCII
+  # ([!-~], which excludes the space, DEL, and every control byte), so an
+  # embedded newline or other control byte is still refused exactly as the
+  # GitHub and GitLab patterns refuse it. It is matched and then dropped:
+  # FM_PR_URL is rebuilt as the canonical .../pull-requests/<number> form,
+  # giving the same one canonical spelling per PR the rest of this file relies
+  # on, so every browser variant of one PR reconstructs to the identical stored
+  # record.
+  pattern='^https://bitbucket\.org/([A-Za-z0-9._-]{1,100})/([A-Za-z0-9._-]{1,100})/pull-requests/([1-9][0-9]*)([/?#][!-~]*)?$'
   if [[ "$raw" =~ $pattern ]]; then
     workspace=${BASH_REMATCH[1]}
     repo=${BASH_REMATCH[2]}
@@ -200,7 +215,7 @@ fm_pr_url_parse() {
     fm_pr_bitbucket_slug_valid "$workspace" || return 1
     fm_pr_bitbucket_slug_valid "$repo" || return 1
     FM_PR_PROVIDER=bitbucket
-    FM_PR_URL=$raw
+    FM_PR_URL="https://bitbucket.org/$workspace/$repo/pull-requests/$number"
     FM_PR_HOST=bitbucket.org
     FM_PR_PATH="$workspace/$repo"
     # Consumed by bin/fm-bitbucket-lib.sh, which addresses Bitbucket by
