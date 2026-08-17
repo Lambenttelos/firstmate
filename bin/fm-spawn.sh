@@ -191,6 +191,8 @@ SUB_HOME_MARKER=".fm-secondmate-home"
 . "$SCRIPT_DIR/fm-pr-lib.sh"
 # shellcheck source=bin/fm-completions-lib.sh
 . "$SCRIPT_DIR/fm-completions-lib.sh"
+# shellcheck source=bin/fm-token-sessions-lib.sh
+. "$SCRIPT_DIR/fm-token-sessions-lib.sh"
 # Fail closed before any fleet mutation: a no-mistakes gate agent must never spawn
 # a direct report (see bin/fm-gate-refuse-lib.sh).
 fm_refuse_if_gate_agent
@@ -1759,6 +1761,11 @@ for kv in "${ENV_OVERRIDES[@]+"${ENV_OVERRIDES[@]}"}"; do
   sleep 0.1
 done
 sleep 0.3
+# Token-session capture anchor: the crew's harness session is created at launch,
+# so its created_at is at or after THIS instant. Captured as late as possible
+# (right before the launch) so an older session that reused this pooled worktree
+# has an earlier created_at and is excluded by the >= floor in the resolver.
+SPAWN_TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 spawn_send_literal "$T" "$LAUNCH"
 sleep 0.3
 if [ "${HERDR_PROJECTED:-0}" -eq 1 ]; then
@@ -1786,6 +1793,26 @@ if [ "$HARNESS" = jcode ]; then
   esac
   jcode_post_launch_delivery "$T" "$BRIEF" "${MODEL:-}" "${EFFORT:-}" "${SPAWN_ACCOUNT:-}" || true
 fi
+
+# Token-session capture (best-effort telemetry, NEVER a spawn blocker). Now that
+# the agent is launched and its session exists, resolve the crew's harness
+# session id (working_dir == the leased worktree, created_at >= SPAWN_TS, newest
+# wins) and (a) append one durable ledger row and (b) stamp session_id= into the
+# meta. This runs on EVERY spawn, so a relaunch/recovery spawn for the same
+# ticket id lands as an ADDITIONAL ledger row (many-rows-per-id). A resolve that
+# returns empty (no matching session, or a harness whose session store we cannot
+# read) writes NOTHING - no bogus ledger row, no session_id in meta - and never
+# fails the spawn. Only jcode's store is readable today; every other harness
+# resolves empty and is skipped, not guessed.
+if [ "$HARNESS" = jcode ]; then
+  CREW_SESSION_ID=$(fm_resolve_crew_session_id "$WT" "$SPAWN_TS" 2>/dev/null || true)
+  if [ -n "$CREW_SESSION_ID" ]; then
+    if fm_token_sessions_record "$DATA" "$ID" "$CREW_SESSION_ID" "$WT" "$SPAWN_TS" "$HARNESS" 2>/dev/null; then
+      echo "session_id=$CREW_SESSION_ID" >> "$STATE/$ID.meta"
+    fi
+  fi
+fi
+
 if [ "$KIND" = secondmate ]; then
   if ! fm_config_reread_discard_pending "$PROJ_ABS" "$ID" "$FM_HOME"; then
     if fm_config_reread_quarantine_pending "$PROJ_ABS" "$ID" "$FM_HOME"; then
