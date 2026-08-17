@@ -214,6 +214,36 @@ Firstmate's skills live in two separate places with different audiences:
 - [`AGENTS.md`](AGENTS.md) - the distro's always-loaded operating contract and routing index for conditional procedures.
 - [CONTRIBUTING.md](CONTRIBUTING.md) - how to contribute, including the dev/test commands.
 
+## Fork improvements
+
+This repository is a fork with substantial additions over its upstreams.
+The two forks below carry the bulk of that work.
+
+### firstmate ([yjuyjuy/firstmate](https://github.com/yjuyjuy/firstmate), upstream [kunchenguid/firstmate](https://github.com/kunchenguid/firstmate))
+
+- Verified jcode as a first-class primary harness, crewmate, and secondmate adapter, including a bounded-checkpoint supervision protocol and an async background-notify wake path.
+- Added daemon-free away mode: paneless pull delivery of escalations, a resilient inbox reader that self-heals, an autonomous queue driver, and persist-across-session-turnover intent.
+- Made teardown release a worktree as soon as its branch is pushed to origin, backed by a durable merge queue of pushed-but-unmerged ship branches and merge-workers-on-demand.
+- Fixed the teardown reachability check so commit containment in a surviving default branch counts as landed rather than blocking cleanup.
+- Added host resource monitoring (CPU, memory, swap) wired into spawn, the watcher, and session start, plus a fleet memory-attribution report and a language-server reclaim tool.
+- Serialized the fleet's heavy runs (test suites, lint, builds) behind a configurable host-global ceiling.
+- Added an external liveness watchdog that re-wakes a dead primary and writes a durable escalation when work is in flight.
+- Added the captain's desk and backlog LAN views, batched drain-and-arm wake handling, an opt-in present-mode supervision daemon, and present-daemon stale-target fixes.
+- Added the direct-push delivery mode for non-PR forges, the +autoland flag for structural green-branch landing, and Bitbucket and GitLab pull/merge request support.
+- Classified auth, quota, and token-exhaustion stalls as blocked rather than paused, and added per-pane 429 anomaly detection ahead of a worker surfacing its own block.
+- Added per-secondmate harness, model, and effort pins, a crewmate dispatch-profile selector, and a decision-desk value ledger.
+- Added the caveman ultra prose rule as a structural fleet rule and baked the standing captain rules into every generated brief.
+
+### jcode ([yjuyjuy/jcode](https://github.com/yjuyjuy/jcode), upstream [1jehuang/jcode](https://github.com/1jehuang/jcode))
+
+- Added automatic account switching: cswap-aligned startup selection and reactive 429 failover with no model downgrade, plus opt-in ranked-priority account selection and poll-driven re-evaluation between turns.
+- Added an agent-callable compact_context tool so a session can reclaim its own context window mid-task.
+- Added a live-session account-switch control surface (ADR 0031 Phase 1) and surfaced which Claude credential source is actually active.
+- Converged Anthropic and OpenAI usage on a shared account-labeled cache key so /usage stops self-storming 429s.
+- Queued skill invocations and user submissions mid-turn instead of rejecting them, with an opt-in one-per-turn queue drain and submission-nonce dedup.
+- Fixed ScheduleWakeup OAuth schema and account-balancing bugs, stopped blocking Opus for Claude Pro OAuth accounts, and surfaced memory-extraction outages instead of failing silently.
+- Kept the fork synced with upstream and its CI green.
+
 ## Contributing
 
 Contributions are welcome - see [CONTRIBUTING.md](CONTRIBUTING.md) for the workflow, repo conventions, and how to run the tests.
