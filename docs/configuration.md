@@ -340,8 +340,19 @@ For Pi secondmate launches, `fm-spawn.sh` starts Pi with `-e` pointed at the sec
 The first non-empty, non-comment line is parsed; an absent file, a non-integer, or a non-positive value falls back to the default `200000`, so a typo never silently disables the safety net.
 `200000` is the point a 200k-window model reaches auto-compact; raise the knob for a larger-window model.
 This is the primary's monitoring knob and is not inherited into secondmate homes, because secondmates do not spawn secondmates and so have nothing downstream that reads it.
-The primary's watcher reads each live secondmate's usage on its slow-poll cadence (claude only; every other harness reads unknown and is skipped) and wakes firstmate once when the count first crosses the threshold.
+The primary's watcher reads each live secondmate's usage on its slow-poll cadence (claude only; every other harness reads unknown and is skipped) and acts once when the count first crosses the threshold, either by waking firstmate to run the handoff by hand or, when automatic handoff is enabled below, by handing off automatically.
 The read mechanism and the evidence behind the claude-only support live in [`docs/secondmate-context-handoff.md`](secondmate-context-handoff.md); the handoff procedure lives in the `secondmate-provisioning` skill; exact flags and paths live in the headers and `--help` of [`bin/fm-secondmate-context.sh`](../bin/fm-secondmate-context.sh) and [`bin/fm-secondmate-handoff.sh`](../bin/fm-secondmate-handoff.sh).
+
+## Automatic secondmate context handoff (config/secondmate-auto-handoff)
+
+`config/secondmate-auto-handoff` is an optional local, gitignored presence flag that opts this home into AUTOMATIC secondmate context handoff.
+It is opt-in and fails closed by default: when the file is absent a threshold crossing only wakes the primary to run `bin/fm-secondmate-handoff.sh <id>` by hand, exactly as before.
+When the file is present the watcher hands the crossed secondmate off automatically, with no primary wake needed to start it.
+Presence is consent: an empty or comment-only file enables the feature; a file whose first non-empty, non-comment line is `off` force-disables it, so a mistakenly created flag can be neutralized without deleting it.
+This is the primary's monitoring knob and is not inherited into secondmate homes, because secondmates do not spawn secondmates.
+The default is fail-closed (escalate-only) rather than on-by-default deliberately: an automatic handoff replaces a live agent, so the captain enables it only after deciding this home should self-heal a context-full secondmate unattended.
+Automatic handoff never widens any other authority: it hands off only an idle secondmate (never mid-turn), runs the same fail-closed, idempotent, work-preserving `bin/fm-secondmate-handoff.sh` sequence, respawns only through the guarded `bin/fm-spawn.sh <id> --secondmate` path, and always tells the primary after the fact.
+The mechanism and its safety invariants live in [`docs/secondmate-context-handoff.md`](secondmate-context-handoff.md); exact flags, env, and the notification wording live in the header of [`bin/fm-secondmate-auto-handoff.sh`](../bin/fm-secondmate-auto-handoff.sh); the procedure lives in the `secondmate-provisioning` skill.
 
 ## Firstmate own-context stow threshold (config/context-stow-threshold)
 

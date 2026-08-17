@@ -292,6 +292,33 @@ test_context_stow_directive_is_self_executing() {
   pass "shared directive is self-executing (stow -> compact -> re-arm) and keeps its key substrings"
 }
 
+test_auto_handoff_flag_opt_in_and_fail_closed() {
+  local cfg
+  cfg="$TMP_ROOT/auto-cfg"; mkdir -p "$cfg"
+  # Absent flag = disabled (fail-closed default, today's escalate-only behavior).
+  fm_sm_auto_handoff_enabled "$cfg" && fail "absent config/secondmate-auto-handoff must be DISABLED (return 1)"
+  # Present-empty = enabled (presence is consent).
+  : > "$cfg/secondmate-auto-handoff"
+  fm_sm_auto_handoff_enabled "$cfg" || fail "present-empty flag must be ENABLED"
+  # Comment-only = enabled (presence is consent).
+  printf '# just a note\n' > "$cfg/secondmate-auto-handoff"
+  fm_sm_auto_handoff_enabled "$cfg" || fail "comment-only flag must be ENABLED (presence is consent)"
+  # First non-empty line "off" = force-disabled.
+  printf 'off\n' > "$cfg/secondmate-auto-handoff"
+  fm_sm_auto_handoff_enabled "$cfg" && fail "an 'off' flag must be DISABLED"
+  # Any other content = enabled.
+  printf 'on\n' > "$cfg/secondmate-auto-handoff"
+  fm_sm_auto_handoff_enabled "$cfg" || fail "a non-off content flag must be ENABLED"
+  pass "auto-handoff flag is opt-in, fail-closed by default, and 'off' force-disables"
+}
+
+test_marker_key_transform() {
+  local k
+  k=$(fm_sm_context_marker_key 'sess:win.2/p3')
+  [ "$k" = 'sess_win_2_p3' ] || fail "marker key must map :/. to _, got: $k"
+  pass "marker-key transform maps ':' '/' '.' to '_'"
+}
+
 test_threshold_default_and_config
 test_munge_matches_claude
 test_claude_read_sums_last_mainthread_usage
@@ -306,5 +333,7 @@ test_jcode_fails_closed
 test_context_stow_threshold_default_and_config
 test_context_stow_should_nudge_state_machine
 test_context_stow_directive_is_self_executing
+test_auto_handoff_flag_opt_in_and_fail_closed
+test_marker_key_transform
 
 echo "# all fm-secondmate-context tests passed"

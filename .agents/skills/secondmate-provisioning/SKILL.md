@@ -167,6 +167,20 @@ It orchestrates, idempotently and failing closed: it resolves the secondmate fro
 Inspect a planned handoff first with `bin/fm-secondmate-context.sh <id>` (a read-only usage report) or `FM_SM_HANDOFF_DRY_RUN=1`.
 The respawn preserves the home's backlog, projects, and in-flight crew exactly as the recovery path below does; a context handoff never tears down or discards unlanded work, and never uses `--force` teardown.
 
+### Automatic handoff (opt-in)
+
+A home can opt into automatic handoff by creating the presence flag `config/secondmate-auto-handoff` (schema in `docs/configuration.md`).
+It is off by default and fails closed: without the flag the crossing only wakes firstmate with `check: secondmate-context <id>` as above, and you run the handoff by hand.
+With the flag, the watcher itself hands off an idle crossed secondmate through `bin/fm-secondmate-auto-handoff.sh <id>` (launched detached so it never stalls supervision), with no primary wake to start it.
+You do not run anything to start an automatic handoff; instead you handle its after-the-fact notification when supervision surfaces it:
+
+- `check: secondmate-handoff <id>`: an automatic handoff completed and a fresh agent replaced the context-full one.
+  This is an FYI - confirm the fresh secondmate is up (`bin/fm-crew-state.sh` / your normal liveness read) and carry on.
+- `check: secondmate-handoff-failed <id>`: the automatic handoff failed and fell back to escalate-only.
+  Run `bin/fm-secondmate-handoff.sh <id>` by hand and investigate the failure, exactly as the manual path above.
+
+The automatic path runs the same `bin/fm-secondmate-handoff.sh` sequence with the same safety invariants (idle-only, work-preserving, guarded respawn); the mechanism and its invariants live in `docs/secondmate-context-handoff.md`.
+
 ## Recovery
 
 For `kind=secondmate` meta with no window, treat the secondmate as a dead persistent direct report and respawn it with:
