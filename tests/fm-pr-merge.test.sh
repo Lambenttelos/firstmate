@@ -541,6 +541,41 @@ test_orphan_bitbucket_merges_and_records_evidence() {
   pass "fm-pr-merge --orphan merges a Bitbucket PR and records evidence with no task meta"
 }
 
+test_orphan_bitbucket_browser_variant_url_merges() {
+  if ! command -v jq >/dev/null 2>&1; then
+    pass "fm-pr-merge --orphan Bitbucket browser-variant path skipped: jq not installed on this host"
+    return
+  fi
+  local case_dir rc
+  case_dir="$TMP_ROOT/orphan-bitbucket-variant"
+  mkdir -p "$case_dir/fakebin"
+  add_bitbucket_curl_mock "$case_dir"
+  : > "$case_dir/bb.log"
+
+  # A Bitbucket PR URL copied from the web UI carries the source-branch title
+  # slug after the number. Before the fix this was rejected at the parse gate
+  # with the generic "invalid PR merge request", so a torn-down Bitbucket PR
+  # could not land through --orphan. The repository argument still equals the
+  # URL's own workspace/repository, and the canonical PR URL is recorded to the
+  # orphan-merge log regardless of the pasted tail.
+  set +e
+  run_pr_merge_orphan_bitbucket "$case_dir" --orphan dashnow/hyfin \
+    https://bitbucket.org/dashnow/hyfin/pull-requests/3615/fix-dual-pricing-branch \
+    > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 0 "$rc" "orphan-bitbucket-variant: fm-pr-merge --orphan should merge a browser-variant Bitbucket PR URL"
+  assert_no_grep 'invalid PR merge request' "$case_dir/stderr" \
+    "orphan-bitbucket-variant: a browser-variant Bitbucket URL was rejected with the generic parse error"
+  grep -qxF 'POST https://api.bitbucket.org/2.0/repositories/dashnow/hyfin/pullrequests/3615/merge' "$case_dir/bb.log" \
+    || fail "orphan-bitbucket-variant: the Bitbucket merge endpoint was not hit: $(cat "$case_dir/bb.log")"
+  assert_grep 'orphan-merge	dashnow/hyfin	https://bitbucket.org/dashnow/hyfin/pull-requests/3615' \
+    "$case_dir/data/orphan-merges.log" \
+    "orphan-bitbucket-variant: the canonical Bitbucket PR URL was not recorded to data/orphan-merges.log"
+  pass "fm-pr-merge --orphan merges a browser-variant Bitbucket PR URL and records the canonical URL"
+}
+
 test_orphan_bitbucket_repo_mismatch_refuses() {
   local case_dir rc
   case_dir="$TMP_ROOT/orphan-bitbucket-mismatch"
@@ -608,5 +643,6 @@ test_orphan_repo_mismatch_refuses
 test_orphan_repo_override_args_refuse
 test_orphan_malformed_url_refuses
 test_orphan_bitbucket_merges_and_records_evidence
+test_orphan_bitbucket_browser_variant_url_merges
 test_orphan_bitbucket_repo_mismatch_refuses
 test_orphan_gitlab_parsed_but_not_supported
