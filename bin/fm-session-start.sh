@@ -121,6 +121,8 @@ PRIMARY_HARNESS=$("$SCRIPT_DIR/fm-harness.sh" 2>/dev/null || printf unknown)
 . "$SCRIPT_DIR/fm-afk-daemon-lib.sh"
 # shellcheck source=bin/fm-hourly-lib.sh
 . "$SCRIPT_DIR/fm-hourly-lib.sh"
+# shellcheck source=bin/fm-token-sessions-lib.sh
+. "$SCRIPT_DIR/fm-token-sessions-lib.sh"
 
 STATUS_TAIL=${FM_SESSION_START_STATUS_TAIL:-5}
 case "$STATUS_TAIL" in ''|*[!0-9]*) STATUS_TAIL=5 ;; esac
@@ -592,6 +594,33 @@ else
   else
     printf '(predecessor closed cleanly - nothing to backfill)\n'
   fi
+fi
+
+# --- 3d. own-session token sentinel -------------------------------------
+# Capture firstmate's OWN harness session id into the durable token-session
+# ledger under the sentinel id __firstmate__, so this home's cross-ticket
+# supervision tokens attribute to the home, not lost and not force-fit to any one
+# ticket. FM_ROOT is firstmate's own working_dir (the primary checkout), and the
+# session started at or before now, so pass no floor (empty spawn_ts) and let the
+# newest session in that working_dir win. Mutating, so it is skipped on the
+# read-only path. FAIL-CLOSED and best-effort: an unresolvable id (a harness
+# whose store we cannot read, or no matching session) skips silently and never
+# blocks the session. The ledger dedupes by (id, session_id), so re-running the
+# same session start is a no-op while a genuinely new session appends a new row.
+subsection "TOKEN SESSION"
+if [ "$READ_ONLY" -eq 1 ]; then
+  printf 'skipped (read-only session) - the session holding the lock owns the ledger.\n'
+elif [ "$PRIMARY_HARNESS" = jcode ]; then
+  FM_SESSION_ID=$(fm_resolve_crew_session_id "$FM_ROOT" "" 2>/dev/null || true)
+  if [ -n "$FM_SESSION_ID" ] \
+    && fm_token_sessions_record "$DATA" __firstmate__ "$FM_SESSION_ID" "$FM_ROOT" \
+         "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$PRIMARY_HARNESS" 2>/dev/null; then
+    printf 'recorded firstmate own-session token attribution (sentinel __firstmate__).\n'
+  else
+    printf '(own session id unresolved - skipped, token attribution best-effort).\n'
+  fi
+else
+  printf '(harness %s session store not readable - skipped).\n' "$PRIMARY_HARNESS"
 fi
 
 # --- 4. supervision operating instructions ----------------------------------
