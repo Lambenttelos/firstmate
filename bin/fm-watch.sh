@@ -437,17 +437,38 @@ recorded_windows() {
 
 # secondmate_context_sweep: the slow-poll context monitor. For each live
 # secondmate window, read its context-window occupancy (claude only; every other
-# harness reads unknown and is skipped - fail closed, no false handoff) and wake
-# firstmate once when it first crosses the configured threshold, so a proactive
-# handoff replaces the context-full agent BEFORE it must /compact. A per-window
-# surfaced marker makes the crossing idempotent: the wake fires once and re-arms
-# only after the count drops back under the threshold (a fresh post-handoff
-# agent). Runs only on the CHECK_INTERVAL cadence, never on every fast poll.
-# Like the *.check.sh loop it lives in, wake() exits the cycle; a second crossed
-# secondmate surfaces on a later cycle.
+# harness reads unknown and is skipped - fail closed, no false handoff) and act
+# once when it first crosses the configured threshold, so a proactive handoff
+# replaces the context-full agent BEFORE it must /compact.
+#
+# Two behaviors on a first crossing, chosen by the opt-in
+# config/secondmate-auto-handoff flag (fm_sm_auto_handoff_enabled; absent =
+# today's escalate-only default, fail-closed):
+#   - AUTO disabled (default): wake firstmate once with a `check:
+#     secondmate-context <id>` line; the primary runs the handoff by hand. Sets
+#     the marker, then wake() exits the cycle exactly as before.
+#   - AUTO enabled: hand off automatically without a primary wake to START it.
+#     Only an IDLE secondmate is handed off (invariant: never fire mid-turn); a
+#     busy one is deferred to a later cycle WITHOUT setting the marker, so the
+#     crossing re-evaluates next poll and once-only semantics hold (the marker is
+#     set only when a handoff actually launches). The handoff itself
+#     (bin/fm-secondmate-handoff.sh, driven by bin/fm-secondmate-auto-handoff.sh)
+#     is launched DETACHED and never waited on, so its multi-minute steer+wait+
+#     respawn cannot stall this slow-poll loop; the wrapper enqueues the required
+#     after-the-fact primary FYI/escalation itself. The sweep sets the marker
+#     BEFORE launching so an in-flight handoff is not re-launched next poll, then
+#     keeps scanning (no wake, no cycle exit) - the FYI arrives via the queue.
+#
+# A per-window surfaced marker makes the crossing idempotent: an action fires
+# once and re-arms only after the count drops back under the threshold (a fresh
+# post-handoff agent). Runs only on the CHECK_INTERVAL cadence, never on every
+# fast poll. Like the *.check.sh loop it lives in, wake() exits the cycle; a
+# second crossed secondmate surfaces on a later cycle.
 secondmate_context_sweep() {
-  local threshold w meta home harness tokens key marker id reason
+  local threshold auto w meta home harness tokens key marker id reason
+  local backend target tail40
   threshold=$(fm_sm_context_threshold "$CONFIG")
+  auto=0; fm_sm_auto_handoff_enabled "$CONFIG" || auto=1
   while IFS= read -r w; do
     [ -n "$w" ] || continue
     [ "$(window_kind "$w")" = secondmate ] || continue
@@ -457,12 +478,29 @@ secondmate_context_sweep() {
     [ -n "$home" ] || continue
     harness=$(fm_meta_get "$meta" harness); [ -n "$harness" ] || harness=$(fm_backend_of_meta "$meta")
     tokens=$(fm_sm_context_tokens "$home" "$harness" 2>/dev/null || true)
-    key=$(printf '%s' "$w" | tr ':/.' '___')
+    key=$(fm_sm_context_marker_key "$w")
     marker="$STATE/.sm-context-surfaced-$key"
     if [ -n "$tokens" ] && [ "$tokens" -ge "$threshold" ]; then
       [ -e "$marker" ] && continue
-      : > "$marker"
       id=$(window_to_task "$w" "$STATE")
+      if [ "$auto" = 0 ]; then
+        # Never hand off a mid-turn agent: defer to a later cycle without marking
+        # the crossing, so once-only semantics are preserved (the marker is set
+        # only when a handoff actually launches). The handoff script re-checks
+        # idle too, but deferring here avoids a launch that would just refuse.
+        backend=$(fm_backend_of_meta "$meta")
+        target=$(fm_backend_target_of_meta "$meta" || true)
+        tail40=$(fm_backend_capture "$backend" "$target" 40 "fm-$id" 2>/dev/null || true)
+        if window_is_busy "$w" "$tail40"; then
+          continue
+        fi
+        : > "$marker"
+        FM_HOME="$FM_HOME" FM_ROOT_OVERRIDE="$FM_ROOT" FM_STATE_OVERRIDE="$STATE" \
+          "$SCRIPT_DIR/fm-secondmate-auto-handoff.sh" "$id" >/dev/null 2>&1 &
+        disown 2>/dev/null || true
+        continue
+      fi
+      : > "$marker"
       reason="check: secondmate-context $id (context ${tokens} tokens >= threshold ${threshold})"
       fm_wake_append check "secondmate-context-$id" "$reason" || exit 1
       touch "$STATE/.last-check"

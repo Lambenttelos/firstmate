@@ -37,6 +37,39 @@ fm_sm_context_threshold() {  # <config-dir>
   printf '%s' "$FM_SM_CONTEXT_THRESHOLD_DEFAULT"
 }
 
+# fm_sm_auto_handoff_enabled: 0 (enabled) iff this home opts in to AUTOMATIC
+# context handoff, else 1 (disabled, today's escalate-only behavior). Opt-in and
+# fail-closed by default: absent config/secondmate-auto-handoff = disabled, so a
+# threshold crossing still only WAKES the primary to run the handoff by hand,
+# exactly as before, until the captain explicitly enables it. Enabled when the
+# local, gitignored config/secondmate-auto-handoff presence flag exists AND its
+# first non-empty non-comment line is not "off" (so a stray "off" force-disables
+# a mistakenly created flag). This is the PRIMARY's monitoring knob and is not
+# inherited into secondmate homes (secondmates do not spawn secondmates). See
+# docs/configuration.md and docs/secondmate-context-handoff.md.
+fm_sm_auto_handoff_enabled() {  # <config-dir>
+  local config=$1 file line
+  file="$config/secondmate-auto-handoff"
+  [ -f "$file" ] || return 1
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    [ -n "$line" ] || continue
+    case "$line" in '#'*) continue ;; esac
+    [ "$line" = off ] && return 1
+    return 0
+  done < "$file"
+  # Present but empty/comment-only: treat presence as consent (enabled).
+  return 0
+}
+
+# fm_sm_context_marker_key: the per-window surfaced-marker key both the watcher's
+# secondmate_context_sweep and the auto-handoff wrapper derive from a window, so
+# neither forks the transform. A window string with ':' '/' '.' mapped to '_'.
+fm_sm_context_marker_key() {  # <window>
+  printf '%s' "$1" | tr ':/.' '___'
+}
+
 # fm_sm_claude_projects_dir: the base directory holding claude's per-session
 # transcript project folders. Honors $CLAUDE_CONFIG_DIR, else ~/.claude.
 fm_sm_claude_projects_dir() {

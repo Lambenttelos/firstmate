@@ -140,9 +140,36 @@ Adding a verified read for another harness is future work - reverse-engineer its
 ## Threshold monitoring and the wake
 
 The primary's watcher already runs a slow poll every `FM_CHECK_INTERVAL` seconds (default 300).
-That block iterates each live secondmate window, reads its context tokens with the rule above, and when the count first crosses the configured threshold it enqueues a `check:` wake (`secondmate-context <id>`) so firstmate is woken to act rather than relying on noticing it at the next heartbeat.
-A per-window surfaced marker makes the crossing idempotent: the wake fires once per crossing and re-arms only after the count drops back below the threshold (which a fresh post-handoff agent does).
+That block iterates each live secondmate window, reads its context tokens with the rule above, and acts once when the count first crosses the configured threshold.
+A per-window surfaced marker makes the crossing idempotent: the action fires once per crossing and re-arms only after the count drops back below the threshold (which a fresh post-handoff agent does).
 The read is bounded and only runs on the slow-poll cadence, never on every fast poll.
+
+What the crossing does depends on the opt-in `config/secondmate-auto-handoff` flag (`docs/configuration.md`):
+
+- Flag ABSENT (the default, fail-closed): the watcher only enqueues a `check:` wake (`secondmate-context <id>`) so firstmate is woken to run `bin/fm-secondmate-handoff.sh <id>` by hand.
+  This is the original behavior, unchanged.
+- Flag PRESENT (opt-in): the watcher hands the secondmate off automatically, with no primary wake needed to start it.
+
+### Automatic handoff (opt-in)
+
+When `config/secondmate-auto-handoff` is enabled, a first threshold crossing on an IDLE secondmate launches the handoff itself instead of waking the primary.
+The design preserves every safety invariant:
+
+- Only an idle secondmate is handed off.
+  The watcher checks the pane is not mid-turn before launching, and the handoff script re-checks idle before it steers, so a mid-turn agent is deferred to a later cycle.
+  A deferred crossing does NOT set the surfaced marker, so it is re-evaluated on the next poll rather than lost.
+- The handoff runs DETACHED from the watcher.
+  The multi-minute steer, bounded wait, exit, and respawn of `bin/fm-secondmate-handoff.sh` is a several-minute sequence, so running it inside the slow-poll cycle would stall the whole supervision loop.
+  The watcher instead launches `bin/fm-secondmate-auto-handoff.sh <id>` in the background and never waits on it, so the supervision loop keeps polling immediately.
+  The surfaced marker is set BEFORE the launch, so a handoff in flight is not re-launched on the next poll.
+- The handoff itself is the SAME orderly, fail-closed, idempotent `bin/fm-secondmate-handoff.sh` sequence below.
+  The auto-handoff wrapper adds nothing to that contract; it delegates the whole sequence unchanged and owns only the after-the-fact primary notification and a per-id double-launch lock.
+- The primary is always told an automatic handoff happened.
+  This FYI is required, so the primary knows its secondmate was replaced.
+  On success the wrapper enqueues one `check: secondmate-handoff <id>` wake the primary surfaces at its next supervision cycle; on failure it enqueues one `check: secondmate-handoff-failed <id>` escalation naming the by-hand command, failing closed to the escalate-only path on any doubt.
+  A failed handoff leaves the surfaced marker in place (the old, still-over-threshold agent keeps the crossing marked), so the escalation fires exactly once and does not re-launch every poll.
+
+Exact flags, env, and the notification wording live in the header of `bin/fm-secondmate-auto-handoff.sh`; the flag schema lives in `docs/configuration.md`; the procedure lives in the `secondmate-provisioning` skill.
 
 ## Handoff sequence
 
