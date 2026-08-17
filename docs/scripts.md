@@ -112,6 +112,7 @@ The shared no-mistakes gate refusal for fleet lifecycle entrypoints is summarize
 | `fm-merge-queue.sh`      | Surface, sweep, and prune the durable list of released-but-unmerged ship branches (docs/merge-queue.md) |
 | `fm-merge-queue-lib.sh`  | Own the `data/merge-queue.tsv` format, locked record/remove writes, and the fresh content-in-base merged check |
 | `fm-completions-lib.sh`  | Own the append-only `data/completions.tsv` ledger format, its atomic, idempotent per-completion append, and the exact-id lookup used by the pre-spawn duplicate-dispatch guard |
+| `fm-token-sessions-lib.sh` | Side-effect-free owner of the append-only `data/token-sessions.tsv` ledger mechanics and `fm_resolve_crew_session_id` (newest-created_at jcode session matching leased worktree and spawn-or-later `created_at`, fail-closed to empty); appended best-effort from `fm-spawn.sh` after every launch and from `fm-session-start.sh` under the sentinel id `__firstmate__` |
 | `fm-harness.sh`          | Detect the running harness and resolve crew or secondmate harness, model, and effort |
 | `fm-lock.sh`             | Per-home firstmate session lock                                                      |
 | `fm-x-lib.sh`            | Shared X-mode config, relay, and reply-threading helpers                             |
