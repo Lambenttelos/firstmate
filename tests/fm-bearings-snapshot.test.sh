@@ -952,6 +952,15 @@ test_open_decision_surfaces_end_to_end() {
     .decisions_open | any(.[]; .id == "mate/mate-decision-race"
       and .key == "mate-decision-race" and .verb == "captain-hold")
   ' >/dev/null || fail "an authoritative captain hold must surface in decisions_open: $json"
+  # Every decision must carry an untruncated summary_full alongside the ~90-char
+  # truncated summary, so the desk can render the full reason expandably. The
+  # captain-hold reason is derivable, so summary_full must be non-empty and at
+  # least as long as the possibly-truncated summary for every entry.
+  printf '%s' "$json" | jq -e '
+    .decisions_open | length > 0 and all(.[];
+      has("summary_full") and (.summary_full | type == "string" and length > 0)
+      and (.summary_full | length) >= (.summary | length))
+  ' >/dev/null || fail "decisions_open entries must carry an untruncated summary_full: $json"
   pass "an authoritative captain hold surfaces end-to-end"
 }
 

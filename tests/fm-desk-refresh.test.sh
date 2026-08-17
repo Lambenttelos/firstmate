@@ -28,7 +28,8 @@ POPULATED=$(cat <<'JSON'
 {
   "decisions_open": [
     {"id":"decide-alpha","summary":"pick a data store","owner":"scout"},
-    {"id":"decide-pay-rename","summary":"confirm the pricing rename","owner":"scout"}
+    {"id":"decide-pay-rename","summary":"confirm the pricing rename","owner":"scout"},
+    {"id":"decide-long","summary":"weigh a long tradeoff between two competing approaches that each carry real cos","summary_full":"weigh a long tradeoff between two competing approaches that each carry real cost, real risk, and a materially different long-term maintenance burden the captain must judge","owner":"scout"}
   ],
   "in_flight": [
     {"id":"ship-one","kind":"ship","state":"working","doing":"editing the parser"},
@@ -255,11 +256,19 @@ assert_no_grep 'fm_wake_append' "$OUT1" 'never wakes: no wake call leaked into o
 
 # Both open decisions must appear (acceptance: captain holds reach the page).
 n_dec=$(grep -c 'your call' "$OUT1")
-if [ "$n_dec" -eq 2 ]; then
-  pass 'populated: both open decisions rendered'
+if [ "$n_dec" -eq 3 ]; then
+  pass 'populated: all open decisions rendered'
 else
-  fail "populated: expected 2 decision cards, got $n_dec"
+  fail "populated: expected 3 decision cards, got $n_dec"
 fi
+
+# Decision descriptions render as expandable <details> with a two-line collapsed
+# clamp, so a long reason is never cut off - it is reachable by click. The full
+# untruncated reason (summary_full) must reach the page, longer than the old
+# ~90-char summary cap.
+assert_grep '<details class="text-sm opacity-80 group">' "$OUT1" 'decisions: descriptions render as expandable <details>'
+assert_grep 'line-clamp-2 group-open:line-clamp-none' "$OUT1" 'decisions: collapsed clamp expands on open'
+assert_grep 'a materially different long-term maintenance burden the captain must judge' "$OUT1" 'decisions: the full untruncated reason reaches the page'
 
 # The desk's resolved home must reach the child snapshot.
 seen=$(cat "$HOME1/seen-home" 2>/dev/null || printf '')

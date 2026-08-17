@@ -1327,7 +1327,9 @@ EOF
 }
 
 secondmate_landed_from_current_json() {  # <secondmate-current-json>
-  jq -n --argjson current "$1" '
+  # The current-json blob can grow past ARG_MAX once a secondmate home has many
+  # landed records, so feed it on stdin rather than as an --argjson argv value.
+  printf '%s' "$1" | jq '. as $current |
     {records:[ $current.records[]
       | select(.provenance.selected == "structured-home") as $mate
       | $mate.landed[]
@@ -1376,7 +1378,10 @@ SECONDMATE_CURRENT_JSON=$(secondmate_current_json "$TASKS_JSON") \
 SECONDMATE_LANDED_JSON=$(secondmate_landed_from_current_json "$SECONDMATE_CURRENT_JSON") \
   || { echo "fm-fleet-snapshot: secondmate landed projection failed" >&2; exit 1; }
 
-printf '%s\n%s\n' "$BACKLOG_JSON" "$TASKS_JSON" | jq -n \
+printf '%s\n%s\n%s\n%s\n%s\n%s\n' \
+  "$BACKLOG_JSON" "$TASKS_JSON" \
+  "$MAIN_INVENTORY_JSON" "$SCOUT_REPORTS_JSON" \
+  "$SECONDMATE_CURRENT_JSON" "$SECONDMATE_LANDED_JSON" | jq -n \
   --arg generated "$SNAPSHOT_NOW" \
   --arg fm_home "$FM_HOME" \
   --arg fm_root "$FM_ROOT" \
@@ -1384,11 +1389,9 @@ printf '%s\n%s\n' "$BACKLOG_JSON" "$TASKS_JSON" | jq -n \
   --arg data "$DATA" \
   --arg config "$CONFIG" \
   --arg projects "$PROJECTS" \
-  --argjson main_inventory "$MAIN_INVENTORY_JSON" \
-  --argjson scout_reports "$SCOUT_REPORTS_JSON" \
-  --argjson secondmate_current "$SECONDMATE_CURRENT_JSON" \
-  --argjson secondmate_landed "$SECONDMATE_LANDED_JSON" \
   '(input) as $backlog | (input) as $tasks
+   | (input) as $main_inventory | (input) as $scout_reports
+   | (input) as $secondmate_current | (input) as $secondmate_landed
    | def backlog_by_id($id): ($backlog.records[]? | select(.structured == true and .id == $id) | .) // null;
    def task_by_id($id): ($tasks[]? | select(.id == $id) | .) // null;
    def report_kind($id): (task_by_id($id).kind // backlog_by_id($id).kind // "scout");
