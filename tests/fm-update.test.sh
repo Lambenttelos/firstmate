@@ -13,7 +13,9 @@
 #     or the shared default branch.
 #   - The caller-action summary is correct: reread-firstmate flips to yes only
 #     when the instruction surface (AGENTS.md / bin / .agents/skills) changed, and
-#     nudge-secondmates lists exactly the live secondmates that advanced.
+#     nudge-secondmates lists exactly the live secondmates that advanced AND carry
+#     in-flight work (any state/*.meta in their own home; lazy nudge policy); an
+#     idle advanced home is skipped with a per-target note and still fast-forwards.
 #   - Secondmate homes resolve from both state/<id>.meta and the
 #     data/secondmates.md registry, deduped, and the firstmate repo is never
 #     re-processed as one of its own secondmates.
@@ -45,6 +47,10 @@ new_world() {
 
   printf 'v1\n' > "$w/seed/AGENTS.md"
   printf 'r1\n' > "$w/seed/README.md"
+  # Mirror the real repo: the gitignored operational dirs never dirty a worktree,
+  # so a secondmate home's in-flight state (its busy signal) cannot block its
+  # fast-forward.
+  printf 'state/\nconfig/\ndata/\n' > "$w/seed/.gitignore"
   mkdir -p "$w/seed/bin" "$w/seed/.agents/skills"
   printf 'echo a\n' > "$w/seed/bin/tool.sh"
   printf 's1\n' > "$w/seed/.agents/skills/note.md"
@@ -59,7 +65,9 @@ new_world() {
 }
 
 # Add a secondmate home as a DETACHED worktree of the firstmate repo (matching
-# how treehouse leases a secondmate home), plus its state meta. Args: world id.
+# how treehouse leases a secondmate home), plus its state meta. The home also
+# gets one in-flight crewmate meta in its own state/ (the busy signal) so it is
+# nudge-eligible. Args: world id.
 add_sm() {
   local w=$1 id=$2
   git -C "$w/main" worktree add -q --detach "$w/$id" main
@@ -69,6 +77,8 @@ add_sm() {
     printf 'home=%s/%s\n' "$w" "$id"
   } > "$w/home/state/$id.meta"
   printf '%s\n' "$id" > "$w/$id/.fm-secondmate-home"
+  mkdir -p "$w/$id/state"
+  printf 'window=main:fm-w\nkind=crewmate\nhome=%s/%s\n' "$w" "$id" > "$w/$id/state/w.meta"
 }
 
 # Advance origin by one commit. mode=instr changes the instruction surface
@@ -125,6 +135,31 @@ test_updates_main_and_secondmate() {
   [ "$(git -C "$w/sm1" rev-list --parents -n1 HEAD | wc -w | tr -d ' ')" -eq 2 ] \
     || fail "secondmate tip is not a single-parent fast-forward"
   pass "T1 main + secondmate fast-forward (single-parent), reread + nudge signalled"
+}
+
+# --- T1b: an idle advanced secondmate is excluded from the nudge list ----------
+# Lazy nudge policy: an advanced secondmate whose own home carries no in-flight
+# work is not woken to re-read AGENTS.md. It fast-forwards like any other target
+# and the skip is reported as a per-target note; the nudge-secondmates line stays
+# empty for it, so /updatefirstmate sends it zero re-read nudges.
+test_idle_advanced_secondmate_not_nudged() {
+  local w out nudge_line skip_line
+  w=$(new_world t1b)
+  add_sm "$w" sm1
+  rm -rf "$w/sm1/state"                       # make it idle: no in-flight work
+  bump_origin "$w" instr
+
+  out=$(run_update "$w")
+
+  assert_contains "$out" "secondmate sm1: updated " "idle secondmate still fast-forwards"
+  skip_line=$(printf '%s\n' "$out" | grep 'secondmate sm1: nudge skipped (idle secondmate with no work in flight; picks up new instructions at next routed task or respawn)' || true)
+  [ -n "$skip_line" ] || fail "idle advanced home should report the nudge skip (got: $out)"
+  nudge_line=$(printf '%s\n' "$out" | grep '^nudge-secondmates:')
+  assert_contains "$nudge_line" "none" "idle secondmate leaves an empty nudge list"
+  assert_not_contains "$nudge_line" "fm-sm1" "idle secondmate is not listed for nudge"
+  [ "$(git -C "$w/sm1" rev-parse HEAD)" = "$(git -C "$w/sm1" rev-parse origin/main)" ] \
+    || fail "idle secondmate HEAD not at origin/main"
+  pass "T1b idle advanced secondmate fast-forwards but is excluded from the nudge list"
 }
 
 # --- T3: README-only change does not trigger a reread ----------------------
@@ -292,6 +327,7 @@ test_unsafe_secondmate_home_skipped_before_git_update() {
 }
 
 test_updates_main_and_secondmate
+test_idle_advanced_secondmate_not_nudged
 test_reread_gate_is_instruction_only
 test_dirty_secondmate_skipped
 test_diverged_secondmate_skipped

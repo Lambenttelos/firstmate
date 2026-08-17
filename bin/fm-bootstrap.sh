@@ -20,6 +20,7 @@
 #                 "SECONDMATE_SYNC: secondmate <id>: skipped: <reason>",
 #                 "NUDGE_SECONDMATES: secondmate <id>: send failed: <reason>",
 #                 "BOOTSTRAP_INFO: nudged fm-<id> with '<message>'",
+#                 "BOOTSTRAP_INFO: skipped AGENTS.md re-read nudge for fm-<id> (idle secondmate with no work in flight; picks up new instructions at next routed task or respawn)",
 #                 "SECONDMATE_LIVENESS: secondmate <id>: skipped: <reason>|respawn failed: <reason>",
 #                 "AFK_READER: away-mode escalation reader is not running ...",
 #                 "FMX: X mode on ..." or "FMX: X mode off ...".
@@ -29,8 +30,14 @@
 #          or .agents/skills/) actually changed, bootstrap immediately nudges it
 #          via FM_HOME=<active-home> bin/fm-send.sh fm-<id> so meta resolves the
 #          current backend target and the standard from-firstmate marker is
-#          applied. A successful send prints one BOOTSTRAP_INFO line with the
-#          exact target and message sent; a failed send leaves an idempotent
+#          applied - but only when the home carries in-flight work (any
+#          state/*.meta in its own home; lazy nudge policy, fm-ff-lib.sh). An
+#          idle secondmate is never nudged: its instructions are already advanced
+#          on disk by the fast-forward, and it picks them up at next routed task
+#          or respawn when the agent reads instructions fresh at launch. A
+#          successful send prints one BOOTSTRAP_INFO line with the exact target
+#          and message sent; a skipped idle home prints one BOOTSTRAP_INFO skip
+#          line and is otherwise left alone; a failed send leaves an idempotent
 #          retry marker under state/.secondmate-nudge-pending/ and prints an
 #          actionable NUDGE_SECONDMATES line.
 #          Already-current or no-instruction-change homes are silently left alone.
@@ -228,8 +235,11 @@ secondmate_sync() {
   # commit (fm-ff-lib.sh), while a standalone clone without it is skipped until
   # /updatefirstmate refreshes it from origin. Startup sends reread nudges only
   # for RUNNING secondmates whose instruction surface (AGENTS.md, bin/, or
-  # .agents/skills/) actually changed, so a secondmate already on the primary's
-  # version is never disturbed (AGENTS.md bootstrap + supervision). Unlike
+  # .agents/skills/) actually changed AND whose own home carries in-flight work
+  # (any state/*.meta; lazy nudge policy, fm-ff-lib.sh), so a secondmate already
+  # on the primary's version, or an idle one, is never disturbed: an idle home
+  # picks the new instructions up at next routed task or respawn (AGENTS.md
+  # bootstrap + supervision). Unlike
   # /updatefirstmate, startup owns the live-convergence send itself because it is
   # a deterministic locked sweep and can report success as BOOTSTRAP_INFO while
   # preserving failed sends as NUDGE_SECONDMATES retry markers.
@@ -277,6 +287,14 @@ secondmate_sync() {
 
   secondmate_send_nudge() {
     local id=$1 home=$2 commit=$3 instr=$4 selector marker out
+    # Lazy nudge policy (fm-ff-lib.sh): only a secondmate with in-flight work in
+    # its own home is nudged. An idle home is already advanced on disk and picks
+    # the new instructions up at next routed task or respawn, so sending here
+    # would wake it for zero useful work; record the skip and leave it alone.
+    if ! secondmate_has_inflight_work "$home"; then
+      echo "BOOTSTRAP_INFO: skipped AGENTS.md re-read nudge for fm-$id (idle secondmate with no work in flight; picks up new instructions at next routed task or respawn)"
+      return 0
+    fi
     selector="fm-$id"
     marker=$(secondmate_nudge_marker_path "$id") || {
       echo "NUDGE_SECONDMATES: secondmate $id: send failed: unsafe id"
@@ -346,6 +364,15 @@ secondmate_sync() {
         echo "NUDGE_SECONDMATES: secondmate $id: send failed: retry target is not at recorded instruction commit"
         continue
       }
+      # Lazy nudge policy (fm-ff-lib.sh): a pending re-read nudge for a home that
+      # now carries no in-flight work is satisfied by the launch-time fresh read
+      # at next routed task or respawn, so clear the marker and record the skip
+      # instead of waking an idle agent to re-read instructions it cannot yet use.
+      if ! secondmate_has_inflight_work "$home_real"; then
+        rm -f "$marker"
+        echo "BOOTSTRAP_INFO: skipped AGENTS.md re-read nudge for fm-$id (idle secondmate with no work in flight; picks up new instructions at next routed task or respawn)"
+        continue
+      fi
       if out=$(FM_HOME="$FM_HOME" FM_ROOT_OVERRIDE="$FM_ROOT" FM_STATE_OVERRIDE="$STATE" FM_SEND_NO_REPLY_EXPECTED=1 "$SCRIPT_DIR/fm-send.sh" "$selector" "$SECOND_MATE_NUDGE_MESSAGE" 2>&1); then
         rm -f "$marker"
         echo "BOOTSTRAP_INFO: nudged $selector with '$SECOND_MATE_NUDGE_MESSAGE'"

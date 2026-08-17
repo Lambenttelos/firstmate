@@ -377,18 +377,44 @@ ff_target() {
 FF_NUDGE_WINDOWS=""
 FF_SEEN_HOMES=""
 
+# Does a secondmate home currently carry in-flight work? Defined as any
+# state/*.meta record in its own home: a meta is written at spawn and removed at
+# teardown, so presence means a live crewmate task. The lazy AGENTS.md re-read
+# nudge policy (owned by fm-bootstrap.sh and fm-update.sh, shared here) sends
+# the nudge only to a busy secondmate. An idle home is never nudged: its
+# instructions are already advanced on disk by the fast-forward, and it picks
+# them up at next routed task or respawn, when the agent reads instructions
+# fresh at launch. The skip is recorded by the caller (BOOTSTRAP_INFO in
+# bootstrap, a per-target note in fm-update.sh), not queued.
+secondmate_has_inflight_work() {
+  local home=$1 state meta
+  [ -n "$home" ] || return 1
+  [ -d "$home" ] || return 1
+  state="$home/state"
+  [ -d "$state" ] || return 1
+  for meta in "$state"/*.meta; do
+    [ -f "$meta" ] && return 0
+  done
+  return 1
+}
+
 # Validate and fast-forward one secondmate home, accumulating its stable
 # fm-<id> task selector into FF_NUDGE_WINDOWS when it should be live-converged.
 # Args:
-#   id home window base_mode nudge_requires_instr
+#   id home window base_mode nudge_requires_instr [nudge_skip_idle]
 # A home is nudged only when it ACTUALLY advanced (FF_STATUS=updated) and has a
 # live window. With nudge_requires_instr=yes the advance must also have changed
 # the instruction surface (FF_INSTR non-empty): an already-current home, or one
-# whose only change was non-instruction tracked files, is left undisturbed. The
-# firstmate repo itself (FM_ROOT) is never processed as its own secondmate, and
-# each resolved home is processed at most once.
+# whose only change was non-instruction tracked files, is left undisturbed. With
+# nudge_skip_idle=yes an advanced live home whose own home carries no in-flight
+# state/*.meta is left undisturbed too (lazy nudge policy, see
+# secondmate_has_inflight_work): it prints a per-target note instead of entering
+# FF_NUDGE_WINDOWS, and converges at next routed task or respawn. The firstmate
+# repo itself (FM_ROOT) is never processed as its own secondmate, and each
+# resolved home is processed at most once.
 process_secondmate() {
-  local id=$1 home=$2 window=${3:-} base_mode=$4 nudge_requires_instr=${5:-no} home_real fm_root_real
+  local id=$1 home=$2 window=${3:-} base_mode=$4 nudge_requires_instr=${5:-no} \
+    nudge_skip_idle=${6:-no} home_real fm_root_real
   [ -n "$id" ] || return 0
   [ -n "$home" ] || return 0
   fm_root_real=$(resolve_path "$FM_ROOT")
@@ -407,6 +433,10 @@ process_secondmate() {
   ff_target "$home_real" "secondmate $id" "$base_mode" yes yes
   if [ "$FF_STATUS" = "updated" ] && [ -n "$window" ]; then
     if [ "$nudge_requires_instr" = yes ] && [ -z "$FF_INSTR" ]; then
+      return 0
+    fi
+    if [ "$nudge_skip_idle" = yes ] && ! secondmate_has_inflight_work "$home_real"; then
+      echo "secondmate $id: nudge skipped (idle secondmate with no work in flight; picks up new instructions at next routed task or respawn)"
       return 0
     fi
     FF_NUDGE_WINDOWS="$FF_NUDGE_WINDOWS fm-$id"
