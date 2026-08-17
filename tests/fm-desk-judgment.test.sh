@@ -60,13 +60,18 @@ SH
   printf '%s\n' "$f"
 }
 
-# run_desk <home> <out> <judgment-path>: render with the fake snapshot, a
-# minimal tasks-axi stub, and a judgment path via FM_DESK_JUDGMENT. Pass a
-# nonexistent path for the absent case so the loader finds no file.
-run_desk() {  # <home> <out> <judgment-path>
-  local home="$1" out="$2" fakebin jpath
+# run_desk <home> <out> <judgment-path> [feed-path]: render with the fake
+# snapshot, a minimal tasks-axi stub, a judgment path via FM_DESK_JUDGMENT, and
+# an OPTIONAL durable transcript feed via FM_DESK_TRANSCRIPT. Pass a nonexistent
+# judgment path for the absent case. When no feed path is given, the feed is
+# pointed at a nonexistent file so the durable-feed source is absent and the
+# existing golden regressions still hold.
+run_desk() {  # <home> <out> <judgment-path> [feed-path]
+  local home="$1" out="$2" fakebin jpath fpath
   jpath="${3:-$home/no-such-judgment.json}"
   [ -n "$jpath" ] || jpath="$home/no-such-judgment.json"
+  fpath="${4:-$home/no-such-feed.jsonl}"
+  [ -n "$fpath" ] || fpath="$home/no-such-feed.jsonl"
   fakebin=$(fm_fakebin "$home")
   cat > "$fakebin/tasks-axi" <<'SH'
 #!/usr/bin/env bash
@@ -101,6 +106,7 @@ SH
   FM_DESK_CI_BUDGET=0 \
   FM_DESK_NOW_EPOCH="$FAKE_EPOCH" \
   FM_DESK_JUDGMENT="$jpath" \
+  FM_DESK_TRANSCRIPT="$fpath" \
   FM_DESK_OUT="$out" FM_DESK_NOW='2026-07-28 09:00' \
     bash "$DESK" >/dev/null 2>&1
 }
@@ -351,5 +357,125 @@ run_desk "$HOME_ESC" "$OUT_ESC" "$HOME_ESC/judgment.json"
 assert_no_grep '<script>alert(1)</script>' "$OUT_ESC" 'escape: raw HTML metacharacters do not reach the page'
 assert_grep '&lt;script&gt;' "$OUT_ESC" 'escape: the metacharacters are HTML-escaped'
 assert_grep 'worker hit' "$OUT_ESC" 'translate: internal vocabulary is rewritten to captain nouns'
+
+# ============================================================================
+# 9. DURABLE FEED: sections 11 and 12 render from the transcript feed, which is
+#    the PRIMARY source (bin/fm-desk-transcript.sh). The feed stores turns
+#    oldest-first; the panel shows them newest-first with the unread rail.
+# ============================================================================
+HOME_FEED="$TMP_ROOT/feed"; mkdir -p "$HOME_FEED"
+SNAP=$(make_snapshot "$HOME_FEED")
+OUT_FEED="$HOME_FEED/desk.html"
+FEED_FILE="$HOME_FEED/desk-transcript.jsonl"
+{
+  printf '%s\n' '{"ts":1,"kind":"turn","who":"captain","text":"the FIRST turn","unread":false}'
+  printf '%s\n' '{"ts":2,"kind":"turn","who":"firstmate","text":"the SECOND turn","unread":true}'
+  printf '%s\n' '{"ts":3,"kind":"question","q":"which store for the feed?","a":"postgres for the feed"}'
+} > "$FEED_FILE"
+run_desk "$HOME_FEED" "$OUT_FEED" "" "$FEED_FILE"
+assert_grep 'which store for the feed?' "$OUT_FEED" 'feed: a question from the feed renders in section 11'
+assert_grep 'postgres for the feed' "$OUT_FEED" 'feed: the question answer renders'
+assert_grep 'the FIRST turn' "$OUT_FEED" 'feed: a turn from the feed renders in section 12'
+assert_grep 'the SECOND turn' "$OUT_FEED" 'feed: the second turn renders'
+assert_grep '#eb760f' "$OUT_FEED" 'feed: an unread turn carries the orange rail'
+assert_no_grep 'no local transcript source' "$OUT_FEED" 'feed: no 11/12 gap note when the feed supplied them'
+assert_no_grep 'About the two catch-up panels' "$OUT_FEED" 'feed: the catch-up note is suppressed when the feed is present'
+# Newest-first: the SECOND (newer) turn must appear on the page before the FIRST.
+first_pos=$(grep -n 'the FIRST turn' "$OUT_FEED" | head -n1 | cut -d: -f1)
+second_pos=$(grep -n 'the SECOND turn' "$OUT_FEED" | head -n1 | cut -d: -f1)
+if [ -n "$first_pos" ] && [ -n "$second_pos" ] && [ "$second_pos" -lt "$first_pos" ]; then
+  pass 'feed: section 12 renders newest-first'
+else
+  fail "feed: transcript order wrong (FIRST at $first_pos, SECOND at $second_pos)"
+fi
+
+# ============================================================================
+# 10. PRECEDENCE: with BOTH a feed and a fresh judgment, the feed WINS and the
+#     judgment turns are NOT rendered (no double-render).
+# ============================================================================
+HOME_PREC="$TMP_ROOT/prec"; mkdir -p "$HOME_PREC"
+SNAP=$(make_snapshot "$HOME_PREC")
+OUT_PREC="$HOME_PREC/desk.html"
+FEED_PREC="$HOME_PREC/desk-transcript.jsonl"
+printf '%s\n' '{"ts":1,"kind":"turn","who":"captain","text":"FEED turn wins","unread":false}' > "$FEED_PREC"
+printf '%s\n' '{"ts":1,"kind":"question","q":"FEED question wins","a":"yes"}' >> "$FEED_PREC"
+JBODY_PREC=$(cat <<'JSON'
+{
+  "questions": [ {"q":"JUDGMENT question loses","a":"no"} ],
+  "transcript": [ {"who":"firstmate","text":"JUDGMENT turn loses","unread":false} ]
+}
+JSON
+)
+write_judgment "$HOME_PREC/judgment.json" "$FAKE_EPOCH" "$JBODY_PREC"
+run_desk "$HOME_PREC" "$OUT_PREC" "$HOME_PREC/judgment.json" "$FEED_PREC"
+assert_grep 'FEED turn wins' "$OUT_PREC" 'precedence: the feed transcript renders'
+assert_grep 'FEED question wins' "$OUT_PREC" 'precedence: the feed question renders'
+assert_no_grep 'JUDGMENT turn loses' "$OUT_PREC" 'precedence: the judgment transcript is NOT rendered (no double-render)'
+assert_no_grep 'JUDGMENT question loses' "$OUT_PREC" 'precedence: the judgment question is NOT rendered (no double-render)'
+
+# ============================================================================
+# 11. FALLBACK: an EMPTY feed falls back to the judgment file for 11/12.
+# ============================================================================
+HOME_FB="$TMP_ROOT/fallback"; mkdir -p "$HOME_FB"
+SNAP=$(make_snapshot "$HOME_FB")
+OUT_FB="$HOME_FB/desk.html"
+FEED_FB="$HOME_FB/desk-transcript.jsonl"
+: > "$FEED_FB"   # present but empty
+JBODY_FB=$(cat <<'JSON'
+{
+  "questions": [ {"q":"JUDGMENT fallback question","a":"ok"} ],
+  "transcript": [ {"who":"captain","text":"JUDGMENT fallback turn","unread":false} ]
+}
+JSON
+)
+write_judgment "$HOME_FB/judgment.json" "$FAKE_EPOCH" "$JBODY_FB"
+run_desk "$HOME_FB" "$OUT_FB" "$HOME_FB/judgment.json" "$FEED_FB"
+assert_grep 'JUDGMENT fallback question' "$OUT_FB" 'fallback: empty feed falls back to the judgment question'
+assert_grep 'JUDGMENT fallback turn' "$OUT_FB" 'fallback: empty feed falls back to the judgment transcript'
+
+# ============================================================================
+# 12. MALFORMED FEED: a present feed of only unparseable lines degrades sections
+#     11 and 12 to the EXACT absent golden output, never an error.
+# ============================================================================
+HOME_FBAD="$TMP_ROOT/feed-bad"; mkdir -p "$HOME_FBAD"
+SNAP=$(make_snapshot "$HOME_FBAD")
+OUT_FBAD="$HOME_FBAD/desk.html"
+FEED_FBAD="$HOME_FBAD/desk-transcript.jsonl"
+{
+  printf '%s\n' 'this is not json'
+  printf '%s\n' '{"ts":1,"kind":"turn"'      # truncated
+  printf '%s\n' '   '                         # whitespace only
+} > "$FEED_FBAD"
+run_desk "$HOME_FBAD" "$OUT_FBAD" "" "$FEED_FBAD"
+assert_present "$OUT_FBAD" 'feed-malformed: the page still renders'
+for pair in "sec-questions:desk-s11-absent.golden" "sec-conversation:desk-s12-absent.golden"; do
+  secid="${pair%%:*}"; golden="${pair##*:}"
+  extract "$OUT_FBAD" "$secid" > "$HOME_FBAD/$secid.actual"
+  if diff -u "$FIXTURES/$golden" "$HOME_FBAD/$secid.actual" >/dev/null 2>&1; then
+    pass "feed-malformed: $secid degrades to the exact absent golden"
+  else
+    diff -u "$FIXTURES/$golden" "$HOME_FBAD/$secid.actual" || true
+    fail "feed-malformed: $secid did not degrade to the golden"
+  fi
+done
+
+# ============================================================================
+# 13. A GARBLED line among GOOD lines is skipped individually; the good turns
+#     still render (line-level tolerance).
+# ============================================================================
+HOME_MIX="$TMP_ROOT/feed-mix"; mkdir -p "$HOME_MIX"
+SNAP=$(make_snapshot "$HOME_MIX")
+OUT_MIX="$HOME_MIX/desk.html"
+FEED_MIX="$HOME_MIX/desk-transcript.jsonl"
+{
+  printf '%s\n' '{"ts":1,"kind":"turn","who":"captain","text":"good turn one","unread":false}'
+  printf '%s\n' 'GARBAGE not json at all'
+  printf '%s\n' '{"ts":3,"kind":"turn","who":"firstmate","text":"good turn two","unread":false}'
+} > "$FEED_MIX"
+run_desk "$HOME_MIX" "$OUT_MIX" "" "$FEED_MIX"
+assert_grep 'good turn one' "$OUT_MIX" 'feed-mixed: the first good turn renders past a garbled line'
+assert_grep 'good turn two' "$OUT_MIX" 'feed-mixed: the second good turn renders'
+# The catch-up note is suppressed because a source (the feed) DID supply a panel.
+assert_no_grep 'About the two catch-up panels' "$OUT_MIX" 'feed-mixed: the catch-up note is suppressed when the feed supplied section 12'
 
 echo "all fm-desk-judgment tests passed"

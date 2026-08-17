@@ -52,6 +52,12 @@
 #                                        mtime for the fleet-health line
 #   tasks-axi (in FM_HOME)               the backlog, for the full captain-hold
 #                                        list and the four ranked queue lists
+#   state/desk-transcript.jsonl          the durable captain-private transcript
+#                                        feed the running session publishes to
+#                                        (bin/fm-desk-transcript.sh), the PRIMARY
+#                                        source for sections 11 and 12. A bounded
+#                                        tail read; absent/empty degrades to the
+#                                        judgment-file fallback and then to a gap
 #
 # DEGRADE QUIETLY. Every source is optional. A missing, failing, or unparseable
 # source is recorded as a gap, shown in the page, and the rest of the page is
@@ -63,8 +69,10 @@
 # blockers, ready-to-merge, slots and host, two progress windows, upcoming,
 # captain-held tickets, four ranked queue lists, stats, recent questions, and a
 # recent-conversation transcript panel. Sections 11 and 12 are transcript-
-# sourced by design and render as marked gaps when no local transcript source is
-# available to this read-only builder.
+# sourced: they read the durable transcript feed the running session publishes
+# (state/desk-transcript.jsonl, owned by bin/fm-desk-transcript.sh), falling back
+# to the judgment file, and render as marked gaps when neither has published a
+# turn yet.
 #
 # A dedicated per-secondmate panel (id sec-secondmates) sits between section 4
 # (crew slots) and section 5. It is a re-layout of the same fleet projection: the
@@ -113,10 +121,10 @@
 #         "diagnosis": "what is actually stuck and why",
 #         "needs": "what would unblock it" }
 #     ],
-#     "questions": [                       SOLE source for section 11
+#     "questions": [                       FALLBACK source for section 11 (feed is primary)
 #       { "q": "question firstmate asked", "a": "captain's short answer, or empty" }
 #     ],
-#     "transcript": [                      SOLE source for section 12; newest LAST in array
+#     "transcript": [                      FALLBACK source for section 12; newest LAST in array
 #       { "who": "captain"|"firstmate", "text": "turn text", "unread": true }
 #     ]
 #   }
@@ -129,9 +137,14 @@
 #   clearly-labeled "firstmate also flags" sub-block. It ADDS, never suppresses,
 #   and is keyed strictly by id so there are never duplicate cards.
 #
-#   SOLE-SOURCE for sections 11 and 12: the script has no data for these, so the
-#   judgment file is the only source. Absent or stale degrades to today's exact
-#   gap note.
+#   FALLBACK SOURCE for sections 11 and 12: the durable transcript feed
+#   (state/desk-transcript.jsonl, bin/fm-desk-transcript.sh) is the PRIMARY
+#   source for these two panels; the judgment file's questions/transcript arrays
+#   are the FALLBACK used only when the feed is absent or empty, so the /desk
+#   synthesis still populates the panels with no feed. The two never compose into
+#   one section, so a turn is never double-rendered. Absent, stale, or empty
+#   everywhere degrades to today's exact gap note. The durable-transcript-feed
+#   block near the source loads owns that precedence.
 #
 #   Every array is optional and independently degradable, so one missing array
 #   degrades ONLY its section. Every value still passes through desk_text()
@@ -143,6 +156,9 @@
 # fm-bearings-snapshot.sh) so a test can drive the projection failure paths.
 # FM_DESK_NOW_EPOCH injects the reference epoch the progress windows count back
 # from, and FM_DESK_COMPLETIONS overrides the completion-ledger path.
+# FM_DESK_TRANSCRIPT overrides the durable transcript-feed path (mirroring the
+# producer's own seam) and FM_DESK_TRANSCRIPT_READ bounds how many feed lines
+# are read.
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -173,7 +189,7 @@ DESK_MAX_DECISIONS=${FM_DESK_MAX_DECISIONS:-12}
 # The header comment IS the help text: from the description line down to the
 # last comment line before the first executable line.
 usage() {
-  sed -n '2,145p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '2,161p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 # --- internal-vocabulary translation ----------------------------------------
@@ -449,6 +465,59 @@ if [ "$HAVE_JQ" -eq 1 ] && [ -f "$JUDGMENT_PATH" ]; then
       # is obvious. Falls back to the raw epoch when date cannot format it.
       JUDGMENT_STAMP=$(date -d "@$_wa" '+%Y-%m-%d %H:%M' 2>/dev/null \
         || date -r "$_wa" '+%Y-%m-%d %H:%M' 2>/dev/null || printf '%s' "$_wa")
+    fi
+  fi
+fi
+
+# --- durable transcript feed (sections 11 and 12) ---------------------------
+#
+# The SEPARATE, durable, captain-private rolling feed the running session
+# appends to as real captain-facing turns happen. bin/fm-desk-transcript.sh is
+# its single owner and only writer; this read-only builder only READS it, and
+# only when it is present and has usable lines. It is a plain jsonl file under
+# state/ (gitignored, captain-private), so a bounded tail read is cheap.
+#
+# SOURCE PRECEDENCE for sections 11 and 12 (stated once, here, where the panels
+# consume it): the durable feed is the PRIMARY source when it is present and
+# yields at least one usable record; the judgment file's .questions/.transcript
+# remain the FALLBACK when the feed is absent or empty, so the existing /desk
+# model synthesis still works with no feed. The two never compose into one
+# section, so the same turn is never double-rendered. When neither source
+# yields content, each panel degrades to EXACTLY today's gap note.
+#
+# Fail-safe by construction: jq absent, file absent, empty, or every line
+# unparseable leaves FEED_QUESTIONS/FEED_TRANSCRIPT empty and FEED_PRESENT at 0,
+# and the panels fall back to the judgment layer and then to today's gap. A
+# malformed line is skipped individually rather than failing the whole section.
+FEED_PRESENT=0
+FEED_QUESTIONS=""
+FEED_TRANSCRIPT=""
+FEED_PATH="${FM_DESK_TRANSCRIPT:-$STATE/desk-transcript.jsonl}"
+# How many trailing feed lines to read. A bounded tail keeps the read cheap even
+# if the file ever grew; the producer already caps the file, so this is belt.
+FEED_MAX_READ=${FM_DESK_TRANSCRIPT_READ:-200}
+case "$FEED_MAX_READ" in ''|*[!0-9]*) FEED_MAX_READ=200 ;; esac
+if [ "$HAVE_JQ" -eq 1 ] && [ -f "$FEED_PATH" ]; then
+  _feed=$(tail -n "$FEED_MAX_READ" "$FEED_PATH" 2>/dev/null)
+  if [ -n "$_feed" ]; then
+    # Section 11: question records, oldest first as stored, one Q<TAB>A per line.
+    # Each line is parsed on its own so a malformed line is skipped, never fatal.
+    # tostring coerces a non-scalar q/a to a visible string rather than blanking
+    # the row (the feed producer only writes strings, but a hand-edited feed
+    # might not). This runs before DESK_JQ_PRELUDE is defined, so it is inline.
+    FEED_QUESTIONS=$(printf '%s\n' "$_feed" | while IFS= read -r _l; do
+      [ -n "$_l" ] || continue
+      printf '%s' "$_l" | jq -r 'select(.kind == "question") | [((.q // "")|tostring), ((.a // "")|tostring)] | @tsv' 2>/dev/null
+    done)
+    # Section 12: turn records, reversed to newest-first, one who<TAB>unread<TAB>text
+    # per line. Same per-line parse so one bad line cannot blank the panel. The
+    # awk reverse is portable where tac (a GNU coreutils tool) is absent.
+    FEED_TRANSCRIPT=$(printf '%s\n' "$_feed" | while IFS= read -r _l; do
+      [ -n "$_l" ] || continue
+      printf '%s' "$_l" | jq -r 'select(.kind == "turn") | [((.who // "")|tostring), (if .unread == true then "1" else "0" end), ((.text // "")|tostring)] | @tsv' 2>/dev/null
+    done | awk '{ a[NR] = $0 } END { for (i = NR; i >= 1; i--) print a[i] }')
+    if [ -n "$FEED_QUESTIONS" ] || [ -n "$FEED_TRANSCRIPT" ]; then
+      FEED_PRESENT=1
     fi
   fi
 fi
@@ -1565,17 +1634,21 @@ render_stats() {
 
 # --- sections 11 and 12: reference catch-up panels --------------------------
 # Both are transcript-sourced by design (the sole deliberate exception to the
-# never-scraped-chat rule) and the judgment file is their SOLE source: the
-# running session, which trivially holds its own last-N turns and recent
-# questions, publishes them into state/desk-judgment.json, and this read-only
-# builder only renders them. When no fresh judgment supplies them - absent,
-# stale, or an empty array - each panel degrades to EXACTLY today's gap note and
-# the transcript hook note below still explains why, so there is no regression.
+# never-scraped-chat rule). Their PRIMARY source is the durable transcript feed
+# (state/desk-transcript.jsonl, owned by bin/fm-desk-transcript.sh) the running
+# session publishes; the judgment file's questions/transcript arrays are the
+# FALLBACK when the feed is empty. This read-only builder only renders them.
+# When neither source supplies a panel - both absent, empty, stale, or every
+# line unparseable - each panel degrades to EXACTLY today's gap note and the
+# catch-up note below explains why, so there is no regression.
 
-# desk_judgment_has_1112: 0/1 whether a fresh judgment supplied section 11 or 12
-# content. Drives suppression of the explanatory note and the terminal
-# needs-decision line, which are only meaningful while the hook is unwired.
-desk_judgment_has_1112() {
+# desk_has_1112: 0/1 whether ANY source (the durable feed OR a fresh judgment)
+# supplied section 11 or 12 content. Drives suppression of the explanatory note,
+# which is only meaningful while NO source has published a panel yet. The durable
+# feed (bin/fm-desk-transcript.sh) is now the primary source, so once it or the
+# judgment file yields a panel the note no longer applies.
+desk_has_1112() {
+  if [ "$FEED_PRESENT" -eq 1 ]; then printf '1'; return 0; fi
   [ "$JUDGMENT_PRESENT" -eq 1 ] || { printf '0'; return 0; }
   local q t
   q=$(desk_judgment_field '.questions | length'); [ -n "$q" ] || q=0
@@ -1587,8 +1660,13 @@ render_recent_questions() {
   local rows
   echo '  <section id="sec-questions" class="mb-10">'
   echo '    <h2 class="text-lg font-semibold mb-3">11. Recent questions</h2>'
+  # Source precedence (owned by the durable-transcript-feed block above): the
+  # durable feed is primary, the judgment file is the fallback. Never both, so a
+  # question is never double-rendered.
   rows=""
-  if [ "$JUDGMENT_PRESENT" -eq 1 ]; then
+  if [ "$FEED_PRESENT" -eq 1 ] && [ -n "$FEED_QUESTIONS" ]; then
+    rows="$FEED_QUESTIONS"
+  elif [ "$JUDGMENT_PRESENT" -eq 1 ]; then
     rows=$(printf '%s' "$JUDGMENT" | jq -r "$DESK_JQ_PRELUDE"'.questions[]? | [((.q // "")|z), ((.a // "")|z)] | @tsv' 2>/dev/null)
   fi
   if [ -z "$rows" ]; then
@@ -1616,8 +1694,15 @@ render_recent_conversation() {
   local rows
   echo '  <section id="sec-conversation" class="mb-10">'
   echo '    <h2 class="text-lg font-semibold mb-3">12. Recent conversation</h2>'
+  # Source precedence (owned by the durable-transcript-feed block above): the
+  # durable feed is primary, the judgment file is the fallback. Never both, so a
+  # turn is never double-rendered. Both sources present rows newest-FIRST here.
   rows=""
-  if [ "$JUDGMENT_PRESENT" -eq 1 ]; then
+  if [ "$FEED_PRESENT" -eq 1 ] && [ -n "$FEED_TRANSCRIPT" ]; then
+    # The feed loader already reversed the stored oldest-first turns to
+    # newest-first, matching the judgment path's on-page order.
+    rows="$FEED_TRANSCRIPT"
+  elif [ "$JUDGMENT_PRESENT" -eq 1 ]; then
     # Newest LAST in the array, newest FIRST on the page: reverse, then emit
     # who / unread / text per turn.
     rows=$(printf '%s' "$JUDGMENT" | jq -r "$DESK_JQ_PRELUDE"'.transcript | reverse[]? | [((.who // "")|z), (if .unread == true then "1" else "0" end), ((.text // "")|z)] | @tsv' 2>/dev/null)
@@ -1661,13 +1746,15 @@ HTML
 }
 
 # render_transcript_note: the single visible note explaining WHY sections 11 and
-# 12 are gaps and naming the exact source hook needed to wire them. Also drives
-# the machine-readable needs-decision line appended to stderr in the entry point.
-# Both are SUPPRESSED once a fresh judgment supplies the panels: the hook is then
-# wired, so the note and the terminal needs-decision line no longer apply.
-TRANSCRIPT_HOOK_NOTE='Sections 11 and 12 need a local transcript source hook: the running session must publish its own last-N captain/firstmate turns (and recent questions) to a file under this home, e.g. state/desk-transcript.jsonl, that the builder can read cheaply. Without such a hook the read-only builder has no safe way to identify and read THIS session'"'"'s transcript, so both panels stay gaps.'
+# 12 are currently empty. The source hook now EXISTS - bin/fm-desk-transcript.sh
+# is the durable feed the running session publishes to, and the judgment file is
+# the fallback - so the note no longer claims the source is unwired. It explains
+# that no turns have been published yet, and is SUPPRESSED the moment either
+# source supplies a panel. There is no terminal needs-decision line anymore: an
+# empty catch-up panel is a "nothing published yet" state, not a human decision.
+TRANSCRIPT_HOOK_NOTE='These two catch-up panels read from a durable transcript feed the running session publishes (state/desk-transcript.jsonl, written by bin/fm-desk-transcript.sh), with the /desk analysis pass as a fallback. They are empty here because no recent turns or questions have been published to either source yet, not because the source is missing. They fill in as the session records captain-facing turns.'
 render_transcript_note() {
-  [ "$(desk_judgment_has_1112)" = "1" ] && return 0
+  [ "$(desk_has_1112)" = "1" ] && return 0
   printf '  <div class="alert alert-info mb-8 text-sm block"><div><strong>About the two catch-up panels.</strong> %s</div></div>\n' \
     "$(desk_esc <<<"$TRANSCRIPT_HOOK_NOTE")"
 }
@@ -1808,13 +1895,11 @@ if ! mv -f "$TMP" "$OUT" 2>/dev/null; then
   exit 1
 fi
 
-# Sections 11 and 12 have no local transcript source UNLESS a fresh judgment
-# file supplied them. When it did not, surface the exact hook firstmate would
-# need to wire them as a machine-readable needs-decision line on STDOUT. This is
-# NOT a status-file write and NOT a wake: it is one printed line on the manual
-# invocation, so the NEVER WAKES invariant holds. Once the judgment file supplies
-# the panels the hook is wired, so the line is suppressed.
-if [ "$(desk_judgment_has_1112)" != "1" ]; then
-  printf 'needs-decision: %s\n' "$TRANSCRIPT_HOOK_NOTE"
-fi
+# Sections 11 and 12 now have a real local transcript source: the durable feed
+# (bin/fm-desk-transcript.sh) the running session publishes to, with the /desk
+# judgment file as a fallback. The old terminal needs-decision line asked
+# firstmate to WIRE that hook; the hook exists now, so that decision is resolved
+# and the line is gone. An empty catch-up panel is a "nothing published yet"
+# state, surfaced by the in-page note only, never a wake or a human decision -
+# the NEVER WAKES invariant is unaffected.
 exit 0
