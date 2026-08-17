@@ -900,6 +900,35 @@ test_large_backlog_survives_argv_limit() {
   pass "a >128KB backlog still renders a full valid snapshot (argv-limit regression)"
 }
 
+# The secondmate landed/current blobs and the main-inventory/scout-reports blobs
+# can each grow past ARG_MAX once a home accumulates many landed records. Passing
+# them as --argjson argv values crashed the whole snapshot with
+# "Argument list too long", which silently blanked the captain's desk. The fix
+# feeds every large blob to jq on stdin via `input`. Guard that the two fixed
+# assembly sites no longer route a large blob through --argjson.
+test_large_blobs_reach_jq_via_stdin_not_argv() {
+  local src landed_fn final_asm
+  src=$ROOT/bin/fm-fleet-snapshot.sh
+  # The secondmate-landed projection must consume its blob from stdin, never argv.
+  landed_fn=$(awk '/^secondmate_landed_from_current_json\(\)/{f=1} f{print} /^}/{if(f)exit}' "$src")
+  printf '%s' "$landed_fn" | grep -q -- '--argjson current' \
+    && fail "secondmate_landed_from_current_json still passes the current blob as --argjson (ARG_MAX regression)"
+  printf '%s' "$landed_fn" | grep -Eq 'printf .* \| jq' \
+    || fail "secondmate_landed_from_current_json must feed the current blob to jq on stdin"
+  # The final snapshot-assembly jq must not pass any of the four large blobs as
+  # --argjson; they belong on the stdin stream as `(input)` reads.
+  final_asm=$(awk '/\$BACKLOG_JSON" "\$TASKS_JSON"/{f=1} f{print} /report_kind\(\$id\)/{if(f)exit}' "$src")
+  printf '%s' "$final_asm" | grep -Eq -- '--argjson (main_inventory|scout_reports|secondmate_current|secondmate_landed)' \
+    && fail "final snapshot assembly still passes a large blob as --argjson (ARG_MAX regression)"
+  # shellcheck disable=SC2016  # literal $VAR needle strings matched against the script source, not expansions
+  printf '%s' "$final_asm" | grep -q 'MAIN_INVENTORY_JSON" "$SCOUT_REPORTS_JSON"' \
+    || fail "final snapshot assembly must feed main_inventory/scout_reports on stdin"
+  # shellcheck disable=SC2016  # literal $VAR needle strings matched against the script source, not expansions
+  printf '%s' "$final_asm" | grep -q 'SECONDMATE_CURRENT_JSON" "$SECONDMATE_LANDED_JSON"' \
+    || fail "final snapshot assembly must feed secondmate current/landed on stdin"
+  pass "large snapshot blobs reach jq on stdin, never as --argjson argv (ARG_MAX regression)"
+}
+
 test_empty_fleet_json
 test_fixture_snapshot_json
 test_main_inventory_orphan_and_unstructured_disclosure
@@ -912,6 +941,7 @@ test_open_decision_clears_on_keyed_resolution
 test_completed_scout_report_is_pointer_not_pending
 test_parked_scout_decision_stays_pending
 test_large_backlog_survives_argv_limit
+test_large_blobs_reach_jq_via_stdin_not_argv
 test_scout_reports_include_teardown_reports
 test_backlog_tasks_axi_forms_and_overrides
 test_view_renders_snapshot

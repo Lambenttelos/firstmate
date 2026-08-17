@@ -867,7 +867,7 @@ desk_decisions_only() {  # <script-rows-tsv>
 
 render_decisions() {
   local rows st jonly
-  rows=$(desk_json ".decisions_open[:${DESK_MAX_DECISIONS}][] | [.id, (.summary|z), (.owner|z)] | @tsv"); st=$?
+  rows=$(desk_json ".decisions_open[:${DESK_MAX_DECISIONS}][] | [.id, (.summary|z), (.owner|z), ((.summary_full // .summary)|z)] | @tsv"); st=$?
   echo '  <section id="sec-decisions" class="mb-10">'
   echo '    <h2 class="text-lg font-semibold mb-3">1. Decisions needed</h2>'
   if [ "$st" -ne 0 ]; then
@@ -883,15 +883,22 @@ render_decisions() {
   fi
   if [ -n "$rows" ]; then
     echo '    <div class="grid gap-4 md:grid-cols-2">'
-    printf '%s\n' "$rows" | while IFS=$'\t' read -r id summary owner; do
+    printf '%s\n' "$rows" | while IFS=$'\t' read -r id summary owner full; do
       [ -n "$id" ] || continue
       local money=''
-      desk_is_money "$id $summary" && money='<span class="badge badge-error badge-sm">money</span>'
+      desk_is_money "$id $summary $full" && money='<span class="badge badge-error badge-sm">money</span>'
       if [ "$JUDGMENT_PRESENT" -eq 1 ] && [ -z "$money" ]; then
         local jmoney
         jmoney=$(printf '%s' "$JUDGMENT" | jq -r --arg id "$id" '(first(.decisions[]? | select(.id == $id)) | .money) // false' 2>/dev/null)
         [ "$jmoney" = "true" ] && money='<span class="badge badge-error badge-sm">money</span>'
       fi
+      # Prefer the untruncated hold reason from tasks-axi; else the full summary
+      # carried by the projection; else the truncated summary. Whichever wins, the
+      # body is fully expandable so nothing stays cut off.
+      local reason
+      reason=$(desk_full_reason "$id" "$full")
+      [ -n "$reason" ] || reason=$(desk_text "$full")
+      [ -n "$reason" ] || reason=$(desk_text "$summary")
       cat <<HTML
       <div class="card bg-base-200 rail" style="--rail: oklch(0.75 0.16 70)">
         <div class="card-body gap-2">
@@ -899,7 +906,12 @@ render_decisions() {
             <h3 class="card-title text-base">$(desk_title "$id")</h3>
             <span class="flex gap-1 shrink-0">${money}<span class="badge badge-warning badge-sm">your call</span></span>
           </div>
-          <p class="text-sm opacity-80">$(desk_full_reason "$id" "$summary")</p>
+          <details class="text-sm opacity-80 group">
+            <summary class="cursor-pointer list-none marker:hidden [&::-webkit-details-marker]:hidden">
+              <span class="line-clamp-2 group-open:line-clamp-none align-middle">${reason}</span>
+              <span class="text-xs opacity-50 group-open:hidden"> more</span>
+            </summary>
+          </details>
 HTML
       desk_decision_enrich "$id" || desk_no_analysis_marker
       cat <<HTML

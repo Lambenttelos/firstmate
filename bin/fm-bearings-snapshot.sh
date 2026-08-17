@@ -396,12 +396,14 @@ MODEL=$(printf '%s' "$SNAP" | jq \
          | select(.structured and .captain_actionable == true)
          | {id,key:.id,verb:"captain-hold",
             blocking:(.priority == "0"),since:(.since // null),
-            summary:((.title + ": " + .hold_reason) | trunc(90)),owner:"(main)"} ]
+            summary:((.title + ": " + .hold_reason) | trunc(90)),
+            summary_full:(.title + ": " + .hold_reason),owner:"(main)"} ]
      + [ (.secondmate_current.records // [])[] as $m | $m.decisions_open[]?
          | select(.source == "backlog" and .verb == "captain-hold")
          | {id:($m.id + "/" + .id),key,verb,
             blocking:(.blocking // false),since:(.since // null),
-            summary:(((.summary // .id) + ": " + (.reason // "captain decision pending")) | trunc(90)),owner:$m.id} ]
+            summary:(((.summary // .id) + ": " + (.reason // "captain decision pending")) | trunc(90)),
+            summary_full:((.summary // .id) + ": " + (.reason // "captain decision pending")),owner:$m.id} ]
      | sort_by([(if .blocking then 0 else 1 end), (.since // "9999-99-99"), .id])) as $decisions_all
   | ((if (.main_inventory.valid == false) then
         [{id:"(main-inventory)",
