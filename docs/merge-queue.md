@@ -40,9 +40,16 @@ or hand-edits the file.
 
 ## Lifecycle
 
-- **Record.** Teardown records an entry only for a released ship task (not scout,
-  secondmate, or `local-only`) whose branch is fully pushed to origin AND is not
-  already merged.
+- **Record.** Teardown records an entry for a released ship task (not scout,
+  secondmate, or `local-only`) unless the branch is proven landed by commit
+  reachability - a merged PR, or HEAD reachable from a surviving default branch.
+  Content equivalence (a merge-tree content compare) is never by itself a skip proof:
+  a branch verifiably on origin and not proven merged is recorded even if its content
+  already appears in the default branch, since its PR may still be open. Content
+  equivalence only justifies a skip when the branch is not confirmed on origin at all
+  (landed by squash/rebase under no branch of its own). Anything ambiguous or errored
+  (fetch/gh failure, unresolved HEAD/base/origin) is reported loudly to stderr and
+  still recorded, so a genuinely pushed-but-unmerged branch is never silently dropped.
   A forced teardown records too: recording is read-only, and a forced release of a
   pushed-but-unmerged branch is exactly the case where the branch is most easily lost.
 - **Surface automatically.** The session-start fleet digest prints one bounded line

@@ -1854,6 +1854,100 @@ test_forced_pushed_unmerged_still_records_merge_queue() {
   pass "forced teardown of a pushed-but-unmerged branch is still queued for merge"
 }
 
+# Land a squash commit on origin/main whose NET content equals the task branch, while
+# the task branch itself stays pushed to origin under its own name and its own commits
+# are NOT reachable from origin/main. This is the #124/#125 shape: content_in_default
+# reports "already landed" (merge-tree of origin/main + HEAD == origin/main's tree)
+# even though the branch's PR is still open and unmerged. Args: case_dir file content
+land_equivalent_content_on_origin_main_keeping_branch() {
+  local case_dir=$1 file=$2 content=$3 tmp
+  git -C "$case_dir/wt" push -q origin fm/task-x1
+  git -C "$case_dir/project" fetch -q origin
+  tmp="$case_dir/_equiv_main"
+  git clone -q "$case_dir/origin.git" "$tmp"
+  printf '%s\n' "$content" > "$tmp/$file"
+  git -C "$tmp" add -- "$file"
+  git -C "$tmp" -c user.email=t@t -c user.name=t commit -q -m "squash equivalent $file"
+  git -C "$tmp" push -q origin HEAD:main
+  rm -rf "$tmp"
+  git -C "$case_dir/project" fetch -q origin
+}
+
+# (z3) REGRESSION for the #124/#125 incident: a branch that IS pushed to origin and
+#      NOT merged (its own commits are not reachable from origin/main), whose NET
+#      content nonetheless already appears in origin/main via an equivalent squash
+#      commit, MUST still be recorded in the merge queue. The pre-fix recorder skipped
+#      on content_in_default's say-so and silently dropped exactly this branch.
+test_pushed_unmerged_content_equivalent_still_records_merge_queue() {
+  local case_dir rc
+  case_dir=$(make_case pushed-unmerged-content-equiv)
+  write_meta "$case_dir" no-mistakes ship
+  wt_commit_file "$case_dir" feature.txt hello "pushed unmerged work"
+  land_equivalent_content_on_origin_main_keeping_branch "$case_dir" feature.txt hello
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 0 "$rc" "content-equiv-unmerged: teardown should release a fully pushed branch"
+  ! grep -q REFUSED "$case_dir/stderr" || fail "content-equiv-unmerged: teardown printed a REFUSED line"
+  grep -F 'fm/task-x1' "$case_dir/data/merge-queue.tsv" >/dev/null \
+    || fail "content-equiv-unmerged: pushed-but-unmerged branch not recorded despite content match (#124/#125 regression)"$'\n'"$(cat "$case_dir/stderr")"
+  pass "pushed-but-unmerged branch is recorded even when its content already appears in the default branch (#124/#125 regression)"
+}
+
+# (z4) a provably-merged branch (merged PR whose head contains the local work) is
+#      correctly SKIPPED: nothing to track, and no spurious merge-queue entry.
+test_merged_pr_branch_is_not_recorded_in_merge_queue() {
+  local case_dir rc pr_head
+  case_dir=$(make_case merged-pr-no-record)
+  write_meta "$case_dir" no-mistakes ship
+  wt_commit_file "$case_dir" feature.txt hello "merged work"
+  push_branch_then_forget_local_ref "$case_dir"
+  pr_head=$(git -C "$case_dir/wt" rev-parse HEAD)
+  append_pr_meta_for_current_head "$case_dir"
+  add_gh_pr_merged_for_head "$case_dir" "$pr_head"
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 0 "$rc" "merged-pr-no-record: teardown should release a merged branch"
+  ! grep -q REFUSED "$case_dir/stderr" || fail "merged-pr-no-record: teardown printed a REFUSED line"
+  [ ! -f "$case_dir/data/merge-queue.tsv" ] \
+    || ! grep -q task-x1 "$case_dir/data/merge-queue.tsv" \
+    || fail "merged-pr-no-record: a provably-merged branch must not be queued"
+  pass "a provably-merged branch is skipped and never queued"
+}
+
+# (z5) an ERRORED / INCONCLUSIVE merge check on an unproven-landed branch must REPORT
+#      LOUDLY to stderr and still record, never silently drop. Reproduced by forcing
+#      the recorder down its ambiguous path with --force on a branch that is not on
+#      origin, not merged, and whose content is not in the default branch.
+test_errored_unproven_branch_reports_and_records() {
+  local case_dir rc
+  case_dir=$(make_case errored-unproven-records)
+  write_meta "$case_dir" no-mistakes ship
+  wt_commit_file "$case_dir" feature.txt hello "unproven work"
+  add_gh_axi_error "$case_dir"
+  # Branch is never pushed to origin, so no origin ref contains HEAD and its content is
+  # absent from origin/main. --force skips the safety refusal so the recorder runs on
+  # this genuinely ambiguous, never-proven-landed branch.
+  set +e
+  run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 0 "$rc" "errored-unproven: forced teardown should complete"
+  grep -F 'teardown: WARNING' "$case_dir/stderr" >/dev/null \
+    || fail "errored-unproven: no loud WARNING for an unproven-landed branch"$'\n'"$(cat "$case_dir/stderr")"
+  grep -F 'fm/task-x1' "$case_dir/data/merge-queue.tsv" >/dev/null \
+    || fail "errored-unproven: an unproven branch must still be recorded, not silently dropped"$'\n'"$(cat "$case_dir/stderr")"
+  pass "an errored/inconclusive unproven-landed branch reports loudly and is still recorded"
+}
+
 # (aa) no-mistakes + pushed base commit + an EXTRA local commit past the origin ref ->
 #      REFUSE (a commit absent from the remote ref is still unpushed).
 test_pushed_with_extra_local_commit_refuses() {
@@ -2259,6 +2353,9 @@ test_no_extra_worktree_unchanged
 test_extra_worktree_unlanded_refuses
 test_extra_worktree_force_overrides_unlanded
 test_forced_pushed_unmerged_still_records_merge_queue
+test_pushed_unmerged_content_equivalent_still_records_merge_queue
+test_merged_pr_branch_is_not_recorded_in_merge_queue
+test_errored_unproven_branch_reports_and_records
 test_pushed_with_extra_local_commit_refuses
 test_pushed_but_dirty_refuses
 test_pushed_but_origin_unreachable_refuses

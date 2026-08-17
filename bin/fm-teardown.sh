@@ -585,22 +585,75 @@ EOF
 
 # Record a released-but-unmerged ship branch in the durable merge queue. Called once
 # from the main flow (never from the idempotent safety check) after safety passes and
-# while the worktree still exists. Skips work that is not on origin or already merged,
-# so only genuinely pushed-but-unmerged branches are queued. Best-effort: a recording
-# failure never blocks teardown.
+# while the worktree still exists. The merge queue is the ONLY durable tracker of a
+# released ship branch (teardown also drops the armed merge-poll check.sh), so a silent
+# miss orphans a merge-ready PR permanently. This recorder therefore NEVER skips in
+# silence on a branch it cannot PROVE already landed: every skip is either a
+# reachability-proven landing or a loud stderr report, and it errs toward recording.
+#
+# Decision order:
+#   1. Proven landed -> skip silently. Proof is COMMIT REACHABILITY only, never content
+#      equivalence: a merged PR whose head contains the local work (pr_is_merged), or
+#      HEAD's exact commit already reachable from a default branch that survives
+#      teardown (head_contained_in_default_branch). Content equivalence
+#      (content_in_default, a git merge-tree tree compare) is deliberately NOT a skip
+#      proof here: its false positives - a branch whose net content already appears in
+#      the default branch yet whose own PR is still open and unmerged - are exactly what
+#      silently dropped PR #124/#125 from this queue.
+#   2. Otherwise, when the branch is verifiably durable on origin
+#      (branch_fully_pushed_to_origin, or head_on_any_origin_ref for a rename/relanded
+#      push), RECORD it, even if content_in_default would call it landed: a
+#      pushed-but-unmerged branch/PR still needs a merge decision.
+#   3. Otherwise the branch is not confirmed on origin. If its content is already in the
+#      default branch it landed by squash/rebase under no origin branch of its own, so
+#      there is no pushed branch to lose - skip. Anything else is genuinely ambiguous or
+#      errored (gh failure, fetch failure, inconclusive check): REPORT LOUDLY and still
+#      try to record so real work is never silently lost. This ambiguous path is
+#      normally reached only under --force, where safety was skipped and a real branch is
+#      most easily lost.
+#
+# Best-effort: a recording failure warns loudly but never blocks teardown.
 record_pushed_unmerged_to_merge_queue() {
-  local branch head base remote url
+  local branch head base remote url on_origin=
   branch=${TEARDOWN_WORKTREE_BRANCH_FOR_SAFETY:-}
   [ -n "$branch" ] || branch=$(git -C "$WT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)
   [ "$branch" != HEAD ] || return 0
-  branch_fully_pushed_to_origin "$branch" || return 0
-  if pr_is_merged "$branch" || content_in_default; then
+
+  # Step 1: proven landed by commit reachability -> nothing to track.
+  if pr_is_merged "$branch" || head_contained_in_default_branch; then
     return 0
   fi
-  head=$(git -C "$WT" rev-parse --verify HEAD 2>/dev/null) || return 0
-  base=$(default_branch) || return 0
-  remote=$(git -C "$WT" remote get-url origin 2>/dev/null) || return 0
-  url=$(fm_merge_queue_compare_url "$remote" "$base" "$branch") || return 0
+
+  # Step 2: verifiably on origin and not proven merged -> must record.
+  if branch_fully_pushed_to_origin "$branch" || head_on_any_origin_ref; then
+    on_origin=1
+  fi
+
+  # Step 3: not confirmed on origin.
+  if [ -z "$on_origin" ]; then
+    if content_in_default; then
+      # Landed by squash/rebase under no origin branch of its own; no pushed branch to
+      # lose. This is the only non-reachability skip, and only when the branch is
+      # genuinely absent from origin (nothing to track), never on its say-so for a
+      # branch that is still on origin.
+      return 0
+    fi
+    echo "teardown: WARNING $branch is not proven merged and not confirmed on origin; recording it in the merge queue so it is not silently lost" >&2
+  fi
+
+  head=$(git -C "$WT" rev-parse --verify HEAD 2>/dev/null) || {
+    echo "teardown: WARNING could not resolve HEAD to record $branch in the merge queue; track it manually" >&2
+    return 0
+  }
+  base=$(default_branch) || {
+    echo "teardown: WARNING could not resolve the default branch to record $branch in the merge queue; track it manually" >&2
+    return 0
+  }
+  remote=$(git -C "$WT" remote get-url origin 2>/dev/null) || {
+    echo "teardown: WARNING could not resolve origin to record $branch in the merge queue; track it manually" >&2
+    return 0
+  }
+  url=$(fm_merge_queue_compare_url "$remote" "$base" "$branch") || url="branch $branch (base $base)"
   fm_merge_queue_record "$DATA" "$ID" "$PROJ" "$branch" "$head" "$base" "$url" || {
     echo "teardown: WARNING could not record $branch in the merge queue; track it manually" >&2
     return 0
