@@ -699,6 +699,14 @@ case "\$cmd \$sub" in
       printf '{"error":{"code":"agent_not_found","message":"gone"}}\n' >&2
     fi
     ;;
+  "pane read")
+    # The stale pane has no agent, so the adapter's no-agent liveness probe
+    # corroborates with a pane-content read; return bare non-composer text so
+    # the verdict resolves to dead (a real husk shell) rather than unknown.
+    if [ "\$arg" = "${stale#*:}" ]; then
+      printf 'bare shell with no agent and no composer row\n'
+    fi
+    ;;
   "pane send-text"|"pane run"|"pane send-keys")
     if [ "\$arg" = "${stale#*:}" ]; then
       exit 1
