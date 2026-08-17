@@ -30,10 +30,21 @@ It is read-only over fleet state, never wakes anyone, and is built fresh on requ
    The **header of `bin/fm-desk-refresh.sh` (the `JUDGMENT LAYER` block) is the single owner of this file's schema and behavior** - read it and follow it; do not restate it here.
    In short:
    - `schema` must be `1` and `written_at` a fresh unix epoch; the builder only reads a file written within the last 900 seconds, so write it immediately before step 1.
-   - `decisions` and `blockers` ENRICH the script's own cards BY TASK `id` (the script still decides which items appear); `questions` and `transcript` are the SOLE source for sections 11 and 12.
+   - `decisions` and `blockers` ENRICH the script's own cards BY TASK `id` (the script still decides which items appear); `questions` and `transcript` are the FALLBACK source for sections 11 and 12, used when the durable transcript feed (step 0b) is empty.
    - Synthesize from context this session already holds (recent captain/firstmate turns, the open decisions and live blockers, recent questions) - no new reads.
    - Everything you write must already be in the captain's vocabulary; the builder still escapes and translates defensively.
    If you skip this step the desk still renders correctly: every section degrades to its mechanical or gap form, and the page shows a "no fresh analysis" stamp. The judgment layer only ever ADDS.
+
+0b. **Publish recent turns to the durable transcript feed (sections 11 and 12).**
+   Alongside the judgment write, append this session's recent captain-facing turns and recent questions to the durable feed with `bin/fm-desk-transcript.sh`.
+   This feed is the PRIMARY source for sections 11 and 12; the judgment file's `questions`/`transcript` arrays are only the fallback when the feed is empty.
+   `bin/fm-desk-transcript.sh` is the single owner and only writer of the feed - read its `--help` for the record shape and the bound; do not restate them here.
+   In short:
+   - A captain-facing turn: `bin/fm-desk-transcript.sh turn captain "<turn text>"` or `... turn firstmate "<turn text>"`; add `--unread` on a turn the captain has not read yet (it carries the orange rail in section 12).
+   - A question and its short answer: `bin/fm-desk-transcript.sh question "<question firstmate asked>" "<captain's short answer, or omit for none>"`.
+   - Append only a bounded set of recent turns from context this session already holds (a few dozen at most); the feed self-caps and trims the oldest, so this stays cheap.
+   - This is a build-time write only, exactly like the judgment file: do NOT create a standing background writer or a new supervised process (the desk's "no standing agent" decision stands).
+   If you skip this step the desk still renders: sections 11 and 12 fall back to the judgment file, and then to the gap note.
 
 1. **Build the desk.**
    ```sh
