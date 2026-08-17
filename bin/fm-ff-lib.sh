@@ -379,13 +379,18 @@ FF_SEEN_HOMES=""
 
 # Does a secondmate home currently carry in-flight work? Defined as any
 # state/*.meta record in its own home: a meta is written at spawn and removed at
-# teardown, so presence means a live crewmate task. The lazy AGENTS.md re-read
-# nudge policy (owned by fm-bootstrap.sh and fm-update.sh, shared here) sends
-# the nudge only to a busy secondmate. An idle home is never nudged: its
-# instructions are already advanced on disk by the fast-forward, and it picks
-# them up at next routed task or respawn, when the agent reads instructions
-# fresh at launch. The skip is recorded by the caller (BOOTSTRAP_INFO in
-# bootstrap, a per-target note in fm-update.sh), not queued.
+# teardown, so presence means a live crewmate task. This is the single
+# busy/idle predicate owner for every lazy nudge path: the bootstrap sweep's
+# AGENTS.md re-read nudge and its retry (bin/fm-bootstrap.sh), /updatefirstmate's
+# nudge-secondmates list (bin/fm-update.sh), and the inherited-config reread
+# pointer send (bin/fm-config-inherit-lib.sh). All of them send the nudge only
+# to a busy secondmate. An idle home is never nudged: its instructions and
+# inherited config are already advanced on disk by the fast-forward or
+# propagation, and it picks them up at next routed task or respawn, when the
+# agent reads instructions and config fresh at launch. The skip is recorded by
+# the caller (BOOTSTRAP_INFO in bootstrap and the config-reread path, a
+# per-target note in fm-update.sh), not queued - except the config-reread path,
+# which keeps its existing .pending marker as the durable record.
 secondmate_has_inflight_work() {
   local home=$1 state meta
   [ -n "$home" ] || return 1
