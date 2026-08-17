@@ -1868,6 +1868,7 @@ test_config_reread_stops_after_failed_generation() {
   local w fakebin state_real old new report log out status
   w=$(new_world config-reread-order)
   mkdir -p "$w/sm/state"
+  printf 'window=firstmate:fm-w\nkind=crewmate\nhome=%s/sm\n' "$w" > "$w/sm/state/w.meta"
   state_real=$(cd "$w/sm/state" && pwd -P)
   old="$state_real/.fm-inherited-config-reread.0000-fail"
   new="$state_real/.fm-inherited-config-reread.0001-new"

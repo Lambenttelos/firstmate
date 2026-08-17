@@ -69,7 +69,7 @@ FF_SEEN_HOMES=""
 
 # Live direct reports first: state/<id>.meta with kind=secondmate carries the
 # authoritative home= path.
-sweep_live_secondmate_metas "$STATE" origin no yes
+sweep_live_secondmate_metas "$STATE" origin no "$SECONDMATES_MD" yes
 
 # Registry backstop: a secondmate registered in data/secondmates.md but without
 # a live meta (e.g. between restarts) is still its persistent on-disk home.

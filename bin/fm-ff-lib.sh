@@ -453,14 +453,17 @@ process_secondmate() {
 }
 
 # Sweep this home's LIVE secondmate direct reports - state/<id>.meta files with
-# kind=secondmate - fast-forwarding each to base_mode. Passes base_mode and
-# nudge_requires_instr through to process_secondmate. Accumulates into
-# FF_NUDGE_WINDOWS / FF_SEEN_HOMES, which the caller resets before and reads after.
-# The registry argument is only for home= fallback on older or incomplete meta records.
+# kind=secondmate - fast-forwarding each to base_mode. Passes base_mode,
+# nudge_requires_instr, and nudge_skip_idle through to process_secondmate.
+# Accumulates into FF_NUDGE_WINDOWS / FF_SEEN_HOMES, which the caller resets
+# before and reads after. The registry argument is only for home= fallback on
+# older or incomplete meta records.
 sweep_live_secondmate_metas() {
-  local state=$1 base_mode=$2 nudge_requires_instr=${3:-no} registry=${4:-$FM_HOME/data/secondmates.md} id home window meta
+  local state=$1 base_mode=$2 nudge_requires_instr=${3:-no} \
+    registry=${4:-$FM_HOME/data/secondmates.md} nudge_skip_idle=${5:-no} \
+    id home window meta
   [ -d "$state" ] || return 0
   while IFS='|' read -r id home window meta; do
-    process_secondmate "$id" "$home" "$window" "$base_mode" "$nudge_requires_instr"
+    process_secondmate "$id" "$home" "$window" "$base_mode" "$nudge_requires_instr" "$nudge_skip_idle"
   done < <(live_secondmate_meta_records "$state" "$registry")
 }
