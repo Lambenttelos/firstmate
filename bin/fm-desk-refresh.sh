@@ -908,8 +908,7 @@ render_decisions() {
           </div>
           <details class="text-sm opacity-80 group">
             <summary class="cursor-pointer list-none marker:hidden [&::-webkit-details-marker]:hidden">
-              <span class="line-clamp-2 group-open:line-clamp-none align-middle">${reason}</span>
-              <span class="text-xs opacity-50 group-open:hidden"> more</span>
+              <span class="align-middle">${reason}</span>
             </summary>
           </details>
 HTML
