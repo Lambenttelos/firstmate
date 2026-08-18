@@ -104,7 +104,14 @@ LABEL=fm-$ID
 DOC="$HOME_DIR/data/handoff-latest.md"
 REQ="$HOME_DIR/data/.handoff-request"
 DONE="$HOME_DIR/data/.handoff-done"
-INSTR="$HOME_DIR/data/.handoff-instructions.md"
+
+# The step-2 follow-up steer is a single self-contained line (fm-send delivers
+# one literal line): it names every action inline, so no transient instruction
+# file is written or referenced. A file pointer here would name a path that is
+# deleted at cleanup, and because a secondmate steer opens a parent-owned
+# pending-reply expectation the about-to-be-exited agent can never answer, it
+# escalated a phantom "blocked: pending-reply-missed" on every handoff.
+STEP2_INSTR="Finish the handoff now: copy the continuation document you just wrote from the OS temp dir to data/handoff-latest.md in this home (overwrite any existing copy), then invoke the stow skill, then run: touch data/.handoff-done. Do NOT run /compact. Do not stop until both data/handoff-latest.md and data/.handoff-done exist."
 
 agent_alive() { [ "$(fm_backend_agent_alive "$BACKEND" "$WINDOW" 2>/dev/null || echo unknown)" = alive ]; }
 agent_dead()  { [ "$(fm_backend_agent_alive "$BACKEND" "$WINDOW" 2>/dev/null || echo unknown)" = dead ]; }
@@ -146,24 +153,8 @@ else
   # the OS temp dir, so the follow-up instruction (a plain text steer the model
   # acts on) moves that doc to the durable in-home path, runs stow, and marks done.
   if [ -n "$DRY_RUN" ]; then
-    printf 'DRY-RUN: write %s and touch %s\n' "$INSTR" "$REQ"
+    printf 'DRY-RUN: touch %s\n' "$REQ"
   else
-    umask 077
-    cat > "$INSTR" <<EOF
-# Context handoff - finish the handoff, now
-
-You just ran /handoff, which wrote a continuation document to your OS temporary
-directory. Firstmate is replacing you with a fresh agent that recovers from
-durable state, so that document must live on disk in this home. Do NOT run /compact.
-
-1. Copy the continuation document you just wrote from the OS temp dir to
-   data/handoff-latest.md in this home, overwriting any existing copy.
-2. Invoke the stow skill to sweep any uncaptured durable knowledge into its
-   canonical homes.
-3. Then run: touch data/.handoff-done
-
-Do not stop until both data/handoff-latest.md and data/.handoff-done exist.
-EOF
     rm -f "$DONE"
     date +%s > "$REQ"
   fi
@@ -180,7 +171,7 @@ EOF
     done
   fi
   # Step 2: move the temp doc to the durable path, stow, and mark done.
-  act "$SCRIPT_DIR/fm-send.sh" "$ID" "Read data/.handoff-instructions.md and follow it exactly now."
+  act "$SCRIPT_DIR/fm-send.sh" "$ID" "$STEP2_INSTR"
 
   if [ -n "$DRY_RUN" ]; then
     printf 'DRY-RUN: wait up to %ss for %s and %s\n' "$TIMEOUT" "$DOC" "$DONE"
@@ -235,7 +226,7 @@ else
   # continuation context so it never relies on compacted memory.
   sleep "$POLL"
   "$SCRIPT_DIR/fm-send.sh" "$ID" "Context handoff recovery: read data/handoff-latest.md for continuation context, then resume per your charter." || true
-  rm -f "$REQ" "$DONE" "$INSTR"
+  rm -f "$REQ" "$DONE"
 fi
 
 echo "handoff complete for '$ID': fresh agent respawned from durable state"

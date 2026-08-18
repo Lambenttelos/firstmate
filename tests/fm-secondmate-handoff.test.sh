@@ -96,6 +96,21 @@ test_dry_run_full_sequence_over_threshold() {
   pass "over-threshold dry-run runs the full steer/exit/respawn sequence"
 }
 
+# Regression: the post-respawn steer must reference only files that exist. A
+# prior version pointed the (about-to-be-exited) agent at
+# data/.handoff-instructions.md, a transient file deleted at cleanup, which
+# opened a parent pending-reply expectation the dead agent could never answer
+# and escalated a phantom "blocked: pending-reply-missed" on every handoff. The
+# handoff steer now names the durable data/handoff-latest.md inline.
+test_no_stale_instruction_reference() {
+  local fmhome home config out
+  IFS=$'\t' read -r fmhome home config < <(setup_home no-stale-instr 260000)
+  run_handoff "$fmhome" "$config" sm; out=$OUT; expect_code 0 "$STATUS" "over-threshold dry-run should complete"
+  assert_not_contains "$out" ".handoff-instructions.md" "no message may reference the transient instruction file"
+  assert_contains "$out" "data/handoff-latest.md" "the handoff steer must name the durable in-home doc"
+  pass "the post-respawn steer references only the durable handoff doc, never a transient file"
+}
+
 test_force_bypasses_threshold() {
   local fmhome home config out
   # Force with an unreadable context still proceeds.
@@ -134,6 +149,7 @@ test_refuse_missing_and_non_secondmate
 test_refuse_no_window_or_home
 test_threshold_gate
 test_dry_run_full_sequence_over_threshold
+test_no_stale_instruction_reference
 test_force_bypasses_threshold
 test_env_force_bypasses_threshold
 test_capture_idempotent
