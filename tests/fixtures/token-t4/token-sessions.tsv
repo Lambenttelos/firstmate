@@ -1,0 +1,8 @@
+# firstmate token-session ledger fixture (PR-T4 tests): exact per-ticket rollup
+# and --by-ticket attribution. Format: <id>\t<session_id>\t<working_dir>\t<spawn_ts>\t<harness>.
+# ticket-a is MULTI-SESSION (sessions a1 and a2) to exercise the many-rows-per-id
+# sum; ticket-b has one row; session_unattr intentionally has NO ledger row so it
+# must land in the labeled "unattributed" bucket under --by-ticket.
+ticket-a	session_a1	/wt/a	2026-08-13T10:00:00Z	jcode
+ticket-a	session_a2	/wt/a	2026-08-13T11:00:00Z	jcode
+ticket-b	session_b1	/wt/b	2026-08-13T12:00:00Z	jcode

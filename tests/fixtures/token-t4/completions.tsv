@@ -1,0 +1,8 @@
+# firstmate completion ledger fixture (PR-T4 --retro tests).
+# Format: <id>\t<closed-date>\t<kind>\t<repo>\t<landing-sha>.
+# ticket-retro predates the spawn session-id capture: it has NO ledger row, only
+# a close date. The 07-day retro window ends at this close date (2026-08-13).
+# The second row for ticket-reship exercises the "LAST completion row wins" rule.
+ticket-retro	2026-08-13	ship	firstmate	abc123
+ticket-reship	2026-08-14	ship	firstmate	123abc
+ticket-reship	2026-08-15	ship	firstmate	456def

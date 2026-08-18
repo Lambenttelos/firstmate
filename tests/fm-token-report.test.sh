@@ -307,6 +307,141 @@ test_bad_args_rejected() {
   pass "invalid arguments and a missing session id fail closed (non-zero)"
 }
 
+# --- PR-T4: per-ticket rollup rides the session ledger -----------------------
+#
+# These tests use the COMMITTED fixture set under tests/fixtures/token-t4: a
+# token-sessions.tsv ledger, a completions.tsv, and two jcode store dirs
+# (sessions/ for the exact rollup + --by-ticket, retro-sessions/ for --retro).
+# Every test points the env seams at the fixtures via $JCODE_SESSIONS_DIR (the
+# store) and $FM_DATA_OVERRIDE (the ledger + completions), never the real
+# home's files, per the brief's test contract.
+
+FIXDATA="$ROOT/tests/fixtures/token-t4"
+FIXSESS="$FIXDATA/sessions"
+FIXRETRO="$FIXDATA/retro-sessions"
+
+run_fix() { # <sessions_dir> <args...>
+  local sdir=$1; shift
+  JCODE_SESSIONS_DIR="$sdir" FM_TOKEN_PRICES="$PRICE" FM_DATA_OVERRIDE="$FIXDATA" "$CLI" "$@"
+}
+
+test_ticket_rollup_sums_every_ledger_session() {
+  # ticket-a has TWO ledger rows (session_a1 + session_a2): the rollup must sum
+  # BOTH. 1M + 2M input = 3M tokens = $15.00 at $5/Mtok, and the per-session
+  # numbers come from the one coster lib (fm_token_sum_session), so the total is
+  # exact - never an ESTIMATE.
+  local out json
+  out=$(run_fix "$FIXSESS" ticket-a)
+  assert_contains "$out" "ticket ticket-a" "ticket line missing: $out"
+  assert_contains "$out" "sessions=2" "multi-session rollup must count both sessions: $out"
+  assert_contains "$out" "\$15.00" "ticket-a must sum to \$15.00: $out"
+  assert_contains "$out" "3,000,000" "ticket-a must sum 3,000,000 input tokens: $out"
+  assert_not_contains "$out" "ESTIMATE" "the exact ledger rollup must not carry the ESTIMATE label: $out"
+  json=$(run_fix "$FIXSESS" ticket-a --json)
+  printf '%s\n' "$json" | python3 -c '
+import json, sys
+o = json.load(sys.stdin)
+assert o["mode"] == "ticket", o["mode"]
+assert o["ticket"] == "ticket-a", o["ticket"]
+assert o["sessions"] == 2, o["sessions"]
+assert o["ledger_sessions"] == 2, o["ledger_sessions"]
+assert o["unresolved_sessions"] == 0, o["unresolved_sessions"]
+assert o["cost_if_api_estimate"] is False, o["cost_if_api_estimate"]
+assert abs(o["cost_if_api"] - 15.0) < 1e-9, o["cost_if_api"]
+assert o["token_input"] == 3000000, o["token_input"]
+print("ok")
+' >/dev/null || fail "exact ticket-a JSON wrong: $json"
+  pass "a multi-session ticket sums every ledger session exactly (1M+2M -> \$15.00), never ESTIMATE"
+}
+
+test_ticket_missing_ledger_prompts_retro() {
+  # ticket-retro has NO ledger row (pre-capture): the bare rollup must fail
+  # closed (non-zero) and point the captain at the labeled --retro path instead
+  # of guessing a number.
+  local status out
+  out=$(run_fix "$FIXSESS" ticket-retro 2>&1); status=$?
+  [ "$status" -ne 0 ] || fail "a ticket with no ledger rows must exit non-zero"
+  assert_contains "$out" "--retro" "the no-ledger error must point at --retro: $out"
+  pass "a pre-capture ticket with no ledger rows fails closed and points at --retro"
+}
+
+test_by_ticket_buckets_unattributed() {
+  # --period all --by-ticket: ledger sessions land under their ticket; the store
+  # session with NO ledger row (session_unattr) lands in the labeled
+  # "unattributed" bucket - never force-fit to a ticket.
+  local out json
+  out=$(run_fix "$FIXSESS" --period all --by-ticket)
+  assert_contains "$out" "ticket=ticket-a  sessions=2  cost_if_api \$15.00" "ticket-a row wrong: $out"
+  assert_contains "$out" "ticket=ticket-b  sessions=1  cost_if_api \$15.00" "ticket-b row wrong: $out"
+  assert_contains "$out" "ticket=unattributed  sessions=1  cost_if_api \$20.00" "unattributed bucket wrong: $out"
+  assert_contains "$out" "total  sessions=4  cost_if_api \$50.00" "grand total wrong: $out"
+  json=$(run_fix "$FIXSESS" --period all --by-ticket --json)
+  printf '%s\n' "$json" | python3 -c '
+import json, sys
+o = json.load(sys.stdin)
+rows = {r["dimension"]: r for r in o["rows"]}
+assert "ticket-a" in rows and "ticket-b" in rows and "unattributed" in rows, list(rows)
+assert rows["ticket-a"]["sessions"] == 2, rows["ticket-a"]
+assert rows["ticket-a"]["ticket"] == "ticket-a", rows["ticket-a"]
+assert rows["unattributed"]["ticket"] == "unattributed", rows["unattributed"]
+assert rows["unattributed"]["sessions"] == 1, rows["unattributed"]
+assert abs(rows["ticket-a"]["cost_if_api"] - 15.0) < 1e-9, rows["ticket-a"]
+assert abs(rows["unattributed"]["cost_if_api"] - 20.0) < 1e-9, rows["unattributed"]
+print("ok")
+' >/dev/null || fail "--by-ticket JSON bucketing wrong: $json"
+  pass "a store session with no ledger row lands in the labeled unattributed bucket, never force-fit"
+}
+
+test_retro_labeled_estimate() {
+  # --retro on a pre-capture ticket: the completions close date (2026-08-13)
+  # bounds a coarse 7-day window 2026-08-07..2026-08-13. Only session_retro_in
+  # (created 08-12, 500K input = $2.50) falls in the window; session_retro_out
+  # (created 08-01, 9M input = $45) is EXCLUDED. The output MUST carry the
+  # ESTIMATE label and refuse exactness (D4).
+  local out json
+  out=$(run_fix "$FIXRETRO" ticket-retro --retro)
+  assert_contains "$out" "ticket ticket-retro" "retro ticket line missing: $out"
+  assert_contains "$out" "sessions=1" "retro must count the in-window session: $out"
+  assert_contains "$out" "\$2.50" "retro must sum the in-window \$2.50: $out"
+  assert_contains "$out" "2026-08-07..2026-08-13" "retro window bound wrong: $out"
+  assert_contains "$out" "ESTIMATE" "retro output must carry the ESTIMATE label: $out"
+  assert_contains "$out" "NOT an exact per-ticket cost" "retro output must refuse exactness: $out"
+  assert_not_contains "$out" "\$45.00" "out-of-window session leaked into the estimate: $out"
+  json=$(run_fix "$FIXRETRO" ticket-retro --retro --json)
+  printf '%s\n' "$json" | python3 -c '
+import json, sys
+o = json.load(sys.stdin)
+assert o["estimate"] is True, o["estimate"]
+assert o["cost_if_api_estimate"] is True, o["cost_if_api_estimate"]
+assert o["retro_window"] == {"close_date": "2026-08-13", "start": "2026-08-07", "end": "2026-08-13"}, o["retro_window"]
+assert o["sessions"] == 1, o["sessions"]
+assert abs(o["cost_if_api"] - 2.5) < 1e-9, o["cost_if_api"]
+print("ok")
+' >/dev/null || fail "retro JSON wrong: $json"
+  pass "--retro produces a coarse date-window estimate, always labeled ESTIMATE, never claiming exactness"
+}
+
+test_retro_refuses_exact_ledger_ticket() {
+  # A ticket that HAS exact ledger data must not be run through the coarse
+  # estimate path: --retro fails closed and says to drop it.
+  local status out
+  out=$(run_fix "$FIXSESS" ticket-a --retro 2>&1); status=$?
+  [ "$status" -ne 0 ] || fail "--retro on an exact-ledger ticket must exit non-zero"
+  assert_contains "$out" "drop --retro" "the refusal must name the exact path: $out"
+  pass "--retro refuses to run on a ticket that has exact ledger data"
+}
+
+test_ticket_arg_guards() {
+  local status
+  run_fix "$FIXSESS" ticket-a --by-ticket >/dev/null 2>&1; status=$?
+  [ "$status" -ne 0 ] || fail "--by-ticket on a task-id must be rejected"
+  run_fix "$FIXSESS" --period all --by-ticket --by-model >/dev/null 2>&1; status=$?
+  [ "$status" -ne 0 ] || fail "two --by-<dimension> flags must be rejected"
+  run_fix "$FIXSESS" --period all --retro >/dev/null 2>&1; status=$?
+  [ "$status" -ne 0 ] || fail "--retro without a task-id must be rejected"
+  pass "--by-ticket and --retro reject their invalid combinations fail-closed"
+}
+
 test_session_matches_lib_exactly
 test_period_sums_range
 test_by_day_and_precise_bucketing
@@ -314,3 +449,9 @@ test_json_shape_stable
 test_unknown_model_withholds_dollars
 test_by_provider_grouping
 test_bad_args_rejected
+test_ticket_rollup_sums_every_ledger_session
+test_ticket_missing_ledger_prompts_retro
+test_by_ticket_buckets_unattributed
+test_retro_labeled_estimate
+test_retro_refuses_exact_ledger_ticket
+test_ticket_arg_guards

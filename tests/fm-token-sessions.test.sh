@@ -150,6 +150,31 @@ test_unsafe_or_empty_field_refused() {
   pass "unsafe or empty fields are refused without writing"
 }
 
+# --- read path ---------------------------------------------------------------
+
+test_rows_for_reads_exact_id_in_order() {
+  # The report CLI's single read path: exact first-column id match, file order,
+  # comment lines skipped, never a substring false hit.
+  local data="$TMP_ROOT/rows/data"
+  mkdir -p "$data"
+  fm_token_sessions_record "$data" task-a session_1 /wt/a 2026-08-17T12:00:00Z jcode
+  fm_token_sessions_record "$data" task-a session_2 /wt/a 2026-08-17T13:00:00Z jcode
+  fm_token_sessions_record "$data" task-bb session_x /wt/b 2026-08-17T14:00:00Z jcode
+  local out want
+  out=$(fm_token_sessions_rows_for "$data" task-a)
+  want=$(printf 'task-a\tsession_1\t/wt/a\t2026-08-17T12:00:00Z\tjcode\ntask-a\tsession_2\t/wt/a\t2026-08-17T13:00:00Z\tjcode\n')
+  [ "$out" = "$want" ] || fail "rows_for returned the wrong rows: $out"
+  # task-bb must NOT match task-b, and an unknown id returns non-zero.
+  out=$(fm_token_sessions_rows_for "$data" task-b) || true
+  [ -z "$out" ] || fail "rows_for matched a prefix id: $out"
+  fm_token_sessions_rows_for "$data" nope >/dev/null 2>&1 \
+    && fail "rows_for returned success for an unknown id"
+  local missing="$TMP_ROOT/rows/nodata"
+  fm_token_sessions_rows_for "$missing" task-a >/dev/null 2>&1 \
+    && fail "rows_for succeeded with an absent ledger"
+  pass "rows_for returns exactly the ledger rows for an id, in order, no prefix or unknown-id false hits"
+}
+
 # --- spawn integration ------------------------------------------------------
 
 # Drive the REAL bin/fm-spawn.sh with a fake tmux backend (the same shape the
@@ -415,6 +440,7 @@ test_record_appends_one_correct_row
 test_second_session_same_id_appends_second_row
 test_same_session_is_idempotent
 test_unsafe_or_empty_field_refused
+test_rows_for_reads_exact_id_in_order
 test_spawn_captures_jcode_session
 test_spawn_relaunch_appends_second_row
 test_spawn_unresolvable_writes_nothing

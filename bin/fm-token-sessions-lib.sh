@@ -87,6 +87,34 @@ fm_token_sessions_record() {
   return 0
 }
 
+# Look up every recorded ledger row for an exact task id. Args: data_dir id.
+# Prints one matching ledger line per session (verbatim, tab-separated), in file
+# order, and returns 0 when at least one match exists. Returns 1 without
+# printing when the id has no ledger rows or the ledger is absent. The id is
+# matched against the first tab-separated field only, so a substring of another
+# id or a field value elsewhere on the line is never a false hit. Comment lines
+# are skipped. This is the single read path for the per-ticket rollup
+# (bin/fm-token-report.sh), so report callers never hand-parse columns. The
+# unknown-model "unattributed" notion never lives here: this returns exactly
+# what the ledger records for one id.
+fm_token_sessions_rows_for() {
+  local data_dir=$1 id=$2 file found=1 rec_id line
+  [ -n "$id" ] || return 1
+  file=$(fm_token_sessions_file "$data_dir")
+  [ -f "$file" ] || return 1
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      ''|'#'*) continue ;;
+    esac
+    rec_id=${line%%$'\t'*}
+    if [ "$rec_id" = "$id" ]; then
+      printf '%s\n' "$line"
+      found=0
+    fi
+  done < "$file"
+  return "$found"
+}
+
 # Resolve the harness session id for a just-launched agent. Args:
 #   working_dir spawn_ts [sessions_dir]
 # Prints the id of the newest-created_at session whose working_dir matches and
