@@ -1,0 +1,316 @@
+#!/usr/bin/env bash
+# Tests for the token usage + cost reporting CLI (bin/fm-token-report.sh) -
+# PR-T2 of the token-usage-visibility design of record.
+#
+# Design of record: data/design-token-usage-visibility/report.md, section
+# "PR-T2" and its test list (line 188); captain decisions D1/D2/D5 in
+# data/design-token-usage-visibility/decisions-d1-d2-d5.md.
+#
+# The CLI is JOIN-FREE (no per-ticket rollup; that is PR-T4). It is a READER: it
+# reads the jcode session store ($JCODE_SESSIONS_DIR) and the owned price
+# snapshot ($FM_TOKEN_PRICES) and derives every dollar figure through the ONE
+# coster lib bin/fm-token-lib.sh. These tests therefore point both env seams at
+# committed-shaped fixtures written into the suite's temp store (never the real
+# ~/.jcode/sessions), and assert:
+#   - --session on a fixture matches the PR-T1 lib numbers EXACTLY (the coster is
+#     the single owner, so the CLI must not drift from it);
+#   - --period sums a date range correctly, and its window is inclusive by day;
+#   - --by day places sessions in the right day buckets, and a >1h session lands
+#     WHOLE in its start bucket by default (D5 option a) but SPLITS per message
+#     under --precise (D5 option b), with the same grand total both ways;
+#   - --json output shape is stable (documented keys present, cost a number or
+#     null, estimate=false);
+#   - the unknown-model row WITHHOLDS dollars (never a fabricated $0) and carries
+#     its tokens in a separate unknown bucket;
+#   - --by-model / --by-provider group correctly and compose with --by <unit>.
+set -u
+
+# shellcheck source=tests/lib.sh disable=SC1091
+. "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+fm_git_identity fmtest fmtest@example.invalid
+
+CLI="$ROOT/bin/fm-token-report.sh"
+# shellcheck source=bin/fm-token-lib.sh disable=SC1091
+. "$ROOT/bin/fm-token-lib.sh"
+
+TMP_ROOT=$(fm_test_tmproot fm-token-report-tests)
+STORE="$TMP_ROOT/sessions"
+PRICE="$TMP_ROOT/prices.json"
+mkdir -p "$STORE"
+
+# Owned-snapshot-shaped price fixture: real anthropic USD-per-Mtok values, the
+# same header shape bin/fm-token-prices.sh writes. claude-opus-4-8 is priced;
+# 'mock' is deliberately ABSENT so the unknown-model path is exercised.
+cat > "$PRICE" <<'JSON'
+{
+  "price_source": "jcode-models-dev-cache",
+  "cached_at": "2026-08-17T00:03:10Z",
+  "prices": {
+    "claude-opus-4-8": {"input_usd_per_mtok": 5, "output_usd_per_mtok": 25, "cache_read_usd_per_mtok": 0.5, "cache_write_usd_per_mtok": 6.25},
+    "claude-sonnet-5": {"input_usd_per_mtok": 2, "output_usd_per_mtok": 10, "cache_read_usd_per_mtok": 0.2, "cache_write_usd_per_mtok": 2.5}
+  }
+}
+JSON
+
+# Write one jcode-shaped session file into the fixture store.
+# Args: name model provider route created_at messages_json
+write_session() {
+  local name=$1 model=$2 provider=$3 route=$4 created=$5 messages=$6
+  cat > "$STORE/session_$name.json" <<JSON
+{"id":"session_$name","model":"$model","provider_key":"$provider","route_api_method":$route,"created_at":"$created","updated_at":"$created","messages":$messages}
+JSON
+}
+
+run() { # invoke the CLI against the fixture store + price fixture
+  JCODE_SESSIONS_DIR="$STORE" FM_TOKEN_PRICES="$PRICE" "$CLI" "$@"
+}
+
+# --- --session matches PR-T1 lib numbers exactly ------------------------------
+
+test_session_matches_lib_exactly() {
+  # An opus session split across two assistant messages plus one message with no
+  # token_usage (must contribute nothing), provider claude = API-metered.
+  write_session s_one "claude-opus-4-8" "claude" "null" "2026-08-13T10:00:00.000Z" '[
+    {"role":"user","content":"x"},
+    {"role":"assistant","timestamp":"2026-08-13T10:00:01.000Z","token_usage":{"input_tokens":1000,"output_tokens":500,"cache_read_input_tokens":200000,"cache_creation_input_tokens":4000}},
+    {"role":"assistant","timestamp":"2026-08-13T10:05:00.000Z","token_usage":{"input_tokens":3000,"output_tokens":1500,"cache_read_input_tokens":800000,"cache_creation_input_tokens":6000}},
+    {"role":"assistant","content":"no usage here"}
+  ]'
+  # The lib is the single owner of the number; the CLI must equal it exactly.
+  local lib_cost cli_json cli_cost
+  lib_cost=$(fm_token_cost 4000 2000 1000000 10000 "claude-opus-4-8" "$PRICE")
+  cli_json=$(run --session session_s_one --json)
+  # token sums exact
+  case "$cli_json" in
+    *'"token_input": 4000'*) : ;; *) fail "session token_input wrong: $cli_json" ;;
+  esac
+  case "$cli_json" in
+    *'"token_output": 2000'*) : ;; *) fail "session token_output wrong: $cli_json" ;;
+  esac
+  case "$cli_json" in
+    *'"token_cache_read": 1000000'*) : ;; *) fail "session token_cache_read wrong: $cli_json" ;;
+  esac
+  case "$cli_json" in
+    *'"token_cache_write": 10000'*) : ;; *) fail "session token_cache_write wrong: $cli_json" ;;
+  esac
+  # cost equals the lib's, rounded to the JSON's 6 places
+  cli_cost=$(printf '%s\n' "$cli_json" | sed -n 's/.*"cost_if_api": \([0-9.]*\).*/\1/p')
+  local want
+  want=$(python3 -c "print(round(float('$lib_cost'),6))")
+  [ "$cli_cost" = "$want" ] || fail "CLI cost $cli_cost != lib cost $want (single-owner drift)"
+  # PR-T1 math is exact, never labeled ESTIMATE, and the covered flag is honest.
+  case "$cli_json" in
+    *'"cost_if_api_estimate": false'*) : ;; *) fail "session must not be labeled estimate: $cli_json" ;;
+  esac
+  case "$cli_json" in
+    *'"subscription_covered": false'*) : ;; *) fail "plain claude must not be covered: $cli_json" ;;
+  esac
+  pass "--session matches the PR-T1 coster lib exactly (token sums + cost, not estimate)"
+}
+
+# --- --period sums a date range correctly, inclusive by day -------------------
+
+test_period_sums_range() {
+  # Two opus sessions on adjacent days, plus one OUTSIDE the requested range that
+  # must be excluded. Use a store isolated from the other tests' sessions.
+  local store2="$TMP_ROOT/range-store"
+  mkdir -p "$store2"
+  cat > "$store2/session_in1.json" <<'JSON'
+{"id":"session_in1","model":"claude-opus-4-8","provider_key":"claude","route_api_method":null,"created_at":"2026-08-13T09:00:00.000Z","updated_at":"2026-08-13T09:10:00.000Z","messages":[{"role":"assistant","timestamp":"2026-08-13T09:00:00.000Z","token_usage":{"input_tokens":1000000,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}]}
+JSON
+  cat > "$store2/session_in2.json" <<'JSON'
+{"id":"session_in2","model":"claude-opus-4-8","provider_key":"claude","route_api_method":null,"created_at":"2026-08-14T23:59:00.000Z","updated_at":"2026-08-15T00:05:00.000Z","messages":[{"role":"assistant","timestamp":"2026-08-14T23:59:00.000Z","token_usage":{"input_tokens":2000000,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}]}
+JSON
+  cat > "$store2/session_out.json" <<'JSON'
+{"id":"session_out","model":"claude-opus-4-8","provider_key":"claude","route_api_method":null,"created_at":"2026-08-16T09:00:00.000Z","updated_at":"2026-08-16T09:10:00.000Z","messages":[{"role":"assistant","timestamp":"2026-08-16T09:00:00.000Z","token_usage":{"input_tokens":9000000,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}]}
+JSON
+  # 3,000,000 input tokens in-range at $5/Mtok = $15.00 exactly; the out-of-range
+  # session (would add $45) must be excluded.
+  local out
+  out=$(JCODE_SESSIONS_DIR="$store2" FM_TOKEN_PRICES="$PRICE" "$CLI" --period 2026-08-13..2026-08-14)
+  assert_contains "$out" "sessions=2" "range must include exactly the two in-window sessions: $out"
+  assert_contains "$out" "\$15.00" "range cost must be exactly \$15.00 (3M input @ \$5/Mtok): $out"
+  assert_not_contains "$out" "session_out" "out-of-range session leaked into the total: $out"
+  # The 15th (one day past the inclusive end) is excluded; a range through the
+  # 16th includes the $45 session for $60.00 total.
+  out=$(JCODE_SESSIONS_DIR="$store2" FM_TOKEN_PRICES="$PRICE" "$CLI" --period 2026-08-13..2026-08-16)
+  assert_contains "$out" "\$60.00" "widening the range to the 16th must add the \$45 session: $out"
+  pass "--period sums a date range correctly and is inclusive by whole day"
+}
+
+# --- --by day bucketing: whole-session default vs --precise split -------------
+
+test_by_day_and_precise_bucketing() {
+  # One session that SPANS three hours across two assistant messages, plus a
+  # short same-day session. Store isolated.
+  local store3="$TMP_ROOT/bucket-store"
+  mkdir -p "$store3"
+  # Span session: created 10:30, messages at 10:30 (h10) and 12:15 (h12).
+  cat > "$store3/session_span.json" <<'JSON'
+{"id":"session_span","model":"claude-opus-4-8","provider_key":"claude","route_api_method":null,"created_at":"2026-08-13T10:30:00.000Z","updated_at":"2026-08-13T12:30:00.000Z","messages":[
+  {"role":"assistant","timestamp":"2026-08-13T10:30:00.000Z","token_usage":{"input_tokens":1000000,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}},
+  {"role":"assistant","timestamp":"2026-08-13T12:15:00.000Z","token_usage":{"input_tokens":3000000,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}
+]}
+JSON
+  # A second session on the NEXT day so --by day yields two day buckets.
+  cat > "$store3/session_day2.json" <<'JSON'
+{"id":"session_day2","model":"claude-opus-4-8","provider_key":"claude","route_api_method":null,"created_at":"2026-08-14T08:00:00.000Z","updated_at":"2026-08-14T08:05:00.000Z","messages":[
+  {"role":"assistant","timestamp":"2026-08-14T08:00:00.000Z","token_usage":{"input_tokens":2000000,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}
+]}
+JSON
+  # --by day: the span session's 4M input all lands on the 13th ($20), the day2
+  # session's 2M on the 14th ($10). Day buckets are identical default vs precise.
+  local out
+  out=$(JCODE_SESSIONS_DIR="$store3" FM_TOKEN_PRICES="$PRICE" "$CLI" --period 2026-08-13..2026-08-14 --by day)
+  assert_contains "$out" "2026-08-13" "day bucket for the 13th missing: $out"
+  assert_contains "$out" "2026-08-14" "day bucket for the 14th missing: $out"
+  # 13th = $20.00 (4M @ $5), 14th = $10.00 (2M @ $5).
+  printf '%s\n' "$out" | grep -F '2026-08-13' | grep -qF "\$20.00" \
+    || fail "the 13th day bucket must be \$20.00 (whole span session): $out"
+  printf '%s\n' "$out" | grep -F '2026-08-14' | grep -qF "\$10.00" \
+    || fail "the 14th day bucket must be \$10.00: $out"
+
+  # --by hour DEFAULT: the span session lands WHOLE in its START hour (10), so
+  # hour 10 carries all 4M ($20) and there is NO hour-12 bucket.
+  out=$(JCODE_SESSIONS_DIR="$store3" FM_TOKEN_PRICES="$PRICE" "$CLI" --period 2026-08-13 --by hour)
+  assert_contains "$out" "2026-08-13T10" "default hour bucketing must key on created_at hour 10: $out"
+  printf '%s\n' "$out" | grep -F '2026-08-13T10' | grep -qF "\$20.00" \
+    || fail "default: whole span session (4M, \$20) must land in start hour 10: $out"
+  assert_not_contains "$out" "2026-08-13T12" "default bucketing must NOT split the span into hour 12: $out"
+
+  # --precise --by hour: the two messages SPLIT - hour 10 gets 1M ($5), hour 12
+  # gets 3M ($15) - and the grand total still equals the whole-session $20.
+  out=$(JCODE_SESSIONS_DIR="$store3" FM_TOKEN_PRICES="$PRICE" "$CLI" --period 2026-08-13 --by hour --precise)
+  assert_contains "$out" "2026-08-13T10" "precise: hour 10 bucket missing: $out"
+  assert_contains "$out" "2026-08-13T12" "precise: hour 12 bucket missing (message must split out): $out"
+  printf '%s\n' "$out" | grep -F '2026-08-13T10' | grep -qF "\$5.00" \
+    || fail "precise: hour 10 must carry only the first message (1M, \$5): $out"
+  printf '%s\n' "$out" | grep -F '2026-08-13T12' | grep -qF "\$15.00" \
+    || fail "precise: hour 12 must carry the second message (3M, \$15): $out"
+  printf '%s\n' "$out" | grep -F 'total' | grep -qF "\$20.00" \
+    || fail "precise split total must still equal the whole-session \$20.00: $out"
+  pass "--by day buckets correctly; a >1h session lands WHOLE in its start bucket by default but SPLITS under --precise (D5)"
+}
+
+# --- --json shape is stable ---------------------------------------------------
+
+test_json_shape_stable() {
+  local store4="$TMP_ROOT/json-store"
+  mkdir -p "$store4"
+  cat > "$store4/session_j.json" <<'JSON'
+{"id":"session_j","model":"claude-opus-4-8","provider_key":"claude-oauth","route_api_method":"claude-oauth","created_at":"2026-08-13T10:00:00.000Z","updated_at":"2026-08-13T10:10:00.000Z","messages":[{"role":"assistant","timestamp":"2026-08-13T10:00:00.000Z","token_usage":{"input_tokens":1000000,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}]}
+JSON
+  local out
+  out=$(JCODE_SESSIONS_DIR="$store4" FM_TOKEN_PRICES="$PRICE" "$CLI" --period all --json)
+  # Valid JSON with the documented top-level and row keys.
+  printf '%s\n' "$out" | python3 -c '
+import json, sys
+o = json.load(sys.stdin)
+for k in ("mode", "period", "by_time", "by_dimension", "precise", "price_source", "price_cached_at", "rows", "totals"):
+    assert k in o, "missing top-level key %s" % k
+assert o["mode"] == "period", o["mode"]
+assert o["price_source"] == "jcode-models-dev-cache", o["price_source"]
+assert isinstance(o["rows"], list) and o["rows"], "rows must be a non-empty list"
+r = o["rows"][0]
+for k in ("bucket", "dimension", "sessions", "token_input", "token_output", "token_cache_read", "token_cache_write", "cost_if_api", "cost_if_api_covered", "cost_if_api_billed", "cost_if_api_estimate", "unknown_model_tokens", "unknown_models"):
+    assert k in r, "missing row key %s" % k
+assert r["cost_if_api_estimate"] is False, "exact math must not be labeled estimate"
+# a priced opus-oauth session: cost is a number, covered==cost, billed==0
+assert isinstance(r["cost_if_api"], (int, float)), r["cost_if_api"]
+assert abs(r["cost_if_api"] - 5.0) < 1e-9, r["cost_if_api"]
+assert abs(o["totals"]["cost_if_api_covered"] - 5.0) < 1e-9, o["totals"]
+assert abs(o["totals"]["cost_if_api_billed"] - 0.0) < 1e-9, o["totals"]
+print("ok")
+' >/dev/null || fail "--json shape unstable or values wrong: $out"
+  pass "--json output shape is stable (documented keys, cost a number, estimate=false)"
+}
+
+# --- unknown-model row withholds dollars (never a fabricated $0) --------------
+
+test_unknown_model_withholds_dollars() {
+  local store5="$TMP_ROOT/unknown-store"
+  mkdir -p "$store5"
+  # A priced opus session and an UNPRICED 'mock' session in the same period.
+  cat > "$store5/session_priced.json" <<'JSON'
+{"id":"session_priced","model":"claude-opus-4-8","provider_key":"claude","route_api_method":null,"created_at":"2026-08-13T10:00:00.000Z","updated_at":"2026-08-13T10:10:00.000Z","messages":[{"role":"assistant","timestamp":"2026-08-13T10:00:00.000Z","token_usage":{"input_tokens":1000000,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}]}
+JSON
+  cat > "$store5/session_mock.json" <<'JSON'
+{"id":"session_mock","model":"mock","provider_key":"claude","route_api_method":null,"created_at":"2026-08-13T11:00:00.000Z","updated_at":"2026-08-13T11:10:00.000Z","messages":[{"role":"assistant","timestamp":"2026-08-13T11:00:00.000Z","token_usage":{"input_tokens":7000000,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}]}
+JSON
+  # Human --by-model: the mock row must say UNKNOWN and never $0.00, and carry its
+  # 7,000,000 tokens; the opus row prices normally.
+  local out
+  out=$(JCODE_SESSIONS_DIR="$store5" FM_TOKEN_PRICES="$PRICE" "$CLI" --period all --by-model)
+  printf '%s\n' "$out" | grep -F 'model=mock' | grep -qF 'UNKNOWN' \
+    || fail "mock (unpriced) row must be UNKNOWN: $out"
+  printf '%s\n' "$out" | grep -F 'model=mock' | grep -qF '7,000,000' \
+    || fail "mock row must still report its tokens: $out"
+  printf '%s\n' "$out" | grep -F 'model=mock' | grep -qF "\$0.00" \
+    && fail "mock row must NEVER show a fabricated \$0.00: $out"
+  printf '%s\n' "$out" | grep -F 'model=claude-opus-4-8' | grep -qF "\$5.00" \
+    || fail "priced opus row must cost \$5.00: $out"
+  # JSON: the mock row's cost_if_api is null (not 0), tokens carried in
+  # unknown_model_tokens, and the period total's cost excludes the mock dollars.
+  out=$(JCODE_SESSIONS_DIR="$store5" FM_TOKEN_PRICES="$PRICE" "$CLI" --period all --by-model --json)
+  printf '%s\n' "$out" | python3 -c '
+import json, sys
+o = json.load(sys.stdin)
+rows = {r["dimension"]: r for r in o["rows"]}
+assert rows["mock"]["cost_if_api"] is None, "unknown model cost must be null, got %r" % rows["mock"]["cost_if_api"]
+assert rows["mock"]["unknown_model_tokens"] == 7000000, rows["mock"]["unknown_model_tokens"]
+assert "mock" in rows["mock"]["unknown_models"], rows["mock"]["unknown_models"]
+assert abs(rows["claude-opus-4-8"]["cost_if_api"] - 5.0) < 1e-9, rows["claude-opus-4-8"]["cost_if_api"]
+# The grand total counts only priced dollars, and reports the unknown tokens
+# separately - never folds a fake zero into the dollar total.
+assert abs(o["totals"]["cost_if_api"] - 5.0) < 1e-9, o["totals"]["cost_if_api"]
+assert o["totals"]["unknown_model_tokens"] == 7000000, o["totals"]
+print("ok")
+' >/dev/null || fail "--json unknown-model handling wrong: $out"
+  pass "unknown-model row withholds dollars (null cost, no fake \$0), tokens carried separately"
+}
+
+# --- --by-provider grouping and subscription split ----------------------------
+
+test_by_provider_grouping() {
+  local store6="$TMP_ROOT/provider-store"
+  mkdir -p "$store6"
+  # One subscription-covered (claude-oauth) and one API-metered (claude) opus
+  # session, same model, so only the provider dimension separates them.
+  cat > "$store6/session_covered.json" <<'JSON'
+{"id":"session_covered","model":"claude-opus-4-8","provider_key":"claude-oauth","route_api_method":"claude-oauth","created_at":"2026-08-13T10:00:00.000Z","updated_at":"2026-08-13T10:10:00.000Z","messages":[{"role":"assistant","timestamp":"2026-08-13T10:00:00.000Z","token_usage":{"input_tokens":1000000,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}]}
+JSON
+  cat > "$store6/session_api.json" <<'JSON'
+{"id":"session_api","model":"claude-opus-4-8","provider_key":"claude","route_api_method":null,"created_at":"2026-08-13T11:00:00.000Z","updated_at":"2026-08-13T11:10:00.000Z","messages":[{"role":"assistant","timestamp":"2026-08-13T11:00:00.000Z","token_usage":{"input_tokens":2000000,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}]}
+JSON
+  local out
+  out=$(JCODE_SESSIONS_DIR="$store6" FM_TOKEN_PRICES="$PRICE" "$CLI" --period all --by-provider)
+  # covered provider: $5 all covered; api provider: $10 all billed.
+  printf '%s\n' "$out" | grep -F 'provider=claude-oauth' | grep -qF "covered \$5.00 / api \$0.00" \
+    || fail "claude-oauth provider must be fully subscription-covered: $out"
+  printf '%s\n' "$out" | grep -F 'provider=claude' | grep -v 'oauth' | grep -qF "covered \$0.00 / api \$10.00" \
+    || fail "plain claude provider must be fully API-billed: $out"
+  pass "--by-provider groups by provider and splits subscription-covered vs API-billed cost"
+}
+
+# --- guardrail: bad args fail closed ------------------------------------------
+
+test_bad_args_rejected() {
+  local status
+  JCODE_SESSIONS_DIR="$STORE" FM_TOKEN_PRICES="$PRICE" "$CLI" >/dev/null 2>&1; status=$?
+  [ "$status" -ne 0 ] || fail "no mode should exit non-zero"
+  JCODE_SESSIONS_DIR="$STORE" FM_TOKEN_PRICES="$PRICE" "$CLI" --period all --by fortnight >/dev/null 2>&1; status=$?
+  [ "$status" -ne 0 ] || fail "an unknown --by unit must be rejected"
+  JCODE_SESSIONS_DIR="$STORE" FM_TOKEN_PRICES="$PRICE" "$CLI" --session x --period all >/dev/null 2>&1; status=$?
+  [ "$status" -ne 0 ] || fail "--session and --period together must be rejected"
+  JCODE_SESSIONS_DIR="$STORE" FM_TOKEN_PRICES="$PRICE" "$CLI" --session does-not-exist >/dev/null 2>&1; status=$?
+  [ "$status" -ne 0 ] || fail "a missing session id must exit non-zero"
+  pass "invalid arguments and a missing session id fail closed (non-zero)"
+}
+
+test_session_matches_lib_exactly
+test_period_sums_range
+test_by_day_and_precise_bucketing
+test_json_shape_stable
+test_unknown_model_withholds_dollars
+test_by_provider_grouping
+test_bad_args_rejected
