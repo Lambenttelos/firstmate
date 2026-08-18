@@ -1,15 +1,23 @@
 #!/usr/bin/env bash
 # fm-token-report.sh - token usage and cost reporting for jcode sessions.
 #
-# PR-T2 of the token-usage-visibility design of record
+# PR-T2 + PR-T4 of the token-usage-visibility design of record
 # (data/design-token-usage-visibility/report.md, sections "CLI design:
-# bin/fm-token-report.sh" and "PR-T2"). Ships usable per-session, per-period,
-# and time-bucketed cost visibility immediately, JOIN-FREE: there is no
-# per-ticket rollup here (that is PR-T4, gated on the spawn session-id ledger).
+# bin/fm-token-report.sh", "PR-T2", and "PR-T4"). PR-T2 ships usable
+# per-session, per-period, and time-bucketed cost visibility JOIN-FREE.
+# PR-T4 adds the per-ticket dimension on top: an exact <task-id> rollup that
+# rides the durable spawn session ledger (data/token-sessions.tsv), a
+# --period --by-ticket grouping, and a --retro coarse date-window ESTIMATE
+# path for tickets that predate the spawn session-id capture. Captain decision
+# D4 (data/design-token-usage-visibility/decision-d4.md) binds the retro path:
+# the forward-captured rollup is exact, the retro path is coarse and MUST
+# always carry the ESTIMATE label and never be presented as exact.
 #
 # Read-only. Reads the jcode session store ($JCODE_SESSIONS_DIR, default
-# ~/.jcode/sessions), derives cost through bin/fm-token-lib.sh, and writes
-# nothing.
+# ~/.jcode/sessions), the token-session ledger and completion ledger under the
+# data dir (data/token-sessions.tsv + data/completions.tsv, resolved through
+# their owning libs), derives cost through bin/fm-token-lib.sh, and writes
+# nothing and changes nothing any producer records.
 #
 # ONE-OWNER-PER-CONTRACT (the reason for the architecture below): every dollar
 # figure is produced by bin/fm-token-lib.sh, never by a formula in this file.
@@ -43,11 +51,14 @@
 #     a SEPARATE unknown-model bucket and never folds them into a dollar total);
 #   - un-priced / ad-hoc / mock / test model sessions land in that same labeled
 #     unknown bucket, never force-fit to a price;
-#   - PR-T1 per-session math is exact, so nothing here is an ESTIMATE; the
-#     cost_if_api_estimate=false key rides through unchanged for the downstream
-#     estimate callers (PR-T4) that reuse it.
-#   - this tool only READS the store and the price snapshot; it changes nothing
-#     any producer records.
+#   - PR-T1 per-session math is exact, so the per-session/period/ledger paths
+#     emit cost_if_api_estimate=false; the --retro path (and ONLY that path)
+#     emits estimate=true and always carries the ESTIMATE label, never exactness.
+#   - sessions in the ledger for a ticket roll up to that ticket exact;
+#     sessions in the store with NO ledger row (ad-hoc, unticketed, mock) land
+#     in a labeled "unattributed" bucket, never force-fit to a ticket.
+#   - this tool only READS the store, the price snapshot, the ledger, and the
+#     completions; it changes nothing any producer records.
 #
 # All bucketing and the --period window are UTC, because the store's timestamps
 # are UTC (ISO-8601 with a trailing Z). "sessions=" counts sessions with billed
@@ -59,11 +70,25 @@
 #   fm-token-report.sh --session <session_id>            one session: token
 #                                                        totals + cost-if-API +
 #                                                        subscription-covered flag
+#   fm-token-report.sh <task-id>                         per-ticket rollup (EXACT:
+#                                                        sums every session the
+#                                                        ledger records for id)
+#   fm-token-report.sh <task-id> --retro                 coarse date-window
+#                                                        ESTIMATE for a ticket
+#                                                        that predates the spawn
+#                                                        session-id capture (no
+#                                                        ledger rows; always
+#                                                        labeled ESTIMATE, never
+#                                                        presented as exact)
 #   fm-token-report.sh --period <range>                  fleet rollup over a range
 #   fm-token-report.sh --period <range> --by <unit>      time-bucketed trend,
 #                                                        unit = hour|day|week|month
 #   fm-token-report.sh --period <range> --by-model       group by model
 #   fm-token-report.sh --period <range> --by-provider    group by provider
+#   fm-token-report.sh --period <range> --by-ticket      group by ticket id
+#                                                        (sessions with no
+#                                                        ledger row land in
+#                                                        "unattributed")
 #   fm-token-report.sh ... --json                        stable machine output
 #   fm-token-report.sh ... --precise                     per-message time
 #                                                        bucketing (D5 option b)
@@ -71,21 +96,36 @@
 #
 # --period <range> forms: all | today | Nd (e.g. 7d) | YYYY-MM-DD |
 #   YYYY-MM-DD..YYYY-MM-DD (both ends inclusive by whole day).
-# --by <time-unit> composes with --by-model / --by-provider (e.g.
-#   --period 7d --by day --by-model = daily cost per model).
+# --by <time-unit> composes with --by-model / --by-provider / --by-ticket
+#   (e.g. --period 7d --by day --by-ticket = daily cost per ticket).
 #
-# Deliberately NOT implemented here (PR-T4, kept out so PR-T2 stays join-free):
-# a <task-id> per-ticket rollup, --by-ticket, and --retro. The session ledger
-# (data/token-sessions.tsv) join rides in PR-T4.
+# --retro details (D4): the ticket must have NO ledger rows (pre-capture) and a
+#   completion record in data/completions.tsv. The completion's close date ends
+#   a coarse 7-day window (close date and the six days before it, whole days
+#   UTC); every session whose created_at falls in that window is attributed to
+#   the ticket HEURISTICALLY. The number is an estimate: the label ESTIMATE is
+#   always printed and --json carries estimate=true. --retro refuses to run on a
+#   ticket that has exact ledger data, because the exact path already covers it.
+#
+# The data dir for the ledger + completions is $FM_DATA_OVERRIDE, else
+# $FM_HOME/data, else <repo-root>/data (the standard firstmate override
+# chain) so tests and the dashboard point them at fixtures, never the real ones.
 set -eu
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
+FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
+DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 
 # shellcheck source=bin/fm-token-lib.sh disable=SC1091
 . "$SCRIPT_DIR/fm-token-lib.sh"
+# shellcheck source=bin/fm-token-sessions-lib.sh disable=SC1091
+. "$SCRIPT_DIR/fm-token-sessions-lib.sh"
+# shellcheck source=bin/fm-completions-lib.sh disable=SC1091
+. "$SCRIPT_DIR/fm-completions-lib.sh"
 
 usage() {
-  sed -n '2,84p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '2,112p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 die() {
@@ -97,27 +137,29 @@ die() {
 
 MODE=""
 SESSION_ID=""
+TASK_ID=""
 PERIOD=""
 BY_TIME=""
 BY_DIM=""
 JSON=0
 PRECISE=0
+RETRO=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --session)
       [ $# -ge 2 ] || die "--session needs a session id"
-      [ -z "$MODE" ] || die "choose one of --session or --period, not both"
+      [ -z "$MODE" ] || die "choose one of --session, --period, or a task-id, not both"
       MODE=session; SESSION_ID=$2; shift 2 ;;
     --session=*)
-      [ -z "$MODE" ] || die "choose one of --session or --period, not both"
+      [ -z "$MODE" ] || die "choose one of --session, --period, or a task-id, not both"
       MODE=session; SESSION_ID=${1#--session=}; shift ;;
     --period)
       [ $# -ge 2 ] || die "--period needs a range (all, today, Nd, a date, or date..date)"
-      [ -z "$MODE" ] || die "choose one of --session or --period, not both"
+      [ -z "$MODE" ] || die "choose one of --session, --period, or a task-id, not both"
       MODE=period; PERIOD=$2; shift 2 ;;
     --period=*)
-      [ -z "$MODE" ] || die "choose one of --session or --period, not both"
+      [ -z "$MODE" ] || die "choose one of --session, --period, or a task-id, not both"
       MODE=period; PERIOD=${1#--period=}; shift ;;
     --by)
       [ $# -ge 2 ] || die "--by needs a time unit (hour, day, week, or month)"
@@ -125,36 +167,52 @@ while [ $# -gt 0 ]; do
     --by=*)
       BY_TIME=${1#--by=}; shift ;;
     --by-model)
-      [ -z "$BY_DIM" ] || die "choose one of --by-model or --by-provider, not both"
+      [ -z "$BY_DIM" ] || die "choose one of --by-model, --by-provider, or --by-ticket, not two"
       BY_DIM=model; shift ;;
     --by-provider)
-      [ -z "$BY_DIM" ] || die "choose one of --by-model or --by-provider, not both"
+      [ -z "$BY_DIM" ] || die "choose one of --by-model, --by-provider, or --by-ticket, not two"
       BY_DIM=provider; shift ;;
+    --by-ticket)
+      [ -z "$BY_DIM" ] || die "choose one of --by-model, --by-provider, or --by-ticket, not two"
+      BY_DIM=ticket; shift ;;
     --json) JSON=1; shift ;;
     --precise) PRECISE=1; shift ;;
+    --retro) RETRO=1; shift ;;
     -h|--help) usage; exit 0 ;;
     --) shift; break ;;
     -*) die "unknown option '$1' (try --help)" ;;
-    *) die "unexpected argument '$1' (try --help)" ;;
+    *)
+      # A bare positional argument is the <task-id> per-ticket rollup.
+      [ -z "$MODE" ] || die "unexpected extra argument '$1' (try --help)"
+      MODE=ticket; TASK_ID=$1; shift ;;
   esac
 done
 
-[ -n "$MODE" ] || die "nothing to report: pass --session <id> or --period <range> (try --help)"
+[ -n "$MODE" ] || die "nothing to report: pass --session <id>, --period <range>, or a <task-id> (try --help)"
 
 case "$BY_TIME" in
   ""|hour|day|week|month) : ;;
   *) die "--by time unit must be hour, day, week, or month (got '$BY_TIME')" ;;
 esac
 
-if [ "$MODE" = session ]; then
+if [ "$MODE" = session ] || [ "$MODE" = ticket ]; then
   [ -z "$BY_TIME" ] && [ -z "$BY_DIM" ] && [ "$PRECISE" -eq 0 ] \
-    || die "--by, --by-model, --by-provider, and --precise apply to --period, not --session"
+    || die "--by, --by-model, --by-provider, --by-ticket, and --precise apply to --period, not a session or task-id"
+fi
+
+if [ "$BY_DIM" = ticket ]; then
+  [ "$MODE" = period ] || die "--by-ticket applies only to --period"
+fi
+
+if [ "$RETRO" -eq 1 ]; then
+  [ "$MODE" = ticket ] || die "--retro applies only to a <task-id> rollup (the pre-capture estimate path)"
 fi
 
 SESSIONS_DIR=${JCODE_SESSIONS_DIR:-$HOME/.jcode/sessions}
 PRICE_FILE=$(fm_token_prices_path)
 PRICE_SOURCE=$(fm_token_prices_field price_source "$PRICE_FILE" 2>/dev/null || true)
 PRICE_CACHED=$(fm_token_prices_field cached_at "$PRICE_FILE" 2>/dev/null || true)
+TOKEN_SESSIONS_FILE=$(fm_token_sessions_file "$DATA")
 
 command -v python3 >/dev/null 2>&1 || die "python3 is required to parse the jcode session store" 3
 
@@ -268,7 +326,7 @@ commafy() {
 # bucketing rule. Emits a leading "@period" line then TSV rows. No costing here.
 aggregate_tokens() {
   FM_TR_DIR="$SESSIONS_DIR" FM_TR_PERIOD="$PERIOD" FM_TR_BYTIME="$BY_TIME" \
-    FM_TR_PRECISE="$PRECISE" python3 - <<'PY'
+    FM_TR_PRECISE="$PRECISE" FM_TR_LEDGER_FILE="$TOKEN_SESSIONS_FILE" python3 - <<'PY'
 import calendar
 import glob
 import json
@@ -282,6 +340,24 @@ sess_dir = os.environ["FM_TR_DIR"]
 period = (os.environ.get("FM_TR_PERIOD", "all") or "all").strip()
 bytime = os.environ.get("FM_TR_BYTIME", "").strip()
 precise = os.environ.get("FM_TR_PRECISE", "") == "1"
+# The session ledger (data/token-sessions.tsv) maps a session id to its ticket
+# id. Every store session either matches a ledger row (attributed to that
+# ticket) or lands in the labeled "unattributed" bucket - never force-fit. The
+# first match in file order wins for a (pathological) duplicate session id.
+ledger_file = os.environ.get("FM_TR_LEDGER_FILE", "")
+sid_to_ticket = {}
+if ledger_file:
+    try:
+        with open(ledger_file) as lfh:
+            for line in lfh:
+                line = line.rstrip("\n")
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split("\t")
+                if len(parts) >= 2 and parts[1] not in sid_to_ticket:
+                    sid_to_ticket[parts[1]] = parts[0]
+    except OSError:
+        pass
 
 
 def to_epoch(s):
@@ -370,10 +446,12 @@ agg = {}
 
 
 def add(key, ti, to, cr, cw, sid):
-    row = agg.get(key)
+    ticket = sid_to_ticket.get(sid) or "unattributed"
+    full_key = key + (ticket,)
+    row = agg.get(full_key)
     if row is None:
         row = [0, 0, 0, 0, set()]
-        agg[key] = row
+        agg[full_key] = row
     row[0] += ti
     row[1] += to
     row[2] += cr
@@ -442,7 +520,7 @@ def iso(ep):
 
 
 sys.stdout.write("@period\t%s\t%s\t%s\n" % (period, iso(start), iso(end)))
-for (b, model, provider, route), row in agg.items():
+for (b, model, provider, route, ticket), row in agg.items():
     sys.stdout.write(
         "\t".join(
             [
@@ -455,6 +533,7 @@ for (b, model, provider, route), row in agg.items():
                 str(row[1]),
                 str(row[2]),
                 str(row[3]),
+                ticket,
             ]
         )
         + "\n"
@@ -512,10 +591,17 @@ for line in costed_lines:
     if not line:
         continue
     parts = line.split("\t")
-    if len(parts) != 10:
+    if len(parts) != 11:
         continue
-    bucket, model, provider, covered, sessions, cost, ti, to, cr, cw = parts
-    dim = model if bydim == "model" else (provider if bydim == "provider" else "")
+    bucket, model, provider, covered, ticket, sessions, cost, ti, to, cr, cw = parts
+    if bydim == "model":
+        dim = model
+    elif bydim == "provider":
+        dim = provider
+    elif bydim == "ticket":
+        dim = ticket
+    else:
+        dim = ""
     key = (bucket, dim)
     g = groups.get(key)
     if g is None:
@@ -571,6 +657,7 @@ if as_json:
             {
                 "bucket": bucket if bytime else None,
                 "dimension": dim if bydim else None,
+                "ticket": dim if bydim == "ticket" else None,
                 "sessions": g["sessions"],
                 "token_input": g["ti"],
                 "token_output": g["to"],
@@ -657,31 +744,21 @@ if len(sorted_keys) > 1:
 PY
 }
 
-do_period() {
-  local agg_tmp costed_tmp
-  agg_tmp=$(mktemp "${TMPDIR:-/tmp}/fm-token-report.aggXXXXXX")
-  costed_tmp=$(mktemp "${TMPDIR:-/tmp}/fm-token-report.costXXXXXX")
-  trap 'rm -f "$agg_tmp" "$costed_tmp"' RETURN
-
-  aggregate_tokens > "$agg_tmp"
-
-  # First line is the resolved period window: "@period <spec> <start> <end>".
-  # The spec field is re-derived from $PERIOD in render, so it is discarded here.
-  local _tag _spec PERIOD_START PERIOD_END
-  IFS=$'\t' read -r _tag _spec PERIOD_START PERIOD_END < "$agg_tmp"
-  [ "$_tag" = "@period" ] || die "internal: aggregate output missing period header" 3
-
-  # Cost each aggregated group through the lib. covered is a pure-bash lib rule
-  # (memoized per provider+route pair); price presence is memoized per model so
-  # an unpriced model never spawns a cost call. fm_token_cost is the ONLY place
-  # a dollar figure is computed.
+# Cost an aggregated TSV through the lib and write a costed TSV. This is the
+# single insertion point of every dollar figure in the period/retro pipelines:
+# fm_token_cost is the ONLY place a cost is computed, and this loop only LOOKS
+# UP coverage (fm_token_subscription_covered) and price presence, both memoized
+# per pair so an unpriced model never spawns a cost call. Reads agg rows
+# (bucket model provider route sessions ti to cr cw ticket) from $1 and writes
+# costed rows (bucket model provider covered ticket sessions cost ti to cr cw)
+# to $2.
+cost_aggregate_rows() {
+  local agg_file=$1 costed_file=$2
   local -A COVERED_CACHE=()
   local -A PRICED_CACHE=()
-  local b model provider route sessions ti to cr cw cov cost pkey ckey
+  local b model provider route sessions ti to cr cw ticket cov cost pkey ckey
 
-  # tail -n +2 drops the @period header; the loop runs in this shell so the
-  # memo caches persist across rows.
-  while IFS=$'\t' read -r b model provider route sessions ti to cr cw; do
+  while IFS=$'\t' read -r b model provider route sessions ti to cr cw ticket; do
     [ -n "$b" ] || continue
     pkey="$provider|$route"
     if [ -z "${COVERED_CACHE[$pkey]+x}" ]; then
@@ -703,17 +780,283 @@ do_period() {
       cost=$(fm_token_cost "$ti" "$to" "$cr" "$cw" "$model" "$PRICE_FILE") || cost=""
     fi
 
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-      "$b" "$model" "$provider" "$cov" "$sessions" "$cost" "$ti" "$to" "$cr" "$cw"
-  done < <(tail -n +2 "$agg_tmp") > "$costed_tmp"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$b" "$model" "$provider" "$cov" "$ticket" "$sessions" "$cost" "$ti" "$to" "$cr" "$cw"
+  done < <(tail -n +2 "$agg_file") > "$costed_file"
+}
+
+do_period() {
+  local agg_tmp costed_tmp
+  agg_tmp=$(mktemp "${TMPDIR:-/tmp}/fm-token-report.aggXXXXXX")
+  costed_tmp=$(mktemp "${TMPDIR:-/tmp}/fm-token-report.costXXXXXX")
+  trap 'rm -f "$agg_tmp" "$costed_tmp"' RETURN
+
+  aggregate_tokens > "$agg_tmp"
+
+  # First line is the resolved period window: "@period <spec> <start> <end>".
+  # The spec field is re-derived from $PERIOD in render, so it is discarded here.
+  local _tag _spec PERIOD_START PERIOD_END
+  IFS=$'\t' read -r _tag _spec PERIOD_START PERIOD_END < "$agg_tmp"
+  [ "$_tag" = "@period" ] || die "internal: aggregate output missing period header" 3
+
+  cost_aggregate_rows "$agg_tmp" "$costed_tmp"
 
   render_period "$costed_tmp"
+}
+
+# --- per-ticket rollup (PR-T4) ------------------------------------------------
+
+# Float addition with full display precision. Used ONLY to sum lib-produced
+# costs (pure addition, never a new cost formula).
+fadd() {
+  awk -v a="$1" -v b="$2" 'BEGIN{printf "%.12f", a+b}'
+}
+
+# Emit the shared per-ticket JSON object (exact and --retro) from env values.
+# D4: the estimate flag is truthful - false for the exact ledger rollup, true
+# for --retro, which always also carries the coarse date window.
+emit_ticket_json() {
+  FM_TRE_TICKET="$TASK_ID" \
+    FM_TRE_ESTIMATE="$TRE_ESTIMATE" FM_TRE_CLOSE="$TRE_CLOSE" \
+    FM_TRE_WSTART="$TRE_WSTART" FM_TRE_WEND="$TRE_WEND" \
+    FM_TRE_SESSIONS="$TRE_SESSIONS" FM_TRE_LEDGER="$TRE_LEDGER" \
+    FM_TRE_UNRESOLVED="$TRE_UNRESOLVED" FM_TRE_TI="$TRE_TI" \
+    FM_TRE_TO="$TRE_TO" FM_TRE_CR="$TRE_CR" FM_TRE_CW="$TRE_CW" \
+    FM_TRE_COST="$TRE_COST" FM_TRE_COVERED="$TRE_COVERED" \
+    FM_TRE_BILLED="$TRE_BILLED" FM_TRE_UNK="$TRE_UNK" \
+    FM_TRE_UNKMODELS="$TRE_UNKMODELS" FM_TRE_PS="$PRICE_SOURCE" \
+    FM_TRE_PC="$PRICE_CACHED" python3 - <<'PY'
+import json, os, sys
+
+
+def nint(name):
+    v = os.environ.get(name, "") or ""
+    try:
+        return int(v)
+    except ValueError:
+        return 0
+
+
+def fnum(name):
+    v = os.environ.get(name, "") or ""
+    if not v:
+        return None
+    try:
+        return round(float(v), 6)
+    except ValueError:
+        return None
+
+
+estimate = os.environ.get("FM_TRE_ESTIMATE", "") == "true"
+models = [m for m in (os.environ.get("FM_TRE_UNKMODELS", "") or "").split(",") if m]
+obj = {
+    "mode": "ticket",
+    "ticket": os.environ.get("FM_TRE_TICKET", ""),
+    "estimate": estimate,
+    "cost_if_api_estimate": estimate,
+    "sessions": nint("FM_TRE_SESSIONS"),
+    "token_input": nint("FM_TRE_TI"),
+    "token_output": nint("FM_TRE_TO"),
+    "token_cache_read": nint("FM_TRE_CR"),
+    "token_cache_write": nint("FM_TRE_CW"),
+    "cost_if_api": fnum("FM_TRE_COST"),
+    "cost_if_api_covered": fnum("FM_TRE_COVERED") or 0.0,
+    "cost_if_api_billed": fnum("FM_TRE_BILLED") or 0.0,
+    "unknown_model_tokens": nint("FM_TRE_UNK"),
+    "unknown_models": sorted(set(models)),
+    "price_source": os.environ.get("FM_TRE_PS", "") or None,
+    "price_cached_at": os.environ.get("FM_TRE_PC", "") or None,
+}
+if os.environ.get("FM_TRE_CLOSE", ""):
+    obj["retro_window"] = {
+        "close_date": os.environ.get("FM_TRE_CLOSE", ""),
+        "start": os.environ.get("FM_TRE_WSTART", ""),
+        "end": os.environ.get("FM_TRE_WEND", ""),
+    }
+else:
+    obj["ledger_sessions"] = nint("FM_TRE_LEDGER")
+    obj["unresolved_sessions"] = nint("FM_TRE_UNRESOLVED")
+json.dump(obj, sys.stdout, indent=2, sort_keys=True)
+sys.stdout.write("\n")
+PY
+}
+
+# Print the shared human per-ticket rollup block from the TRE_* values plus the
+# estimate note ("" for exact, the ESTIMATE window note for --retro).
+print_rollup_human() {
+  local estimate_note=$1
+  local sessions=${TRE_SESSIONS:-0} ti=${TRE_TI:-0} to=${TRE_TO:-0} cr=${TRE_CR:-0} cw=${TRE_CW:-0}
+  if [ "$sessions" -eq 0 ]; then
+    printf 'ticket %s  sessions=0%s  [no session in scope]\n' "$TASK_ID" "$estimate_note"
+    if [ "${TRE_UNRESOLVED:-0}" -gt 0 ]; then
+      printf '  %s ledger session(s) not found in the store (tokens unavailable)\n' "$TRE_UNRESOLVED"
+    fi
+    return 0
+  fi
+  if [ "${TRE_HASPRICED:-0}" -eq 1 ]; then
+    printf 'ticket %s  sessions=%d  cost_if_api $%s  covered $%s / api $%s%s\n' \
+      "$TASK_ID" "$sessions" "$(printf '%.2f' "${TRE_COST:-0}")" \
+      "$(printf '%.2f' "${TRE_COVERED:-0}")" "$(printf '%.2f' "${TRE_BILLED:-0}")" "$estimate_note"
+  else
+    printf 'ticket %s  sessions=%d  cost_if_api UNKNOWN (no price)  tokens %s%s\n' \
+      "$TASK_ID" "$sessions" "$(commafy "$((ti+to+cr+cw))")" "$estimate_note"
+  fi
+  printf '  input %s  output %s  cache_read %s  cache_write %s\n' \
+    "$(commafy "$ti")" "$(commafy "$to")" "$(commafy "$cr")" "$(commafy "$cw")"
+  if [ "${TRE_UNK:-0}" -gt 0 ]; then
+    printf '  [unknown-model tokens %s | %s]\n' "$(commafy "${TRE_UNK:-0}")" "${TRE_UNKMODELS:-}"
+  fi
+  if [ "${TRE_UNRESOLVED:-0}" -gt 0 ]; then
+    printf '  %s ledger session(s) not found in the store (tokens unavailable)\n' "$TRE_UNRESOLVED"
+  fi
+  if [ -n "$PRICE_SOURCE" ]; then
+    printf '  [price %s @%s]\n' "$PRICE_SOURCE" "$PRICE_CACHED"
+  else
+    printf '  [price UNKNOWN (no snapshot)]\n'
+  fi
+}
+
+# EXACT forward-captured path (rides the ledger): read every token-sessions.tsv
+# row for the ticket id, resolve each session in the store, and sum the
+# lib-produced per-session numbers. A ledger session missing from the store is
+# counted as unresolved with its tokens withheld - never guessed. This path is
+# exact and never labeled ESTIMATE.
+do_ticket() {
+  local rows _id sid path out
+  rows=$(fm_token_sessions_rows_for "$DATA" "$TASK_ID") \
+    || die "no session ledger row for ticket '$TASK_ID' (pre-capture?); pass --retro for a labeled date-window estimate" 1
+  TRE_SESSIONS=0 TRE_LEDGER=0 TRE_UNRESOLVED=0
+  TRE_TI=0 TRE_TO=0 TRE_CR=0 TRE_CW=0
+  TRE_COST=0 TRE_COVERED=0 TRE_BILLED=0 TRE_HASPRICED=0
+  TRE_UNK=0 TRE_UNKMODELS=""
+  TRE_CLOSE=""
+  TRE_WSTART=""
+  TRE_WEND=""
+  local mti mto mcr mcw mcost model covered
+  while IFS=$'\t' read -r _id sid _wd _ts _harness; do
+    TRE_LEDGER=$((TRE_LEDGER+1))
+    path=$(resolve_session_path "$sid" "$SESSIONS_DIR") || { TRE_UNRESOLVED=$((TRE_UNRESOLVED+1)); continue; }
+    out=$(fm_token_sum_session "$path" "$PRICE_FILE") || { TRE_UNRESOLVED=$((TRE_UNRESOLVED+1)); continue; }
+    TRE_SESSIONS=$((TRE_SESSIONS+1))
+    mti=$(summary_val "$out" token_input)
+    mto=$(summary_val "$out" token_output)
+    mcr=$(summary_val "$out" token_cache_read)
+    mcw=$(summary_val "$out" token_cache_write)
+    mcost=$(summary_val "$out" cost_if_api)
+    model=$(summary_val "$out" model)
+    covered=$(summary_val "$out" subscription_covered)
+    TRE_TI=$((TRE_TI+mti)); TRE_TO=$((TRE_TO+mto))
+    TRE_CR=$((TRE_CR+mcr)); TRE_CW=$((TRE_CW+mcw))
+    if [ -n "$mcost" ]; then
+      TRE_HASPRICED=1
+      TRE_COST=$(fadd "$TRE_COST" "$mcost")
+      if [ "$covered" = true ]; then
+        TRE_COVERED=$(fadd "$TRE_COVERED" "$mcost")
+      else
+        TRE_BILLED=$(fadd "$TRE_BILLED" "$mcost")
+      fi
+    else
+      TRE_UNK=$((TRE_UNK+mti+mto+mcr+mcw))
+      if [ -z "$TRE_UNKMODELS" ]; then
+        TRE_UNKMODELS=$model
+      else
+        case ",$TRE_UNKMODELS," in
+          *",$model,"*) : ;;
+          *) TRE_UNKMODELS="$TRE_UNKMODELS,$model" ;;
+        esac
+      fi
+    fi
+  done < <(printf '%s\n' "$rows")
+
+  if [ "$JSON" -eq 1 ]; then
+    TRE_ESTIMATE=false
+    emit_ticket_json
+    return 0
+  fi
+  print_rollup_human ""
+}
+
+# --retro (D4): coarse date-window ESTIMATE for a pre-capture ticket with NO
+# ledger rows. The completion ledger's close date bounds a coarse 7-day window
+# (the close date and the six days before it, whole days UTC); every session
+# whose created_at falls in that window is attributed to the ticket
+# HEURISTICALLY. The token math still comes from the one coster lib; it is the
+# ATTRIBUTION that is coarse, so the output always carries the ESTIMATE label,
+# never exactness. Refuses to run on a ticket that has exact ledger data.
+do_retro() {
+  if fm_token_sessions_rows_for "$DATA" "$TASK_ID" | grep -q .; then
+    die "ticket '$TASK_ID' has exact ledger sessions; --retro is only for pre-capture tickets (drop --retro for the exact rollup)" 1
+  fi
+  local comps close_date start_date period_spec
+  comps=$(fm_completions_lookup "$DATA" "$TASK_ID") \
+    || die "no completion record for '$TASK_ID'; --retro cannot bound a date window" 1
+  close_date=$(printf '%s\n' "$comps" | tail -n 1 | cut -f2)
+  [ -n "$close_date" ] || die "completion record for '$TASK_ID' has no close date" 1
+  start_date=$(python3 -c "import datetime,sys; d=datetime.date(*[int(x) for x in sys.argv[1].split('-')]) - datetime.timedelta(days=6); print(d.isoformat())" "$close_date")
+  period_spec="$start_date..$close_date"
+
+  local agg_tmp costed_tmp
+  agg_tmp=$(mktemp "${TMPDIR:-/tmp}/fm-token-report.aggXXXXXX")
+  costed_tmp=$(mktemp "${TMPDIR:-/tmp}/fm-token-report.costXXXXXX")
+  trap 'rm -f "$agg_tmp" "$costed_tmp"' RETURN
+
+  PERIOD="$period_spec"
+  aggregate_tokens > "$agg_tmp"
+  cost_aggregate_rows "$agg_tmp" "$costed_tmp"
+
+  TRE_SESSIONS=0 TRE_UNRESOLVED=0 TRE_LEDGER=0
+  TRE_TI=0 TRE_TO=0 TRE_CR=0 TRE_CW=0
+  TRE_COST=0 TRE_COVERED=0 TRE_BILLED=0 TRE_HASPRICED=0
+  TRE_UNK=0 TRE_UNKMODELS=""
+  TRE_CLOSE="$close_date"
+  local b model covered n cost cti cto ccr ccw
+  while IFS=$'\t' read -r b model _provider covered _ticket n cost cti cto ccr ccw; do
+    [ -n "$b" ] || continue
+    TRE_SESSIONS=$((TRE_SESSIONS+n))
+    TRE_TI=$((TRE_TI+cti)); TRE_TO=$((TRE_TO+cto))
+    TRE_CR=$((TRE_CR+ccr)); TRE_CW=$((TRE_CW+ccw))
+    if [ -n "$cost" ]; then
+      TRE_HASPRICED=1
+      TRE_COST=$(fadd "$TRE_COST" "$cost")
+      if [ "$covered" = true ]; then
+        TRE_COVERED=$(fadd "$TRE_COVERED" "$cost")
+      else
+        TRE_BILLED=$(fadd "$TRE_BILLED" "$cost")
+      fi
+    else
+      TRE_UNK=$((TRE_UNK+cti+cto+ccr+ccw))
+      if [ -z "$TRE_UNKMODELS" ]; then
+        TRE_UNKMODELS=$model
+      else
+        case ",$TRE_UNKMODELS," in
+          *",$model,"*) : ;;
+          *) TRE_UNKMODELS="$TRE_UNKMODELS,$model" ;;
+        esac
+      fi
+    fi
+  done < "$costed_tmp"
+
+  if [ "$JSON" -eq 1 ]; then
+    TRE_ESTIMATE=true
+    TRE_WSTART="$start_date"
+    TRE_WEND="$close_date"
+    emit_ticket_json
+    return 0
+  fi
+  print_rollup_human "  ESTIMATE (coarse, date-window $start_date..$close_date)"
+  printf '  [ESTIMATE: every session created in the window is attributed heuristically; this is NOT an exact per-ticket cost (D4)]\n'
 }
 
 # --- dispatch ----------------------------------------------------------------
 
 if [ "$MODE" = session ]; then
   do_session
+elif [ "$MODE" = ticket ]; then
+  if [ "$RETRO" -eq 1 ]; then
+    do_retro
+  else
+    do_ticket
+  fi
 else
   do_period
 fi
