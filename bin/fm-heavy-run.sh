@@ -503,6 +503,14 @@ WAIT_POSITION=0
 WAIT_AHEAD=0
 try_admit() {
   local f running=0 first_waiting='' pos=0 admitted=1
+  # Re-resolve the ceiling every pass rather than trusting a value cached at
+  # startup. A waiter whose home lacked config/heavy-run-slots when it launched
+  # would otherwise hold ceiling 1 forever and, as the FIFO head, starve the whole
+  # queue once the ceiling is raised. resolve_slots is a cheap config read by
+  # design (see the header), so re-reading it per admission pass is fine, and the
+  # resolution precedence is unchanged. The global SLOTS is refreshed too so the
+  # queued notice below reports the current ceiling.
+  SLOTS=$(resolve_slots)
   lock_acquire || return 2
   reap_dead
   if [ ! -f "$MY_ENTRY" ]; then
