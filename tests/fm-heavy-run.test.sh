@@ -452,6 +452,42 @@ test_pressure_guard_fails_open_when_status_absent_or_stale() {
   pass "fm-heavy-run.sh: the pressure guard fails open on an absent or stale verdict"
 }
 
+# --- stale-ceiling FIFO deadlock (regression) -------------------------------
+
+test_stale_ceiling_head_waiter_picks_up_raised_ceiling() {
+  # The bug: a waiter that started while its home lacked config/heavy-run-slots
+  # resolves ceiling 1 and, if the ceiling was cached once at startup, holds it
+  # forever. As the FIFO head with one slot occupied, it never admits and starves
+  # the whole queue. The fix re-resolves the ceiling each admission pass, so the
+  # head waiter must pick up a raised ceiling and admit WITHOUT being killed.
+  local holder waiter rc
+  reset_queue
+  # No ceiling file yet: the waiter launched now resolves ceiling 1.
+  rm -f "$HOME_DIR/config/heavy-run-slots"
+  # One slot occupied by a long holder.
+  "$HR" --task stale-holder -- sleep 6 & holder=$!
+  STRAYS+=("$holder")
+  wait_status running 1 10 || fail "the holding run never showed as running"
+  # The head waiter enters the queue while ceiling is 1.
+  "$HR" --task stale-head --max-wait 20 -- true & waiter=$!
+  STRAYS+=("$waiter")
+  wait_status waiting 1 10 || fail "the head waiter never showed as queued"
+  # Raise the ceiling to 2 while the holder still runs. With the bug the waiter
+  # keeps ceiling 1 and blocks until the holder exits; with the fix it re-resolves
+  # 2, sees a free slot, and admits while the holder is still running.
+  printf '2\n' > "$HOME_DIR/config/heavy-run-slots"
+  # The waiter must admit and finish while the holder is STILL running, proving it
+  # picked up the raised ceiling rather than merely waiting the holder out (with
+  # the bug it would block until the holder's sleep ends, then admit at ceiling 1).
+  wait "$waiter"; rc=$?
+  expect_code 0 "$rc" "the stale-ceiling head waiter must admit under the raised ceiling"
+  kill -0 "$holder" 2>/dev/null \
+    || fail "the waiter only ran after the holder exited; it did not pick up the raised ceiling"
+  kill "$holder" 2>/dev/null
+  wait "$holder" 2>/dev/null || true
+  pass "fm-heavy-run.sh: a stale-ceiling head waiter picks up a raised ceiling and admits"
+}
+
 test_symlinked_ledger_dir_is_refused() {
   # A ledger root the operating uid does not own (here, a symlink standing in for
   # an attacker pre-created dir on a sticky world-writable tmp) must be refused
@@ -473,6 +509,7 @@ test_symlinked_ledger_dir_is_refused() {
 
 test_script_parses
 test_symlinked_ledger_dir_is_refused
+test_stale_ceiling_head_waiter_picks_up_raised_ceiling
 test_help_includes_entire_header
 test_usage_error_runs_nothing
 test_passes_through_output_and_status
