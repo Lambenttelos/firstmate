@@ -262,12 +262,14 @@ else
   fail "populated: expected 3 decision cards, got $n_dec"
 fi
 
-# Decision descriptions render as expandable <details> with a two-line collapsed
-# clamp, so a long reason is never cut off - it is reachable by click. The full
-# untruncated reason (summary_full) must reach the page, longer than the old
-# ~90-char summary cap.
+# Decision descriptions render as expandable <details>, and the reason span must
+# NOT carry a line-clamp: a Tailwind line-clamp caps the visible text at two
+# lines and vertically CLIPS the rest, hiding part of the reason from the
+# captain. The full untruncated reason (summary_full) must reach the page, and
+# the clamp plus its "more" expand hint must be gone so nothing is cut off.
 assert_grep '<details class="text-sm opacity-80 group">' "$OUT1" 'decisions: descriptions render as expandable <details>'
-assert_grep 'line-clamp-2 group-open:line-clamp-none' "$OUT1" 'decisions: collapsed clamp expands on open'
+assert_no_grep 'line-clamp' "$OUT1" 'decisions: reason span carries no line-clamp (would clip the text)'
+assert_no_grep 'group-open:hidden' "$OUT1" 'decisions: no "more" expand-hint span (clamp affordance removed)'
 assert_grep 'a materially different long-term maintenance burden the captain must judge' "$OUT1" 'decisions: the full untruncated reason reaches the page'
 
 # The desk's resolved home must reach the child snapshot.
