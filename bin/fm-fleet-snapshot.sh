@@ -32,6 +32,9 @@
 #     endpoint.exists is the cheap backend endpoint-presence read.
 #     endpoint.agent_alive is populated for secondmates only, where it is useful
 #     return-channel supervision data; other tasks use "not_checked".
+#     telemetry is the state/<id>.telemetry sub-object (bin/fm-telemetry-lib.sh);
+#     only keys present in the file are rendered, so absent data is {}, never a
+#     fabricated zero.
 #   scout_reports[]: present data/<id>/report.md pointers.
 #   main_inventory: {valid,reason,orphan_in_flight[],unstructured_current_count} -
 #     main-home current-inventory checks shared with secondmate_home_summary_json
