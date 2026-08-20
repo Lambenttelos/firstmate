@@ -7,7 +7,11 @@
             <h3 class="card-title text-base">Decide alpha</h3>
             <span class="flex gap-1 shrink-0"><span class="badge badge-warning badge-sm">your call</span></span>
           </div>
-          <p class="text-sm opacity-80">pick a data store</p>
+          <details class="text-sm opacity-80 group">
+            <summary class="cursor-pointer list-none marker:hidden [&::-webkit-details-marker]:hidden">
+              <span class="align-middle">pick a data store</span>
+            </summary>
+          </details>
           <div class="text-xs opacity-50">scout</div>
         </div>
       </div>
@@ -17,7 +21,11 @@
             <h3 class="card-title text-base">Decide pay rename</h3>
             <span class="flex gap-1 shrink-0"><span class="badge badge-error badge-sm">money</span><span class="badge badge-warning badge-sm">your call</span></span>
           </div>
-          <p class="text-sm opacity-80">confirm the pricing rename</p>
+          <details class="text-sm opacity-80 group">
+            <summary class="cursor-pointer list-none marker:hidden [&::-webkit-details-marker]:hidden">
+              <span class="align-middle">confirm the pricing rename</span>
+            </summary>
+          </details>
           <div class="text-xs opacity-50">scout</div>
         </div>
       </div>

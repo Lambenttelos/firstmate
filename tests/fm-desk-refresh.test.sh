@@ -52,6 +52,48 @@ POPULATED=$(cat <<'JSON'
 JSON
 )
 
+# A fixture quota-axi report (schemaVersion 3, matching the live tool). Claude
+# carries two windows whose binding (lowest-percent) window is the 30% session
+# window, OpenCode one high-runway week window, and Grok NO windows (the
+# auth-required path). The projected-exhausted and reset times come from Claude's
+# session window; the lowest runway across all accounts is Claude 30%.
+QUOTA_FIXTURE=$(cat <<'JSON'
+{
+  "generatedAt": "2026-08-20T00:00:00Z",
+  "schemaVersion": 3,
+  "providers": [
+    {
+      "provider": "claude",
+      "label": "Claude",
+      "source": "oauth",
+      "plan": "team",
+      "state": {"status": "fresh", "stale": false},
+      "windows": [
+        {"id": "five_hour", "kind": "session", "label": "session", "percentUsed": 70, "percentRemaining": 30, "resetsAt": "2026-08-20T18:00:00Z", "pace": {"status": "behind", "projectedExhaustedAt": "2026-08-20T16:00:00Z"}},
+        {"id": "seven_day", "kind": "weekly", "label": "week", "percentUsed": 20, "percentRemaining": 80, "resetsAt": "2026-08-24T13:00:00Z", "pace": {"status": "ahead", "projectedExhaustedAt": "2026-08-23T05:00:00Z"}}
+      ]
+    },
+    {
+      "provider": "opencode",
+      "label": "OpenCode",
+      "source": "unavailable",
+      "state": {"status": "fresh", "stale": false},
+      "windows": [
+        {"id": "seven_day", "kind": "weekly", "label": "week", "percentUsed": 5, "percentRemaining": 95, "resetsAt": "2026-08-24T13:00:00Z", "pace": {"status": "ahead", "projectedExhaustedAt": "2026-08-23T09:00:00Z"}}
+      ]
+    },
+    {
+      "provider": "grok",
+      "label": "Grok",
+      "source": "unavailable",
+      "state": {"status": "auth_required", "stale": false},
+      "windows": []
+    }
+  ]
+}
+JSON
+)
+
 # make_snapshot <dir> writes a fake fm-bearings-snapshot.sh that records the
 # FM_HOME it was invoked with to <dir>/seen-home, then behaves per FAKE_MODE:
 #   json     print $FAKE_JSON verbatim (default)
@@ -83,8 +125,32 @@ SH
   printf '%s\n' "$f"
 }
 
+# make_quota <dir> writes a fake quota-axi that behaves per FAKE_QUOTA_MODE:
+#   json     print $FAKE_QUOTA_JSON verbatim (default)
+#   fail     exit 1, as if the tool is absent/unreadable
+#   broken   print non-JSON, so the fail-closed parse also degrades to a gap
+#   noacc    print valid JSON with an empty providers array (a true empty)
+# The file itself is the fixture "state" the read-only test hashes.
+make_quota() {  # <dir>
+  local f="$1/fake-quota.sh"
+  cat > "$f" <<'SH'
+#!/usr/bin/env bash
+case "${FAKE_QUOTA_MODE:-json}" in
+  json)   printf '%s' "${FAKE_QUOTA_JSON:-}" ;;
+  fail)   exit 1 ;;
+  broken) printf 'this is not json\n' ;;
+  noacc)  printf '{"schemaVersion":3,"providers":[]}' ;;
+esac
+exit 0
+SH
+  chmod +x "$f"
+  printf '%s\n' "$f"
+}
+
 # run_desk <home> <out> : render the desk with the fake snapshot and a minimal
-# tasks-axi/gh stub set, echoing nothing (assertions read <out>).
+# tasks-axi/gh stub set, echoing nothing (assertions read <out>). The quota
+# source is always injected via FM_DESK_QUOTA_BIN so every render is hermetic;
+# FAKE_QUOTA_MODE/FAKE_QUOTA_JSON select the fixture behavior.
 run_desk() {  # <home> <out>
   local home="$1" out="$2" fakebin
   fakebin=$(fm_fakebin "$home")
@@ -171,6 +237,12 @@ SH
       chmod 000 "$home/data/secondmates.md"
     fi
   fi
+  local quotabin
+  if [ "${FAKE_QUOTA_EXISTING:-0}" = 1 ]; then
+    quotabin="$home/fake-quota.sh"
+  else
+    quotabin=$(make_quota "$home")
+  fi
   PATH="$fakebin:$PATH" \
   FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" \
   FM_DESK_SNAPSHOT_BIN="$SNAP" SEEN_HOME="$home/seen-home" \
@@ -178,6 +250,8 @@ SH
   FM_DESK_CI_BUDGET=0 \
   FM_DESK_NOW_EPOCH="${FAKE_EPOCH:-1785225600}" \
   FM_DESK_OUT="$out" FM_DESK_NOW='2026-07-28 09:00' \
+  FM_DESK_QUOTA_BIN="$quotabin" \
+  FAKE_QUOTA_MODE="${FAKE_QUOTA_MODE:-json}" FAKE_QUOTA_JSON="${FAKE_QUOTA_JSON:-$QUOTA_FIXTURE}" \
     bash "$DESK"
 }
 
@@ -384,21 +458,104 @@ OUT8="$HOME8/desk.html"
 FAKE_MODE=json FAKE_JSON="$NO_SM" run_desk "$HOME8" "$OUT8"
 assert_grep 'No second mates are standing' "$OUT8" 'sm-empty: an empty second-mate list is a confident empty'
 
-# --- read-only invariant: building the desk must not mutate the fixture second-
-#     mate registry or the second mate's own backlog (byte-unchanged) -----------
+# --- read-only invariant: building the desk must not mutate the fixture
+#     second-mate registry, the second mate's own backlog, or the quota fixture
+#     (all byte-unchanged) ----------------------------------------------------
 HOME9="$TMP_ROOT/home9"; mkdir -p "$HOME9"
 SNAP=$(make_snapshot "$HOME9")
+make_quota "$HOME9" >/dev/null   # write the quota fixture ONCE; builds reuse it below
 OUT9="$HOME9/desk.html"
-FAKE_MODE=json FAKE_JSON="$POPULATED" run_desk "$HOME9" "$OUT9"
+FAKE_MODE=json FAKE_JSON="$POPULATED" FAKE_QUOTA_EXISTING=1 run_desk "$HOME9" "$OUT9"
 reg_before=$(md5sum "$HOME9/data/secondmates.md" | awk '{print $1}')
 bl_before=$(md5sum "$HOME9/sm-decision-desk/data/backlog.md" | awk '{print $1}')
-FAKE_MODE=json FAKE_JSON="$POPULATED" run_desk "$HOME9" "$OUT9"
+q_before=$(md5sum "$HOME9/fake-quota.sh" | awk '{print $1}')
+FAKE_MODE=json FAKE_JSON="$POPULATED" FAKE_QUOTA_EXISTING=1 run_desk "$HOME9" "$OUT9"
 reg_after=$(md5sum "$HOME9/data/secondmates.md" | awk '{print $1}')
 bl_after=$(md5sum "$HOME9/sm-decision-desk/data/backlog.md" | awk '{print $1}')
-if [ "$reg_before" = "$reg_after" ] && [ "$bl_before" = "$bl_after" ]; then
-  pass 'read-only: the registry and second-mate backlog are byte-unchanged after a build'
+q_after=$(md5sum "$HOME9/fake-quota.sh" | awk '{print $1}')
+if [ "$reg_before" = "$reg_after" ] && [ "$bl_before" = "$bl_after" ] && [ "$q_before" = "$q_after" ]; then
+  pass 'read-only: registry, second-mate backlog, and quota fixture are byte-unchanged after a build'
 else
-  fail 'read-only: the desk mutated the registry or a second-mate backlog'
+  fail 'read-only: the desk mutated the registry, a second-mate backlog, or the quota fixture'
 fi
+
+# --- accounts/quota panel: a populated quota-axi report renders per-account
+#     runway bars, the binding-window label, and projected/reset times ---------
+HOME11="$TMP_ROOT/home11"; mkdir -p "$HOME11"
+SNAP=$(make_snapshot "$HOME11")
+OUT11="$HOME11/desk.html"
+FAKE_MODE=json FAKE_JSON="$POPULATED" run_desk "$HOME11" "$OUT11"
+
+assert_grep 'id="sec-accounts"' "$OUT11" 'accounts: the panel renders'
+assert_grep 'Accounts and quota' "$OUT11" 'accounts: panel heading present'
+# Claude's binding window is the session window at 30% runway; the bar and text
+# reach the page, and the binding window label is shown.
+assert_grep '30% left' "$OUT11" 'accounts: the binding-window runway renders'
+assert_grep 'session' "$OUT11" 'accounts: the binding-window label renders'
+# A high-runway account renders too.
+assert_grep '95% left' "$OUT11" 'accounts: a high-runway account also renders'
+# An auth-required account with NO windows renders a dash, never a zero bar.
+assert_grep 'needs sign-in' "$OUT11" 'accounts: a no-window account is named needs sign-in'
+assert_no_grep 'value="0" max="100"' "$OUT11" 'accounts: no confident-zero runway bar renders anywhere'
+# The binding-window projected-exhausted and reset times reach the page in the
+# same local conversion the builder uses (fixture Claude session window).
+exp_dry=$(date -d '2026-08-20T16:00:00Z' '+%m-%d %H:%M' 2>/dev/null || true)
+exp_reset=$(date -d '2026-08-20T18:00:00Z' '+%m-%d %H:%M' 2>/dev/null || true)
+if [ -n "$exp_dry" ]; then
+  assert_grep "$exp_dry" "$OUT11" 'accounts: projected-exhausted time reaches the panel'
+fi
+if [ -n "$exp_reset" ]; then
+  assert_grep "$exp_reset" "$OUT11" 'accounts: reset time reaches the panel'
+fi
+# The sticky strip headline shows the lowest runway across accounts: Claude 30%.
+assert_grep 'lowest runway:' "$OUT11" 'accounts: the sticky strip carries a runway headline'
+assert_grep 'Claude 30%' "$OUT11" 'accounts: the headline names the lowest-runway account'
+# The sticky nav carries the jump link to the new panel.
+assert_grep 'href="#sec-accounts"' "$OUT11" 'accounts: sticky-nav jump link present'
+# The per-pane attribution half is a labeled gap pending the visibility layer,
+# never silently missing.
+assert_grep 'pending the visibility layer' "$OUT11" 'accounts: the per-pane half is a labeled gap, not silently absent'
+# The numbered spine stays stable: no existing section heading is renumbered.
+assert_grep '1. Decisions needed' "$OUT11" 'accounts: section 1 number unchanged'
+assert_grep '4. Slots and host' "$OUT11" 'accounts: section 4 number unchanged'
+assert_grep '5. Progress - last 3 hours' "$OUT11" 'accounts: section 5 number unchanged'
+
+# --- accounts/quota panel: an ABSENT or unreadable tool renders a GAP, never a
+#     confident-zero runway ---------------------------------------------------
+HOME12="$TMP_ROOT/home12"; mkdir -p "$HOME12"
+SNAP=$(make_snapshot "$HOME12")
+OUT12="$HOME12/desk.html"
+FAKE_MODE=json FAKE_JSON="$POPULATED" FAKE_QUOTA_MODE=fail run_desk "$HOME12" "$OUT12"
+
+assert_grep 'id="sec-accounts"' "$OUT12" 'quota-absent: the panel still renders'
+assert_grep 'could not be read' "$OUT12" 'quota-absent: a visible gap is shown'
+assert_no_grep 'value="0" max="100"' "$OUT12" 'quota-absent: no zero runway bar renders when the tool is absent'
+assert_no_grep '% left' "$OUT12" 'quota-absent: no runway percent at all when the tool is absent'
+assert_grep 'lowest runway:' "$OUT12" 'quota-absent: the sticky headline is still present'
+assert_grep '<strong class="opacity-60">unknown</strong>' "$OUT12" 'quota-absent: the headline is unknown, never a zero'
+assert_grep 'pending the visibility layer' "$OUT12" 'quota-absent: the per-pane labeled gap still renders'
+
+# --- accounts/quota panel: UNPARSEABLE output also degrades to a gap, not a
+#     confident empty ----------------------------------------------------------
+HOME13="$TMP_ROOT/home13"; mkdir -p "$HOME13"
+SNAP=$(make_snapshot "$HOME13")
+OUT13="$HOME13/desk.html"
+FAKE_MODE=json FAKE_JSON="$POPULATED" FAKE_QUOTA_MODE=broken run_desk "$HOME13" "$OUT13"
+
+assert_grep 'id="sec-accounts"' "$OUT13" 'quota-broken: the panel still renders'
+assert_grep 'could not be read' "$OUT13" 'quota-broken: an unparseable report degrades to a visible gap'
+assert_no_grep '% left' "$OUT13" 'quota-broken: no runway percent from an unparseable report'
+assert_no_grep 'No account readings' "$OUT13" 'quota-broken: an unparseable report is never a confident empty'
+
+# --- accounts/quota panel: a present tool returning a genuinely EMPTY report is
+#     a confident empty, not a gap ---------------------------------------------
+HOME14="$TMP_ROOT/home14"; mkdir -p "$HOME14"
+SNAP=$(make_snapshot "$HOME14")
+OUT14="$HOME14/desk.html"
+FAKE_MODE=json FAKE_JSON="$POPULATED" FAKE_QUOTA_MODE=noacc run_desk "$HOME14" "$OUT14"
+
+assert_grep 'id="sec-accounts"' "$OUT14" 'quota-empty: the panel still renders'
+assert_grep 'No account readings are available' "$OUT14" 'quota-empty: a real empty report is a confident empty'
+assert_no_grep 'could not be read' "$OUT14" 'quota-empty: no gap for a genuine empty report'
 
 echo "all fm-desk-refresh tests passed"
