@@ -193,6 +193,12 @@ SUB_HOME_MARKER=".fm-secondmate-home"
 . "$SCRIPT_DIR/fm-completions-lib.sh"
 # shellcheck source=bin/fm-token-sessions-lib.sh
 . "$SCRIPT_DIR/fm-token-sessions-lib.sh"
+# Shared per-task telemetry writer (state/<id>.telemetry, key=value). Gap-1
+# stamps the resolved Claude account (account=/account_source=) at spawn; the
+# same library owns the in-place key update for sibling producers. No side
+# effects on source.
+# shellcheck source=bin/fm-telemetry-lib.sh
+. "$SCRIPT_DIR/fm-telemetry-lib.sh"
 # Fail closed before any fleet mutation: a no-mistakes gate agent must never spawn
 # a direct report (see bin/fm-gate-refuse-lib.sh).
 fm_refuse_if_gate_agent
@@ -1792,6 +1798,10 @@ if [ "$HARNESS" = jcode ]; then
       ;;
   esac
   jcode_post_launch_delivery "$T" "$BRIEF" "${MODEL:-}" "${EFFORT:-}" "${SPAWN_ACCOUNT:-}" || true
+  # Gap-1 visibility: stamp the pinned Claude account onto this task's
+  # state/<id>.telemetry now the spawn has resolved it (account=/account_source=
+  # spawn). FAIL-SOFT: never a spawn blocker; an empty account stamps nothing.
+  fm_telemetry_stamp_account "$STATE/$ID.telemetry" "${SPAWN_ACCOUNT:-}" spawn || true
 fi
 
 # Token-session capture (best-effort telemetry, NEVER a spawn blocker). Now that

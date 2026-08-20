@@ -696,6 +696,66 @@ test_gap3_fresh_agreeing_event_is_paired_without_markers() {
   pass "Gap 3: a fresh agreeing event is paired without OLD or SUPERSEDED"
 }
 
+# Gap 1: the snapshot task rows expose the shared account/quota telemetry
+# (state/<id>.telemetry) as a telemetry:{} sub-object, mirrors of the meta:/
+# status_log: rows. Keys are all optional: a task with no telemetry file gets
+# the empty object, a present key is a real value, and an absent field NEVER
+# renders as zero.
+test_telemetry_subobject_on_task_rows() {
+  local home fakebin out
+  home=$(make_home telemetry)
+  mkdir -p "$home/projects/t1-wt" "$home/projects/t2-wt"
+  fm_write_meta "$home/state/t1.meta" \
+    "window=firstmate:fm-t1" \
+    "worktree=$home/projects/t1-wt" \
+    "project=alpha" \
+    "harness=codex" \
+    "kind=ship" \
+    "mode=ship"
+  fm_write_meta "$home/state/t2.meta" \
+    "window=firstmate:fm-t2" \
+    "worktree=$home/projects/t2-wt" \
+    "project=alpha" \
+    "harness=jcode" \
+    "kind=ship" \
+    "mode=ship"
+  # t1 carries a full account/quota telemetry line set; t2 has NONE (a task
+  # that predates the producer or was never reached by it).
+  cat > "$home/state/t1.telemetry" <<'EOF'
+account=claude-2
+account_source=spawn
+quota_pct=8
+quota_window=seven_day
+quota_reset_ts=1784841600
+last_429_ts=1784800000
+count_429=2
+observed_at=1784841300
+EOF
+  fakebin=$(make_fakebin "$home")
+  out=$(PATH="$fakebin:$PATH" FM_HOME="$home" "$SNAPSHOT" --json)
+  printf '%s' "$out" | jq -e '
+    .tasks[] | select(.id == "t1")
+    | .telemetry.account == "claude-2"
+      and .telemetry.account_source == "spawn"
+      and .telemetry.quota_pct == "8"
+      and .telemetry.quota_window == "seven_day"
+      and .telemetry.quota_reset_ts == "1784841600"
+      and .telemetry.count_429 == "2"
+      and (.telemetry | keys | length) == 8
+  ' >/dev/null || fail "t1 telemetry sub-object missing or wrong: $out"
+  printf '%s' "$out" | jq -e '
+    .tasks[] | select(.id == "t2")
+    | .telemetry == {}
+  ' >/dev/null || fail "a task with no telemetry file must render the EMPTY object, got $out"
+  # Absent-key safety: t1 has no composer_stuck key, so the object must not
+  # fabricate it (absent = unknown, never zero).
+  printf '%s' "$out" | jq -e '
+    .tasks[] | select(.id == "t1")
+    | (.telemetry | has("composer_stuck")) | not
+  ' >/dev/null || fail "an absent telemetry key must stay absent, never rendered as zero: $out"
+  pass "telemetry sub-object appears on task rows and is absent-key-safe"
+}
+
 # A still-open decision must survive a LATER, UNRELATED terminal event on the same
 # append-only stream. This is the fmdev masking bug: last-event-wins read the trailing
 # `done` and reported pending_decision=false while a needs-decision was still open. The
@@ -948,3 +1008,4 @@ test_view_renders_snapshot
 test_view_renders_dead_secondmate_agent_status
 test_gap3_pairs_event_with_current_state_old_and_superseded
 test_gap3_fresh_agreeing_event_is_paired_without_markers
+test_telemetry_subobject_on_task_rows

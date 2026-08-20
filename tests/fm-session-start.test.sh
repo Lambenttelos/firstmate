@@ -1307,6 +1307,61 @@ EOF
   pass "session start rejects Pi loaded markers from previous sessions"
 }
 
+# Gap 1: the fleet-state digest carries one per-account quota line rolled up
+# from the task telemetry files (state/<id>.telemetry), lowest runway first, so
+# the session-start headline is the account nearest exhaustion. Same account on
+# multiple panes rolls to its min quota_pct, an absent window/reset stays
+# absent, and a fleet with no quota data says unavailable (never a zero).
+test_account_quota_digest_line() {
+  local rec root home fakebin out reset1 reset2
+  rec=$(new_world account-quota)
+  IFS='|' read -r root home fakebin <<EOF
+$rec
+EOF
+  make_fake_toolchain "$fakebin"
+  make_fake_ps_claude "$fakebin"
+
+  printf 'kind=ship\n' > "$home/state/t1.meta"
+  printf 'kind=ship\n' > "$home/state/t2.meta"
+  printf 'kind=ship\n' > "$home/state/t3.meta"
+  # claude-1: one pane at 62% on the five_hour window with a known reset.
+  # claude-2: two panes, 8% (seven_day) and 40% - the rollup must use the min 8%.
+  reset1=1800000000
+  reset2=1800864000
+  printf 'account=claude-1\nquota_pct=62\nquota_window=five_hour\nquota_reset_ts=%s\n' "$reset1" \
+    > "$home/state/t1.telemetry"
+  printf 'account=claude-2\nquota_pct=8\nquota_window=seven_day\nquota_reset_ts=%s\n' "$reset2" \
+    > "$home/state/t2.telemetry"
+  printf 'account=claude-2\nquota_pct=40\nquota_window=five_hour\n' > "$home/state/t3.telemetry"
+
+  out=$(TZ=UTC run_session_start "$home" "$root" "$fakebin:$BASE_PATH")
+  assert_contains "$out" "Account quotas" "digest must label the per-account quota rollup"
+  r1=$(date -d "@$reset1" +%H:%M 2>/dev/null || date -r "$reset1" +%H:%M 2>/dev/null)
+  r2=$(date -d "@$reset2" +%H:%M 2>/dev/null || date -r "$reset2" +%H:%M 2>/dev/null)
+  [ -n "$r1" ] && [ -n "$r2" ] || fail "could not compute expected reset clocks in the test"
+  assert_contains "$out" "claude-2 8% (seven_day resets $r2)" \
+    "rollup must lead with the lowest-runway account (claude-2 at 8% from the seven_day pane)"
+  assert_contains "$out" "claude-1 62% (five_hour resets $r1)" \
+    "the higher-runway account must follow, rendered after the lowest-runway account"
+  # claude-2's 40% pane must not leak: the rollup is the min pct per account.
+  assert_not_contains "$out" "claude-2 40%" "per-account rollup must surface the min quota_pct, not every pane"
+  pass "fleet-state digest rolls quota up per account, lowest runway first, with the driving window and reset"
+
+  # A fleet with telemetry but no quota data says unavailable, never a zero.
+  rec=$(new_world account-quota-empty)
+  IFS='|' read -r root home fakebin <<EOF
+$rec
+EOF
+  make_fake_toolchain "$fakebin"
+  make_fake_ps_claude "$fakebin"
+  printf 'kind=ship\n' > "$home/state/t1.meta"
+  printf 'account=claude-1\n' > "$home/state/t1.telemetry"
+  out=$(TZ=UTC run_session_start "$home" "$root" "$fakebin:$BASE_PATH")
+  printf '%s\n' "$out" | grep -A1 -F 'Account quotas' | grep -qF 'unavailable' \
+    || fail "missing quota data must render unavailable under the Account quotas subsection: $out"
+  pass "fleet-state digest renders unavailable when no quota data exists"
+}
+
 test_context_digest_absent_empty_present
 test_cross_session_stall_blocked_surfaces_any_age
 test_cross_session_stall_paused_threshold
@@ -1338,3 +1393,4 @@ test_pi_diagnostic_rejects_stale_loaded_marker
 test_pi_diagnostic_accepts_prelock_loaded_marker
 test_pi_diagnostic_rejects_missing_turnend_guard_marker
 test_pi_diagnostic_rejects_previous_session_loaded_marker
+test_account_quota_digest_line

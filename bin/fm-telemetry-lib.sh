@@ -64,3 +64,20 @@ fm_telemetry_set() {  # <telemetry-file> <key> <value>
   mv -f "$tmp" "$file" || { rm -f "$tmp"; return 1; }
   return 0
 }
+
+# fm_telemetry_stamp_account <telemetry-file> <account> <account-source>
+# Stamp the per-pane Claude account label onto <telemetry-file> as
+# account=<account> + account_source=<account-source> (spawn or switch), the
+# single owned shape every account producer uses (gap-1 at spawn: the resolved
+# SPAWN_ACCOUNT; gap-1 on a live switch: the post-rotation account). Writes
+# through fm_telemetry_set so sibling keys never clobber. An empty <account>
+# means no account is known and writes NOTHING (FAIL-SOFT: absent = unknown,
+# never a fabricated line). Returns 0 on an empty account or a successful
+# stamp, non-zero when a write fails.
+fm_telemetry_stamp_account() {  # <telemetry-file> <account> <account-source>
+  local file=$1 account=${2:-} source=${3:-}
+  [ -n "$account" ] || return 0
+  fm_telemetry_set "$file" account "$account" || return 1
+  fm_telemetry_set "$file" account_source "$source" || return 1
+  return 0
+}
