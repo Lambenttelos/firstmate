@@ -84,6 +84,19 @@
 # outside version control, so this header is the tracked one-owner description of
 # the panel; the spec mirror is updated by firstmate in the same change set.
 #
+# An accounts and quota panel (id sec-accounts) sits next, between the
+# per-secondmate panel and section 5. It reads quota-axi --json (routed through
+# the desk_bound self-degrade wrapper; FM_DESK_QUOTA_BIN overrides the tool for
+# tests) and renders ONE row per account (quota-axi provider): its runway as the
+# lowest percent remaining across that account's quota windows, the label of the
+# binding window, and that binding window's projected-exhausted and reset times,
+# plus a reading note. An account with no windows (unavailable or needs sign-in)
+# renders a dash in its runway cell, never a confident zero. The sticky KPI strip
+# carries the lowest runway across all accounts as its headline. The per-pane
+# attribution half - which worker pane runs on which account and its throttle
+# flags - is a labeled gap pending the visibility layer (PR3), by design and
+# never silently missing.
+#
 # LANGUAGE. The page is captain-facing, so AGENTS.md section 9 applies in full.
 # Free text lifted from fleet records is passed through desk_plain(), which
 # rewrites internal vocabulary into the captain's nouns; DESK_TERMS below is the
@@ -158,7 +171,8 @@
 # from, and FM_DESK_COMPLETIONS overrides the completion-ledger path.
 # FM_DESK_TRANSCRIPT overrides the durable transcript-feed path (mirroring the
 # producer's own seam) and FM_DESK_TRANSCRIPT_READ bounds how many feed lines
-# are read.
+# are read. FM_DESK_QUOTA_BIN overrides the quota-axi command the accounts panel
+# reads, so a test can drive that panel through an absent tool or a fixture.
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -189,7 +203,7 @@ DESK_MAX_DECISIONS=${FM_DESK_MAX_DECISIONS:-12}
 # The header comment IS the help text: from the description line down to the
 # last comment line before the first executable line.
 usage() {
-  sed -n '2,161p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '2,176p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 # --- internal-vocabulary translation ----------------------------------------
@@ -413,6 +427,24 @@ fi
 RES_LEVEL=$(cat "$STATE/.resource-status" 2>/dev/null || printf '')
 if [ -z "$RES_LINE" ] && [ -z "$RES_LEVEL" ]; then
   note_gap "No reading of this machine's capacity was available."
+fi
+
+# The account quota report, read for the accounts/quota panel (sec-accounts) and
+# the sticky KPI strip's lowest-runway headline. quota-axi --json is a cheap
+# local sub-second read routed through desk_bound like every other source.
+# Absent, unreadable, or non-JSON data degrades to a gap in the panel and an
+# "unknown" headline, never a confident-zero runway. FM_DESK_QUOTA_BIN overrides
+# the tool so a test can inject a fixture or drive the failure paths.
+QUOTA=""
+QUOTA_PRESENT=0
+DESK_QUOTA_BIN="${FM_DESK_QUOTA_BIN:-quota-axi}"
+if [ "$HAVE_JQ" -eq 1 ] \
+  && QUOTA=$(desk_bound "$DESK_QUOTA_BIN" --json 2>/dev/null) \
+  && [ -n "$QUOTA" ] && printf '%s' "$QUOTA" | jq -e . >/dev/null 2>&1; then
+  QUOTA_PRESENT=1
+else
+  QUOTA=""
+  note_gap "The account quota report could not be read, so runway figures are unknown on this page."
 fi
 
 AWAY=0
@@ -1264,6 +1296,126 @@ HTML
   echo '  </section>'
 }
 
+# --- section sec-accounts: accounts and quota panel (per-account half) -------
+# One row per account (a quota-axi provider). An account's runway is the lowest
+# percent remaining across its quota windows - the window that throttles first is
+# the binding constraint - and the window label, projected-exhausted time, and
+# reset time shown are that binding window's. An account with no windows
+# (unavailable or needs sign-in) renders a dash in its runway cell, never a
+# confident zero. The per-pane attribution half (which worker pane runs on which
+# account, with its throttle flags) is a labeled gap pending the visibility layer
+# (design-workflow-dashboard section 4); it is never silently missing here. The
+# lowest runway across all accounts feeds the sticky KPI strip headline.
+#
+# desk_quota_status: the captain-facing reading note for one account source.
+desk_quota_status() {  # <state.status>
+  case "$1" in
+    fresh) printf 'ok' ;;
+    auth_required) printf 'needs sign-in' ;;
+    error|unavailable) printf 'unavailable' ;;
+    '') printf 'no reading' ;;
+    *) printf '%s' "$(printf '%s' "$1" | tr '_' ' ')" ;;
+  esac
+}
+
+# desk_iso_time: a captain-friendly local "MM-DD HH:MM" for an ISO-8601 stamp.
+# GNU date converts to local time; BSD date gets the same conversion; the last
+# fallback slices the raw stamp so a readable time still shows no matter what.
+desk_iso_time() {  # <iso8601>
+  local iso="$1" out=""
+  [ -n "$iso" ] || return 0
+  out=$(date -d "$iso" '+%m-%d %H:%M' 2>/dev/null) || out=""
+  [ -n "$out" ] && [ "$out" != "$iso" ] && { printf '%s' "$out"; return 0; }
+  out=$(date -j -f '%Y-%m-%dT%H:%M:%S' "${iso%Z}" '+%m-%d %H:%M' 2>/dev/null) || out=""
+  [ -n "$out" ] && [ "$out" != "$iso" ] && { printf '%s' "$out"; return 0; }
+  printf '%s' "$iso" | sed -n -E 's/^[0-9]{4}-([0-9]{2})-([0-9]{2})[T ]([0-9]{2}:[0-9]{2}).*/\1-\2 \3/p'
+}
+
+render_accounts() {
+  local rows st runway win projected reset status label bar_cls
+  echo '  <section id="sec-accounts" class="mb-10">'
+  echo '    <h2 class="text-lg font-semibold mb-3">Accounts and quota</h2>'
+  if [ "$QUOTA_PRESENT" -ne 1 ]; then
+    desk_section_gap "The account quota report could not be read, so runway figures are unknown right now."
+  else
+    rows=$(printf '%s' "$QUOTA" | jq -r "$DESK_JQ_PRELUDE"'
+      .providers[] | . as $p |
+        (if ($p.windows | length) > 0 then ($p.windows | min_by(.percentRemaining // 101)) else null end) as $bind |
+        [
+          ($p.label | z),
+          (if $bind and ($bind.percentRemaining != null) then ($bind.percentRemaining | tostring) else "-" end),
+          (if $bind then ($bind.label | z) else "-" end),
+          (if $bind then (($bind.resetsAt // "-") | tostring) else "-" end),
+          (if $bind then (((($bind.pace // {}) | .projectedExhaustedAt) // "-") | tostring) else "-" end),
+          (((($p.state.status // "") | z)) | if . == "" then "-" else . end)
+        ] | @tsv'); st=$?
+    if [ "$st" -ne 0 ]; then
+      desk_section_gap "The account quota report could not be read, so runway figures are unknown right now."
+    elif [ -z "$rows" ]; then
+      echo '    <p class="text-sm opacity-60">No account readings are available right now.</p>'
+    else
+      echo '    <p class="text-sm opacity-70 mb-3">Runway is the lowest percent left across the quota windows of an account; the window shown is the binding one. A throttling account cuts off work on this machine early, so the lowest runway is the headline above.</p>'
+      echo '    <div class="overflow-x-auto">'
+      echo '      <table class="table table-sm">'
+      echo '        <thead><tr class="text-xs uppercase tracking-wide opacity-60">'
+      echo '          <th class="w-48">Account</th><th class="w-48">Runway</th><th class="w-20">Window</th><th class="w-36">Runs dry</th><th class="w-36">Resets</th><th class="w-32">Reading</th>'
+      echo '        </tr></thead>'
+      echo '        <tbody>'
+      printf '%s\n' "$rows" | while IFS=$'\t' read -r label runway win reset projected status; do
+        [ -n "$label" ] || continue
+        if [ -n "$runway" ] && [ "$runway" != "-" ]; then
+          case "$runway" in
+            ''|*[!0-9]*) bar_cls='progress-error' ;;
+            *) if [ "$runway" -ge 50 ]; then
+                 bar_cls='progress-success'
+               elif [ "$runway" -ge 20 ]; then
+                 bar_cls='progress-warning'
+               else
+                 bar_cls='progress-error'
+               fi ;;
+          esac
+          runway="<div class=\"flex items-center gap-2\"><progress class=\"progress ${bar_cls} w-24\" value=\"${runway}\" max=\"100\"></progress><span class=\"text-sm font-medium\">${runway}% left</span></div>"
+        else
+          runway='<span class="opacity-50">-</span>'
+        fi
+        if [ -n "$projected" ] && [ "$projected" != "-" ]; then
+          projected="$(desk_iso_time "$projected")"
+        else
+          projected='<span class="opacity-50">-</span>'
+        fi
+        if [ -n "$reset" ] && [ "$reset" != "-" ]; then
+          reset="$(desk_iso_time "$reset")"
+        else
+          reset='<span class="opacity-50">-</span>'
+        fi
+        [ -n "$win" ] && [ "$win" != "-" ] || win='-'
+        if [ -n "$status" ] && [ "$status" != "-" ]; then
+          status="$(desk_quota_status "$status")"
+        else
+          status='no reading'
+        fi
+        cat <<HTML
+          <tr>
+            <td class="font-medium align-top">$(desk_text "$label")</td>
+            <td class="align-top">${runway}</td>
+            <td class="text-sm opacity-70 align-top">$(desk_text "$win")</td>
+            <td class="text-sm align-top">${projected}</td>
+            <td class="text-sm align-top">${reset}</td>
+            <td class="text-sm align-top">$(desk_text "$status")</td>
+          </tr>
+HTML
+      done
+      echo '        </tbody>'
+      echo '      </table>'
+      echo '    </div>'
+    fi
+  fi
+  # The per-pane attribution half is a deliberate labeled gap, never silent: the
+  # visibility layer produces that artifact and this panel only consumes it.
+  printf '%s\n' '    <p class="text-xs opacity-70 mt-3">Per-pane attribution - which worker pane runs on which account, with its throttle flags - is pending the visibility layer, so it does not appear here yet.</p>'
+  echo '  </section>'
+}
+
 # --- section 8: captain-held tickets (full list) ----------------------------
 # The complete Captain's Call list - every captain hold, a superset of the
 # urgent decisions in section 1. Read straight from the backlog through
@@ -1776,7 +1928,7 @@ render_transcript_note() {
 # section, calling out sections 11 and 12 as the spec requires. A count the
 # projection could not supply is shown as a dash, never a confident zero.
 render_sticky_strip() {
-  local decisions decisions_st unmerged blockers held tokens
+  local decisions decisions_st unmerged blockers held quota_cls quota_headline
   decisions=$(desk_json '.decisions_open | length'); decisions_st=$?
   blockers=$(desk_json '[.in_flight[] | select(.state == "blocked" or .state == "failed")] | length')
   unmerged=0; [ -n "$MERGEQ" ] && unmerged=$(printf '%s\n' "$MERGEQ" | grep -c .)
@@ -1793,7 +1945,26 @@ render_sticky_strip() {
   fi
   [ -n "$agents" ] || agents='&mdash;'
   [ -n "$ceiling" ] || ceiling='&mdash;'
-  tokens='not tracked here'
+  # The lowest-runway headline: the account whose binding window is closest to
+  # exhausting is the account that throttles this machine first. Unknown (absent
+  # report or no account with a reading) renders "unknown", never a confident
+  # zero runway.
+  quota_cls='opacity-60'
+  quota_headline='unknown'
+  if [ "$QUOTA_PRESENT" -eq 1 ]; then
+    local qh qlabel qrun
+    qh=$(printf '%s' "$QUOTA" | jq -r "$DESK_JQ_PRELUDE"'
+      [ .providers[] | . as $p | [ .windows[] | select(.percentRemaining != null) ] | select(length > 0) | [ ($p.label | z), (min_by(.percentRemaining) | .percentRemaining) ] ]
+      | min_by(.[1]) | @tsv' 2>/dev/null)
+    qlabel=$(printf '%s' "$qh" | cut -f1)
+    qrun=$(printf '%s' "$qh" | cut -f2)
+    if [ -n "$qlabel" ] && [ -n "$qrun" ] && printf '%s' "$qrun" | grep -q '^[0-9][0-9]*$'; then
+      if [ "$qrun" -ge 50 ]; then quota_cls='text-success'
+      elif [ "$qrun" -ge 20 ]; then quota_cls='text-warning'
+      else quota_cls='text-error'; fi
+      quota_headline="${qlabel} ${qrun}%"
+    fi
+  fi
   cat <<HTML
   <div class="sticky top-0 z-30 -mx-5 px-5 py-3 mb-8 bg-base-100/95 backdrop-blur border-b border-base-300">
     <div class="flex flex-wrap items-center gap-x-5 gap-y-1 text-sm">
@@ -1802,7 +1973,7 @@ render_sticky_strip() {
       <span><strong>${agents}</strong> working &middot; <strong>${free}</strong> free &middot; ceiling ${ceiling}</span>
       <span><strong class="text-error">${blockers}</strong> blocked or failed</span>
       <span><strong>${held}</strong> on hold by you</span>
-      <span class="opacity-60">tokens: ${tokens}</span>
+      <span>lowest runway: <strong class="${quota_cls}">${quota_headline}</strong></span>
     </div>
     <nav class="flex flex-wrap gap-x-3 gap-y-1 text-xs mt-2 opacity-70">
       <a class="link link-hover" href="#sec-decisions">1 Decisions</a>
@@ -1810,6 +1981,7 @@ render_sticky_strip() {
       <a class="link link-hover" href="#sec-merge">3 Merge</a>
       <a class="link link-hover" href="#sec-slots">4 Slots</a>
       <a class="link link-hover" href="#sec-secondmates">Second mates</a>
+      <a class="link link-hover" href="#sec-accounts">Accounts</a>
       <a class="link link-hover" href="#sec-progress-3h">5 Last 3h</a>
       <a class="link link-hover" href="#sec-progress-12h">6 Last 12h</a>
       <a class="link link-hover" href="#sec-upcoming">7 Upcoming</a>
@@ -1857,6 +2029,7 @@ HTML
   render_ready_merge
   render_slots
   render_secondmates
+  render_accounts
   render_progress_3h
   render_progress_12h
   render_upcoming
