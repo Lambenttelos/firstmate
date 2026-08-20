@@ -32,6 +32,9 @@
 #     endpoint.exists is the cheap backend endpoint-presence read.
 #     endpoint.agent_alive is populated for secondmates only, where it is useful
 #     return-channel supervision data; other tasks use "not_checked".
+#     telemetry is the state/<id>.telemetry sub-object (bin/fm-telemetry-lib.sh);
+#     only keys present in the file are rendered, so absent data is {}, never a
+#     fabricated zero.
 #   scout_reports[]: present data/<id>/report.md pointers.
 #   main_inventory: {valid,reason,orphan_in_flight[],unstructured_current_count} -
 #     main-home current-inventory checks shared with secondmate_home_summary_json
@@ -443,7 +446,7 @@ task_json_lines() {
   local meta id kind harness mode yolo project worktree home projects backend target status_log report_path
   local pr pr_source event_json current_json endpoint_exists agent_alive meta_json status_json report_json worktree_json home_json
   local last_event_raw current_state current_source pending_decision blocked_event report_present=0 pr_from_status
-  local open_decisions_tsv open_decisions_json
+  local open_decisions_tsv open_decisions_json telemetry_file telemetry_json
 
   for meta in "$STATE"/*.meta; do
     [ -e "$meta" ] || continue
@@ -546,6 +549,29 @@ task_json_lines() {
     if [ -n "$worktree" ]; then worktree_json=$(path_present_json "$worktree"); else worktree_json=$(jq -n '{path:null,present:false}'); fi
     if [ -n "$home" ]; then home_json=$(path_present_json "$home"); else home_json=$(jq -n '{path:null,present:false}'); fi
 
+    # Gap-1 shared telemetry sub-object (state/<id>.telemetry, the same key=value
+    # shape as .meta, read with fm_meta_get's parser). Only keys PRESENT in the
+    # file are rendered: absent = unknown, NEVER zero. A task with no telemetry
+    # file yet renders the empty object, so the dashboard and fleet view always
+    # read a `telemetry:{}` row.
+    telemetry_file="$STATE/$id.telemetry"
+    if [ -f "$telemetry_file" ]; then
+      # A single pipeline: jq must ALWAYS consume grep's output on a match
+      # (a bare `|| true` after grep would short-circuit jq on the success
+      # path and leak raw key=value text as the JSON). `|| printf '{}'`
+      # guards the pipeline itself, so a grep/jq failure yields the empty
+      # object.
+      telemetry_json=$(grep -E '^[A-Za-z0-9_]+=' "$telemetry_file" 2>/dev/null \
+        | jq -R -s '
+            [splits("\n") | select(length > 0)
+              | capture("^(?<key>[A-Za-z0-9_]+)=(?<value>.*)$")?
+              | select(. != null) ]
+            | from_entries' 2>/dev/null || printf '{}')
+    else
+      telemetry_json='{}'
+    fi
+    case "$telemetry_json" in ''|null) telemetry_json='{}' ;; esac
+
     jq -n \
       --arg id "$id" \
       --arg kind "$kind" \
@@ -574,6 +600,7 @@ task_json_lines() {
       --argjson pending_decision "$(bool_json "$pending_decision")" \
       --argjson blocked_event "$(bool_json "$blocked_event")" \
       --argjson report_present "$(bool_json "$report_present")" \
+      --argjson telemetry "$telemetry_json" \
       '{
         id:$id,
         kind:$kind,
@@ -582,6 +609,7 @@ task_json_lines() {
         yolo:($yolo // ""),
         project:($project // ""),
         backend:$backend,
+        telemetry:$telemetry,
         paths:{
           meta:$meta_path,
           status_log:$status_log,

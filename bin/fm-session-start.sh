@@ -416,6 +416,64 @@ print_current_and_event() {  # <id> <status-file>
   printf '%s\n' "$line"
 }
 
+# Gap 1: per-account quota rollup for the fleet-state digest. Reads each live
+# task's state/<id>.telemetry (the same key=value shape as .meta, via
+# fm_meta_get) and prints ONE line per account, lowest runway first (min
+# quota_pct across the account's panes, with the driving window and its closest
+# reset clock). Absent quota data = "unavailable", never a zero. Passive digest
+# material, never a wake.
+print_account_quotas() {  # <state-dir>
+  local state=$1 tel id acct pct win reset reset_clock out
+  out=$({
+    for tel in "$state"/*.telemetry; do
+      [ -f "$tel" ] || continue
+      id=$(basename "$tel" .telemetry)
+      [ -f "$state/$id.meta" ] || continue
+      acct=$(fm_meta_get "$tel" account)
+      pct=$(fm_meta_get "$tel" quota_pct)
+      [ -n "$acct" ] && [ -n "$pct" ] || continue
+      win=$(fm_meta_get "$tel" quota_window)
+      reset=$(fm_meta_get "$tel" quota_reset_ts)
+      case "$pct" in ''|*[!0-9.]*) continue ;; esac
+      reset_clock=""
+      case "$reset" in
+        ''|*[!0-9]*) : ;;
+        *)
+          reset_clock=$(date -d "@$reset" +%H:%M 2>/dev/null \
+            || date -r "$reset" +%H:%M 2>/dev/null || printf '')
+          ;;
+      esac
+      printf '%s\t%s\t%s\t%s\n' "$acct" "$pct" "$win" "$reset_clock"
+    done
+  } | awk -F '\t' '
+    {
+      acct = $1; pct = $2 + 0; win = $3; rclock = $4
+      if (!(acct in minpct) || pct < minpct[acct]) {
+        minpct[acct] = pct; winid[acct] = win; resetclock[acct] = rclock
+      }
+    }
+    function reset_suffix(a) {
+      return (resetclock[a] != "" ? " resets " resetclock[a] : "")
+    }
+    END {
+      n = 0
+      for (a in minpct) { order[n++] = a }
+      for (i = 0; i < n; i++)
+        for (j = i + 1; j < n; j++)
+          if (minpct[order[j]] < minpct[order[i]]) { t = order[i]; order[i] = order[j]; order[j] = t }
+      if (n == 0) { print "unavailable"; exit }
+      s = ""
+      for (i = 0; i < n; i++) {
+        a = order[i]
+        part = sprintf("%s %d%% (%s%s)", a, minpct[a],
+          (winid[a] != "" ? winid[a] : "window"), reset_suffix(a))
+        s = (s == "" ? part : s " · " part)
+      }
+      print "accounts: " s
+    }')
+  printf '%s\n' "$out"
+}
+
 # Cross-session stall surfacing. Scan every task's CURRENT state via
 # bin/fm-crew-state.sh (the same current-state reconciliation the rest of the
 # fleet uses - NOT a tail of the status EVENT log) and surface, prominently and
@@ -741,6 +799,11 @@ if [ -n "$RESOURCE_OUT" ]; then
 else
   printf 'unavailable\n'
 fi
+
+subsection "Account quotas"
+# Gap 1: per-account lowest-runway rollup from the task telemetry files, next to
+# the host reading where the rest of the machine-level fleet context lives.
+print_account_quotas "$STATE"
 
 subsection "AFK"
 if [ "$AWAY_POSTURE" -eq 1 ]; then

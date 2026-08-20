@@ -858,9 +858,12 @@ status_is_tripwire() {  # <status-line>
 }
 
 # Rotate accounts for a tripped jcode/Claude worker. Idempotent per task within
-# the cooldown window. Never fatal: every failure fails soft.
+# the cooldown window. Never fatal: every failure fails soft. On a successful
+# rotation, stamp the post-rotation Claude account onto the task's
+# state/<id>.telemetry (gap-1: account=/account_source=switch) from switch's own
+# SwitchResponse, so the pane's telemetry follows a live account switch.
 orchestrator_rotate_on_tripwire() {  # <task>
-  local task=$1 meta harness key marker age
+  local task=$1 meta harness key marker age out chosen
   meta="$STATE/$task.meta"
   [ -f "$meta" ] || return 0
   harness=$(fm_meta_get "$meta" harness); [ -n "$harness" ] || harness=$(fm_backend_of_meta "$meta")
@@ -878,8 +881,17 @@ orchestrator_rotate_on_tripwire() {  # <task>
     rm -f "$marker"
   fi
   : > "$marker"
-  if "$SCRIPT_DIR/fm-account-orchestrator.sh" rotate >/dev/null 2>&1; then
+  if out=$("$SCRIPT_DIR/fm-account-orchestrator.sh" rotate 2>/dev/null); then
     triage_log "orchestrator rotated accounts on tripwire for $task"
+    # switch's SwitchResponse names the account the fleet rotated onto
+    # (outcomes[0].chosenAccount); stamp it so the pane's telemetry stays
+    # current. A keep/absent/parse failure stamps nothing - FAIL-SOFT.
+    if command -v jq >/dev/null 2>&1 && [ -n "$out" ]; then
+      chosen=$(printf '%s' "$out" | jq -r '.outcomes[0].chosenAccount // ""' 2>/dev/null || true)
+      if [ -n "$chosen" ]; then
+        fm_telemetry_stamp_account "$STATE/$task.telemetry" "$chosen" switch || true
+      fi
+    fi
   else
     triage_log "orchestrator rotation failed on tripwire for $task; manual fallback available"
   fi
@@ -957,6 +969,73 @@ quota_anomaly_scan() {  # <window> <task> <tail40> <hash>
   reason="check: quota-anomaly $task $account $count"
   fm_wake_append check "quota-anomaly-$key" "$reason" || exit 1
   wake "$reason"
+}
+
+# Visibility Gap-1: the fleet-wide account/quota PRODUCER - this watcher's
+# slow-poll `check: fleet-quota` pass. Runs exactly ONE quota-axi --json per
+# CHECK_INTERVAL (never per pane), folds the claude provider's relevant general
+# windows (five_hour/seven_day) into one lowest-runway reading, and fans
+# quota_pct= / quota_window= / quota_reset_ts= onto every live task's
+# state/<id>.telemetry. The per-pane account label was already stamped at spawn
+# and on switch; quota is per-ACCOUNT, so one fleet-wide reading fans everywhere.
+#
+# PASSIVE (dashboard + session-start digest surfacing only, design "Surfacing"):
+# this sweep NEVER wakes and prints nothing - account level is slow-moving
+# context, not an alarm - so it emits no check: line and enqueues no wake.
+# FAIL-SOFT: an absent/unreadable quota-axi, a missing jq, an unparseable
+# payload, or no relevant general window writes NO quota keys this cycle (absent
+# = unknown, never a zero) and never blocks the watcher loop. Mirrors the shared
+# quota-axi resolution used by fm-account-orchestrator.sh
+# (FM_DISPATCH_QUOTA_AXI, default quota-axi) so the whole fleet addresses one
+# binary. Skips supervise=off panes exactly like recorded_windows, so an
+# unsupervised griller pane is never written.
+fleet_quota_sweep() {
+  local cmd qjson row win pct reset_raw reset_ts meta
+  command -v jq >/dev/null 2>&1 || return 0
+  cmd=$(printf '%s' "${FM_DISPATCH_QUOTA_AXI:-quota-axi}")
+  command -v "$cmd" >/dev/null 2>&1 || return 0
+  qjson=$("$cmd" --json 2>/dev/null) || return 0
+  [ -n "$qjson" ] || return 0
+  # The claude general windows only (the same five_hour/seven_day set
+  # fm-dispatch-select.sh's general_window_matches owns), sorted by remaining so
+  # the minimum drives the pane's quota_pct and names quota_window.
+  row=$(printf '%s' "$qjson" | jq -r '
+    [ .providers[]? | select(.provider == "claude") | .windows // [] | .[]?
+        | select(((.percentRemaining | type)) == "number")
+        | select(.percentRemaining >= 0 and .percentRemaining <= 100)
+        | select(.id == "five_hour" or .id == "seven_day") ]
+    | sort_by(.percentRemaining)
+    | .[0]
+    | [ .id // "", (.percentRemaining | tostring), (.resetsAt // "") ]
+    | @tsv
+  ' 2>/dev/null) || return 0
+  [ -n "$row" ] || return 0
+  IFS=$'\t' read -r win pct reset_raw <<EOF || true
+$row
+EOF
+  [ -n "$pct" ] || return 0
+  # quota_reset_ts is the window's reset as an epoch when quota-axi gives it; an
+  # ISO resetsAt converts on either platform, a numeric value passes through, and
+  # an absent/unparseable one stays absent (never a fabricated value).
+  reset_ts=
+  case "$reset_raw" in
+    '') ;;
+    *[!0-9]*)
+      reset_ts=$(date -u -j -f '%Y-%m-%dT%H:%M:%SZ' "$reset_raw" +%s 2>/dev/null \
+        || date -u -d "$reset_raw" +%s 2>/dev/null || true)
+      ;;
+    *) reset_ts=$reset_raw ;;
+  esac
+  for meta in "$STATE"/*.meta; do
+    [ -e "$meta" ] || continue
+    [ "$(grep '^supervise=' "$meta" | cut -d= -f2- || true)" = off ] && continue
+    fm_telemetry_set "$STATE/$(basename "$meta" .meta).telemetry" quota_pct "$pct" || true
+    fm_telemetry_set "$STATE/$(basename "$meta" .meta).telemetry" quota_window "$win" || true
+    if [ -n "$reset_ts" ]; then
+      fm_telemetry_set "$STATE/$(basename "$meta" .meta).telemetry" quota_reset_ts "$reset_ts" || true
+    fi
+  done
+  return 0
 }
 
 # Reconcile a declared pause or captain-held status with authoritative crew state.
@@ -1482,6 +1561,11 @@ while :; do
     # it while it runs). wake() exits the cycle when it fires; the shared marker
     # prevents re-fire. Nudge only - never runs /stow or /compact.
     context_stow_sweep
+    # Gap-1 fleet-quota producer: ONE quota-axi --json per CHECK_INTERVAL fanned
+    # onto every live task's .telemetry. Passive (never wakes); fail-soft (no
+    # quota data = no keys this cycle). Shares this slow-poll gate, so it never
+    # runs on the fast poll and never per-pane.
+    fleet_quota_sweep
     touch "$STATE/.last-check"
   fi
 
