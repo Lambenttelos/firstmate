@@ -54,6 +54,7 @@ It is read-only over fleet state, never wakes anyone, and is built fresh on requ
    It is slow by design (~2 minutes): the fleet-projection source (`fm-bearings-snapshot.sh`, which reads live current-state for every agent) is the one source that takes real time, and it self-degrades any source that exceeds its internal 120s bound rather than failing the page.
    Run it as a background task and wait for exit 0 rather than blocking a foreground turn.
    `bin/fm-desk-refresh.sh --path` prints the output path without building.
+   The page's Captain's Call panel renders the projection's `decisions_open` in blocking-first order plus the merge-queue count, so the desk and the `/bearings` dated report lead with the same calls.
 
 2. **Publish to the LAN.**
    ```sh
@@ -74,6 +75,8 @@ It is read-only over fleet state, never wakes anyone, and is built fresh on requ
 
 ## Notes
 
+- The desk and the `/bearings` dated report draw every fleet fact from the SAME `fm-bearings-snapshot.sh` projection; the builder header is the single owner of that source contract. There is no second gather path, so the two surfaces cannot disagree.
+- The `/bearings` skill refreshes and republishes the desk after it writes its dated report, so the page is current even on days the captain only asked for /bearings. This skill builds the same page on a direct `/desk` request.
 - Resolve `FM_HOME` to this home explicitly so every child source reads the same home the desk resolved (`bin/fm-desk-refresh.sh` exports it to its children, but pass it in so the build itself resolves the right home).
 - The desk is deliberately not on any schedule and not wired into the watcher; it is built when the captain asks.
 - If a source was unavailable, the page still renders with that section marked as a gap - report the gap, do not fail the desk.

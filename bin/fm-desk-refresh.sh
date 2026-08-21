@@ -74,6 +74,16 @@
 # to the judgment file, and render as marked gaps when neither has published a
 # turn yet.
 #
+# A Captain's Call panel (id sec-captains-call) sits between the count band and
+# section 1, unnumbered like the second-mate and account panels so the twelve
+# numbered section ids stay stable. It renders the SAME decisions_open the
+# /bearings report leads with - in the projection's blocking-first order, which
+# fm-bearings-snapshot.sh owns - plus the merge-queue count, so the live page
+# and the dated report speak one vocabulary for what needs the captain. Every
+# fleet fact on this page comes from that same fm-bearings-snapshot.sh
+# projection, so the desk holds no separate gather path and can never disagree
+# with the report.
+#
 # A dedicated per-secondmate panel (id sec-secondmates) sits between section 4
 # (crew slots) and section 5. It is a re-layout of the same fleet projection: the
 # per-secondmate state/doing/freshness the snapshot already carries, plus each
@@ -848,6 +858,70 @@ desk_is_money() {  # <free text...>
   printf '%s' "$*" | grep -qiE 'pay|price|charg|money|invoice|refund|billing|reprice|epdf|eplf|extrafee|dual.?pric'
 }
 
+# --- Captain's Call panel ----------------------------------------------------
+# The live-page form of the /bearings report's first section: what needs the
+# captain's word right now. It renders the SAME decisions_open the dated report
+# leads with, in the projection's blocking-first order (fm-bearings-snapshot.sh
+# owns that ordering, so this panel preserves it rather than re-sorting), plus
+# the merge-queue count. It is a summary panel only: the detailed decision cards
+# with judgment enrichment stay in section 1 and the full merge compare links
+# stay in section 3, so this panel adds the bearings framing without duplicating
+# card-level detail. Unnumbered, like the second-mate and account panels, so the
+# twelve numbered section ids stay stable. On an unreadable projection it
+# renders a visible gap, never a confident "nothing".
+render_captains_call() {
+  local rows st merge_count merge_line
+  rows=$(desk_json ".decisions_open[:${DESK_MAX_DECISIONS}][] | [.id, ((.summary // \"\")|z), ((.blocking // false)|tostring)] | @tsv"); st=$?
+  merge_count=0
+  [ -n "$MERGEQ" ] && merge_count=$(printf '%s\n' "$MERGEQ" | grep -c .)
+  echo '  <section id="sec-captains-call" class="mb-10">'
+  echo '    <h2 class="text-lg font-semibold mb-3">Captain'"'"'s Call</h2>'
+  printf '    <p class="text-sm opacity-70 mb-3">What needs your word right now, from the same projection as the dated bearings report. Blocking calls come first; the rest wait for your convenience.</p>\n'
+  if [ "$st" -ne 0 ]; then
+    if [ "$merge_count" -gt 0 ]; then
+      [ "$merge_count" -eq 1 ] && merge_line="1 finished branch is ready to merge." || merge_line="${merge_count} finished branches are ready to merge."
+      printf '    <div class="card bg-base-200/60"><div class="card-body py-3"><p class="text-sm">%s <a class="link link-hover" href="#sec-merge">See Ready to merge below.</a></p></div></div>\n' \
+        "$(desk_text "$merge_line")"
+    fi
+    desk_section_gap "The list of decisions waiting on you could not be read, so this panel is unknown right now."
+    echo '  </section>'
+    return 0
+  fi
+  if [ -z "$rows" ] && [ "$merge_count" -eq 0 ]; then
+    echo '    <p class="text-sm opacity-60">Nothing needs your action right now.</p>'
+    echo '  </section>'
+    return 0
+  fi
+  echo '    <div class="space-y-2">'
+  if [ -n "$rows" ]; then
+    printf '%s\n' "$rows" | while IFS=$'\t' read -r id summary blocking; do
+      [ -n "$id" ] || continue
+      local badge=''
+      [ "$blocking" = "true" ] && badge='<span class="badge badge-error badge-xs">blocking</span>'
+      cat <<HTML
+      <div class="card bg-base-200 rail" style="--rail: oklch(0.75 0.16 70)">
+        <div class="card-body py-3 gap-1">
+          <div class="flex items-start justify-between gap-2">
+            <h3 class="font-medium text-sm">$(desk_title "$id")</h3>
+            <span class="flex gap-1 shrink-0"><span class="badge badge-warning badge-sm">your call</span>${badge}</span>
+          </div>
+HTML
+      if [ -n "$summary" ]; then
+        printf '          <p class="text-sm opacity-70">%s</p>\n' "$(desk_text "$summary")"
+      fi
+      echo '        </div>'
+      echo '      </div>'
+    done
+  fi
+  if [ "$merge_count" -gt 0 ]; then
+    [ "$merge_count" -eq 1 ] && merge_line="1 finished branch is ready to merge." || merge_line="${merge_count} finished branches are ready to merge."
+    printf '    <div class="card bg-base-200/60 mt-3"><div class="card-body py-3"><p class="text-sm">%s <a class="link link-hover" href="#sec-merge">See Ready to merge below.</a></p></div></div>\n' \
+      "$(desk_text "$merge_line")"
+  fi
+  echo '    </div>'
+  echo '  </section>'
+}
+
 # --- section 1: decisions needed --------------------------------------------
 # The SCRIPT is authoritative for WHICH decisions appear (backlog-derived
 # decisions_open). The judgment file, when fresh, ENRICHES a matching card BY
@@ -1417,10 +1491,10 @@ HTML
 }
 
 # --- section 8: captain-held tickets (full list) ----------------------------
-# The complete Captain's Call list - every captain hold, a superset of the
-# urgent decisions in section 1. Read straight from the backlog through
-# tasks-axi so it is durable, never scraped from prose. Degrades to a gap when
-# tasks-axi cannot be read.
+# The complete captain-held list - every captain hold, a superset of the
+# urgent decisions in section 1 and the captain's call panel. Read straight from
+# the backlog through tasks-axi so it is durable, never scraped from prose.
+# Degrades to a gap when tasks-axi cannot be read.
 render_captain_held() {
   local rows
   echo '  <section id="sec-held" class="mb-10">'
@@ -1976,6 +2050,7 @@ render_sticky_strip() {
       <span>lowest runway: <strong class="${quota_cls}">${quota_headline}</strong></span>
     </div>
     <nav class="flex flex-wrap gap-x-3 gap-y-1 text-xs mt-2 opacity-70">
+      <a class="link link-hover font-medium text-warning" href="#sec-captains-call">Captain's call</a>
       <a class="link link-hover" href="#sec-decisions">1 Decisions</a>
       <a class="link link-hover" href="#sec-blockers">2 Blockers</a>
       <a class="link link-hover" href="#sec-merge">3 Merge</a>
@@ -2024,6 +2099,7 @@ HTML
   render_generated_stamp
   render_gaps
   render_tickets
+  render_captains_call
   render_decisions
   render_blockers
   render_ready_merge
