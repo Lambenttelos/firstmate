@@ -27,7 +27,7 @@ command -v jq >/dev/null 2>&1 || { echo "skip: jq not found"; exit 0; }
 POPULATED=$(cat <<'JSON'
 {
   "decisions_open": [
-    {"id":"decide-alpha","summary":"pick a data store","owner":"scout"},
+    {"id":"decide-alpha","summary":"pick a data store","owner":"scout","blocking":true},
     {"id":"decide-pay-rename","summary":"confirm the pricing rename","owner":"scout"},
     {"id":"decide-long","summary":"weigh a long tradeoff between two competing approaches that each carry real cos","summary_full":"weigh a long tradeoff between two competing approaches that each carry real cost, real risk, and a materially different long-term maintenance burden the captain must judge","owner":"scout"}
   ],
@@ -201,6 +201,14 @@ SH
       printf 'done-c\t%s\tscout\thyfin-server\t\n' "$yesterday"
     } > "$home/data/completions.tsv"
   fi
+  # A merge-queue row for the ready-to-merge section and the Captain's Call
+  # panel's count, only when FAKE_MERGEQ requests it. The desk invokes the real
+  # bin/fm-merge-queue.sh by absolute path, so the fixture is the durable queue
+  # file itself (data/merge-queue.tsv) rather than a PATH stub.
+  if [ "${FAKE_MERGEQ:-0}" = 1 ]; then
+    mkdir -p "$home/data"
+    printf 'ship-done-a\t%s\tfm/ship-done-a\tabc123def\tmain\thttps://github.com/acme/hyfin/compare/main...fm/ship-done-a\n' "$home" > "$home/data/merge-queue.tsv"
+  fi
   # The second-mate registry the per-secondmate panel parses for home + scope,
   # and a real second-mate home with its own two-item open backlog so the panel's
   # queue-depth read has a file to count. FAKE_NO_SECONDMATE_REG=1 omits the
@@ -329,12 +337,44 @@ assert_grep 'no local transcript source' "$OUT1" '11/12: the transcript gap note
 assert_no_grep 'fm_wake_append' "$OUT1" 'never wakes: no wake call leaked into output'
 
 # Both open decisions must appear (acceptance: captain holds reach the page).
-n_dec=$(grep -c 'your call' "$OUT1")
+# The count is scoped to section 1 because the Captain's Call panel earlier on
+# the page also carries a "your call" badge per decision; a page-wide count
+# would double-count the badges, not the cards.
+n_dec=$(awk 'BEGIN{ins=0;n=0} /id="sec-decisions"/{ins=1} ins && /your call/{n++} ins && /<\/section>/{print n; exit}' "$OUT1")
 if [ "$n_dec" -eq 3 ]; then
-  pass 'populated: all open decisions rendered'
+  pass 'populated: all open decisions rendered in section 1'
 else
-  fail "populated: expected 3 decision cards, got $n_dec"
+  fail "populated: expected 3 decision cards in section 1, got $n_dec"
 fi
+
+# --- Captain's Call panel ----------------------------------------------------
+# The bearings-vocabulary panel renders the open decisions in the projection's
+# blocking-first order (decide-alpha is the blocking one in the fixture) plus the
+# merge-queue count, and joins the sticky nav.
+assert_grep 'id="sec-captains-call"' "$OUT1" 'captains-call: the panel renders'
+assert_grep "Captain's Call" "$OUT1" 'captains-call: the panel uses the bearings heading'
+assert_grep 'href="#sec-captains-call"' "$OUT1" 'captains-call: the sticky nav carries the jump link'
+assert_grep 'badge-error badge-xs">blocking' "$OUT1" 'captains-call: the blocking decision is flagged'
+# Only the blocking decision carries the blocking badge.
+n_block=$(grep -c 'badge-error badge-xs">blocking' "$OUT1")
+if [ "$n_block" -eq 1 ]; then
+  pass 'captains-call: exactly one decision is flagged blocking'
+else
+  fail "captains-call: expected 1 blocking badge, got $n_block"
+fi
+# Blocking-first order is preserved: the blocking decide-alpha row appears ahead
+# of the non-blocking decide-pay-rename row (first occurrences are in the panel,
+# which precedes section 1).
+pos_a=$(grep -n 'Decide alpha' "$OUT1" | head -1 | cut -d: -f1)
+pos_b=$(grep -n 'Decide pay rename' "$OUT1" | head -1 | cut -d: -f1)
+if [ -n "$pos_a" ] && [ -n "$pos_b" ] && [ "$pos_a" -lt "$pos_b" ]; then
+  pass 'captains-call: blocking decision renders ahead of the non-blocking one'
+else
+  fail "captains-call: ordering wrong (alpha at $pos_a, pay at $pos_b)"
+fi
+# The panel summary text reaches the page, so a read-only captain sees the same
+# one-line framing from the report.
+assert_grep 'What needs your word right now' "$OUT1" 'captains-call: the intro line renders'
 
 # Decision descriptions render as expandable <details>, and the reason span must
 # NOT carry a line-clamp: a Tailwind line-clamp caps the visible text at two
@@ -557,5 +597,29 @@ FAKE_MODE=json FAKE_JSON="$POPULATED" FAKE_QUOTA_MODE=noacc run_desk "$HOME14" "
 assert_grep 'id="sec-accounts"' "$OUT14" 'quota-empty: the panel still renders'
 assert_grep 'No account readings are available' "$OUT14" 'quota-empty: a real empty report is a confident empty'
 assert_no_grep 'could not be read' "$OUT14" 'quota-empty: no gap for a genuine empty report'
+
+# --- Captain's Call panel: the merge-queue count reaches the panel from the
+#     durable merge queue, and links to the ready-to-merge section ------------
+HOME15="$TMP_ROOT/home15"; mkdir -p "$HOME15"
+SNAP=$(make_snapshot "$HOME15")
+OUT15="$HOME15/desk.html"
+FAKE_MODE=json FAKE_JSON="$POPULATED" FAKE_MERGEQ=1 run_desk "$HOME15" "$OUT15"
+
+assert_grep 'id="sec-captains-call"' "$OUT15" 'captains-call-merge: the panel renders'
+assert_grep '1 finished branch is ready to merge' "$OUT15" 'captains-call-merge: the merge-queue count reaches the panel'
+assert_grep 'href="#sec-merge"' "$OUT15" 'captains-call-merge: the panel links to the ready-to-merge section'
+assert_grep 'Ship done a' "$OUT15" 'captains-call-merge: the ready-to-merge section still lists the branch'
+
+# --- Captain's Call panel: a genuinely EMPTY call list (no decisions, no merge
+#     queue) is a confident empty, matching the bearings empty-state prose -----
+HOME16="$TMP_ROOT/home16"; mkdir -p "$HOME16"
+SNAP=$(make_snapshot "$HOME16")
+OUT16="$HOME16/desk.html"
+NO_CALLS=$(printf '%s' "$POPULATED" | jq -c '.decisions_open = []')
+FAKE_MODE=json FAKE_JSON="$NO_CALLS" run_desk "$HOME16" "$OUT16"
+
+assert_grep 'id="sec-captains-call"' "$OUT16" 'captains-call-empty: the panel renders'
+assert_grep 'Nothing needs your action right now' "$OUT16" 'captains-call-empty: an empty call list is a confident empty'
+assert_no_grep 'could not be read' "$OUT16" 'captains-call-empty: no gap for a genuine empty call list'
 
 echo "all fm-desk-refresh tests passed"

@@ -11,7 +11,7 @@ metadata:
 Generate a complete standalone snapshot from the fleet's current state, so the captain can resume in one read after a break, a night, or a context reset.
 The deliverable is a dated markdown file plus a concise chat summary that each stand on the current snapshot rather than an earlier report.
 This skill is read-mostly.
-It reads fleet state and writes exactly one report file.
+It reads fleet state and writes exactly two artifacts: the dated report file and the refreshed captain desk page.
 It never tears down a task, merges a PR, dispatches new work, or mutates any task state as a side effect of producing the brief - those belong to the captain's explicit word and the normal task lifecycle.
 
 ## What it does
@@ -45,6 +45,17 @@ It never tears down a task, merges a PR, dispatches new work, or mutates any tas
      If today's file already exists, delete it first, then create a new file from scratch.
    - The chat response is the concise four-section digest defined by the contract below: materially shorter than the report file, complete as a current snapshot, internally consistent with the file, and linked to that file for the full picture.
    - For a richer review surface, optionally offer a Lavish board with `lavish-axi` when the report has enough structure to deserve one, but the markdown file is the required artifact and the four-section chat digest is the required minimum.
+
+4. **Refresh the captain desk from the same snapshot, and link it in the chat digest.**
+   After the report file is written, rebuild and republish the live desk page so both surfaces report the same fleet.
+   The desk draws every fleet fact from the same `bin/fm-bearings-snapshot.sh` projection this report used, so this is a second invocation of one canonical gather, never a separate path.
+   - Render the page with `FM_HOME="$FM_HOME" bin/fm-desk-refresh.sh`.
+     Run it as a background task and wait for exit 0; it is slow by design (~2 minutes) because the projection reads live current state for every agent.
+   - Publish it with `FM_HOME="$FM_HOME" data/serve-desk.sh`.
+     It prints `desk_url: http://<lan-ip>:8899/session/<id>`; relay that full URL as the desk link in your chat digest.
+   - The desk's Captain's Call panel renders this snapshot's `decisions_open` in blocking-first order plus the merge-queue count, so the dated report and the live page lead with the same calls.
+   This step stays read-mostly: the only files this skill writes are the dated report and the desk page artifacts (`.lavish/captain-desk.html` and the LAN-published copy behind it).
+   Do not arm the Lavish background poll from here; that standing order belongs to the `/desk` skill.
 
 ## Chat-response contract
 
@@ -81,5 +92,5 @@ Rules that keep the contract unambiguous:
 ## Supervision discipline
 
 This skill is read-mostly and changes no fleet state.
-Do not tear down a task, merge a PR, dispatch queued work, or mutate any `state/` or `data/` file other than the single report file as a side effect of generating the brief.
+Do not tear down a task, merge a PR, dispatch queued work, or mutate any `state/` or `data/` file other than the report file and the desk page artifacts as a side effect of generating the brief.
 If the state you read suggests an action - a PR ready to merge, a queued item whose gate has arrived, a needs-decision finding - name it in its section (a captain action under "Captain's Call", queued or gated work under "Charted Next") and let the captain decide, rather than taking the action from inside this skill.

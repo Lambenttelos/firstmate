@@ -211,12 +211,22 @@ if [ -n "$fm_pos_a" ] && [ -n "$fm_pos_b" ] && [ "$fm_pos_a" -lt "$fm_pos_b" ]; 
 else
   fail "fresh: transcript order wrong (firstmate at $fm_pos_a, captain at $fm_pos_b)"
 fi
-# No duplicate decision cards: decide-alpha appears exactly once as a card title.
-n_alpha=$(grep -c 'Decide alpha' "$OUT_FRESH")
+# No duplicate decision cards IN SECTION 1: decide-alpha appears exactly once as
+# a card title there. The Captain's Call panel earlier on the page is a separate
+# summary panel that legitimately repeats the title, so this count is scoped to
+# section 1's own markup rather than the whole page.
+n_alpha=$(awk 'BEGIN{ins=0;n=0} /id="sec-decisions"/{ins=1} ins && /Decide alpha/{n++} ins && /<\/section>/{print n; exit}' "$OUT_FRESH")
 if [ "$n_alpha" -eq 1 ]; then
-  pass 'fresh: matched decision renders exactly one card (no duplication)'
+  pass 'fresh: matched decision renders exactly one card in section 1 (no duplication)'
 else
-  fail "fresh: expected 1 Decide alpha card, got $n_alpha"
+  fail "fresh: expected 1 Decide alpha card in section 1, got $n_alpha"
+fi
+# The summary panel itself carries the decision once, never twice.
+n_panel_alpha=$(awk 'BEGIN{ins=0;n=0} /id="sec-captains-call"/{ins=1} ins && /Decide alpha/{n++} ins && /<\/section>/{print n; exit}' "$OUT_FRESH")
+if [ "$n_panel_alpha" -eq 1 ]; then
+  pass 'fresh: captains-call panel lists the decision exactly once'
+else
+  fail "fresh: expected 1 Decide alpha row in the captains-call panel, got $n_panel_alpha"
 fi
 
 # ============================================================================
