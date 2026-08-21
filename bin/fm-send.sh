@@ -87,6 +87,8 @@ fi
 . "$SCRIPT_DIR/fm-marker-lib.sh"
 # shellcheck source=bin/fm-pending-reply-lib.sh
 . "$SCRIPT_DIR/fm-pending-reply-lib.sh"
+# shellcheck source=bin/fm-telemetry-lib.sh
+. "$SCRIPT_DIR/fm-telemetry-lib.sh"
 
 FM_GUARD_CONTINUE_LINE='This is a supervision warning only; the requested message WILL still be sent.' "$SCRIPT_DIR/fm-guard.sh" || true
 
@@ -349,6 +351,16 @@ else
       fi
       exit 1
     fi
+  fi
+  # Visibility Gap-4: record this steer on the target task's telemetry so the
+  # watcher's stale loop can detect a pane that never processes it (a silent
+  # composer-stuck; see data/design-visibility-improvements/report.md "Gap 4").
+  # Only a CONFIRMED text submit stamps - every failure path above has already
+  # exited, so a failed or unconfirmed send never writes. An explicit endpoint
+  # with no recorded meta has no per-task telemetry to write, which is the same
+  # silent-when-absent contract the watcher reader uses (fail-soft).
+  if [ -n "$TARGET_META" ]; then
+    fm_telemetry_set "$STATE/$(fm_send_id_from_meta "$TARGET_META").telemetry" last_steer_ts "$(date +%s)" || true
   fi
   # Submit landed (verdict was not pending/send-failed). Confirmation only proves
   # the text was accepted; the harness still needs a beat to spin up the

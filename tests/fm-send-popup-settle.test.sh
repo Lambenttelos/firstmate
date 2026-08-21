@@ -106,6 +106,19 @@ first_settle() {  # <expected> <label> <harness|--explicit> <message> [selector-
   expect_code 0 "$rc" "$label: send should succeed"
   first=$(head -1 "$log")
   [ "$first" = "$expected" ] || fail "$label: expected popup-settle $expected, got '$first'"$'\n'"--- sleeps ---"$'\n'"$(cat "$log")"
+  # Visibility Gap-4: every confirmed delivery through a meta target stamps
+  # last_steer_ts= into the task's state/<id>.telemetry; an explicit endpoint
+  # with no recorded meta writes nothing (the fail-soft contract the watcher's
+  # stuck-steer reader relies on). FM_SEND_SETTLE=0 still delivers, so each
+  # success case exercises the stamp on the same confirmed-delivery path.
+  if [ "$harness" = --explicit ]; then
+    if compgen -G "$home/state/*.telemetry" >/dev/null; then
+      fail "$label: an explicit endpoint with no meta must not fabricate a telemetry stamp"
+    fi
+  else
+    grep -q '^last_steer_ts=' "$home/state/$meta_id.telemetry" \
+      || fail "$label: a confirmed delivery must stamp last_steer_ts into $meta_id.telemetry"$'\n'"$(cat "$home/state/$meta_id.telemetry" 2>/dev/null || true)"
+  fi
   pass "fm-send popup-settle: $label -> ${expected}s"
 }
 

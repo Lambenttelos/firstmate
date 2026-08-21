@@ -971,6 +971,97 @@ quota_anomaly_scan() {  # <window> <task> <tail40> <hash>
   wake "$reason"
 }
 
+# Visibility Gap-4: detect a delivered-but-never-processed steer (a silent
+# composer-stuck) from the same values the stale loop ALREADY has in hand
+# (tail40, hash, prev) - zero extra backend captures, and the busy probe is
+# gated so it only runs while a steer is actually fresh (design:
+# data/design-visibility-improvements/report.md "Gap 4"). fm-send stamps
+# last_steer_ts= in state/<id>.telemetry on every CONFIRMED text delivery.
+#
+# A steer is STUCK when, within FM_STEER_STUCK_WINDOW of its delivery, the pane
+# hash has NOT advanced since the steer and the pane is not busy: the text left
+# the composer but the harness never started the turn. Detection compares the
+# current hash against a BASELINE hash captured at first observation of the
+# fresh steer (the recorded prev hash - the pane's pre-steer state - in
+# practice), never the rolling .hash-<key> value. The baseline is what prevents
+# a false alarm on a steer the pane DID install: it went busy, produced output,
+# and idled again - that hash differs from the baseline - while a genuinely
+# stuck pane stays on the unchanged baseline. The baseline is persisted in a
+# small .steer-baseline-<key> watcher state file (the .stale-<key> family) so a
+# re-arm inside the freshness window cannot rebaseline onto a post-steer pane
+# state.
+#
+# On stuck: set composer_stuck=1 in telemetry and emit a steer-aware variant of
+# the EXISTING stale wake (fm_wake_append stale ... + wake), once per steer via
+# a .steer-stuck-<key> marker holding the last_steer_ts warned for. On a busy
+# pane or a hash advance: clear composer_stuck=0. On the window expiring: drop
+# the flag and both tracking files, so a long-idle healthy pane never trips it.
+# A declared pause / captain-hold stays on its existing absorb path and is never
+# alarmed. FAIL-SOFT: an absent/unreadable telemetry or a write failure
+# surfaces nothing and never blocks the loop.
+FM_STEER_STUCK_WINDOW=${FM_STEER_STUCK_WINDOW:-600}
+
+steer_stuck_check() {  # <window> <task> <tail40> <hash> <prev-hash>
+  local w=$1 task=$2 tail=$3 h=$4 prev=$5
+  local tel ts now age key base_file marker baseline_ts baseline_hash reason
+  [ -n "$task" ] || return 0
+  tel="$STATE/$task.telemetry"
+  ts=$(fm_meta_get "$tel" last_steer_ts)
+  case "$ts" in
+    ''|*[!0-9]*) return 0 ;;  # no recorded steer: an idle pane with no steer stays quiet
+  esac
+  now=$(date +%s)
+  age=$(( now - ts ))
+  key=$(printf '%s' "$w" | tr ':/.' '___')
+  base_file="$STATE/.steer-baseline-$key"
+  marker="$STATE/.steer-stuck-$key"
+  if [ "$age" -gt "$FM_STEER_STUCK_WINDOW" ]; then
+    # Steer aged out of the fresh window: no longer an active concern. Drop the
+    # flag and the tracking files so a long-idle healthy pane never trips it.
+    rm -f "$base_file" "$marker"
+    if [ "$(fm_meta_get "$tel" composer_stuck)" = 1 ]; then
+      fm_telemetry_set "$tel" composer_stuck 0 || true
+    fi
+    return 0
+  fi
+  # A declared pause / captain-hold is a legitimate wait the existing pause
+  # absorb path owns; never raise the stuck alarm for it.
+  if status_is_paused_or_captain_held "$(last_status_line "$STATE/$task.status")"; then
+    return 0
+  fi
+  # Arm (or re-arm on a new steer's ts) the baseline: the pane hash this steer
+  # was delivered against. In practice the recorded prev hash - the pane's
+  # state before this steer - falls back to the current hash on a fresh
+  # window's first poll.
+  baseline_ts=
+  baseline_hash=
+  if [ -f "$base_file" ]; then
+    IFS=' ' read -r baseline_ts baseline_hash < "$base_file" || true
+  fi
+  if [ "$baseline_ts" != "$ts" ]; then
+    baseline_ts=$ts
+    baseline_hash=$prev
+    [ -n "$baseline_hash" ] || baseline_hash=$h
+    printf '%s %s\n' "$baseline_ts" "$baseline_hash" > "$base_file" || return 0
+  fi
+  [ -n "$baseline_hash" ] || return 0
+  # Stuck iff the pane hash has NOT advanced since the baseline AND the pane is
+  # not busy. The busy probe runs only on the not-advanced path, so it costs
+  # nothing on a pane that processed the steer (or has no fresh steer at all).
+  if [ "$h" = "$baseline_hash" ] && ! window_is_busy "$w" "$tail"; then
+    fm_telemetry_set "$tel" composer_stuck 1 || true
+    if [ "$(cat "$marker" 2>/dev/null || true)" != "$ts" ]; then
+      printf '%s' "$ts" > "$marker" 2>/dev/null || true
+      reason="stale: $w (steer delivered ${age}s ago, pane never processed it - possible stuck composer)"
+      fm_wake_append stale "$w" "$reason" || exit 1
+      wake "$reason"
+    fi
+  elif [ "$(fm_meta_get "$tel" composer_stuck)" = 1 ]; then
+    fm_telemetry_set "$tel" composer_stuck 0 || true
+  fi
+  return 0
+}
+
 # Visibility Gap-1: the fleet-wide account/quota PRODUCER - this watcher's
 # slow-poll `check: fleet-quota` pass. Runs exactly ONE quota-axi --json per
 # CHECK_INTERVAL (never per pane), folds the claude provider's relevant general
@@ -1716,6 +1807,11 @@ EOF
     ewf="$STATE/.wedge-escalations-$key"
     pf="$STATE/.paused-$key"   # flag: this key's stale is using the bounded pause cadence
     prev=$(cat "$hf" 2>/dev/null || true)
+    # Visibility Gap-4: a delivered-but-never-processed steer (a silent
+    # composer-stuck) reuses this loop's already-captured tail40/hash/prev -
+    # zero extra backend capture. Gated internally: it probes busy state only
+    # while a fresh steer is recorded and the pane hash has not advanced.
+    steer_stuck_check "$w" "$task" "$tail40" "$h" "$prev"
     if [ "$h" = "$prev" ]; then
       n=$(( $(cat "$cf" 2>/dev/null || echo 0) + 1 ))
       echo "$n" > "$cf"
