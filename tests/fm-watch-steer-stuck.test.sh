@@ -146,13 +146,38 @@ assert_contains "$OUT" "possible stuck composer" "a fresh stuck steer with sibli
 pass "the stuck flag sets without clobbering sibling telemetry keys"
 
 # --- (7) ZERO new backend capture in the fast loop ---------------------------
-check_body=$(awk '/^steer_stuck_check\(\)/{f=1} f{print} f&&/^}/{exit}' "$WATCH")
-if printf '%s' "$check_body" | grep -q 'fm_backend_capture'; then
-  fail "steer_stuck_check must add NO fm_backend_capture (it reuses the passed tail40/hash/prev)"
-fi
-# shellcheck disable=SC2016  # literal grep pattern, no expansion intended.
-caps=$(grep -c 'fm_backend_capture "\$(window_backend' "$WATCH" || true)
-[ "$caps" = 1 ] || fail "the stale loop must keep exactly one per-window fm_backend_capture, found $caps"
-pass "steer_stuck_check adds zero backend captures; the loop keeps its single capture"
+# Mock fm_backend_capture to log invocations, then drive steer_stuck_check on
+# the existing fresh-steer fixture: it must perform zero captures, since it
+# consumes the loop's already-captured tail40/hash/prev as arguments.
+rm -rf "$STATE"; mkdir -p "$STATE"
+fresh_steer
+CAP_LOG="$STATE/.capture-log"
+: > "$CAP_LOG"
+FM_STATE_OVERRIDE="$STATE" FM_WAKE_QUEUE="$STATE/.wake-queue" \
+      FM_WAKE_QUEUE_LOCK="$STATE/.wake-queue.lock" bash -c '
+      . "'"$WATCH"'" >/dev/null 2>&1
+      STATE="'"$STATE"'"
+      fm_backend_capture() { printf "call\n" >> "'"$CAP_LOG"'"; }
+      steer_stuck_check "'"$W"'" "'"$TASK"'" "$1" "$2" "$3"
+    ' _ "$IDLE_TAIL" "$HASH" "$HASH" >/dev/null 2>&1
+CAPS=$(wc -l < "$CAP_LOG" | tr -d '[:space:]')
+[ "$CAPS" = 0 ] \
+  || fail "steer_stuck_check must add NO fm_backend_capture, found $CAPS call(s)"
+pass "steer_stuck_check performs zero backend captures on the fresh-steer fixture"
+
+# Now exercise the stale loop's own per-window capture path once (the same
+# call expression fm-watch.sh's stale loop uses) and assert exactly one fires.
+: > "$CAP_LOG"
+bash -c '
+      . "'"$WATCH"'" >/dev/null 2>&1
+      fm_backend_capture() { printf "call\n" >> "'"$CAP_LOG"'"; }
+      window_backend() { printf "tmux"; }
+      window_label() { printf "fm-test"; }
+      tail40=$(fm_backend_capture "$(window_backend "w")" "w" 40 "$(window_label "w")" 2>/dev/null) || true
+    ' >/dev/null 2>&1
+CAPS=$(wc -l < "$CAP_LOG" | tr -d '[:space:]')
+[ "$CAPS" = 1 ] \
+  || fail "the stale loop must perform exactly one per-window fm_backend_capture, found $CAPS"
+pass "the stale loop keeps its single per-window backend capture"
 
 pass "fm-watch-steer-stuck.test.sh: all checks passed"
