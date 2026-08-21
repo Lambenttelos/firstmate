@@ -116,7 +116,112 @@ test_key_path_never_pauses() {
   pass "fm-send: the --key path never pauses (settle scoped to text submit)"
 }
 
+# A fake tmux whose composer row keeps real typed text, so the submit core reads
+# "pending" on every Enter check and fm-send reports a swallowed Enter (a
+# non-delivery) after the retry budget. Same stub skeleton as make_stubs.
+make_pending_stubs() {  # <dir> -> echoes fakebin dir
+  local dir=$1 fb="$1/fakebin"
+  mkdir -p "$fb"
+  cat > "$fb/tmux" <<'SH'
+#!/usr/bin/env bash
+set -u
+case "${1:-}" in
+  send-keys) exit 0 ;;
+  display-message)
+    for a in "$@"; do case "$a" in *cursor_y*) printf '0\n'; exit 0 ;; esac; done
+    printf 'fakepane\n'; exit 0 ;;
+  capture-pane) printf '\xe2\x94\x82 hello \xe2\x94\x82\n'; exit 0 ;;
+  list-windows) exit 0 ;;
+esac
+exit 0
+SH
+  chmod +x "$fb/tmux"
+  cat > "$fb/sleep" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "${1:-}" >> "$FM_SLEEP_LOG"
+exit 0
+SH
+  chmod +x "$fb/sleep"
+  printf '%s\n' "$fb"
+}
+
+# Visibility Gap-4: a CONFIRMED text delivery stamps last_steer_ts= into the
+# target task's state/<id>.telemetry (the watcher's stuck-steer reader), while
+# a failed/unconfirmed send and an explicit endpoint with no recorded meta never
+# write. These tests pin that stamp contract hermetically.
+test_confirmed_delivery_stamps_last_steer_ts() {
+  local dir fb log rc home tel
+  dir="$TMP_ROOT/stamp"; mkdir -p "$dir"
+  fb=$(make_stubs "$dir"); log="$dir/sleep.log"
+  home="$dir/home"; mkdir -p "$home/state"
+  fm_write_meta "$home/state/stamptask.meta" "window=sess:win" "kind=ship" "harness=codex"
+  : > "$log"
+  env PATH="$fb:$PATH" FM_ROOT_OVERRIDE="$home" FM_HOME="$home" FM_SLEEP_LOG="$log" FM_SEND_SETTLE=0 \
+    "$SEND" fm-stamptask "hello captain" 2>/dev/null; rc=$?
+  expect_code 0 "$rc" "confirmed delivery send should succeed"
+  tel="$home/state/stamptask.telemetry"
+  assert_present "$tel" "a confirmed delivery must create the task telemetry file"
+  grep -q '^last_steer_ts=' "$tel" || fail "a confirmed delivery must stamp last_steer_ts="$'\n'"$(cat "$tel")"
+  pass "fm-send: a confirmed text delivery stamps last_steer_ts into the task telemetry"
+}
+
+test_stamp_preserves_sibling_telemetry_keys() {
+  local dir fb log rc home tel
+  dir="$TMP_ROOT/sibling"; mkdir -p "$dir"
+  fb=$(make_stubs "$dir"); log="$dir/sleep.log"
+  home="$dir/home"; mkdir -p "$home/state"
+  fm_write_meta "$home/state/stamptask.meta" "window=sess:win" "kind=ship" "harness=codex"
+  tel="$home/state/stamptask.telemetry"
+  fm_write_meta "$tel" "account=claude-2" "count_429=5"
+  : > "$log"
+  env PATH="$fb:$PATH" FM_ROOT_OVERRIDE="$home" FM_HOME="$home" FM_SLEEP_LOG="$log" FM_SEND_SETTLE=0 \
+    "$SEND" fm-stamptask "hello captain" 2>/dev/null; rc=$?
+  expect_code 0 "$rc" "sibling-key send should succeed"
+  grep -q '^last_steer_ts=' "$tel" || fail "delivery must stamp last_steer_ts next to sibling keys"$'\n'"$(cat "$tel")"
+  [ "$(grep '^account=' "$tel" | cut -d= -f2-)" = claude-2 ] \
+    || fail "stamping last_steer_ts must NOT clobber the existing account= key"$'\n'"$(cat "$tel")"
+  [ "$(grep '^count_429=' "$tel" | cut -d= -f2-)" = 5 ] \
+    || fail "stamping last_steer_ts must NOT clobber the existing count_429= key"$'\n'"$(cat "$tel")"
+  pass "fm-send: last_steer_ts stamps without clobbering sibling telemetry keys"
+}
+
+test_non_delivery_does_not_stamp() {
+  local dir fb log rc home tel
+  dir="$TMP_ROOT/pending"; mkdir -p "$dir"
+  fb=$(make_pending_stubs "$dir"); log="$dir/sleep.log"
+  home="$dir/home"; mkdir -p "$home/state"
+  fm_write_meta "$home/state/stamptask.meta" "window=sess:win" "kind=ship" "harness=codex"
+  : > "$log"
+  env PATH="$fb:$PATH" FM_ROOT_OVERRIDE="$home" FM_HOME="$home" FM_SLEEP_LOG="$log" FM_SEND_SETTLE=0 \
+    "$SEND" fm-stamptask "hello captain" 2>/dev/null; rc=$?
+  [ "$rc" -ne 0 ] || fail "an Enter-swallowed send must fail (non-delivery)"
+  tel="$home/state/stamptask.telemetry"
+  if [ -e "$tel" ] && grep -q '^last_steer_ts=' "$tel"; then
+    fail "a non-delivery must NOT stamp last_steer_ts"$'\n'"$(cat "$tel")"
+  fi
+  pass "fm-send: a swallowed Enter (non-delivery) never stamps last_steer_ts"
+}
+
+test_explicit_target_without_meta_does_not_stamp() {
+  local dir fb log rc home tel
+  dir="$TMP_ROOT/explicit"; mkdir -p "$dir"
+  fb=$(make_stubs "$dir"); log="$dir/sleep.log"
+  home="$dir/home"; mkdir -p "$home/state"
+  : > "$log"
+  env PATH="$fb:$PATH" FM_ROOT_OVERRIDE="$home" FM_HOME="$home" FM_SLEEP_LOG="$log" FM_SEND_SETTLE=0 \
+    "$SEND" "sess:win" "hello captain" 2>/dev/null; rc=$?
+  expect_code 0 "$rc" "explicit target send should succeed"
+  if compgen -G "$home/state/*.telemetry" >/dev/null; then
+    fail "an explicit endpoint with no meta must not fabricate a telemetry file"
+  fi
+  pass "fm-send: an explicit endpoint with no recorded meta writes no telemetry stamp"
+}
+
 test_default_send_pauses_one_second
 test_zero_disables_pause
 test_pause_is_tunable
 test_key_path_never_pauses
+test_confirmed_delivery_stamps_last_steer_ts
+test_stamp_preserves_sibling_telemetry_keys
+test_non_delivery_does_not_stamp
+test_explicit_target_without_meta_does_not_stamp
