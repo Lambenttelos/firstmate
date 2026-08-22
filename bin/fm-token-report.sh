@@ -32,6 +32,10 @@
 # So the number is identical to what fm_token_sum_session/fm_token_cost render
 # anywhere else, and --session routes straight through fm_token_sum_session for
 # exact PR-T1 parity.
+# Each aggregated group is costed through the lib with the session provider_key
+# resolved to its models.dev provider (fm_token_resolve_provider), so a model
+# name that exists in several provider tables costs at the table that actually
+# billed it; an unresolved or ambiguous model stays UNKNOWN, never guessed.
 #
 # Captain decisions bound into this tool (data/design-token-usage-visibility/
 # decisions-d1-d2-d5.md, resolved 2026-08-17):
@@ -756,7 +760,8 @@ cost_aggregate_rows() {
   local agg_file=$1 costed_file=$2
   local -A COVERED_CACHE=()
   local -A PRICED_CACHE=()
-  local b model provider route sessions ti to cr cw ticket cov cost pkey ckey
+  local -A RESOLVED_CACHE=()
+  local b model provider route sessions ti to cr cw ticket cov cost pkey ckey rkey resolved
 
   while IFS=$'\t' read -r b model provider route sessions ti to cr cw ticket; do
     [ -n "$b" ] || continue
@@ -766,9 +771,15 @@ cost_aggregate_rows() {
     fi
     cov=${COVERED_CACHE[$pkey]}
 
-    ckey=$model
+    rkey="$provider"
+    if [ -z "${RESOLVED_CACHE[$rkey]+x}" ]; then
+      RESOLVED_CACHE[$rkey]=$(fm_token_resolve_provider "$provider")
+    fi
+    resolved=${RESOLVED_CACHE[$rkey]}
+
+    ckey="$provider|$model"
     if [ -z "${PRICED_CACHE[$ckey]+x}" ]; then
-      if fm_token_model_price "$model" "$PRICE_FILE" >/dev/null 2>&1; then
+      if fm_token_model_price "$model" "$PRICE_FILE" "$resolved" >/dev/null 2>&1; then
         PRICED_CACHE[$ckey]=1
       else
         PRICED_CACHE[$ckey]=0
@@ -777,7 +788,7 @@ cost_aggregate_rows() {
 
     cost=""
     if [ "${PRICED_CACHE[$ckey]}" = 1 ]; then
-      cost=$(fm_token_cost "$ti" "$to" "$cr" "$cw" "$model" "$PRICE_FILE") || cost=""
+      cost=$(fm_token_cost "$ti" "$to" "$cr" "$cw" "$model" "$PRICE_FILE" "$resolved") || cost=""
     fi
 
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \

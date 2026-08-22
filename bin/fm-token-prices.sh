@@ -1,20 +1,29 @@
 #!/usr/bin/env bash
 # fm-token-prices.sh - the single owner of firstmate's token-price snapshot.
 #
-# One owned file carries the per-model USD-per-Mtok price table the coster
+# One owned file carries the per-model USD-per-Mtok price tables the coster
 # (bin/fm-token-lib.sh) multiplies token usage against. Prices are NEVER
 # hand-maintained, per the one-owner-per-contract rule: `--refresh` copies
-# providers.anthropic out of jcode's live cached models.dev feed (the exact
-# numbers jcode itself bills against) into the owned snapshot, and stamps a
-# header that makes every price traceable from the file alone:
-#   price_source           where the prices came from ("jcode-models-dev-cache")
-#   cached_at_unix_secs    the SOURCE feed's own cache timestamp (epoch seconds)
-#   cached_at              the same timestamp as ISO-8601 UTC
-#   written_at_unix_secs   this snapshot's own written-at timestamp
-#   written_at             the same as ISO-8601 UTC
-#   prices                 the providers.anthropic table, kept in jcode's exact
-#                          shape (model_id -> input/output/cache_read/cache_write
-#                          _usd_per_mtok) so the refresh is a straight copy.
+# EVERY provider table out of jcode's live cached models.dev feed (the exact
+# numbers jcode itself bills against, not only providers.anthropic) into the
+# owned snapshot, and stamps a header that makes every price traceable from
+# the file alone:
+#   price_source            where the prices came from ("jcode-models-dev-cache")
+#   cached_at_unix_secs     the SOURCE feed's own cache timestamp (epoch seconds)
+#   cached_at               the same timestamp as ISO-8601 UTC
+#   written_at_unix_secs    this snapshot's own written-at timestamp
+#   written_at              the same as ISO-8601 UTC
+#   providers               every provider table from the feed, kept in jcode's
+#                           exact shape (provider -> model_id ->
+#                           input/output/cache_read/cache_write _usd_per_mtok)
+#                           so the refresh is a straight copy
+#   prices                  the merged flat map: model ids present in EXACTLY
+#                           ONE provider table. A model id that appears in two
+#                           or more provider tables is ambiguous and is EXCLUDED
+#                           here on purpose: the lib must fail loudly on it, not
+#                           guess which provider's price applies. The coster
+#                           looks a model up by its session provider first and
+#                           falls back to this unambiguous flat map only.
 #
 # Why snapshot rather than read the jcode cache live: the cache is jcode's
 # private file (a different domain; it may move or clear), while firstmate owns
@@ -37,8 +46,8 @@
 #
 # Failure modes (fail-closed, never a guessed price): a missing or unreadable
 # source cache exits non-zero with a clear message and writes nothing; a source
-# cache with no providers.anthropic table does the same; a bare call with no
-# snapshot yet exits non-zero telling the caller to run --refresh.
+# cache with no providers table does the same; a bare call with no snapshot yet
+# exits non-zero telling the caller to run --refresh.
 set -eu
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -76,10 +85,28 @@ except ValueError as exc:
     sys.exit(3)
 
 providers = feed.get("providers") or {}
-prices = providers.get("anthropic")
-if not isinstance(prices, dict) or not prices:
-    print("fm-token-prices: --refresh source cache has no providers.anthropic table: %s" % source, file=sys.stderr)
+if not isinstance(providers, dict) or not providers:
+    print("fm-token-prices: --refresh source cache has no providers table: %s" % source, file=sys.stderr)
     sys.exit(3)
+
+# Flat merged map = model ids present in EXACTLY ONE provider table. A model id
+# in two or more tables is ambiguous (the same name bills differently per
+# provider), so it is left OUT of the flat map and the lib fails loudly on it
+# instead of guessing; provider-scoped lookups still cost it exactly.
+counts = {}
+for table in providers.values():
+    if not isinstance(table, dict):
+        continue
+    for model_id in table:
+        counts[model_id] = counts.get(model_id, 0) + 1
+flat = {}
+for model_id, n in counts.items():
+    if n != 1:
+        continue
+    for table in providers.values():
+        if isinstance(table, dict) and model_id in table:
+            flat[model_id] = table[model_id]
+            break
 
 raw_cached = feed.get("cached_at_unix_secs")
 cached_at = epoch_iso(raw_cached) if isinstance(raw_cached, (int, float)) else None
@@ -90,7 +117,8 @@ out = {
     "cached_at": cached_at,
     "written_at_unix_secs": now,
     "written_at": epoch_iso(now),
-    "prices": prices,
+    "providers": providers,
+    "prices": flat,
 }
 
 os.makedirs(os.path.dirname(snapshot) or ".", exist_ok=True)
@@ -108,7 +136,8 @@ except OSError as exc:
     print("fm-token-prices: --refresh could not write snapshot: %s (%s)" % (snapshot, exc), file=sys.stderr)
     sys.exit(3)
 
-print("fm-token-prices: snapshot written: %s (%d models, cached_at %s)" % (snapshot, len(prices), cached_at or "unknown"))
+print("fm-token-prices: snapshot written: %s (%d providers, %d models, %d unambiguous in flat map, cached_at %s)" % (
+    snapshot, len(providers), sum(len(t) for t in providers.values() if isinstance(t, dict)), len(flat), cached_at or "unknown"))
 PY
 }
 
