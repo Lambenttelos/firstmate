@@ -10,10 +10,13 @@
 # Covers, per the brief acceptance criteria:
 #   - `--refresh` writes the snapshot with the sourced+dated header: price_source,
 #     the source's cached_at_unix_secs + derived cached_at, this snapshot's own
-#     written_at timestamps, and the providers.anthropic table as a straight copy
+#     written_at timestamps, and EVERY provider table as a straight copy
 #   - a missing source cache fails loudly with a clear message, non-zero exit,
 #     and writes no guessed snapshot
-#   - a source cache with no providers.anthropic table fails the same way
+#   - a source cache with no providers table fails the same way
+#   - the flat `prices` map holds only globally unambiguous model ids: a model
+#     present in TWO provider tables is excluded so the coster fails loudly on
+#     it instead of guessing which provider's price applies
 #   - a bare call prints the current snapshot when it exists, or a clear
 #     "not yet refreshed" message (never invented prices) when it does not
 set -u
@@ -25,8 +28,10 @@ fm_git_identity fmtest fmtest@example.invalid
 SCRIPT="$ROOT/bin/fm-token-prices.sh"
 TMP_ROOT=$(fm_test_tmproot fm-token-prices-tests)
 
-# A fixture models.dev cache: header + providers.anthropic, plus a non-anthropic
-# provider (crof) that must be EXCLUDED from the snapshot.
+# A fixture models.dev cache: header + three provider tables. crof's glm-5.2 is
+# unique to crof (flat map includes it); deepseek-v4-flash appears in BOTH crof
+# and opencode-go at different prices (flat map must exclude it as ambiguous);
+# mimo-v2.5 is unique to opencode-go (flat map includes it).
 SOURCE_FIXTURE="$TMP_ROOT/src/models_dev_pricing.json"
 OUT_SNAPSHOT="$TMP_ROOT/out/token-prices.json"
 write_source_fixture() {
@@ -35,7 +40,14 @@ write_source_fixture() {
 {
   "cached_at_unix_secs": 1786924990,
   "providers": {
-    "crof": {"glm-5.2": {"input_usd_per_mtok": 0.5, "output_usd_per_mtok": 2.2, "cache_read_usd_per_mtok": 0.08}},
+    "crof": {
+      "glm-5.2": {"input_usd_per_mtok": 0.5, "output_usd_per_mtok": 2.2, "cache_read_usd_per_mtok": 0.08},
+      "deepseek-v4-flash": {"input_usd_per_mtok": 0.2, "output_usd_per_mtok": 0.4, "cache_read_usd_per_mtok": 0.02}
+    },
+    "opencode-go": {
+      "deepseek-v4-flash": {"input_usd_per_mtok": 0.22, "output_usd_per_mtok": 0.66, "cache_read_usd_per_mtok": 0.007},
+      "mimo-v2.5": {"input_usd_per_mtok": 0.3, "output_usd_per_mtok": 0.6}
+    },
     "anthropic": {
       "claude-opus-4-8": {"input_usd_per_mtok": 5, "output_usd_per_mtok": 25, "cache_read_usd_per_mtok": 0.5, "cache_write_usd_per_mtok": 6.25},
       "claude-haiku-4-5": {"input_usd_per_mtok": 1, "output_usd_per_mtok": 5, "cache_read_usd_per_mtok": 0.1, "cache_write_usd_per_mtok": 1.25},
@@ -65,8 +77,10 @@ print(d["cached_at_unix_secs"])
 print(d["cached_at"])
 print(d["written_at_unix_secs"])
 print(d["written_at"])
-print(len(d["prices"]))
+print(json.dumps(sorted(d["providers"].keys())))
 print(json.dumps(sorted(d["prices"].keys())))
+print(d["providers"]["opencode-go"]["deepseek-v4-flash"]["input_usd_per_mtok"])
+print(len(d["prices"]))
 PY
 )
   [ "$(echo "$header" | sed -n 1p)" = "jcode-models-dev-cache" ] \
@@ -80,9 +94,16 @@ PY
     20[0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z) : ;;
     *) fail "written_at ISO format wrong: $(echo "$header" | sed -n 5p)" ;;
   esac
-  [ "$(echo "$header" | sed -n 6p)" = "3" ] || fail "expected exactly the 3 anthropic fixture models"
+  [ "$(echo "$header" | sed -n 6p)" = '["anthropic", "crof", "opencode-go"]' ] \
+    || fail "providers map must carry every provider table: $(echo "$header" | sed -n 6p)"
+  [ "$(echo "$header" | sed -n 7p)" = '["claude-haiku-4-5", "claude-haiku-4-5-20251001", "claude-opus-4-8", "glm-5.2", "mimo-v2.5"]' ] \
+    || fail "flat prices map must hold exactly the unambiguous models: $(echo "$header" | sed -n 7p)"
+  [ "$(echo "$header" | sed -n 8p)" = "0.22" ] \
+    || fail "provider-scoped price row must be the straight copy: $(echo "$header" | sed -n 8p)"
+  [ "$(echo "$header" | sed -n 9p)" = "5" ] || fail "expected exactly 5 unambiguous fixture models"
   echo "$header" | sed -n 7p | grep -q "claude-haiku-4-5-20251001" || fail "dated model missing from snapshot"
-  echo "$header" | sed -n 7p | grep -q "glm-5.2" && fail "non-anthropic provider leaked into the snapshot"
+  echo "$header" | sed -n 7p | grep -q "glm-5.2" || fail "unique non-anthropic model must land in the flat map"
+  echo "$header" | sed -n 7p | grep -q "deepseek-v4-flash" && fail "ambiguous model must be EXCLUDED from the flat map"
   # The snapshot's per-model price rows keep jcode's exact shape.
   python3 - "$OUT_SNAPSHOT" <<'PY' || fail "anthropic price row shape wrong"
 import json, sys
@@ -107,19 +128,19 @@ test_refresh_missing_source_fails_loudly() {
   pass "missing source cache fails loudly, non-zero, and writes no guesses"
 }
 
-test_refresh_no_anthropic_table_fails_loudly() {
-  local empty="$TMP_ROOT/noanth/feed.json"
-  mkdir -p "$TMP_ROOT/noanth"
+test_refresh_no_providers_table_fails_loudly() {
+  local empty="$TMP_ROOT/noprov/feed.json"
+  mkdir -p "$TMP_ROOT/noprov"
   cat > "$empty" <<'JSON'
-{"cached_at_unix_secs": 1, "providers": {"crof": {"x": {}}}}
+{"cached_at_unix_secs": 1, "other": {"x": {}}}
 JSON
-  local out status out_noanth="$TMP_ROOT/out-noanth/token-prices.json"
-  out=$(FM_TOKEN_PRICES="$out_noanth" FM_TOKEN_PRICES_SOURCE="$empty" "$SCRIPT" --refresh 2>&1)
+  local out status out_noprov="$TMP_ROOT/out-noprov/token-prices.json"
+  out=$(FM_TOKEN_PRICES="$out_noprov" FM_TOKEN_PRICES_SOURCE="$empty" "$SCRIPT" --refresh 2>&1)
   status=$?
-  [ "$status" -ne 0 ] || fail "refresh succeeded with no providers.anthropic table"
-  assert_contains "$out" "no providers.anthropic" "no-anthropic failure is not loud/clear"
-  assert_absent "$out_noanth" "refresh wrote a snapshot without an anthropic table"
-  pass "a source cache with no providers.anthropic table fails loudly, non-zero, and writes nothing"
+  [ "$status" -ne 0 ] || fail "refresh succeeded with no providers table"
+  assert_contains "$out" "has no providers table" "no-providers failure is not loud/clear"
+  assert_absent "$out_noprov" "refresh wrote a snapshot without a providers table"
+  pass "a source cache with no providers table fails loudly, non-zero, and writes nothing"
 }
 
 test_refresh_unreadable_source_fails_loudly() {
@@ -171,7 +192,7 @@ test_unknown_argument_refused() {
 
 test_refresh_writes_snapshot_with_sourced_and_dated_header
 test_refresh_missing_source_fails_loudly
-test_refresh_no_anthropic_table_fails_loudly
+test_refresh_no_providers_table_fails_loudly
 test_refresh_unreadable_source_fails_loudly
 test_bare_call_prints_snapshot_when_present
 test_bare_call_no_snapshot_prints_not_yet_refreshed

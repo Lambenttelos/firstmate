@@ -157,6 +157,154 @@ JSON
   pass "dated model ids price exact-first, then -YYYYMMDD family fallback"
 }
 
+# --- multi-provider: provider-scoped lookup, ambiguity fails loudly -----------
+
+MP_FIXTURE="$TMP_ROOT/multi/prices.json"
+write_multi_provider_fixture() {
+  mkdir -p "$TMP_ROOT/multi"
+  cat > "$MP_FIXTURE" <<'JSON'
+{
+  "price_source": "test-fixture",
+  "cached_at": "2026-08-01T00:00:00Z",
+  "providers": {
+    "anthropic": {
+      "claude-opus-4-8": {"input_usd_per_mtok": 5, "output_usd_per_mtok": 25, "cache_read_usd_per_mtok": 0.5, "cache_write_usd_per_mtok": 6.25},
+      "claude-haiku-4-5-20251001": {"input_usd_per_mtok": 99, "output_usd_per_mtok": 5, "cache_read_usd_per_mtok": 0.1, "cache_write_usd_per_mtok": 1.25}
+    },
+    "opencode-go": {
+      "deepseek-v4-flash": {"input_usd_per_mtok": 0.22, "output_usd_per_mtok": 0.66, "cache_read_usd_per_mtok": 0.007},
+      "mimo-v2.5": {"input_usd_per_mtok": 0.3, "output_usd_per_mtok": 0.6}
+    },
+    "crof": {
+      "deepseek-v4-flash": {"input_usd_per_mtok": 0.2, "output_usd_per_mtok": 0.4, "cache_read_usd_per_mtok": 0.02},
+      "glm-5.2": {"input_usd_per_mtok": 0.5, "output_usd_per_mtok": 2.2, "cache_read_usd_per_mtok": 0.08}
+    }
+  },
+  "prices": {
+    "claude-opus-4-8": {"input_usd_per_mtok": 5, "output_usd_per_mtok": 25, "cache_read_usd_per_mtok": 0.5, "cache_write_usd_per_mtok": 6.25},
+    "claude-haiku-4-5-20251001": {"input_usd_per_mtok": 99, "output_usd_per_mtok": 5, "cache_read_usd_per_mtok": 0.1, "cache_write_usd_per_mtok": 1.25},
+    "mimo-v2.5": {"input_usd_per_mtok": 0.3, "output_usd_per_mtok": 0.6},
+    "glm-5.2": {"input_usd_per_mtok": 0.5, "output_usd_per_mtok": 2.2, "cache_read_usd_per_mtok": 0.08}
+  }
+}
+JSON
+}
+
+test_multi_provider_lookup_and_ambiguity() {
+  write_multi_provider_fixture
+  local row status cost
+  # A model name in TWO provider tables is ambiguous: no provider given means
+  # the flat map, which excludes it -> UNKNOWN, never a guessed provider price.
+  row=$(fm_token_model_price "deepseek-v4-flash" "$MP_FIXTURE"); status=$?
+  [ -z "$row" ] || fail "ambiguous model priced without a provider: $row"
+  [ "$status" -ne 0 ] || fail "ambiguous model returned 0 without a provider"
+  # With the session provider resolved, the provider's own table wins.
+  row=$(fm_token_model_price "deepseek-v4-flash" "$MP_FIXTURE" "opencode-go") || fail "opencode-go lookup failed"
+  case "$row" in
+    *'"input_usd_per_mtok":0.22'*) : ;;
+    *) fail "opencode-go price not used: $row" ;;
+  esac
+  row=$(fm_token_model_price "deepseek-v4-flash" "$MP_FIXTURE" "crof") || fail "crof lookup failed"
+  case "$row" in
+    *'"input_usd_per_mtok":0.2'*) : ;;
+    *) fail "crof price not used: $row" ;;
+  esac
+  # A provider table that lacks the model falls back to the flat map, and when
+  # the model is ambiguous there too it stays UNKNOWN.
+  row=$(fm_token_model_price "deepseek-v4-flash" "$MP_FIXTURE" "absent-provider"); status=$?
+  [ -z "$row" ] && [ "$status" -ne 0 ] || fail "absent-provider ambiguous lookup must be UNKNOWN: $row"
+  # A globally unique model prices from the flat map even without a provider.
+  row=$(fm_token_model_price "mimo-v2.5" "$MP_FIXTURE") || fail "unique model must price from the flat map"
+  case "$row" in
+    *'"input_usd_per_mtok":0.3'*) : ;;
+    *) fail "flat-map price wrong: $row" ;;
+  esac
+  # Provider-scoped lookup still prices a model that is unique in flat.
+  cost=$(fm_token_cost 1000 500 2000 0 "deepseek-v4-flash" "$MP_FIXTURE" "opencode-go") || fail "provider-scoped cost failed"
+  [ "$cost" = "0.000564" ] || fail "provider-scoped cost wrong: '$cost' (want 0.000564)"
+  pass "multi-provider lookup: provider table wins, ambiguity without provider fails loudly, unique ids price from flat"
+}
+
+test_provider_key_resolution() {
+  [ "$(fm_token_resolve_provider "claude")" = "anthropic" ] \
+    || fail "provider_key claude must resolve to anthropic"
+  [ "$(fm_token_resolve_provider "claude-oauth")" = "anthropic" ] \
+    || fail "provider_key claude-oauth must resolve to anthropic"
+  [ "$(fm_token_resolve_provider "remote")" = "anthropic" ] \
+    || fail "provider_key remote must resolve to anthropic"
+  [ "$(fm_token_resolve_provider "remote-catalog")" = "anthropic" ] \
+    || fail "provider_key remote-catalog must resolve to anthropic"
+  [ "$(fm_token_resolve_provider "openrouter")" = "openrouter" ] \
+    || fail "provider_key openrouter must resolve to openrouter"
+  [ "$(fm_token_resolve_provider "openai-compatible:opencode-go")" = "opencode-go" ] \
+    || fail "openai-compatible:opencode-go must resolve to opencode-go"
+  [ -z "$(fm_token_resolve_provider "openai-compatible")" ] \
+    || fail "bare openai-compatible must resolve to nothing"
+  [ -z "$(fm_token_resolve_provider "antigravity")" ] \
+    || fail "unmapped provider_key must resolve to nothing"
+  pass "session provider_key resolves to the models.dev provider that bills it"
+}
+
+test_multi_provider_session_costing() {
+  write_multi_provider_fixture
+  local session out
+  # A real fleet shape: deepseek-v4-flash dispatched through opencode-go bills at
+  # opencode-go's price, even though the same name exists in other tables.
+  session="$TMP_ROOT/multi/deepseek.json"
+  write_session "$session" "deepseek-v4-flash" "openai-compatible:opencode-go" "null" '[
+    {"role":"assistant","token_usage":{"input_tokens":1000,"output_tokens":500,"cache_read_input_tokens":2000,"cache_creation_input_tokens":0}}
+  ]'
+  out=$(fm_token_sum_session "$session" "$MP_FIXTURE")
+  [ "$(summary_val "$out" cost_if_api)" = "0.000564" ] \
+    || fail "opencode-go session cost wrong: $(summary_val "$out" cost_if_api)"
+  # The same model via a provider with no matching table (openrouter here) is
+  # ambiguous and stays UNKNOWN, never guessed at another provider's price.
+  session="$TMP_ROOT/multi/deepseek-openrouter.json"
+  write_session "$session" "deepseek-v4-flash" "openrouter" "null" '[
+    {"role":"assistant","token_usage":{"input_tokens":1000,"output_tokens":500,"cache_read_input_tokens":2000,"cache_creation_input_tokens":0}}
+  ]'
+  out=$(fm_token_sum_session "$session" "$MP_FIXTURE")
+  [ "$(summary_val "$out" cost_if_api)" = "" ] \
+    || fail "openrouter deepseek session must stay UNKNOWN: $(summary_val "$out" cost_if_api)"
+  # Claude sessions keep billing against the anthropic table.
+  session="$TMP_ROOT/multi/opus.json"
+  write_session "$session" "claude-opus-4-8" "claude" "null" '[
+    {"role":"assistant","token_usage":{"input_tokens":1000,"output_tokens":500,"cache_read_input_tokens":2000,"cache_creation_input_tokens":0}}
+  ]'
+  # 1000@5 + 500@25 + 2000@0.5 = 18500 -> 0.0185 (cache_write billed 0).
+  out=$(fm_token_sum_session "$session" "$MP_FIXTURE")
+  [ "$(summary_val "$out" cost_if_api)" = "0.0185" ] \
+    || fail "claude session cost wrong: $(summary_val "$out" cost_if_api)"
+  pass "session costing resolves the provider and stays UNKNOWN on ambiguity"
+}
+
+# --- missing cache price: zero tokens tolerate it, billed tokens do not -------
+
+test_missing_cache_price_semantics() {
+  local sparse="$TMP_ROOT/sparse/prices.json"
+  mkdir -p "$TMP_ROOT/sparse"
+  cat > "$sparse" <<'JSON'
+{"price_source":"test-fixture","cached_at":"2026-08-01T00:00:00Z","prices":{"sparse-model":{"input_usd_per_mtok":1,"output_usd_per_mtok":2}}}
+JSON
+  local cost status
+  # No cache tokens billed: the omitted cache prices contribute zero.
+  cost=$(fm_token_cost 1000 500 0 0 "sparse-model" "$sparse") || fail "sparse row with zero cache tokens must cost"
+  [ "$cost" = "0.002" ] || fail "sparse-row cost wrong: '$cost' (want 0.002)"
+  # Cache tokens billed with no cache price: UNKNOWN, never a fabricated zero.
+  cost=$(fm_token_cost 1000 500 100 0 "sparse-model" "$sparse"); status=$?
+  [ -z "$cost" ] && [ "$status" -ne 0 ] || fail "billed cache_read with no price must be UNKNOWN: '$cost'"
+  cost=$(fm_token_cost 1000 500 0 100 "sparse-model" "$sparse"); status=$?
+  [ -z "$cost" ] && [ "$status" -ne 0 ] || fail "billed cache_write with no price must be UNKNOWN: '$cost'"
+  # A row missing input OR output is garbage no matter what: UNKNOWN.
+  local broken="$TMP_ROOT/sparse/broken.json"
+  cat > "$broken" <<'JSON'
+{"price_source":"test-fixture","cached_at":"2026-08-01T00:00:00Z","prices":{"broken-model":{"output_usd_per_mtok":2}}}
+JSON
+  cost=$(fm_token_cost 1000 500 0 0 "broken-model" "$broken"); status=$?
+  [ -z "$cost" ] && [ "$status" -ne 0 ] || fail "row without an input price must be UNKNOWN: '$cost'"
+  pass "missing cache prices are tolerated only for components with zero billed tokens"
+}
+
 # --- subscription_covered OR logic -------------------------------------------
 
 test_subscription_covered_or_logic() {
@@ -219,6 +367,10 @@ test_price_path_and_header_fields() {
 test_worked_example_exact_sums_and_cost
 test_unknown_model_cost_is_null_never_zero
 test_dated_id_exact_then_family_fallback
+test_multi_provider_lookup_and_ambiguity
+test_provider_key_resolution
+test_multi_provider_session_costing
+test_missing_cache_price_semantics
 test_subscription_covered_or_logic
 test_missing_or_incomplete_inputs_fail_closed
 test_price_path_and_header_fields

@@ -138,6 +138,42 @@ JSON
   pass "--period sums a date range correctly and is inclusive by whole day"
 }
 
+# --- --period costs a non-anthropic provider session in dollars ---------------
+
+test_period_prices_non_anthropic_provider() {
+  local store5b="$TMP_ROOT/nonanthropic-store"
+  mkdir -p "$store5b"
+  # Real fleet shape: deepseek-v4-flash dispatched through opencode-go. The
+  # models.dev name exists in many provider tables, so pre-change it landed in
+  # the UNKNOWN bucket; with the session provider resolved it must cost dollars.
+  cat > "$store5b/session_deepseek.json" <<'JSON'
+{"id":"session_deepseek","model":"deepseek-v4-flash","provider_key":"openai-compatible:opencode-go","route_api_method":null,"created_at":"2026-08-13T09:00:00.000Z","updated_at":"2026-08-13T09:10:00.000Z","messages":[{"role":"assistant","timestamp":"2026-08-13T09:00:00.000Z","token_usage":{"input_tokens":1000000,"output_tokens":500000,"cache_read_input_tokens":2000000,"cache_creation_input_tokens":0}}]}
+JSON
+  local price2="$TMP_ROOT/prices-multi.json"
+  cat > "$price2" <<'JSON'
+{
+  "price_source": "jcode-models-dev-cache",
+  "cached_at": "2026-08-22T00:00:00Z",
+  "providers": {
+    "anthropic": {"claude-opus-4-8": {"input_usd_per_mtok": 5, "output_usd_per_mtok": 25, "cache_read_usd_per_mtok": 0.5, "cache_write_usd_per_mtok": 6.25}},
+    "opencode-go": {"deepseek-v4-flash": {"input_usd_per_mtok": 0.22, "output_usd_per_mtok": 0.66, "cache_read_usd_per_mtok": 0.007}}
+  },
+  "prices": {"claude-opus-4-8": {"input_usd_per_mtok": 5, "output_usd_per_mtok": 25, "cache_read_usd_per_mtok": 0.5, "cache_write_usd_per_mtok": 6.25}}
+}
+JSON
+  # 1M in @ 0.22 + 0.5M out @ 0.66 + 2M cache-read @ 0.007 = $0.564 -> $0.56.
+  local out
+  out=$(JCODE_SESSIONS_DIR="$store5b" FM_TOKEN_PRICES="$price2" "$CLI" --period 2026-08-13..2026-08-13)
+  assert_contains "$out" "sessions=1" "deepseek session missing from period: $out"
+  assert_contains "$out" "\$0.56" "deepseek cost must be a dollar figure: $out"
+  assert_not_contains "$out" "UNKNOWN" "deepseek tokens must not be UNKNOWN: $out"
+  # The same session against an anthropic-only flat fixture (no providers map):
+  # the ambiguous name must fail loudly, never cost at a guessed provider price.
+  out=$(JCODE_SESSIONS_DIR="$store5b" FM_TOKEN_PRICES="$PRICE" "$CLI" --period 2026-08-13..2026-08-13)
+  assert_contains "$out" "UNKNOWN" "ambiguity must fail loudly, not guess: $out"
+  pass "--period costs a non-anthropic provider session in dollars and stays UNKNOWN on ambiguity"
+}
+
 # --- --by day bucketing: whole-session default vs --precise split -------------
 
 test_by_day_and_precise_bucketing() {
@@ -444,6 +480,7 @@ test_ticket_arg_guards() {
 
 test_session_matches_lib_exactly
 test_period_sums_range
+test_period_prices_non_anthropic_provider
 test_by_day_and_precise_bucketing
 test_json_shape_stable
 test_unknown_model_withholds_dollars

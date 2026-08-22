@@ -22,10 +22,22 @@
 # output, non-zero exit), never zero. Lookup is exact model id first, then the
 # -YYYYMMDD-stripped family, then UNKNOWN.
 #
-# Price snapshot (owned by bin/fm-token-prices.sh): config/token-prices.json,
-# with a header carrying price_source, cached_at (the source feed's own cache
-# timestamp), and written_at (this snapshot's own). Every cost is annotated
-# with price_source + price_cached_at so staleness is visible from the file.
+# MULTI-PROVIDER lookup rule: the snapshot (owned by bin/fm-token-prices.sh,
+# config/token-prices.json) carries a `providers` map with EVERY provider
+# table from jcode's models.dev feed plus a flat `prices` map that holds only
+# model ids present in exactly ONE provider table. A model id in two or more
+# tables is ambiguous - the same name bills differently per provider - and the
+# flat map EXCLUDES it by construction, so an unqualified lookup fails loudly
+# (UNKNOWN) instead of guessing. Callers that know the session's provider pass
+# it in: the resolved provider's table wins, and only when that table lacks the
+# model does the lookup fall back to the unambiguous flat map. fm_token_sum_session
+# resolves the session provider_key for the caller.
+#
+# Price snapshot header (owned by bin/fm-token-prices.sh): config/
+# token-prices.json, with a header carrying price_source, cached_at (the source
+# feed's own cache timestamp), and written_at (this snapshot's own). Every cost
+# is annotated with price_source + price_cached_at so staleness is visible from
+# the file.
 #
 # Staleness/estimate labeling contract: PR-T1's per-session math is exact, so
 # fm_token_sum_session always emits cost_if_api_estimate=false. The key exists
@@ -68,31 +80,73 @@ sys.stdout.write(str(data.get(os.environ["FM_TOK_KEY"], "") or ""))
 PY
 }
 
+# Resolve a jcode session provider_key to the models.dev provider id whose
+# price table bills that route, or print NOTHING when no table maps to it.
+#   claude | claude-oauth | remote | remote-catalog -> anthropic
+#       (jcode's claude routes all bill against models.dev's anthropic table,
+#        the same basis the snapshot used when it was anthropic-only)
+#   openrouter -> openrouter
+#   openai-compatible:<name> -> <name>  (e.g. openai-compatible:opencode-go)
+#   anything else -> nothing (lookup then falls back to the flat map only)
+fm_token_resolve_provider() {
+  local provider_key=$1 name
+  case "$provider_key" in
+    claude|claude-oauth|remote|remote-catalog)
+      printf 'anthropic\n'
+      ;;
+    openrouter)
+      printf 'openrouter\n'
+      ;;
+    openai-compatible:*)
+      name="${provider_key#openai-compatible:}"
+      [ -n "$name" ] && printf '%s\n' "$name"
+      ;;
+  esac
+  return 0
+}
+
 # Print the price row for a model as one compact JSON object carrying the four
 # per-Mtok USD fields, or print NOTHING and return 1 when the model is unpriced.
-# Exact model id first, then the trailing -YYYYMMDD-stripped family. A missing
-# price snapshot is UNKNOWN (return 1), never a guessed price.
+# Args: model [price_file] [provider]. With a provider, the provider's table is
+# tried first (exact id, then the trailing -YYYYMMDD-stripped family) and only
+# then the flat unambiguous map; without a provider only the flat map is read,
+# so an ambiguous id is UNKNOWN (fail loudly, never a guessed provider). A
+# missing price snapshot is UNKNOWN (return 1), never a guessed price.
 fm_token_model_price() {
-  local model=$1 price_file=${2:-}
+  local model=$1 price_file=${2:-} provider=${3:-}
   [ -n "$model" ] || return 1
   [ -n "$price_file" ] || price_file=$(fm_token_prices_path)
   [ -f "$price_file" ] || return 1
   command -v python3 >/dev/null 2>&1 || return 1
-  FM_TOK_MODEL="$model" FM_TOK_PRICE_FILE="$price_file" python3 - <<'PY'
+  FM_TOK_MODEL="$model" FM_TOK_PRICE_FILE="$price_file" FM_TOK_PROVIDER="$provider" python3 - <<'PY'
 import json, os, re, sys
 
 model = os.environ["FM_TOK_MODEL"]
+provider = os.environ.get("FM_TOK_PROVIDER", "")
 try:
     with open(os.environ["FM_TOK_PRICE_FILE"]) as fh:
         data = json.load(fh)
 except Exception:
     sys.exit(1)
-prices = data.get("prices") or {}
-row = prices.get(model)
+comp = {}
+providers = data.get("providers") or {}
+if provider and isinstance(providers.get(provider), dict):
+    comp = providers[provider]
+if not comp:
+    comp = data.get("prices") or {}
+row = comp.get(model)
 if row is None:
     base = re.sub(r"-[0-9]{8}$", "", model)
     if base != model:
-        row = prices.get(base)
+        row = comp.get(base)
+if row is None and provider and isinstance(providers.get(provider), dict):
+    # The provider table lacks the model: fall back to the unambiguous flat map.
+    flat = data.get("prices") or {}
+    row = flat.get(model)
+    if row is None:
+        base = re.sub(r"-[0-9]{8}$", "", model)
+        if base != model:
+            row = flat.get(base)
 if row is None:
     sys.exit(1)
 sys.stdout.write(json.dumps(row, separators=(",", ":")))
@@ -102,13 +156,18 @@ PY
 # Dot-product cost in USD for the given token counts at the model's price:
 # (input*in + output*out + cache_read*cr + cache_write*cw) / 1_000_000.
 # Prints the full-precision decimal, or NOTHING (exit 1) when UNKNOWN.
-# A priced row must carry every billed component; an incomplete row is UNKNOWN,
-# never a partial cost with a fabricated zero for the missing component.
+# Args: input output cache_read cache_write model [price_file] [provider].
+# Row-completeness rule: input and output are the always-billed components, so
+# both prices must be present; a missing cache price is only tolerated when the
+# session billed ZERO tokens for that component (the feed omits cache prices for
+# providers that do not publish them, so a zero-token component costs nothing).
+# A billed component with a missing price stays UNKNOWN: never a partial cost
+# with a fabricated zero for a component that was actually billed.
 fm_token_cost() {
-  local input=$1 output=$2 cache_read=$3 cache_write=$4 model=$5 price_file=${6:-} row
+  local input=$1 output=$2 cache_read=$3 cache_write=$4 model=$5 price_file=${6:-} provider=${7:-} row
   [ -n "$model" ] || return 1
   [ -n "$price_file" ] || price_file=$(fm_token_prices_path)
-  row=$(fm_token_model_price "$model" "$price_file") || return 1
+  row=$(fm_token_model_price "$model" "$price_file" "$provider") || return 1
   [ -n "$row" ] || return 1
   command -v python3 >/dev/null 2>&1 || return 1
   FM_TOK_ROW="$row" \
@@ -135,8 +194,14 @@ pi = row.get("input_usd_per_mtok")
 po = row.get("output_usd_per_mtok")
 pcr = row.get("cache_read_usd_per_mtok")
 pcw = row.get("cache_write_usd_per_mtok")
-if not all(isinstance(x, (int, float)) for x in (pi, po, pcr, pcw)):
+if not (isinstance(pi, (int, float)) and isinstance(po, (int, float))):
     sys.exit(1)
+if cr > 0 and not isinstance(pcr, (int, float)):
+    sys.exit(1)
+if cw > 0 and not isinstance(pcw, (int, float)):
+    sys.exit(1)
+pcr = pcr if isinstance(pcr, (int, float)) else 0.0
+pcw = pcw if isinstance(pcw, (int, float)) else 0.0
 cost = (inp * pi + out * po + cr * pcr + cw * pcw) / 1000000.0
 sys.stdout.write(str(cost))
 PY
@@ -166,7 +231,7 @@ fm_token_subscription_covered() {
 # estimate callers reuse the same labeling key. Returns non-zero only when the
 # session file cannot be parsed.
 fm_token_sum_session() {
-  local session_file=$1 price_file=${2:-} out model provider route
+  local session_file=$1 price_file=${2:-} out model provider route resolved
   local input output cache_read cache_write cost covered ps pc
   [ -f "$session_file" ] || { echo "fm-token-lib: session file not found: $session_file" >&2; return 1; }
   command -v python3 >/dev/null 2>&1 || { echo "fm-token-lib: python3 required to parse sessions" >&2; return 1; }
@@ -212,7 +277,8 @@ PY
     read -r cache_read
     read -r cache_write
   } <<< "$out"
-  cost=$(fm_token_cost "$input" "$output" "$cache_read" "$cache_write" "$model" "$price_file") || true
+  resolved=$(fm_token_resolve_provider "$provider")
+  cost=$(fm_token_cost "$input" "$output" "$cache_read" "$cache_write" "$model" "$price_file" "$resolved") || true
   covered=$(fm_token_subscription_covered "$provider" "$route")
   ps=$(fm_token_prices_field price_source "$price_file") || true
   pc=$(fm_token_prices_field cached_at "$price_file") || true
