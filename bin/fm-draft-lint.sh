@@ -104,6 +104,9 @@ function flush(  hdr, isdeploy) {
   # --- 4. bare PR numbers in DRAFT REPLY ---
   if (barepr) { viol++; print "entry [" id "]: DRAFT REPLY has a bare PR number without an adjacent https URL" }
 
+  # --- 4b. no UTC datetime anywhere in the DRAFT REPLY (all datetimes must be CDT) ---
+  if (utc) { viol++; print "entry [" id "]: DRAFT REPLY carries a UTC datetime (Z/+0000); all datetimes must be CDT" }
+
   # --- 5. Suggested reply addressee ---
   if (sugg != "") {
     if (sugg !~ /Suggested reply to (merchant|partner|rep|customer|user|[A-Z][A-Za-z]+)/) {
@@ -118,7 +121,7 @@ function flush(  hdr, isdeploy) {
   # reset state
   id=""; title=""; hdrline=""; rcpos=0; drpos=0; pos=0
   seen_sym=0; seen_root=0; seen_fix=0; seen_data=0; seen_going=0
-  fixline=""; dataline=""; sugg=""; indraft=0; barepr=0; expect_hdr=0
+  fixline=""; dataline=""; sugg=""; indraft=0; barepr=0; expect_hdr=0; utc=0
   # extract numeric id from "## [N]" without gawk 3-arg match (mawk-safe)
   hdr0=$0
   if (hdr0 ~ /^## \[[0-9]+\]/) {
@@ -150,6 +153,8 @@ function flush(  hdr, isdeploy) {
     # bare PR: "PR <4+ digits>" on a line that has NO bitbucket pull-requests URL.
     # mawk has no {4} interval, so match 4 explicit digits.
     if ($0 ~ /PR[s]?[ ]?#?[0-9][0-9][0-9][0-9]/ && $0 !~ /pull-requests\/[0-9]/) barepr=1
+    # UTC datetime detection: ISO "...T##:##Z" (optionally with seconds) or "... +0000".
+    if ($0 ~ /[0-9][0-9]:[0-9][0-9]Z/ || $0 ~ /[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z/ || $0 ~ /\+0000/ || $0 ~ /[0-9] UTC/) utc=1
   }
 }
 
