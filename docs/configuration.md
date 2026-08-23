@@ -405,6 +405,14 @@ Crews left unchecked when the budget runs out count toward the live total anyway
 That marker is cached with the count, so a partly checked count keeps the same label on the later synchronous readings that reuse it.
 `FM_RESOURCE_PROBE_TIMEOUT` bounds each individual crew-liveness check inside that budget, defaulting to `5`, with the same fallback for `0` or a malformed value; each check is terminated as a process group, so a wedged backend leaves no stuck process behind.
 
+The probe process that runs the sweep is bounded and serialized so a wedged backend can never take the host down, the failure mode recorded in the `20260823T031739Z-home-oom-fm-resource-probe-runaway` incident.
+The probe concurrency lock is host-global: it lives at `${TMPDIR:-/tmp}/fm-resource-probe-<uid>.lock` (one per operating user), so a fleet running several homes and a treehouse spreading one home across several worktrees still run exactly one probe at a time on the host, rather than N simultaneous heavy sweeps.
+A home that loses the race defers and keeps its previous cached reading, well within the two-interval freshness window every consumer already tolerates.
+`FM_RESOURCE_PROBE_LOCK` overrides the lock path (a test seam, and the way to scope a lock to something narrower than the whole host); `bin/fm-resource-probe.sh --lock-path` prints the resolved path, which is how the watcher consults it.
+`FM_RESOURCE_PROBE_MEM_MB` is a hard address-space ceiling (`ulimit -v`) set on the probe and inherited by the sweep and every backend CLI it forks, defaulting to `1024` MiB, with `0` or a malformed value disabling it; a healthy probe costs single-digit MB and a herdr query tens of MB, so the default is a wide margin that still kills a genuine runaway before it can OOM a swapless host.
+`FM_RESOURCE_PROBE_MAX_BYTES` truncates the sweep output the probe reads into a shell variable, defaulting to `1048576` bytes, with `0` or a malformed value disabling it, so a backend dumping a huge stream cannot inflate the probe through the command capture itself.
+The probe also renices itself to `19` and drops to the idle I/O class (best-effort, no privilege required) before any work, so a probe that is slow under load yields CPU and disk to interactive work such as an ssh login rather than queuing ahead of it.
+
 `FM_RESOURCE_SWEEP_BUDGET` is the number of seconds one sweep may spend checking crew liveness in total, defaulting to `30`, and a malformed value falls back to that default rather than disabling the budget.
 It bounds the watcher's poll loop however many crews are recorded and however unresponsive a backend is, since bounding each check on its own would still allow one timeout per recorded crew.
 Crews left unchecked when the budget runs out count toward the live total anyway, the same conservative direction an unanswered check already takes, and the reading says "liveness partly unverified" so a partly checked count is never shown as a fully verified one.
@@ -808,6 +816,9 @@ FM_HOURLY_REVIEW_INTERVAL=3600   # seconds between hourly session-review passes;
 FM_HOURLY_CLEANUP_INTERVAL=3600  # seconds between hourly cleanup sweeps; same 0/malformed rules
 FM_RESOURCE_SWEEP_BUDGET=30   # seconds one sweep may spend on crew-liveness checks in total; 0 or malformed falls back to the default
 FM_RESOURCE_PROBE_TIMEOUT=5   # seconds allowed per crew-liveness check inside a sweep; 0 or malformed falls back to the default
+FM_RESOURCE_PROBE_LOCK=       # override for the host-global probe concurrency lock path; default ${TMPDIR:-/tmp}/fm-resource-probe-<uid>.lock (one probe at a time across every worktree and home on the host); the tests use it to isolate
+FM_RESOURCE_PROBE_MEM_MB=1024 # hard address-space ceiling (ulimit -v, MiB) on the probe and every child it forks; 0 or malformed disables it
+FM_RESOURCE_PROBE_MAX_BYTES=1048576 # cap on the sweep output the probe reads into a variable; 0 or malformed disables it
 FM_HEAVY_SLOTS=         # heavy-run ceiling override; wins over the authoritative and local config, malformed or below-floor values fall back to 1 (see the heavy-run serialization section above)
 FM_HEAVY_SLOTS_FILE=    # path to the authoritative heavy-run ceiling file (the primary home's config/heavy-run-slots); when set and readable it overrides this home's own config so every home sharing the host-global ledger resolves one cap, otherwise the local config is used
 FM_HEAVY_RUN_DIR=       # alternate heavy-run queue dir; the default is host-global ($TMPDIR/fm-heavy-runs-<uid>, one queue for the whole machine), and this override scopes the queue elsewhere (the tests use it to isolate)
