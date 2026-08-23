@@ -76,6 +76,9 @@ test_guard_denies_every_currently_known_delegation_tool() {
   for tool in $DELEGATION_TOOLS; do
     case "$tool" in
       TaskOutput|TaskStop|TaskGet|TaskList|CronList) continue ;;
+      # Self-scheduling tools deliver a prompt back to THIS session later and
+      # create no untracked worker; the shipped guard allows them (10d26a4).
+      CronCreate|CronDelete|ScheduleWakeup) continue ;;
     esac
     expect_deny "known delegation tool" "$tool"
   done
@@ -103,6 +106,11 @@ test_guard_allows_ordinary_and_observe_only_tools() {
   # work, and blocking it would strand a runaway task with no way to end it.
   for tool in TaskOutput TaskStop TaskGet TaskList CronList BashOutput KillShell; do
     expect_allow "observe-or-stop tool" "$tool"
+  done
+  # Self-scheduling tools re-prompt THIS session later; they create no untracked
+  # worker or isolated workspace, so the shipped guard allows them (10d26a4).
+  for tool in ScheduleWakeup CronCreate CronDelete; do
+    expect_allow "self-schedule tool" "$tool"
   done
   pass "the guard leaves ordinary tools and observe-or-stop operations alone"
 }
