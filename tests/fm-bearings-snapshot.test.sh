@@ -882,7 +882,10 @@ test_afk_guard_blocks_but_readonly_bypass_yields_real_data() {
   set +e
   json=$(PATH="$fakebin:$PATH" FM_HOME="$home" FM_BEARINGS_NOW=2026-07-11T18:00:00Z \
     NET_LOG="$home/net.log" "$BEARINGS" --json 2>/dev/null); rc=$?
-  set -e
+  # Restore this file's baseline (errexit off, set -u only): a stray `set -e`
+  # would leak into later tests, aborting the first one that runs a command
+  # expected to fail (e.g. test_projection_and_toon_fail_closed's --json call).
+  set +e
   [ "$rc" -eq 3 ] || fail "away-return guard must still block an ordinary bearings read, got rc=$rc"
   [ -z "$json" ] || fail "blocked bearings read must yield no projection, got: $json"
 
@@ -901,7 +904,7 @@ test_afk_guard_blocks_but_readonly_bypass_yields_real_data() {
   set +e
   PATH="$fakebin:$PATH" FM_HOME="$home" FM_BEARINGS_NOW=2026-07-11T18:00:00Z \
     NET_LOG="$home/net.log" "$BEARINGS" --json >/dev/null 2>&1; rc=$?
-  set -e
+  set +e
   [ "$rc" -eq 3 ] || fail "away gate must remain armed after a read-only bypass, got rc=$rc"
   # Restore errexit OFF (the suite default): this function toggles set -e
   # around failure-capturing substitutions, and if it returns while errexit
