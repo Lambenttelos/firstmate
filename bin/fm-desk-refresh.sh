@@ -112,13 +112,14 @@
 # rewrites internal vocabulary into the captain's nouns; DESK_TERMS below is the
 # single owner of that mapping.
 #
-# JUDGMENT LAYER. Four sections need judgment a read-only script cannot
-# synthesize: 1 (decisions needed) and 2 (blockers/failures) are thin, and 11
-# (recent questions) and 12 (recent conversation) have NO local source at all.
-# The running firstmate session writes ONE small bounded file, and this builder
-# splices it in when present and fresh. This comment is the SINGLE OWNER of that
-# file's schema; the /desk skill and AGENTS.md point here, they do not restate
-# it.
+# JUDGMENT LAYER. Two sections need judgment a read-only script cannot
+# synthesize: 1 (decisions needed) and 2 (blockers/failures) are thin. Sections
+# 11 (recent questions) and 12 (recent conversation) are transcript-sourced
+# instead; see the durable-transcript-feed block below for how this file's
+# questions/transcript arrays relate to that feed. The running firstmate
+# session writes ONE small bounded file, and this builder splices it in when
+# present and fresh. This comment is the SINGLE OWNER of that file's schema;
+# the /desk skill and AGENTS.md point here, they do not restate it.
 #
 #   Path:    $FM_HOME/state/desk-judgment.json (override: FM_DESK_JUDGMENT)
 #   Freshness: read only when written within FM_DESK_JUDGMENT_MAX_AGE seconds
@@ -711,10 +712,20 @@ desk_judgment_ids() {  # <decisions|blockers>
 # freshness explicitly so a stale-but-present desk cannot masquerade as live -
 # the judgment layer is time-sensitive and the page must say when it was
 # synthesized. Renders a plain "no analysis layer" line when absent/stale.
+# When the durable transcript feed supplied sections 11 and 12, the stamp says
+# so instead of claiming analysis coverage for those panels: they are
+# transcript-sourced and the page must not present them as a mechanical view.
 render_generated_stamp() {
   if [ "$JUDGMENT_PRESENT" -eq 1 ]; then
-    printf '    <p class="text-xs opacity-50 mb-6">Firstmate analysis for sections 1, 2, 11, and 12 was written %s (within the last %s minutes).</p>\n' \
-      "$(desk_esc <<<"$JUDGMENT_STAMP")" "$(( JUDGMENT_MAX_AGE / 60 ))"
+    if [ "$FEED_PRESENT" -eq 1 ]; then
+      printf '    <p class="text-xs opacity-50 mb-6">Firstmate analysis for sections 1 and 2 was written %s (within the last %s minutes). Sections 11 and 12 show the durable transcript feed.</p>\n' \
+        "$(desk_esc <<<"$JUDGMENT_STAMP")" "$(( JUDGMENT_MAX_AGE / 60 ))"
+    else
+      printf '    <p class="text-xs opacity-50 mb-6">Firstmate analysis for sections 1, 2, 11, and 12 was written %s (within the last %s minutes).</p>\n' \
+        "$(desk_esc <<<"$JUDGMENT_STAMP")" "$(( JUDGMENT_MAX_AGE / 60 ))"
+    fi
+  elif [ "$FEED_PRESENT" -eq 1 ]; then
+    printf '    <p class="text-xs opacity-50 mb-6">No fresh firstmate analysis layer for sections 1 and 2; those show the mechanical view only. Sections 11 and 12 show the durable transcript feed.</p>\n'
   else
     printf '    <p class="text-xs opacity-50 mb-6">No fresh firstmate analysis layer for sections 1, 2, 11, and 12; those show the mechanical view only.</p>\n'
   fi
