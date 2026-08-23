@@ -43,8 +43,48 @@
 # rule the inline sweep followed; the disabled case is already gated off before
 # launch by the watcher, so reaching it here is only belt-and-suspenders.
 #
+# HOST-GLOBAL CONCURRENCY. The probe lock is host-global by default, NOT scoped
+# to one firstmate home's state dir. A fleet runs several operational homes and a
+# treehouse spreads one home across several worktrees, each with its own watcher
+# on the same cadence; a per-worktree lock caps overlap only within one worktree,
+# so N worktrees launched N heavy sweeps at once and, when a sweep wedged under
+# memory pressure, that multiplication is what took the whole host down (see
+# data/20260823T031739Z-home-oom-fm-resource-probe-runaway). The default lock at
+# ${TMPDIR:-/tmp}/fm-resource-probe-<uid>.lock (one per operating user, the same
+# host-global pattern bin/fm-heavy-run.sh uses) serializes probes across every
+# worktree and home on the host to exactly one at a time. A home that loses the
+# race this cycle simply DEFERS - it exits 0 and publishes nothing, keeping its
+# previous cached reading, and wins the lock on a later poll well within the
+# two-interval freshness window every consumer already tolerates. Serializing is
+# the point: while one probe is in flight (or wedged) no home launches a second
+# heavy sweep into a host that may already be thrashing. FM_RESOURCE_PROBE_LOCK
+# overrides the path (a test seam, and the way to scope a lock to something other
+# than the whole host).
+#
+# BOUNDED FOOTPRINT. Two independent caps keep a single probe from ballooning:
+#   - Address-space ceiling. A hard `ulimit -v` (FM_RESOURCE_PROBE_MEM_MB, default
+#     1024) is set on this shell before it forks anything, so the probe AND every
+#     child (fm-resource-check.sh, and the backend CLIs it spawns per crew) each
+#     fail their allocations rather than growing without bound. A healthy probe
+#     costs single-digit MB (the sweep) and a backend query tens of MB (herdr's
+#     measured VmPeak is ~20MB), so 1 GiB is a wide margin that still kills a
+#     genuine runaway long before it can OOM a swapless host. 0 disables it.
+#   - Captured-output cap. The sweep's stdout is truncated to
+#     FM_RESOURCE_PROBE_MAX_BYTES (default 1 MiB) before it is read into a shell
+#     variable, so a backend that dumps a huge stream can never inflate this
+#     process through the command capture itself. 0 disables it.
+# Neither cap changes a normal reading; both exist only so a wedged backend
+# degrades to a missing reading instead of a host lockup.
+#
+# LOW PRIORITY. The probe renices itself and drops to the idle I/O class
+# (best-effort, no privilege required) before doing any work, so even a probe
+# that is slow under load yields CPU and disk to interactive work - an ssh login
+# on a thrashing host must not queue behind a liveness probe. Both are
+# inherited by the sweep and its backend children.
+#
 # Usage:
 #   fm-resource-probe.sh        run one probe cycle and publish its reading
+#   fm-resource-probe.sh --lock-path   print the resolved host-global lock path
 #   fm-resource-probe.sh --help
 set -u
 
@@ -59,21 +99,64 @@ usage() {
        { exit }' "$0"
 }
 
+# resolve_lock_path: the host-global probe lock, one owner of the path so the
+# watcher (which queries it via --lock-path) and the probe can never disagree.
+# FM_RESOURCE_PROBE_LOCK overrides it for tests and for scoping a lock to
+# something narrower than the whole host.
+resolve_lock_path() {
+  if [ -n "${FM_RESOURCE_PROBE_LOCK:-}" ]; then
+    printf '%s' "$FM_RESOURCE_PROBE_LOCK"
+  else
+    printf '%s/fm-resource-probe-%s.lock' "${TMPDIR:-/tmp}" "$(id -u 2>/dev/null || printf '%s' 0)"
+  fi
+}
+
 case "${1:-}" in
   -h|--help) usage; exit 0 ;;
+  --lock-path) resolve_lock_path; printf '\n'; exit 0 ;;
   '') : ;;
   *) echo "error: unknown argument '$1'" >&2; exit 64 ;;
 esac
 
-# The probe lock keeps two overlapping probes from double-reading one host. It is
-# a DIFFERENT lock from the watcher singleton, so it can never contend with or
-# evict the one supervision cycle. A crashed probe leaves a lock naming a dead
-# pid, which fm_lock_try_acquire reclaims on the next attempt.
+# Drop to low priority FIRST, before any work, so a slow probe under load never
+# queues ahead of interactive work. Best-effort: a missing tool or a refusal is
+# ignored, and both settings are inherited by the sweep and its backend children.
+renice 19 -p "$$" >/dev/null 2>&1 || true
+if command -v ionice >/dev/null 2>&1; then
+  ionice -c 3 -p "$$" >/dev/null 2>&1 || true
+fi
+
+# Hard address-space ceiling on this shell and everything it forks, so a runaway
+# probe (or a wedged backend child) fails its allocations instead of growing
+# until the host OOMs. Set as both soft and hard so a child cannot raise it.
+# 0 or a malformed value disables the cap; any other value is megabytes.
+PROBE_MEM_MB=${FM_RESOURCE_PROBE_MEM_MB:-1024}
+case "$PROBE_MEM_MB" in
+  ''|*[!0-9]*) PROBE_MEM_MB=1024 ;;
+esac
+if [ "$PROBE_MEM_MB" -gt 0 ]; then
+  ulimit -v $(( PROBE_MEM_MB * 1024 )) 2>/dev/null || true
+fi
+
+# Cap the sweep output read into a shell variable, so a backend dumping a huge
+# stream cannot inflate this process through the command capture. 0 or a
+# malformed value disables the cap; any other value is bytes.
+PROBE_MAX_BYTES=${FM_RESOURCE_PROBE_MAX_BYTES:-1048576}
+case "$PROBE_MAX_BYTES" in
+  ''|*[!0-9]*) PROBE_MAX_BYTES=1048576 ;;
+esac
+
+# The probe lock keeps overlapping probes from double-reading one host. It is
+# HOST-GLOBAL by default (see the header), and a DIFFERENT lock from the watcher
+# singleton, so it can never contend with or evict the one supervision cycle. A
+# crashed probe leaves a lock naming a dead pid, which fm_lock_try_acquire
+# reclaims on the next attempt.
 # shellcheck source=bin/fm-mutex-lib.sh
 . "$SCRIPT_DIR/fm-mutex-lib.sh"
 
-PROBE_LOCK="$STATE/.resource-probe.lock"
+PROBE_LOCK=$(resolve_lock_path)
 mkdir -p "$STATE" 2>/dev/null || true
+mkdir -p "$(dirname "$PROBE_LOCK")" 2>/dev/null || true
 fm_lock_try_acquire "$PROBE_LOCK" || exit 0
 trap 'fm_lock_release "$PROBE_LOCK"' EXIT
 
@@ -90,7 +173,16 @@ write_atomic() {  # <path> <content>
   fi
 }
 
-out=$("$SCRIPT_DIR/fm-resource-check.sh" --sweep 2>/dev/null) && rc=0 || rc=$?
+# Run the sweep, capping its captured stdout so a backend dumping a huge stream
+# cannot inflate this process through the command substitution. The cap runs in
+# the pipeline so the sweep's own exit status is preserved (PIPESTATUS[0]); head
+# closing its input early makes a runaway sweep exit on SIGPIPE rather than fill
+# memory. A normal reading is a few hundred bytes, far under the cap.
+if [ "$PROBE_MAX_BYTES" -gt 0 ]; then
+  out=$( { "$SCRIPT_DIR/fm-resource-check.sh" --sweep 2>/dev/null | head -c "$PROBE_MAX_BYTES"; } ; exit "${PIPESTATUS[0]}" ) && rc=0 || rc=$?
+else
+  out=$("$SCRIPT_DIR/fm-resource-check.sh" --sweep 2>/dev/null) && rc=0 || rc=$?
+fi
 case "$rc" in
   0) status=healthy ;;
   1) status=degraded ;;

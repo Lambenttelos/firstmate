@@ -590,11 +590,18 @@ context_stow_sweep() {
 # background and return at once. It is NOT a second supervision cycle: the probe
 # handles no wakes, enqueues nothing, and takes its own lock rather than the
 # watcher singleton (see bin/fm-resource-probe.sh). Skip a launch while a probe
-# is still running so a fast cadence cannot pile processes up; the probe's own
-# lock is the authoritative guard against a genuine overlap.
+# is still running; the probe's own lock is the authoritative guard against a
+# genuine overlap. That lock is HOST-GLOBAL (bin/fm-resource-probe.sh, resolved
+# here via --lock-path), so this skip - and the probe's own deferral - now bound
+# concurrent probes to one across every worktree and home on the host, not just
+# within this worktree. This is the fix for the per-worktree-only guard that let
+# N treehouse worktrees each launch a heavy sweep at once and OOM the host
+# (data/20260823T031739Z-home-oom-fm-resource-probe-runaway).
+RESOURCE_PROBE_LOCK=$("$SCRIPT_DIR/fm-resource-probe.sh" --lock-path 2>/dev/null | head -n 1)
 resource_probe_running() {
   local pid
-  pid=$(cat "$STATE/.resource-probe.lock/pid" 2>/dev/null || true)
+  [ -n "$RESOURCE_PROBE_LOCK" ] || return 1
+  pid=$(cat "$RESOURCE_PROBE_LOCK/pid" 2>/dev/null || true)
   case "$pid" in ''|*[!0-9]*) return 1 ;; esac
   fm_pid_alive "$pid"
 }

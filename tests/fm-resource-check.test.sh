@@ -1031,7 +1031,8 @@ test_main_loop_surfaces_from_the_cache_without_probing() {
   # Interval far larger than the checkpoint window, so no probe runs: any wake
   # can only come from the cheap surface read of the seeded cache.
   env "${HEALTHY_ENV[@]}" FM_RESOURCE_INTERVAL=999999 \
-    FM_HOME="$home" FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 \
+    FM_HOME="$home" FM_RESOURCE_PROBE_LOCK="$home/state/.resource-probe.lock" \
+    FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 \
     "$CHECKPOINT" --seconds 6 >"$out" 2>/dev/null || status=$?
   expect_code 0 "$status" "cache-surface checkpoint exit"
   assert_contains "$(cat "$out")" "check: host-resources" "the cached pressure was not surfaced"
@@ -1051,7 +1052,8 @@ test_stale_cached_reading_is_never_surfaced() {
   out="$home/out.txt"
   status=0
   env "${HEALTHY_ENV[@]}" FM_RESOURCE_INTERVAL=999999 \
-    FM_HOME="$home" FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 \
+    FM_HOME="$home" FM_RESOURCE_PROBE_LOCK="$home/state/.resource-probe.lock" \
+    FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 \
     "$CHECKPOINT" --seconds 4 >"$out" 2>/dev/null || status=$?
   expect_code 124 "$status" "stale-reading checkpoint should stay quiet"
   assert_not_contains "$(cat "$out")" "host-resources" \
@@ -1077,7 +1079,8 @@ test_watcher_surfaces_pressure_once_and_queues_it() {
   out="$home/out.txt"
   status=0
   env "${HEALTHY_ENV[@]}" FM_RESOURCE_INTERVAL=1 FM_RESOURCE_LOAD1=40 \
-    FM_HOME="$home" FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 \
+    FM_HOME="$home" FM_RESOURCE_PROBE_LOCK="$home/state/.resource-probe.lock" \
+    FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 \
     "$CHECKPOINT" --seconds 8 >"$out" 2>/dev/null || status=$?
   expect_code 0 "$status" "resource wake checkpoint exit"
   assert_contains "$(cat "$out")" "check: host-resources" "host pressure was not surfaced"
@@ -1097,7 +1100,8 @@ test_watcher_absorbs_already_reported_pressure() {
   out="$home/out.txt"
   status=0
   env "${HEALTHY_ENV[@]}" FM_RESOURCE_INTERVAL=1 FM_RESOURCE_LOAD1=40 \
-    FM_HOME="$home" FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 \
+    FM_HOME="$home" FM_RESOURCE_PROBE_LOCK="$home/state/.resource-probe.lock" \
+    FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 \
     "$CHECKPOINT" --seconds 4 >"$out" 2>/dev/null || status=$?
   expect_code 124 "$status" "repeat-pressure checkpoint should stay quiet"
   assert_not_contains "$(cat "$out")" "host-resources" "already-reported pressure must not re-wake"
@@ -1111,7 +1115,8 @@ test_watcher_stays_quiet_on_a_healthy_host_and_rearms() {
   out="$home/out.txt"
   status=0
   env "${HEALTHY_ENV[@]}" FM_RESOURCE_INTERVAL=1 \
-    FM_HOME="$home" FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 \
+    FM_HOME="$home" FM_RESOURCE_PROBE_LOCK="$home/state/.resource-probe.lock" \
+    FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 \
     "$CHECKPOINT" --seconds 4 >"$out" 2>/dev/null || status=$?
   expect_code 124 "$status" "healthy-host checkpoint should stay quiet"
   assert_not_contains "$(cat "$out")" "host-resources" "a healthy host must not wake firstmate"
@@ -1125,7 +1130,8 @@ test_disabled_monitor_leaves_the_watcher_untouched() {
   out="$home/out.txt"
   status=0
   env "${HEALTHY_ENV[@]}" FM_RESOURCE_INTERVAL=0 FM_RESOURCE_LOAD1=40 \
-    FM_HOME="$home" FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 \
+    FM_HOME="$home" FM_RESOURCE_PROBE_LOCK="$home/state/.resource-probe.lock" \
+    FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 \
     "$CHECKPOINT" --seconds 4 >"$out" 2>/dev/null || status=$?
   expect_code 124 "$status" "disabled-monitor checkpoint should stay quiet"
   assert_not_contains "$(cat "$out")" "host-resources" "a disabled monitor must not wake firstmate"
@@ -1143,7 +1149,8 @@ annotated_heartbeat_reason() {
   out="$home/out.txt"
   status=0
   env "${HEALTHY_ENV[@]}" FM_RESOURCE_INTERVAL=1 FM_RESOURCE_LOAD1=40 \
-    FM_HOME="$home" FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 \
+    FM_HOME="$home" FM_RESOURCE_PROBE_LOCK="$home/state/.resource-probe.lock" \
+    FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 \
     FM_HEARTBEAT=1 "$CHECKPOINT" --seconds 8 >"$out" 2>/dev/null || status=$?
   [ "$status" = 0 ] || fail "annotated-heartbeat checkpoint exited $status"
   grep -m1 '^heartbeat' "$out" || fail "the watcher printed no heartbeat wake"
@@ -1180,7 +1187,8 @@ test_heartbeat_carries_the_cached_pressure() {
   out="$home/out.txt"
   status=0
   env "${HEALTHY_ENV[@]}" FM_RESOURCE_INTERVAL=1 FM_RESOURCE_LOAD1=40 \
-    FM_HOME="$home" FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 \
+    FM_HOME="$home" FM_RESOURCE_PROBE_LOCK="$home/state/.resource-probe.lock" \
+    FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 \
     FM_HEARTBEAT=1 "$CHECKPOINT" --seconds 8 >"$out" 2>/dev/null || status=$?
   expect_code 0 "$status" "heartbeat checkpoint exit"
   assert_contains "$(cat "$out")" "heartbeat: host resources critical" \
@@ -1195,7 +1203,8 @@ test_heartbeat_is_unannotated_on_a_healthy_host() {
   out="$home/out.txt"
   status=0
   env "${HEALTHY_ENV[@]}" FM_RESOURCE_INTERVAL=1 \
-    FM_HOME="$home" FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 \
+    FM_HOME="$home" FM_RESOURCE_PROBE_LOCK="$home/state/.resource-probe.lock" \
+    FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 \
     FM_HEARTBEAT=1 "$CHECKPOINT" --seconds 8 >"$out" 2>/dev/null || status=$?
   expect_code 0 "$status" "healthy heartbeat checkpoint exit"
   assert_contains "$(cat "$out")" "heartbeat" "the heartbeat itself went missing"
@@ -1215,7 +1224,8 @@ test_disabled_monitor_never_annotates_from_a_stale_reading() {
   out="$home/out.txt"
   status=0
   env "${HEALTHY_ENV[@]}" FM_RESOURCE_INTERVAL=0 \
-    FM_HOME="$home" FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 \
+    FM_HOME="$home" FM_RESOURCE_PROBE_LOCK="$home/state/.resource-probe.lock" \
+    FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 \
     FM_HEARTBEAT=1 "$CHECKPOINT" --seconds 8 >"$out" 2>/dev/null || status=$?
   expect_code 0 "$status" "disabled-monitor heartbeat checkpoint exit"
   assert_contains "$(cat "$out")" "heartbeat" "the heartbeat itself went missing"
@@ -1238,7 +1248,8 @@ test_stale_reading_never_annotates_a_heartbeat() {
   # Enabled, but with a cadence long enough that no sweep runs inside the
   # checkpoint, so the annotation can only come from the stale cached file.
   env "${HEALTHY_ENV[@]}" FM_RESOURCE_INTERVAL=999999 \
-    FM_HOME="$home" FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 \
+    FM_HOME="$home" FM_RESOURCE_PROBE_LOCK="$home/state/.resource-probe.lock" \
+    FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 \
     FM_HEARTBEAT=1 "$CHECKPOINT" --seconds 8 >"$out" 2>/dev/null || status=$?
   expect_code 0 "$status" "stale-reading heartbeat checkpoint exit"
   assert_contains "$(cat "$out")" "heartbeat" "the heartbeat itself went missing"
