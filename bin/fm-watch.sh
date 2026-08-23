@@ -1830,6 +1830,14 @@ EOF
       done <<EOF
 $pending
 EOF
+      # Keep the captain's live desk current on a real fleet-state change. This
+      # actionable-signal branch is where a worker's done/failed/needs-decision/
+      # blocked status (and a finish reported only through the pane) surfaces, so
+      # it is the one central place a crew's own progress can refresh the desk.
+      # Best-effort, silent, detached: a no-op without a live desk, it never
+      # re-serves and never wakes, and runs before the wake exit below so it
+      # cannot delay surfacing. See bin/fm-desk-event.sh.
+      FM_HOME="$FM_HOME" "$SCRIPT_DIR/fm-desk-event.sh" "done" >/dev/null 2>&1 || true
       wake "$reason"
     else
       while IFS=$(printf '\t') read -r sf sig f; do
