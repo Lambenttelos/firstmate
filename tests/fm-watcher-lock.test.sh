@@ -522,7 +522,7 @@ test_watcher_self_evicts_on_lock_takeover() {
   state="$dir/state"
   fakebin="$dir/fakebin"
   out="$dir/watch.out"
-  PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_POLL=0.2 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &  # integer-only cadence: a fractional poll falls back to 300s (fm-cadence-lib.sh)
   pid=$!
   i=0
   while [ "$i" -lt 80 ]; do
@@ -553,7 +553,7 @@ test_arm_self_eviction_is_loud_without_successor() {
   fakebin="$dir/fakebin"
   armout="$dir/arm.out"
   mark_pr_check_migration_complete "$state"
-  PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_POLL=0.2 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 FM_ARM_CONFIRM_TIMEOUT=1 "$WATCH_ARM" > "$armout" &
+  PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 FM_ARM_CONFIRM_TIMEOUT=1 "$WATCH_ARM" > "$armout" &  # integer-only cadence: a fractional poll falls back to 300s (fm-cadence-lib.sh)
   armpid=$!
   i=0
   while [ "$i" -lt 80 ]; do
@@ -607,7 +607,8 @@ test_arm_classifies_tick_close_as_benign_completion() {
   fakebin2="$dir2/fakebin"
   armout2="$dir2/arm.out"
   mark_pr_check_migration_complete "$state2"
-  PATH="$fakebin2:$PATH" FM_STATE_OVERRIDE="$state2" FM_POLL=0.2 FM_SIGNAL_GRACE=1 \
+  # integer-only cadence: a fractional poll falls back to 300s (fm-cadence-lib.sh).
+  PATH="$fakebin2:$PATH" FM_STATE_OVERRIDE="$state2" FM_POLL=1 FM_SIGNAL_GRACE=1 \
     FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 FM_WATCH_ABSORB_TICK=1 FM_ARM_CONFIRM_TIMEOUT=1 "$WATCH_ARM" > "$armout2" &
   armpid2=$!
   i=0
