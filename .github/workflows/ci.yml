@@ -193,8 +193,8 @@ jobs:
           printf '%s\n' "$status"
           version=$(printf '%s' "$status" | jq -r '.client.version // empty')
           protocol=$(printf '%s' "$status" | jq -r '.client.protocol // empty')
-          [ "$version" = "0.7.4" ] || {
-            echo "::error::expected exact Herdr pin 0.7.4, got ${version:-<empty>}"
+          [ "$version" = "0.7.5-fm.1" ] || {
+            echo "::error::expected exact Herdr pin 0.7.5-fm.1, got ${version:-<empty>}"
             exit 1
           }
           case "$protocol" in
@@ -327,8 +327,8 @@ jobs:
           snapshot_output=$(/bin/bash tests/fm-fleet-snapshot-view.test.sh)
           printf '%s\n' "$snapshot_output"
           snapshot_count=$(printf '%s\n' "$snapshot_output" | grep -c '^ok - ')
-          [ "$snapshot_count" -eq 15 ] || {
-            echo "::error::expected 15 snapshot/fleet-view tests, got $snapshot_count"
+          [ "$snapshot_count" -eq 20 ] || {
+            echo "::error::expected 20 snapshot/fleet-view tests, got $snapshot_count"
             exit 1
           }
 
@@ -353,7 +353,10 @@ jobs:
       - name: Personal fleet paths must not be tracked
         run: |
           set -eu
-          tracked=$(git ls-files -- data state config projects .no-mistakes)
+          # config/token-prices.json is an intentionally tracked default price
+          # snapshot shipped with the repo and read by bin/fm-token-lib.sh; every
+          # other config/ path is personal fleet state and must stay untracked.
+          tracked=$(git ls-files -- data state config projects .no-mistakes ':!config/token-prices.json')
           if [ -n "$tracked" ]; then
             echo "::error::Personal fleet paths are tracked in git:"
             printf '%s\n' "$tracked"
