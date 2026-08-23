@@ -6,8 +6,10 @@
 #     judgment file only ENRICHES matched items by task id, an unmatched script
 #     item shows a no-analysis marker, and a judgment-only id renders in a
 #     labeled "firstmate also flags" sub-block. No duplicate cards.
-#   - Sections 11 and 12 are SOLE-SOURCE from the judgment file, degrading to the
-#     exact byte output of today's gap note when absent/stale/malformed.
+#   - Sections 11 and 12 are TRANSCRIPT-SOURCED: the durable feed is the PRIMARY
+#     source and the judgment file is the FALLBACK when the feed is absent or
+#     empty, degrading to the exact byte output of today's gap note when neither
+#     supplied content.
 #   - A visible generated-at stamp and a 900s max-age govern freshness.
 # The absence path is a byte-identical regression lock against tests/fixtures.
 set -u
@@ -398,6 +400,15 @@ if [ -n "$first_pos" ] && [ -n "$second_pos" ] && [ "$second_pos" -lt "$first_po
 else
   fail "feed: transcript order wrong (FIRST at $first_pos, SECOND at $second_pos)"
 fi
+# The generated-at stamp stays honest about the 11/12 source: with the FEED
+# present and no judgment, the no-analysis line covers sections 1 and 2 ONLY and
+# names the durable feed for 11 and 12. It must never claim a mechanical view
+# for panels the feed actually supplied.
+assert_grep 'No fresh firstmate analysis layer for sections 1 and 2; those show the mechanical view only. Sections 11 and 12 show the durable transcript feed.' "$OUT_FEED" 'feed: the stamp scopes the no-analysis view to sections 1 and 2'
+assert_no_grep 'sections 1, 2, 11, and 12' "$OUT_FEED" 'feed: the stamp never claims analysis coverage for all four sections'
+# The builder header must not regress to the pre-feed claim that sections 11 and
+# 12 have no local source at all: the durable feed is their source.
+assert_no_grep 'NO local source at all' "$DESK" 'header: no stale no-local-source claim for sections 11/12'
 
 # ============================================================================
 # 10. PRECEDENCE: with BOTH a feed and a fresh judgment, the feed WINS and the
@@ -422,6 +433,11 @@ assert_grep 'FEED turn wins' "$OUT_PREC" 'precedence: the feed transcript render
 assert_grep 'FEED question wins' "$OUT_PREC" 'precedence: the feed question renders'
 assert_no_grep 'JUDGMENT turn loses' "$OUT_PREC" 'precedence: the judgment transcript is NOT rendered (no double-render)'
 assert_no_grep 'JUDGMENT question loses' "$OUT_PREC" 'precedence: the judgment question is NOT rendered (no double-render)'
+# With BOTH sources present the stamp scopes analysis to sections 1 and 2: the
+# feed, not the judgment, supplied 11 and 12.
+assert_grep 'Firstmate analysis for sections 1 and 2 was written' "$OUT_PREC" 'precedence: the stamp scopes analysis to sections 1 and 2'
+assert_grep 'Sections 11 and 12 show the durable transcript feed' "$OUT_PREC" 'precedence: the stamp names the feed for 11 and 12'
+assert_no_grep 'Firstmate analysis for sections 1, 2, 11, and 12 was written' "$OUT_PREC" 'precedence: no claim that analysis covered 11 and 12'
 
 # ============================================================================
 # 11. FALLBACK: an EMPTY feed falls back to the judgment file for 11/12.
