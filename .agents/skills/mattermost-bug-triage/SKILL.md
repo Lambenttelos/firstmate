@@ -73,5 +73,6 @@ A bug that did not reproduce skips this stage entirely; its passing spec still l
 ## Landing
 
 Batch the resulting green branches into a single merge worker per repository rather than one per branch.
+For an owned GitHub tooling fork, `bin/fm-merge-queue.sh dispatch` automates that batch (see `docs/merge-queue.md`); a product repo is never auto-merged there, so a Mattermost bug fix on hyfin or hyfin-server still lands through the captain's own merge.
 Merge authority is unchanged: `AGENTS.md` section 7 still governs it.
 Relay each landed bug's thread link to the captain as described in the hard rules.

@@ -21,6 +21,16 @@
 FM_MERGE_QUEUE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=bin/fm-mutex-lib.sh
 . "$FM_MERGE_QUEUE_LIB_DIR/fm-mutex-lib.sh"
+# fm-pr-lib.sh supplies the origin-slug resolver the auto-merge eligibility gate
+# below reads. It is a leaf lib whose only top-level side effects are resetting
+# its own FM_PR_* globals to empty, so a caller that already sourced it (teardown
+# does, before this lib) must not get those globals clobbered mid-flow. Source it
+# only when its resolver is absent, the same discipline the mutex source uses for
+# "no side effects on a caller".
+if ! declare -F fm_pr_github_origin_slug >/dev/null 2>&1; then
+  # shellcheck source=bin/fm-pr-lib.sh
+  . "$FM_MERGE_QUEUE_LIB_DIR/fm-pr-lib.sh"
+fi
 
 # Serialize the read-modify-write in record/remove so two concurrent teardowns
 # cannot lose an entry. The mutex primitives come from bin/fm-mutex-lib.sh, a leaf
@@ -241,4 +251,112 @@ fm_merge_queue_compare_url() {
     esac
   fi
   printf '%s\n' "branch $branch (base $base) in ${path:-$remote}"
+}
+
+# The GitHub owner whose forks firstmate owns and may auto-merge. It is the
+# origin owner of every tooling fork in this fleet (firstmate, no-mistakes,
+# jcode, tasks-axi, herdr, quota-axi, claude-swap, mongosh-axi), each cloned as
+# git@github.com:yjuyjuy/<repo>.git.
+FM_MERGE_QUEUE_OWNED_GITHUB_OWNER=${FM_MERGE_QUEUE_OWNED_GITHUB_OWNER:-yjuyjuy}
+
+# Decide whether the queued branches for one clone may be auto-merged by a
+# firstmate-dispatched merge worker.
+#
+# This is the hard product-repo safety gate the captain set on 2026-08-23: our
+# PRODUCT repos (hyfin, hyfin-server, dashposserver3, and every other Bitbucket
+# dashnow repo) are NEVER auto-merged - the captain reviews and merges those PRs
+# himself. Only the tooling forks we own on GitHub are eligible.
+#
+# The gate is an ALLOWLIST on the clone's LIVE git origin, deliberately never a
+# denylist of product-repo names. A denylist fails OPEN: the day a new product
+# repo is cloned, its name is not on the list yet, so it would slip through and be
+# auto-merged - exactly the mistake this gate exists to prevent. An origin
+# allowlist fails CLOSED: a repo is eligible only when it PROVABLY resolves to a
+# github.com/<owned-owner> origin, so anything else - a Bitbucket dashnow product
+# repo, a GitHub repo under any other owner, a clone with no resolvable origin -
+# is skipped by construction. The check reads the clone's real origin URL
+# (fm_pr_github_origin_slug, a config read, never the network), so it tracks
+# where the code actually lands rather than a name that can drift.
+#
+# Prints the reason for the decision on stdout and returns:
+#   0  eligible: origin is github.com/<owned-owner>/<repo>
+#   1  skipped:  any other origin, or origin unresolved (fail closed)
+fm_merge_queue_repo_auto_mergeable() {
+  local project=$1 slug owner
+  if [ -z "$project" ] || [ ! -d "$project" ]; then
+    printf 'skip: clone path %s is missing, cannot verify it is an owned tooling repo\n' "${project:-(empty)}"
+    return 1
+  fi
+  # fm_pr_github_origin_slug prints owner/repo and returns 0 ONLY for a
+  # github.com origin in a recognized form; a Bitbucket origin, any other host,
+  # or no origin returns non-zero. That non-zero is exactly "not provably an
+  # owned GitHub tooling repo", so it is the skip path.
+  if ! slug=$(fm_pr_github_origin_slug "$project"); then
+    printf 'skip: %s origin is not a github.com/%s tooling repo (product or not-owned repo, captain merges those)\n' \
+      "$project" "$FM_MERGE_QUEUE_OWNED_GITHUB_OWNER"
+    return 1
+  fi
+  owner=${slug%%/*}
+  # Owner comparison is case-insensitive: GitHub owners are case-insensitive, and
+  # fm_pr_refuse_unowned_github_target folds case the same way.
+  if [ "${owner,,}" = "${FM_MERGE_QUEUE_OWNED_GITHUB_OWNER,,}" ]; then
+    printf 'eligible: %s is our owned tooling fork\n' "$slug"
+    return 0
+  fi
+  printf 'skip: %s is on GitHub but not under %s, a repo we do not own\n' \
+    "$slug" "$FM_MERGE_QUEUE_OWNED_GITHUB_OWNER"
+  return 1
+}
+
+# Group the live queue by clone and classify each clone for auto-merge dispatch.
+# This is the pure planning core the dispatch CLI renders and acts on; it spawns
+# nothing and mutates nothing, so it is safe to run any time and easy to test.
+#
+# Args: data_dir [min_batch]. min_batch (default 1) is the smallest branch count
+# that makes a clone worth a dedicated merge worker; an eligible clone below it is
+# reported as below-threshold rather than dispatched, so a single stray branch
+# does not spawn a whole worker unless the caller lowers the bar.
+#
+# Prints one tab-separated row per clone, in first-seen queue order:
+#   <decision>\t<project-path>\t<count>\t<reason>
+# decision is one of:
+#   eligible         auto-mergeable AND count >= min_batch  -> dispatch a worker
+#   below-threshold  auto-mergeable AND count <  min_batch  -> report, do not spawn
+#   skip             NOT auto-mergeable (product/not-owned/unresolved) -> never spawn
+# The reason is the human string fm_merge_queue_repo_auto_mergeable produced, so
+# the skip rationale (the hard product-repo exclusion) travels with every row.
+fm_merge_queue_dispatch_plan() {
+  local data_dir=$1 min_batch=${2:-1} entries grouped path count reason rc
+  entries=$(fm_merge_queue_entries "$data_dir") || return 0
+  [ -n "$entries" ] || return 0
+  # One pass: count entries per clone and remember first-seen order. Project
+  # paths can carry neither a tab nor a newline (fm_merge_queue_field_safe
+  # enforces that at record time), so a tab-delimited read of field 2 is safe.
+  grouped=$(printf '%s\n' "$entries" | awk -F'\t' '
+    $2 != "" {
+      c[$2]++
+      if (!($2 in seen)) { seen[$2] = 1; order[++n] = $2 }
+    }
+    END { for (i = 1; i <= n; i++) printf "%s\t%s\n", order[i], c[order[i]] }
+  ')
+  [ -n "$grouped" ] || return 0
+  while IFS='	' read -r path count; do
+    [ -n "$path" ] || continue
+    if reason=$(fm_merge_queue_repo_auto_mergeable "$path"); then
+      rc=0
+    else
+      rc=1
+    fi
+    if [ "$rc" -eq 0 ]; then
+      if [ "$count" -ge "$min_batch" ]; then
+        printf 'eligible\t%s\t%s\t%s\n' "$path" "$count" "$reason"
+      else
+        printf 'below-threshold\t%s\t%s\t%s\n' "$path" "$count" "$reason"
+      fi
+    else
+      printf 'skip\t%s\t%s\t%s\n' "$path" "$count" "$reason"
+    fi
+  done <<EOF
+$grouped
+EOF
 }
