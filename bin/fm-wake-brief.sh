@@ -16,21 +16,35 @@
 # liveness. Nothing here re-derives any of those contracts, so a change to an
 # owner changes this brief with it.
 #
-# SIDE EFFECTS. The drain in section 1 is the only mutating component, and it is
-# the same already-approved drain firstmate is required to run first anyway.
-# Everything after it is strictly read-only. This script never arms, restarts,
-# or touches the watcher: arming remains a separate call, because the supervision
-# protocols require it to be its own background task and never bundled
-# (docs/supervision-protocols/). fm-wake-drain.sh's own liveness assertion still
-# fires from inside section 1, so a lapsed chain still surfaces here.
+# TRIMMED BY DEFAULT. A wake turn needs what changed since the last drain, not
+# everything again: each woken task's status tail shows only the lines appended
+# since the previous brief, and the endpoint-liveness sweep prints only the
+# endpoints whose state changed, while a heartbeat wake (the fleet-wide review)
+# still prints the whole sweep. Per-task read positions live durably under
+# state/.wake-brief-seen-<id> and are written only when a value actually changes,
+# so the brief stays byte-silent on a turn with nothing new. --full restores the
+# old untrimmed read for that call, and the full status log path is always named
+# alongside the trimmed tail. Metadata was already printed only for woken tasks
+# and stays that way.
+#
+# SIDE EFFECTS. The drain in section 1 is one mutating component, and it is
+# the same already-approved drain firstmate is required to run first anyway;
+# the seen-position records in sections 2 and 4 are the second, and they exist
+# only to make the next brief cheaper. Everything else is strictly read-only. This script
+# never arms, restarts, or touches the watcher: arming remains a separate call,
+# because the supervision protocols require it to be its own background task and
+# never bundled (docs/supervision-protocols/). fm-wake-drain.sh's own liveness
+# assertion still fires from inside section 1, so a lapsed chain still surfaces
+# here.
 #
 # Usage:
-#   fm-wake-brief.sh              brief the tasks named by the drained wakes
+#   fm-wake-brief.sh              trimmed brief for the tasks the wakes name
+#   fm-wake-brief.sh --full       untrimmed brief (the pre-trim behavior)
 #   fm-wake-brief.sh <id>...      also brief these tasks, whether or not they woke
 #   fm-wake-brief.sh --help
 #
 # Environment:
-#   FM_WAKE_BRIEF_TAIL   status-tail lines per task (default 5)
+#   FM_WAKE_BRIEF_TAIL   status-tail lines per task in --full mode (default 5)
 #
 # Exit status is 0 whenever the reads themselves succeed. A missing file is a
 # fact about the fleet, not an error: it prints an explicit ABSENT marker rather
@@ -63,24 +77,31 @@ esac
 
 usage() {
   cat <<'EOF'
-usage: fm-wake-brief.sh [<id>...]
+usage: fm-wake-brief.sh [--full] [<id>...]
 
 Compose one wake-handling turn's reads: drain the durable wake queue, then for
-every task the wakes name (plus any id given explicitly) print its status tail,
-reconciled current state, and key metadata, followed by one host-resource
-reading and one endpoint-liveness sweep.
+every task the wakes name (plus any id given explicitly) print its new status
+lines since the last brief, reconciled current state, and key metadata, followed
+by one host-resource reading and one endpoint-liveness sweep (state changes
+only, or the full sweep when a heartbeat wake was drained).
 
-Read-only apart from the wake drain itself. Never arms or touches the watcher.
+--full restores the pre-trim behavior: the bounded status tail and the complete
+endpoint sweep, whether or not a heartbeat woke.
+
+Read-only apart from the wake drain and the per-task seen-position records that
+make the next brief cheaper. Never arms or touches the watcher.
 
 Environment:
-  FM_WAKE_BRIEF_TAIL   status-tail lines per task (default 5)
+  FM_WAKE_BRIEF_TAIL   status-tail lines per task in --full mode (default 5)
 EOF
 }
 
 EXPLICIT_IDS=
+FULL=0
 for arg in "$@"; do
   case "$arg" in
     -h|--help) usage; exit 0 ;;
+    --full) FULL=1 ;;
     -*) echo "fm-wake-brief: unknown argument: $arg" >&2; usage >&2; exit 2 ;;
     *) EXPLICIT_IDS="$EXPLICIT_IDS $arg" ;;
   esac
@@ -99,6 +120,67 @@ valid_id() {
 
 known_id() {
   [ -f "$STATE/$1.meta" ] || [ -f "$STATE/$1.status" ]
+}
+
+# Durable per-task read positions for the trimmed brief: the status-line count
+# printed so far and the last observed endpoint state. One small key=value file
+# per task under state/.wake-brief-seen-<id>. Two rules keep the brief cheap and
+# quiet: a value is written only when it differs from what is already recorded,
+# so a turn with nothing new writes nothing at all, and nothing is written at all
+# when the drain failed, because then the queue is still full and the reads this
+# turn made must not advance any baseline.
+SEEN_PERSIST=1
+seen_file() { printf '%s/.wake-brief-seen-%s' "$STATE" "$1"; }
+
+# Print the recorded value for <key>, or nothing when the record is absent.
+# Deliberately exits 0 either way: an absent baseline simply behaves as 0 or as
+# "nothing known", which is exactly what a first-ever brief must assume.
+seen_get() {
+  local f=$1 key=$2
+  [ -f "$f" ] || return 0
+  sed -n "s/^$key=//p" "$f" | tail -n 1
+  return 0
+}
+
+# Record <key>=<value>, replacing any older value for that key, only when the
+# stored content actually changes and only when the drain succeeded. Written via
+# a same-dir temp plus rename so a partial write can never be observed.
+seen_put() {
+  local f=$1 key=$2 value=$3 base new tmp
+  [ "$SEEN_PERSIST" -eq 1 ] || return 0
+  if [ -f "$f" ]; then
+    base=$(sed "/^$key=/d" "$f")
+    if [ -z "$base" ]; then
+      new="${key}=${value}"
+    else
+      new=$(printf '%s\n%s=%s' "$base" "$key" "$value")
+    fi
+    [ "$new" = "$(cat "$f")" ] && return 0
+  else
+    new="${key}=${value}"
+  fi
+  tmp="$f.$$"
+  if printf '%s\n' "$new" > "$tmp"; then
+    mv "$tmp" "$f"
+  else
+    rm -f "$tmp"
+  fi
+}
+
+# Drop seen-position records whose task no longer exists (no meta, no status
+# log), so a torn-down task cannot leave its read position behind forever.
+prune_seen() {
+  local f id
+  for f in "$STATE"/.wake-brief-seen-*; do
+    [ -f "$f" ] || continue
+    id=${f##*/}
+    id=${id#.wake-brief-seen-}
+    valid_id "$id" || { rm -f "$f"; continue; }
+    if [ -f "$STATE/$id.meta" ] || [ -f "$STATE/$id.status" ]; then
+      continue
+    fi
+    rm -f "$f"
+  done
 }
 
 # Map one drained wake key to the task it is about, or print nothing.
@@ -168,7 +250,18 @@ fi
 if [ "$DRAIN_STATUS" -ne 0 ]; then
   printf 'DRAIN FAILED (exit %s): the queue was NOT drained, so this is not an empty queue. Any DRAIN STDERR text above is the drain error, not wakes. Drained records, if any, are retained in %s\n' \
     "$DRAIN_STATUS" "$DRAIN_SPOOL"
+  # A failed drain leaves the queue full, so the reads below must not advance
+  # any seen position: the next successful drain re-presents the same records.
+  SEEN_PERSIST=0
 fi
+
+# A heartbeat wake is the fleet-wide review, the one wake whose contract is the
+# whole sweep, so it forces the untrimmed endpoint output for this call.
+HEARTBEAT_WAKE=0
+WAKE_KINDS=$(awk -F '\t' 'NF >= 5 { print $3 }' "$DRAIN_SPOOL")
+for kind in $WAKE_KINDS; do
+  [ "$kind" = heartbeat ] && HEARTBEAT_WAKE=1
+done
 
 # --- 2. tasks named by the wakes -------------------------------------------
 IDS=
@@ -221,12 +314,38 @@ for id in $IDS; do
   printf '\n--- %s ---\n' "$id"
 
   status="$STATE/$id.status"
+  seen=$(seen_file "$id")
   if [ -f "$status" ]; then
-    printf 'status tail (last %s line(s), wake-EVENT history, not current state; full log: %s):\n' \
-      "$TAIL_LINES" "$status"
-    tail -n "$TAIL_LINES" "$status"
+    if [ "$FULL" -eq 1 ]; then
+      printf 'status tail (last %s line(s), wake-EVENT history, not current state; full log: %s):\n' \
+        "$TAIL_LINES" "$status"
+      tail -n "$TAIL_LINES" "$status"
+    else
+      total=$(wc -l < "$status")
+      old=$(seen_get "$seen" status-lines)
+      case "$old" in ''|*[!0-9]*) old=0 ;; esac
+      if [ "$total" -le "$old" ]; then
+        if [ "$total" -lt "$old" ]; then
+          # The log shrank (rebuilt or replaced): everything in it is new.
+          printf 'status tail (file reset: %s new line(s), wake-EVENT history, not current state; full log: %s):\n' \
+            "$total" "$status"
+          cat "$status"
+          seen_put "$seen" status-lines "$total"
+        else
+          printf 'status tail (no new lines since the last brief; full log: %s):\n' "$status"
+        fi
+      else
+        printf 'status tail (%s new line(s) since the last brief, wake-EVENT history, not current state; full log: %s):\n' \
+          "$((total - old))" "$status"
+        tail -n +"$((old + 1))" "$status"
+        seen_put "$seen" status-lines "$total"
+      fi
+    fi
+    # --full also advances the baseline: the captain just saw the whole tail.
+    [ "$FULL" -eq 1 ] && seen_put "$seen" status-lines "$(wc -l < "$status")"
   else
     printf 'status tail: ABSENT (%s)\n' "$status"
+    seen_put "$seen" status-lines 0
   fi
 
   printf 'current: '
@@ -260,7 +379,10 @@ fi
 
 # --- 4. endpoint liveness sweep --------------------------------------------
 # One sweep over every recorded endpoint in this home, not just the woken ones,
-# because a crew that died quietly never appends a wake.
+# because a crew that died quietly never appends a wake. A heartbeat wake (the
+# fleet-wide review) or --full prints every row as before; otherwise only the
+# rows whose endpoint state differs from what the last brief observed are
+# printed, so a quiet fleet costs one summary line instead of one line per task.
 #
 # For tmux this takes ONE `tmux list-windows -a` reading and compares the
 # recorded window against it with an EXACT string compare. Deliberately not
@@ -270,6 +392,9 @@ fi
 # reading carries `pane_current_command`, so a live harness process and a bare
 # `zsh` husk are distinguishable at a glance without a second call.
 section "ENDPOINTS"
+FULL_SWEEP=0
+[ "$FULL" -eq 1 ] && FULL_SWEEP=1
+[ "$HEARTBEAT_WAKE" -eq 1 ] && FULL_SWEEP=1
 TMUX_WINDOWS=
 TMUX_READ=0
 # The two fields are separated by a single SPACE, and the command comes FIRST,
@@ -312,21 +437,25 @@ EOF
 }
 
 META_FOUND=0
+PRINTED=0
 for meta in "$STATE"/*.meta; do
   [ -f "$meta" ] || continue
   META_FOUND=1
   id=$(basename "$meta" .meta)
+  seen=$(seen_file "$id")
   backend=$(fm_backend_of_meta "$meta")
   window=$(fm_meta_get "$meta" window)
   target=$(fm_backend_target_of_meta "$meta")
   if [ -z "$window" ]; then
     printf '%s backend=%s endpoint=unknown (no window recorded)\n' "$id" "$backend"
+    PRINTED=1
     continue
   fi
   if [ "$backend" = tmux ]; then
     tmux_window_row "${target:-$window}"
-    printf '%s backend=tmux window=%s endpoint=%s pane=%s\n' \
-      "$id" "$window" "$TMUX_ROW_STATE" "$TMUX_ROW_CMD"
+    line=$(printf '%s backend=tmux window=%s endpoint=%s pane=%s\n' \
+      "$id" "$window" "$TMUX_ROW_STATE" "$TMUX_ROW_CMD")
+    exists=$TMUX_ROW_STATE
   else
     # Non-tmux backends expose no equivalent single-listing sweep, so reuse the
     # liveness primitives bin/fm-backend.sh already publishes rather than
@@ -345,13 +474,25 @@ for meta in "$STATE"/*.meta; do
       herdr) agent=$(fm_backend_agent_alive "$backend" "${target:-$window}") ;;
       *) agent='unknown (backend cannot classify)' ;;
     esac
-    printf '%s backend=%s window=%s endpoint=%s agent=%s\n' \
-      "$id" "$backend" "$window" "$exists" "$agent"
+    line=$(printf '%s backend=%s window=%s endpoint=%s agent=%s\n' \
+      "$id" "$backend" "$window" "$exists" "$agent")
   fi
+  if [ "$FULL_SWEEP" -eq 1 ]; then
+    printf '%s\n' "$line"
+    PRINTED=1
+  elif [ "$(seen_get "$seen" endpoint)" != "$exists" ]; then
+    printf '%s\n' "$line"
+    PRINTED=1
+  fi
+  seen_put "$seen" endpoint "$exists"
 done
 [ "$META_FOUND" -eq 1 ] || printf '(no recorded endpoints)\n'
+if [ "$META_FOUND" -eq 1 ] && [ "$PRINTED" -eq 0 ]; then
+  printf '(no endpoint state changes since the last brief)\n'
+fi
 
 # A failed drain is the one read that cannot be reported as a fleet fact: the
 # queue is still full and this turn's work is unknown, so it fails the brief.
+prune_seen
 [ "$DRAIN_STATUS" -eq 0 ] || exit 1
 exit 0

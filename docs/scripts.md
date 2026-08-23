@@ -92,7 +92,7 @@ The shared no-mistakes gate refusal for fleet lifecycle entrypoints is summarize
 | `fm-config-inherit-lib.sh` | Shared primary-to-secondmate inherited local-material propagation and config-reread delivery |
 | `fm-tasks-axi-lib.sh`    | Shared backlog-backend selector and `tasks-axi` compatibility probe                  |
 | `fm-wake-drain.sh`       | Atomically drain queued watcher wakes, emit bounded best-effort status-event annotations, then assert watcher liveness |
-| `fm-wake-brief.sh`       | Compose one wake-handling turn's reads: that same drain, plus each woken task's status tail, current state, and metadata, one host reading, and one endpoint sweep |
+| `fm-wake-brief.sh`       | Compose one wake-handling turn's reads: that same drain, plus each woken task's new status events, current state, and metadata, one host reading, and an endpoint sweep (full on heartbeat wakes, state changes otherwise; `--full` for the untrimmed read) |
 | `fm-wake-lib.sh`         | Shared durable wake queue and watcher identity/health helpers, layered on `fm-mutex-lib.sh` |
 | `fm-mutex-lib.sh`        | Side-effect-free portable advisory-mutex primitives (`fm_lock_try_acquire` and friends) |
 | `fm-pid-lib.sh`          | Side-effect-free process liveness and pid-identity helpers shared by the wake and daemon libs |

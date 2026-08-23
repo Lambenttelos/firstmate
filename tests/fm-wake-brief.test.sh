@@ -4,9 +4,12 @@
 # The brief composes owners rather than reimplementing them, so these tests
 # assert the COMPOSITION: that the drain's raw records survive verbatim, that
 # every task a wake names is briefed, that a missing file becomes an explicit
-# ABSENT marker instead of a failure or a silent omission, and - the safety
-# property - that nothing in state/ is written except the queue the drain
-# legitimately consumes.
+# ABSENT marker instead of a failure or a silent omission, that the default
+# brief prints only what changed since the last drain (new status lines, changed
+# endpoint states, the full endpoint sweep only on a heartbeat wake) while
+# --full restores the untrimmed read, and - the safety property - that nothing
+# in state/ is written except the queue the drain consumes and the brief's own
+# per-task seen-position records.
 set -u
 
 # shellcheck source=tests/wake-helpers.sh
@@ -152,25 +155,90 @@ test_drained_wakes_brief_their_tasks() {
   pass "wake brief prints raw records, then the status tail, current state, and meta of each woken task"
 }
 
-test_bounded_tail_is_configurable() {
+test_full_flag_restores_the_bounded_status_tail() {
   local home state out lines
   home=$(make_home tail)
   state="$home/state"
   fm_write_meta "$state/beta.meta" 'window=firstmate:fm-beta'
   printf 'l1\nl2\nl3\nl4\nl5\nl6\nl7\n' > "$state/beta.status"
 
-  out=$(run_brief "$home" beta) || fail "brief must exit 0"
+  out=$(run_brief "$home" --full beta) || fail "brief must exit 0"
   lines=$(printf '%s\n' "$out" | grep -c '^l[0-9]$')
-  [ "$lines" -eq 5 ] || fail "default tail must be 5 lines, got $lines"
+  [ "$lines" -eq 5 ] || fail "--full must still bound the tail at 5 lines, got $lines"
   case "$out" in
     *l7*) ;;
-    *) fail "default tail must be the LAST lines: $out" ;;
+    *) fail "--full tail must be the LAST lines: $out" ;;
   esac
 
-  out=$(FM_WAKE_BRIEF_TAIL=2 run_brief "$home" beta) || fail "brief must exit 0"
+  out=$(FM_WAKE_BRIEF_TAIL=2 run_brief "$home" --full beta) || fail "brief must exit 0"
   lines=$(printf '%s\n' "$out" | grep -c '^l[0-9]$')
-  [ "$lines" -eq 2 ] || fail "FM_WAKE_BRIEF_TAIL must bound the tail, got $lines"
-  pass "wake brief bounds the status tail at 5 lines and honors FM_WAKE_BRIEF_TAIL"
+  [ "$lines" -eq 2 ] || fail "FM_WAKE_BRIEF_TAIL must bound the --full tail, got $lines"
+
+  # --full advances the seen baseline, so the trimmed run right after it must
+  # report no new lines instead of re-printing the log.
+  out=$(run_brief "$home" beta) || fail "brief must exit 0"
+  case "$out" in
+    *"no new lines since the last brief"*) ;;
+    *) fail "a trimmed run after --full must not re-print the briefed log: $out" ;;
+  esac
+  pass "wake brief --full restores the bounded status tail and advances the seen baseline"
+}
+
+test_trimmed_mode_prints_only_new_status_lines() {
+  local home state out
+  home=$(make_home newlines)
+  state="$home/state"
+  fm_write_meta "$state/eta.meta" 'window=firstmate:fm-eta'
+  printf 'working: began\n' > "$state/eta.status"
+  append_wake "$state" signal eta.status 'signal: eta.status'
+
+  out=$(run_brief "$home") || fail "brief must exit 0"
+  case "$out" in
+    *"1 new line(s) since the last brief"*"working: began"*) ;;
+    *) fail "the first brief must print the whole log as new: $out" ;;
+  esac
+
+  printf 'blocked: stuck\nresolved: moving\n' >> "$state/eta.status"
+  append_wake "$state" signal eta.status 'signal: eta.status'
+  out=$(run_brief "$home") || fail "brief must exit 0"
+  case "$out" in
+    *"2 new line(s) since the last brief"*"blocked: stuck"*"resolved: moving"*) ;;
+    *) fail "the trimmed brief must show only lines appended since the last drain: $out" ;;
+  esac
+  case "$out" in
+    *"working: began"*) fail "already-briefed status lines must not re-print: $out" ;;
+  esac
+  pass "wake brief prints only status lines new since the last drain"
+}
+
+test_trimmed_mode_reports_no_new_lines_and_file_resets() {
+  local home state out
+  home=$(make_home nonew)
+  state="$home/state"
+  fm_write_meta "$state/theta.meta" 'window=firstmate:fm-theta'
+  printf 'working: going\nstill: here\n' > "$state/theta.status"
+  append_wake "$state" signal theta.status 'signal: theta.status'
+  run_brief "$home" >/dev/null || fail "first brief must exit 0"
+
+  append_wake "$state" signal theta.status 'signal: theta.status'
+  out=$(run_brief "$home") || fail "brief must exit 0"
+  case "$out" in
+    *"no new lines since the last brief"*) ;;
+    *) fail "an unchanged status log must say so, not re-print: $out" ;;
+  esac
+  case "$out" in
+    *"working: going"*) fail "an unchanged status log must not re-print its lines: $out" ;;
+  esac
+
+  # A replaced (shorter) log is treated as fully new, never silently skipped.
+  printf 'working: fresh task\n' > "$state/theta.status"
+  append_wake "$state" signal theta.status 'signal: theta.status'
+  out=$(run_brief "$home") || fail "brief must exit 0"
+  case "$out" in
+    *"file reset: 1 new line(s)"*"working: fresh task"*) ;;
+    *) fail "a reset status log must print the whole new file: $out" ;;
+  esac
+  pass "wake brief reports no new lines on an unchanged log and a file reset as all-new"
 }
 
 test_absent_files_are_marked_not_skipped() {
@@ -270,6 +338,90 @@ claude firstmate:fm-live-extra" run_brief "$home") || fail "brief must exit 0"
   pass "wake brief sweeps endpoints by exact window match and shows the live pane command"
 }
 
+test_trimmed_endpoint_sweep_prints_only_state_changes() {
+  local home state out
+  home=$(make_home epchanges)
+  state="$home/state"
+  fm_write_meta "$state/u1.meta" 'window=firstmate:fm-u1'
+  fm_write_meta "$state/u2.meta" 'window=firstmate:fm-u2'
+
+  # First observation: no baseline yet, so every endpoint prints once.
+  out=$(FM_FAKE_TMUX_WINDOWS="claude firstmate:fm-u1" run_brief "$home") || fail "brief must exit 0"
+  case "$out" in
+    *"u1 backend=tmux window=firstmate:fm-u1 endpoint=alive"*"u2 backend=tmux window=firstmate:fm-u2 endpoint=dead"*) ;;
+    *) fail "the first-ever sweep must print every endpoint: $out" ;;
+  esac
+
+  # Unchanged: one summary line, no per-endpoint rows.
+  out=$(FM_FAKE_TMUX_WINDOWS="claude firstmate:fm-u1" run_brief "$home") || fail "brief must exit 0"
+  case "$out" in
+    *"(no endpoint state changes since the last brief)"*) ;;
+    *) fail "an unchanged sweep must collapse to one summary line: $out" ;;
+  esac
+  case "$out" in
+    *"u1 backend=tmux"*) fail "an unchanged endpoint row must not re-print: $out" ;;
+  esac
+
+  # u2 came alive: only its row prints.
+  out=$(FM_FAKE_TMUX_WINDOWS="claude firstmate:fm-u1
+zsh firstmate:fm-u2" run_brief "$home") || fail "brief must exit 0"
+  case "$out" in
+    *"u2 backend=tmux window=firstmate:fm-u2 endpoint=alive pane=zsh"*) ;;
+    *) fail "a changed endpoint row must print: $out" ;;
+  esac
+  case "$out" in
+    *"u1 backend=tmux"*) fail "an unchanged endpoint row must not re-print alongside a change: $out" ;;
+  esac
+  pass "wake brief prints endpoint rows only when the endpoint state changed"
+}
+
+test_heartbeat_wake_forces_the_full_endpoint_sweep() {
+  local home state out
+  home=$(make_home hb)
+  state="$home/state"
+  fm_write_meta "$state/v1.meta" 'window=firstmate:fm-v1'
+  fm_write_meta "$state/v2.meta" 'window=firstmate:fm-v2'
+  printf 'working: going\n' > "$state/v1.status"
+  append_wake "$state" signal v1.status 'signal: v1.status'
+
+  # Establish the baseline (first observation prints every row once, then the
+  # seen records hold the states).
+  run_brief "$home" >/dev/null || fail "baseline brief must exit 0"
+
+  # A plain wake with an unchanged fleet: one summary line, no rows.
+  append_wake "$state" signal v1.status 'signal: v1.status'
+  out=$(run_brief "$home") || fail "brief must exit 0"
+  case "$out" in
+    *"(no endpoint state changes since the last brief)"*) ;;
+    *) fail "a plain wake must not print an unchanged endpoint sweep: $out" ;;
+  esac
+
+  # A heartbeat wake prints the whole sweep even though nothing changed.
+  append_wake "$state" heartbeat heartbeat 'heartbeat: fleet review'
+  out=$(run_brief "$home") || fail "brief must exit 0"
+  case "$out" in
+    *"v1 backend=tmux window=firstmate:fm-v1 endpoint=dead"*"v2 backend=tmux window=firstmate:fm-v2 endpoint=dead"*) ;;
+    *) fail "a heartbeat wake must print the full endpoint sweep: $out" ;;
+  esac
+  pass "wake brief prints the whole endpoint sweep on a heartbeat wake"
+}
+
+test_seen_records_are_pruned_with_the_task() {
+  local home state
+  home=$(make_home prune)
+  state="$home/state"
+  fm_write_meta "$state/xi.meta" 'window=firstmate:fm-xi'
+  printf 'working: going\n' > "$state/xi.status"
+  run_brief "$home" xi >/dev/null || fail "brief must exit 0"
+  [ -f "$state/.wake-brief-seen-xi" ] || fail "a briefed task must have a seen record"
+
+  rm -f "$state/xi.meta" "$state/xi.status"
+  run_brief "$home" >/dev/null || fail "brief must exit 0"
+  [ ! -e "$state/.wake-brief-seen-xi" ] \
+    || fail "a seen record must be pruned once its task is gone"
+  pass "wake brief prunes seen-position records for tasks that no longer exist"
+}
+
 # Seed two identical homes so the brief's write footprint can be differenced
 # against a bare fm-wake-drain.sh's. Both get the same fixtures, aged past the
 # one-second mtime boundary so an in-run rewrite shows up as a fresher mtime.
@@ -291,14 +443,14 @@ footprint() {
     | sed -n 's/^[<>] \([^ ]*\) .*/\1/p' | sort -u
 }
 
-test_brief_writes_nothing_beyond_the_drain_it_runs() {
-  local brief_home drain_home before after brief_footprint drain_footprint state
+test_brief_writes_nothing_beyond_the_drain_and_its_seen_records() {
+  local brief_home drain_home before after brief_extra drain_extra unexpected missing state
 
   brief_home=$(seed_readonly_home readonly-brief)
   before=$(state_fingerprint "$brief_home/state")
   run_brief "$brief_home" >/dev/null || fail "brief must exit 0"
   after=$(state_fingerprint "$brief_home/state")
-  brief_footprint=$(footprint "$before" "$after")
+  brief_extra=$(footprint "$before" "$after")
 
   drain_home=$(seed_readonly_home readonly-drain)
   before=$(state_fingerprint "$drain_home/state")
@@ -306,29 +458,39 @@ test_brief_writes_nothing_beyond_the_drain_it_runs() {
     FM_STATE_OVERRIDE="$drain_home/state" "$ROOT/bin/fm-wake-drain.sh" >/dev/null 2>&1 \
     || fail "drain fixture must exit 0"
   after=$(state_fingerprint "$drain_home/state")
-  drain_footprint=$(footprint "$before" "$after")
+  drain_extra=$(footprint "$before" "$after")
 
-  [ "$brief_footprint" = "$drain_footprint" ] || fail "brief wrote state beyond its drain:
---- brief ---
-$brief_footprint
---- bare drain ---
-$drain_footprint"
+  # The brief must reproduce every drain write, and its only additional write is
+  # its own seen-position record for the one task.
+  missing=$(comm -23 <(printf '%s\n' "$drain_extra") <(printf '%s\n' "$brief_extra"))
+  [ -z "$missing" ] || fail "the brief must reproduce the drain's own writes, missing:
+$missing"
+  unexpected=$(comm -13 <(printf '%s\n' "$drain_extra") <(printf '%s\n' "$brief_extra") \
+    | grep -v '^\.wake-brief-seen-epsilon$' || true)
+  [ -z "$unexpected" ] || fail "brief wrote state beyond its drain and its seen record:
+$unexpected"
 
   state="$brief_home/state"
-  case "$brief_footprint" in
+  case "$brief_extra" in
     *epsilon.meta*) fail "brief must not touch task metadata" ;;
     *epsilon.status*) fail "brief must not touch a task status log" ;;
   esac
+  [ -f "$state/.wake-brief-seen-epsilon" ] || fail "the brief must leave its seen record"
+  grep -q '^status-lines=1$' "$state/.wake-brief-seen-epsilon" \
+    || fail "the seen record must hold the briefed status position"
+  grep -q '^endpoint=dead$' "$state/.wake-brief-seen-epsilon" \
+    || fail "the seen record must hold the observed endpoint state"
   [ ! -s "$state/.wake-queue" ] || fail "brief must consume the queue it drained"
 
   # Second run: the queue is empty now, so nothing names a task, and the task's
-  # own records are still byte- and mtime-identical to their seeded state.
+  # own records plus the seen record are still byte- and mtime-identical to
+  # their post-brief state.
   before=$(state_fingerprint "$state")
   run_brief "$brief_home" >/dev/null || fail "brief must exit 0 on a re-run"
-  case "$(footprint "$before" "$(state_fingerprint "$state")")" in
-    *epsilon.*) fail "re-running the brief modified a task's records" ;;
-  esac
-  pass "wake brief writes nothing in state/ beyond the already-approved drain it runs"
+  rerun=$(footprint "$before" "$(state_fingerprint "$state")")
+  [ -z "$rerun" ] || fail "re-running the brief modified state records:
+$rerun"
+  pass "wake brief writes nothing in state/ beyond the drain it runs and its own seen records"
 }
 
 test_failed_drain_is_distinct_from_an_empty_queue() {
@@ -529,9 +691,14 @@ test_drain_spool_is_removed_only_after_the_records_are_printed
 test_invalid_explicit_id_is_reported_not_dropped
 test_glob_like_id_is_not_expanded_against_the_working_dir
 test_tmux_listing_is_read_once_for_the_whole_sweep
-test_bounded_tail_is_configurable
+test_full_flag_restores_the_bounded_status_tail
+test_trimmed_mode_prints_only_new_status_lines
+test_trimmed_mode_reports_no_new_lines_and_file_resets
 test_absent_files_are_marked_not_skipped
 test_explicit_ids_join_the_wake_named_ones
 test_stale_wake_key_resolves_through_the_window_label
 test_endpoint_sweep_uses_exact_window_match
-test_brief_writes_nothing_beyond_the_drain_it_runs
+test_trimmed_endpoint_sweep_prints_only_state_changes
+test_heartbeat_wake_forces_the_full_endpoint_sweep
+test_seen_records_are_pruned_with_the_task
+test_brief_writes_nothing_beyond_the_drain_and_its_seen_records

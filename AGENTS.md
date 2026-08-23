@@ -119,6 +119,7 @@ state/               volatile runtime signals; gitignored
   .afk-delivery .afk-outbox* .afk-inbox.beat  away-mode delivery mode, the durable pull-delivery records used when no supervisor pane exists, and the reader's liveness beacon; acknowledged only by bin/fm-afk-inbox.sh (docs/configuration.md)
   .watch.lock .wake-queue.lock watcher singleton and queue serialization locks
   .wake-brief-spool-*  bin/fm-wake-brief.sh's drained-record spool; removed after a successful brief, kept and named in the output when the drain failed because it is then the only copy of those records
+  .wake-brief-seen-*  bin/fm-wake-brief.sh's per-task read positions (status-line count and last endpoint state) that let the default trimmed brief print only what changed since the last drain; written only when a value changes, pruned when the task goes away, never touched by hand
   .hash-* .count-* .stale-* .stale-since-* .paused-* .wedge-escalations-* .seen-* .hb-surfaced-* .last-* .resource-* .heartbeat-streak   watcher internals; never touch
   .hourly-armed .hourly-*-surfaced .hourly-*.latest .hourly-decision-* .hourly-cleanup.log  hourly session-review and cleanup pass state: armed for the session by bin/fm-session-start.sh, run by the one watcher on its slow poll (docs/configuration.md); watcher internals, never touch
   .watch-triage.log  watcher's absorbed-wake debug log (size-capped); never relied on, safe to delete
@@ -360,7 +361,7 @@ For every actionable wake, follow the ordinary-wake continuation in the emitted 
 No turn ends blind while work is under way, including turns described as holding or waiting.
 
 At the start of every wake-handling turn, drain the durable wake queue before peeking, reading beyond the reason line, steering, or starting work.
-Prefer `bin/fm-wake-brief.sh`, which runs that same drain and returns the woken tasks' status tails, current states, and metadata plus a host reading and an endpoint sweep in one call; arming stays a separate call.
+Prefer `bin/fm-wake-brief.sh`, which runs that same drain and returns the woken tasks' new status events, current states, and metadata plus a host reading and a trimmed endpoint sweep (state changes, or the full sweep on heartbeat wakes) in one call; `--full` restores the untrimmed read; arming stays a separate call.
 Session start is the only exception because its one-shot digest already drained while locked or deliberately left the queue untouched in lock-refused read-only mode.
 A status line is a wake event, not current state; use `bin/fm-crew-state.sh` when current state matters, especially before re-escalating an old decision, blocker, or pause.
 A declared `paused:` event means a bounded external wait expected to clear on its own, while `blocked:` means firstmate action is needed; `bin/fm-classify-lib.sh` owns the exception for a captain-fixable auth/quota/token-exhaustion stall, which classifies as `blocked` even when reported as `paused:`.

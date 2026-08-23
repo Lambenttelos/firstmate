@@ -5,7 +5,7 @@ See [`../jcode-wake-adapter.md`](../jcode-wake-adapter.md) for the cross-turn ve
 The one jcode-specific rule is that arming the wake is TWO paired model actions: launch the arm as a background task, then immediately set `wake: true` on that exact task id. A forgotten wake set silently reverts to `wake: false` and leaves supervision blind, so the two steps are never separated.
 
 When this session owns supervision and away mode is not active:
-1. Drain first with `bin/fm-wake-drain.sh`, or with `bin/fm-wake-brief.sh` to get that same drain plus each woken task's status tail, current state, metadata, one host reading, and an endpoint sweep in one call.
+1. Drain first with `bin/fm-wake-drain.sh`, or with `bin/fm-wake-brief.sh` to get that same drain plus each woken task's new status events, current state, metadata, one host reading, and an endpoint sweep (full on heartbeat wakes, state changes otherwise; --full for the untrimmed read) in one call.
    To fold that drain into the arm itself as one call, launch `bin/fm-watch-arm.sh --drain` as the background task in step 3a: it drains first, then arms exactly one watcher, so a wake landing inside the arm window does not become a drain/arm/retry loop.
 2. Source `__FM_X_MODE_ENV__` first when X mode is active.
 3. First cycle, as two paired actions:

@@ -1,7 +1,7 @@
 Mode: Grok background-notify supervision.
 
 When this session owns supervision and away mode is not active:
-1. Drain first with `bin/fm-wake-drain.sh`, or with `bin/fm-wake-brief.sh` to get that same drain plus each woken task's status tail, current state, metadata, one host reading, and an endpoint sweep in one call.
+1. Drain first with `bin/fm-wake-drain.sh`, or with `bin/fm-wake-brief.sh` to get that same drain plus each woken task's new status events, current state, metadata, one host reading, and an endpoint sweep (full on heartbeat wakes, state changes otherwise; --full for the untrimmed read) in one call.
 2. Source `__FM_X_MODE_ENV__` first when X mode is active.
 3. First cycle: arm with Grok's tracked background tool, as its own call:
 

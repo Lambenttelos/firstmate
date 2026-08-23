@@ -21,7 +21,7 @@ Fresh stale panes use the same current-state read before trusting the status log
 No-change heartbeats are also benign.
 Absorbed wakes advance their suppression markers, log to `state/.watch-triage.log`, and keep the watcher blocking without a queue record or LLM turn.
 After each drain, `fm-wake-drain.sh` runs the same liveness guard as the supervision scripts, so a lapsed watcher chain surfaces even on a turn that only drains and handles queued wakes.
-`bin/fm-wake-brief.sh` composes that drain with each woken task's status tail, reconciled current state, and metadata, one `bin/fm-resource-check.sh` host reading, and one endpoint-liveness sweep, so a wake-handling turn is one call instead of five; it never arms, because arming stays its own background call.
+`bin/fm-wake-brief.sh` composes that drain with each woken task's new status events, reconciled current state, and metadata, one `bin/fm-resource-check.sh` host reading, and a trimmed endpoint-liveness sweep (full on heartbeat wakes, state changes otherwise; `--full` for the untrimmed read), so a wake-handling turn is one call instead of five; it never arms, because arming stays its own background call.
 Routine watcher polling, supervision no-ops, elapsed waiting time, and absorbed benign wakes stay silent.
 A declared external wait trades that silence for one bounded recheck per pause window, so a forgotten pause cannot remain invisible indefinitely.
 
