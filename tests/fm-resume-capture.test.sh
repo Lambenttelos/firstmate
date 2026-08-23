@@ -87,9 +87,9 @@ test_resume_token_for_harness() {
 # --- spawn integration -------------------------------------------------------
 #
 # Drive the REAL bin/fm-spawn.sh with a fake tmux backend against a real own-clone
-# worktree, a fake jcode session store, and a real tasks-axi markdown backlog, and
-# assert the resume= meta stamp + the durable task-record mirror. Mirrors the
-# scaffold in tests/fm-token-sessions.test.sh.
+# worktree, a fake jcode session store, and a controlled tasks-axi seam, and
+# assert the resume= meta stamp + the durable task-record mirror invocation.
+# Mirrors the scaffold in tests/fm-token-sessions.test.sh.
 
 SPAWN="$ROOT/bin/fm-spawn.sh"
 
@@ -109,6 +109,39 @@ exit 0
 SH
   chmod +x "$fakebin/tmux"
   fm_fake_exit0 "$fakebin" treehouse
+  # A controlled tasks-axi seam. The durable-backlog mirror is best-effort and
+  # must not depend on the ambient tasks-axi binary or its on-disk backlog store
+  # (that dependency is what made this test flaky in CI): the seam reports itself
+  # compatible so fm-spawn reaches the mirror, and records each
+  # `update <id> --resume <token>` line to FM_FAKE_TAXI_REC so the test asserts
+  # the exact invocation fm-spawn makes.
+  cat > "$fakebin/tasks-axi" <<'SH'
+#!/usr/bin/env bash
+set -u
+case "${1:-}" in
+  --version) printf 'tasks-axi 0.2.5\n'; exit 0 ;;
+esac
+sub=${1:-}; shift || true
+case "$sub" in
+  update)
+    if [ "${1:-}" = "--help" ]; then printf -- '--archive-body\n'; exit 0; fi
+    id=${1:-}; shift || true
+    token=''
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --resume) token=${2:-}; shift 2 || break ;;
+        *) shift ;;
+      esac
+    done
+    if [ -n "${FM_FAKE_TAXI_REC:-}" ] && [ -n "$token" ]; then
+      printf 'update %s resume=%s\n' "$id" "$token" >> "$FM_FAKE_TAXI_REC"
+    fi
+    exit 0 ;;
+  mv) [ "${1:-}" = "--help" ] && { printf -- '[<id>...]\n'; exit 0; }; exit 0 ;;
+  *) exit 0 ;;
+esac
+SH
+  chmod +x "$fakebin/tasks-axi"
   printf '%s\n' "$fakebin"
 }
 
@@ -120,10 +153,12 @@ write_session() {
 EOF
 }
 
-# Build a jcode-crew home with one own-clone project + worktree and a tasks-axi
-# markdown backlog carrying the task already in flight. Echoes: home|proj|wt|fakebin
-make_spawn_home() {  # <name> <id> [--no-backlog]
-  local name=$1 id=$2 flag=${3:-} case_dir home proj wt fakebin
+# Build a jcode-crew home with one own-clone project + worktree. The durable
+# backlog mirror is exercised through the controlled tasks-axi seam in
+# make_spawn_fakebin (recording to state/taxi-calls.log), so no real backlog
+# store is needed. Echoes: home|proj|wt|fakebin
+make_spawn_home() {  # <name> <id>
+  local name=$1 id=$2 case_dir home proj wt fakebin
   case_dir="$TMP_ROOT/$name"
   home="$case_dir/home"
   proj="$home/projects/project"
@@ -135,18 +170,6 @@ make_spawn_home() {  # <name> <id> [--no-backlog]
   mkdir -p "$home/data/$id"
   printf 'brief for %s\n' "$id" > "$home/data/$id/brief.md"
   touch "$home/state/.last-watcher-beat"
-  if [ "$flag" != "--no-backlog" ]; then
-    # A tasks-axi markdown backlog with the task in flight, so the spawn's
-    # `tasks-axi update --resume` mirror has a task to write to.
-    cat > "$home/.tasks.toml" <<EOF
-backend = "markdown"
-[markdown]
-path = "data/backlog.md"
-archive = "data/done-archive.md"
-done_keep = 10
-EOF
-    ( cd "$home" && tasks-axi add "$id" "resume capture task" --kind ship --start ) >/dev/null 2>&1 || true
-  fi
   printf '%s|%s|%s|%s\n' "$home" "$proj" "$wt" "$fakebin"
 }
 
@@ -160,6 +183,7 @@ run_spawn_jcode() {  # <home> <proj> <wt> <fakebin> <id> <sessions_dir> [extra a
     FM_FAKE_PANE_PATH="$wt" \
     FM_SPAWN_JCODE_READY_POLLS=0 \
     JCODE_SESSIONS_DIR="$sdir" \
+    FM_FAKE_TAXI_REC="$home/state/taxi-calls.log" \
     PATH="$fakebin:$PATH" \
     "$SPAWN" "$id" "$proj" "$@" 2>&1
 }
@@ -167,7 +191,6 @@ run_spawn_jcode() {  # <home> <proj> <wt> <fakebin> <id> <sessions_dir> [extra a
 test_spawn_stamps_resume_and_mirrors_to_backlog() {
   command -v git >/dev/null 2>&1 || { echo "skip: git not found"; return 0; }
   command -v python3 >/dev/null 2>&1 || { echo "skip: python3 not found"; return 0; }
-  command -v tasks-axi >/dev/null 2>&1 || { echo "skip: tasks-axi not found"; return 0; }
   local rec home proj wt fakebin id sdir out status wt_real
   id=resume-spawn-1
   rec=$(make_spawn_home resume1 "$id")
@@ -187,9 +210,11 @@ EOF
   # The meta carries the resume= stamp with the resolved session id.
   assert_grep "resume=session_crew" "$home/state/$id.meta" \
     "spawn did not stamp resume= into meta"
-  # The durable task record was updated too (survives a later meta teardown).
-  ( cd "$home" && tasks-axi show "$id" 2>/dev/null ) | grep -q 'resume: session_crew' \
-    || fail "spawn did not mirror the resume token into the task record"
+  # The durable task record was updated too (survives a later meta teardown):
+  # the spawn mirrors the token via `tasks-axi update <id> --resume <token>`,
+  # recorded by the controlled tasks-axi seam.
+  assert_grep "update $id resume=session_crew" "$home/state/taxi-calls.log" \
+    "spawn did not mirror the resume token into the task record"
   pass "a jcode spawn stamps resume= into meta and mirrors it into the durable task record"
 }
 
@@ -221,7 +246,7 @@ test_spawn_resume_cmd_roundtrip() {
   command -v python3 >/dev/null 2>&1 || { echo "skip: python3 not found"; return 0; }
   local rec home proj wt fakebin id sdir wt_real cmd
   id=resume-spawn-3
-  rec=$(make_spawn_home resume3 "$id" --no-backlog)
+  rec=$(make_spawn_home resume3 "$id")
   IFS='|' read -r home proj wt fakebin <<EOF
 $rec
 EOF
