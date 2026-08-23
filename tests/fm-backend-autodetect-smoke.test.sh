@@ -81,7 +81,11 @@ STATE="$TMP_ROOT/state"; DATA="$TMP_ROOT/data"; CONFIG="$TMP_ROOT/config"
 mkdir -p "$STATE" "$DATA/$ID" "$CONFIG"
 printf 'trivial autodetect-smoke brief: nothing to do.\n' > "$DATA/$ID/brief.md"
 
-PROJ="$TMP_ROOT/scratch-project"
+# fm-spawn refuses a project that is not a direct child of this home's projects
+# registry (bin/fm-spawn.sh validate_project_is_own_clone), so the scratch clone
+# lives under the FM_PROJECTS_OVERRIDE dir passed to the spawn below.
+PROJECTS_DIR="$TMP_ROOT/projects"
+PROJ="$PROJECTS_DIR/scratch-project"
 mkdir -p "$PROJ"
 git -C "$PROJ" init -q
 printf '# scratch\n' > "$PROJ/README.md"
@@ -93,7 +97,7 @@ git -C "$PROJ" -c user.name='Firstmate Tests' -c user.email='tests@example.inval
 OUT_FILE="$TMP_ROOT/spawn.out"; ERR_FILE="$TMP_ROOT/spawn.err"
 env -u TMUX -u FM_BACKEND PATH="$PATH" HERDR_ENV=1 \
   FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$STATE" FM_DATA_OVERRIDE="$DATA" \
-  FM_CONFIG_OVERRIDE="$CONFIG" FM_PROJECTS_OVERRIDE="$TMP_ROOT/unused-projects" \
+  FM_CONFIG_OVERRIDE="$CONFIG" FM_PROJECTS_OVERRIDE="$PROJECTS_DIR" \
   FM_SPAWN_NO_GUARD=1 \
   "$ROOT/bin/fm-spawn.sh" "$ID" "$PROJ" "sh -c 'echo autodetect-smoke-ok'" \
   >"$OUT_FILE" 2>"$ERR_FILE"

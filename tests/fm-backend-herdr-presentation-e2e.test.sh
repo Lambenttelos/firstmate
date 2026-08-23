@@ -384,7 +384,10 @@ make_project() {  # <dir>
 
 spawn_task() {  # <id> <home> <project>
   local id=$1 home=$2 project=$3
-  FM_GATE_REFUSE_BYPASS=1 FM_SPAWN_NO_GUARD=1 FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" \
+  # This fixture deliberately re-spawns the same id (e.g. 'shape') after a
+  # teardown that records a durable completion ledger line, so the duplicate
+  # dispatch guard (bin/fm-spawn.sh) is overridden the same way an operator would.
+  FM_SPAWN_ALLOW_DUPLICATE=1 FM_GATE_REFUSE_BYPASS=1 FM_SPAWN_NO_GUARD=1 FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" \
     "$ROOT/bin/fm-spawn.sh" "$id" "$project" "sh -c 'sleep 120'" --backend herdr
 }
 
@@ -450,7 +453,10 @@ assert_no_projection_mutation_since() {  # <line-count> <case-name>
 }
 
 HOME_DIR="$TMP_ROOT/home"
-PROJECT_DIR="$TMP_ROOT/project"
+# fm-spawn refuses a project that is not a direct child of this home's projects
+# registry (bin/fm-spawn.sh validate_project_is_own_clone), so the fixture clone
+# lives under HOME_DIR/projects rather than a sibling of the home.
+PROJECT_DIR="$HOME_DIR/projects/project"
 mkdir -p "$HOME_DIR/state" "$HOME_DIR/config" \
   "$HOME_DIR/data/anchor" "$HOME_DIR/data/shape" \
   "$HOME_DIR/data/order-a" "$HOME_DIR/data/order-b" \

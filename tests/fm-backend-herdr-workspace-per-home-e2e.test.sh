@@ -99,8 +99,12 @@ make_scratch_project() {  # <dir>
   git -C "$dir" -c user.name='Firstmate Tests' -c user.email='tests@example.invalid' commit -qm initial
 }
 
-PROJ1="$TMP_ROOT/scratch-project-1"; make_scratch_project "$PROJ1"
-PROJ2="$TMP_ROOT/scratch-project-2"; make_scratch_project "$PROJ2"
+# fm-spawn refuses a project that is not a direct child of the spawning home's
+# projects registry (bin/fm-spawn.sh validate_project_is_own_clone), so each
+# scratch clone lives under the home that spawns its crewmate: cm1 spawns from
+# the primary home, cm2 from the secondmate home.
+PROJ1="$PRIMARY_HOME/projects/scratch-project-1"; make_scratch_project "$PROJ1"
+PROJ2="$SM_HOME/projects/scratch-project-2"; make_scratch_project "$PROJ2"
 
 # --- 1. primary-shaped home: a crewmate spawns into the "firstmate" space ---
 
