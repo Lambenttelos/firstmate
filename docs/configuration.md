@@ -298,7 +298,7 @@ A standalone-clone home cannot receive a primary-local commit through that no-fe
 When it is unset, most scripts use the repo root as the home; when it is set, scripts still run from this repo's `bin/`, but `state/`, `data/`, `config/`, and `projects/` come from `$FM_HOME`.
 `FM_ROOT_OVERRIDE` overrides the firstmate repo root used by scripts, including the primary checkout watched by the worktree-tangle guard.
 When `FM_HOME` is unset, it also behaves as the old whole-root override.
-`bin/fm-send.sh` is intentionally stricter than that general fallback: it requires `FM_HOME` to be set before resolving a target, so operator steers cannot silently resolve against the wrong home.
+`bin/fm-send.sh` is intentionally stricter than that general fallback: it requires `FM_HOME` unless the current directory is itself a valid firstmate home (data/, state/, config/ and AGENTS.md present), so operator steers cannot silently resolve against the wrong home.
 `FM_STATE_OVERRIDE`, `FM_DATA_OVERRIDE`, `FM_PROJECTS_OVERRIDE`, and `FM_CONFIG_OVERRIDE` override individual operational directories for tests and specialized harness setup.
 For the herdr backend, `FM_HOME` also determines the workspace label used by the adapter.
 For the zellij backend, `FM_HOME` does not split containers, but it determines the readable home prefix embedded in visible tab titles; use `FM_ZELLIJ_SESSION` when a separate zellij session is needed.
@@ -777,7 +777,7 @@ All generated state lives under the already-gitignored `state/`.
 Runtime tuning via environment variables (defaults shown):
 
 ```sh
-FM_HOME=                 # optional operational home for most scripts, unset means this repo root; fm-send requires it explicitly
+FM_HOME=                 # optional operational home for most scripts, unset means this repo root; fm-send defaults to the current directory when that directory is a valid firstmate home
 FM_ROOT_OVERRIDE=        # override firstmate repo root, tangle-guard target, and zellij/cmux home-title hash; also legacy whole-root override when FM_HOME is unset
 FM_STATE_OVERRIDE=       # alternate state dir, mainly for tests
 FM_DATA_OVERRIDE=        # alternate data dir, mainly for tests
