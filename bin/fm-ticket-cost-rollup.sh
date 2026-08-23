@@ -85,7 +85,7 @@ DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 . "$SCRIPT_DIR/fm-completions-lib.sh"
 
 usage() {
-  sed -n '2,79p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '2,72p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 die() {
@@ -145,11 +145,6 @@ COMPLETIONS_FILE=$(fm_completions_file "$DATA")
 TOKEN_SESSIONS_FILE=$(fm_token_sessions_file "$DATA")
 
 [ -f "$COMPLETIONS_FILE" ] || die "no completion ledger at $COMPLETIONS_FILE (no landed ticket to roll up)" 1
-
-# Thousands separators for a plain integer, portable (no locale dependency).
-commafy() {
-  printf '%s' "$1" | sed -e ':a' -e 's/\(.*[0-9]\)\([0-9]\{3\}\)/\1,\2/;ta'
-}
 
 # Float addition with full display precision. Used ONLY to sum lib-produced
 # costs (pure addition, never a new cost formula), exactly as fm-token-report.sh.
