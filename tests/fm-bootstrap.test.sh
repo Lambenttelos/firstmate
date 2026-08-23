@@ -671,6 +671,16 @@ make_routine_bootstrap_fixture() {
     printf 'harness=codex\n'
     printf 'home=%s\n' "$sm"
   } > "$home/state/sm.meta"
+  # Pre-seed the secondmate's inherited config to match the parent so a routine
+  # bootstrap finds it already converged: propagation reports no changed item,
+  # stages no config-reread, and stays silent. Without this the first bootstrap
+  # would legitimately emit a BOOTSTRAP_INFO idle config-reread skip (see
+  # fm-secondmate-harness test_bootstrap_lazy_config_reread_skips_idle_home),
+  # which is real work, not the routine no-op this case asserts is silent.
+  mkdir -p "$sm/config"
+  printf '%s\n' codex > "$sm/config/crew-harness"
+  printf '%s\n' '{"rules":[{"when":"normal work","use":{"harness":"codex"}}],"default":{"harness":"claude","effort":"low"}}' \
+    > "$sm/config/crew-dispatch.json"
   fakebin=$(make_fake_toolchain "$case_dir")
   add_real_jq "$fakebin"
   cat > "$fakebin/tmux" <<'SH'
