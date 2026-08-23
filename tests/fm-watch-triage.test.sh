@@ -1507,7 +1507,7 @@ test_afk_paused_changed_pane_hands_off_plain_stale() {
     FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_PAUSE_RESURFACE_SECS=240 FM_POLL=1 FM_SIGNAL_GRACE=1 \
     FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
   pid=$!
-  wait_for_exit "$pid" 40 || { kill "$daemon_pid" 2>/dev/null; fail "AFK paused changed pane did not hand off a stale wake"; }
+  wait_for_exit "$pid" 80 || { kill "$daemon_pid" 2>/dev/null; fail "AFK paused changed pane did not hand off a stale wake"; }
   kill "$daemon_pid" 2>/dev/null || true
   grep -Fx "stale: $window" "$out" >/dev/null || fail "AFK paused stale did not preserve its plain window identity: $(cat "$out")"
   grep -F "awaiting external" "$out" >/dev/null && fail "AFK watcher decorated a stale identity instead of handing it to the daemon"
