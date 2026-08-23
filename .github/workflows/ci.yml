@@ -353,7 +353,11 @@ jobs:
       - name: Personal fleet paths must not be tracked
         run: |
           set -eu
-          tracked=$(git ls-files -- data state config projects .no-mistakes)
+          # config/ holds gitignored per-fleet knobs, with one documented tracked
+          # exception: the shared token-price snapshot owned by fm-token-prices.sh
+          # (docs/configuration.md "config/ holds local gitignored operating choices").
+          tracked=$(git ls-files -- data state config projects .no-mistakes \
+            | grep -vx 'config/token-prices.json' || true)
           if [ -n "$tracked" ]; then
             echo "::error::Personal fleet paths are tracked in git:"
             printf '%s\n' "$tracked"
