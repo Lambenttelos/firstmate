@@ -1,0 +1,12 @@
+# firstmate completion ledger fixture (ticket-cost-rollup tests).
+# Format: <id>\t<closed-date>\t<kind>\t<repo>\t<landing-sha>.
+# ticket-precapture has a completion row but NO token-session ledger row.
+# ticket-reship has TWO rows; the LAST (2026-08-13) wins for window + display.
+ticket-multi	2026-08-13	ship	alpha	sha1
+ticket-covered	2026-08-13	ship	alpha	sha2
+ticket-unpriced	2026-08-13	scout	beta	
+ticket-precapture	2026-08-13	ship	alpha	shap
+ticket-unresolved	2026-08-13	ship	beta	shau
+ticket-outside	2026-08-20	ship	alpha	shao
+ticket-reship	2026-08-01	scout	gamma	shar1
+ticket-reship	2026-08-13	ship	alpha	shar2

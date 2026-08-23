@@ -13,7 +13,7 @@ This skill generalizes the one-off `data/weekly-fm-session-report/report.md` pro
 Do not delete or repurpose that example.
 
 The report synthesis stays agent-driven.
-`bin/fm-work-report-counts.sh` mechanizes only the two error-prone git counts; everything else - reading commit subjects, writing plain-language impact, categorizing repos, bucketing time - is your judgment.
+`bin/fm-work-report-counts.sh` mechanizes only the two error-prone git counts, and `bin/fm-ticket-cost-rollup.sh` mechanizes the optional per-ticket dollar cost; everything else - reading commit subjects, writing plain-language impact, categorizing repos, bucketing time - is your judgment.
 
 ## Prime accuracy rules (these are the hard-won lessons - bake them in)
 
@@ -73,6 +73,27 @@ For **TICKETS FILED**, count `data/backlog.md` rows whose `created` date falls i
 
 Then read the in-window commit subjects on each repo (`git -C <repo> log --first-parent <ref> --since --until --pretty='%h %s'`) to write the work-by-area narrative with verbatim shas and plain-language impact.
 
+## Step 3b - optional per-ticket dollar cost
+
+For a cost dimension - "what did the tickets that landed in this window cost" - run the completions-anchored rollup once for the whole fleet with the SAME resolved bounds:
+
+```
+bin/fm-ticket-cost-rollup.sh --since <date> --until <date> --json
+# human table (costliest ticket first, one line per landed ticket):
+bin/fm-ticket-cost-rollup.sh --since <date> --until <date>
+# scope to one repo:
+bin/fm-ticket-cost-rollup.sh --since <date> --until <date> --repo <name>
+```
+
+It walks `data/completions.tsv` (the durable landed-ticket ledger), keeps the tickets whose close date is in `[since, until)`, joins each to its `data/token-sessions.tsv` sessions, and derives every dollar through the one coster lib `bin/fm-token-lib.sh` - so the number equals `bin/fm-token-report.sh <task-id>` exactly and is never a re-implemented formula.
+Bake these honesty rules into any cost section, they are the hard-won constraints of the token tooling:
+
+- `cost_if_api` is the API-metered cost; `covered` is subscription-covered (billed nothing), `billed` is real API spend. Report the split, do not present covered as money out the door.
+- A ticket that landed **before** the spawn-session capture (roughly pre-2026-08-17) has a completion row but no session ledger, so it shows `sessions=0  cost n/a (pre-capture, no ledger)`. Never read that as `$0`; the totals footer counts these separately. Use `bin/fm-token-report.sh <id> --retro` for a single-ticket labeled ESTIMATE.
+- An unpriced model shows `cost_if_api UNKNOWN` with its tokens, never a fabricated `$0`.
+
+This is optional and cost is not a throughput number, so keep it a distinct section (below), never conflated with COMMITS / LANDINGS / FILED.
+
 ## Step 4 - assemble the report
 
 Write `data/work-report-<slug>/report.md` with these sections, mirroring the reference report:
@@ -81,9 +102,10 @@ Write `data/work-report-<slug>/report.md` with these sections, mirroring the ref
 2. **Work by area** - per product repo then tooling, grouped by theme, each line `<sha> <lane-or-subject> - plain-language impact`.
 3. **Throughput** - the three numbers, each with its explicit command and a per-repo table, plus a short reconciliation (COMMITS > LANDINGS > FILED is expected; they are different populations).
 4. **Ticket stats** - created by type and by category (tables), and per-day completion via the git landing signal with the honesty note about `closed`.
-5. **Work volume by time window** - bucket activity by local-time windows (business hours / after-hours / weekend); state the timezone offset used and any proxy caveats (e.g. human-message count as an engagement proxy, fleet-active vs human-active).
-6. **Appendix: fleet reliability notes** - short, off to the side.
-7. **Evidence index** - the commands and sources used.
+5. **Ticket cost** (optional, only if a cost dimension was requested) - the per-ticket dollar cost from `bin/fm-ticket-cost-rollup.sh`, as a costliest-first table (ticket, repo, kind, sessions, `cost_if_api`, covered/api split) plus the fleet total, the covered-vs-billed split called out, and the count of pre-capture tickets whose cost is `n/a`. State the price source and its cache date (the tool prints them). Keep this separate from Throughput; cost is not a throughput number.
+6. **Work volume by time window** - bucket activity by local-time windows (business hours / after-hours / weekend); state the timezone offset used and any proxy caveats (e.g. human-message count as an engagement proxy, fleet-active vs human-active).
+7. **Appendix: fleet reliability notes** - short, off to the side.
+8. **Evidence index** - the commands and sources used.
 
 Write the report prose caveman ultra per the fleet compression contract (terse, no articles or filler, every technical fact intact); identifiers, shas, paths, commands, and error strings stay verbatim as evidence.
 

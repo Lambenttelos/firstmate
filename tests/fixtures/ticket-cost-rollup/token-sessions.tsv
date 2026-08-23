@@ -1,0 +1,14 @@
+# firstmate token-session ledger fixture (ticket-cost-rollup tests).
+# Format: <id>\t<session_id>\t<working_dir>\t<spawn_ts>\t<harness>.
+# ticket-multi is MULTI-SESSION (session_m1 + session_m2); session_m2 is stored
+# under a MISMATCHED filename (session_odd.json), so the O(1) filename==id lookup
+# fails for it and the store-scan fallback (which verifies the inner id) must
+# resolve it. session_gone is intentionally absent from the store (unresolved,
+# tokens withheld).
+ticket-multi	session_m1	/wt/m	2026-08-13T10:00:00Z	jcode
+ticket-multi	session_m2	/wt/m	2026-08-13T11:00:00Z	jcode
+ticket-covered	session_cov	/wt/c	2026-08-13T10:00:00Z	jcode
+ticket-unpriced	session_unp	/wt/u	2026-08-13T10:00:00Z	jcode
+ticket-unresolved	session_gone	/wt/g	2026-08-13T10:00:00Z	jcode
+ticket-reship	session_reship	/wt/r	2026-08-13T10:00:00Z	jcode
+ticket-outside	session_outside	/wt/o	2026-08-20T10:00:00Z	jcode
