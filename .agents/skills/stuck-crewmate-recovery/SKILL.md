@@ -31,6 +31,9 @@ Do not sweep another home's endpoints or infer ownership from a matching window 
 
 Before relaunch, prove that no live agent still owns the recorded task and that the existing worktree remains available.
 Preserve its uncommitted changes and commits, keep the same task identity, and resume or relaunch the recorded harness in that existing worktree with the same brief plus a concise progress note.
+Prefer resuming the dead harness session in place over a fresh relaunch: a resume restores the session's full turn history, the original brief and every step of progress, instead of re-deriving it.
+Run `bin/fm-resume-cmd.sh <id>` for the exact resume command; when it prints one, run that command in the task's own worktree pane instead of relaunching from the brief.
+It fails closed when no resume token was captured (only jcode captures one today) or the recorded harness has no verified by-id resume command, and then a fresh relaunch with the brief plus a progress note is the fallback.
 Do not use a fresh generic spawn while the recorded worktree is unaccounted for, because allocating another worktree can split one task across two copies.
 If the worktree or ownership cannot be reconciled safely, leave all state intact and report the task failed or blocked with the conflicting evidence.
 
@@ -42,8 +45,10 @@ Escalate in order:
 2. If the crewmate is waiting on a question its brief already answers, answer in one line via `FM_HOME=<this-firstmate-home> bin/fm-send.sh` from an active firstmate session unless `FM_HOME` is already set to the active firstmate home.
 3. If the crewmate is confused or looping, interrupt with the adapter's interrupt key, then redirect with one corrective line.
    For example, for a single-Escape adapter: `FM_HOME=<this-firstmate-home> bin/fm-send.sh <window> --key Escape`.
-4. If the crewmate is genuinely wedged after redirection, exit the agent with the adapter's exit command and relaunch with the same brief plus a `progress so far` note appended to it.
+4. If the crewmate is genuinely wedged after redirection, exit the agent with the adapter's exit command and bring it back in the same worktree.
+   Prefer resuming the session: run `bin/fm-resume-cmd.sh <id>` and, when it prints a command, run that in the worktree pane so the session's full history returns, instead of relaunching from the brief.
+   When it fails closed (no captured resume token, or a harness with no verified by-id resume command), relaunch with the same brief plus a `progress so far` note appended to it.
    Genuine wedging means looping, unresponsive, repeating the same obstacle, or truly dead.
    A low context reading is not wedging; modern harnesses auto-compact and keep going.
-   The worktree and commits persist, so relaunch is cheap.
+   The worktree and commits persist, so resume or relaunch is cheap.
 5. If a second relaunch fails too, write `failed` to the backlog and tell the captain the plain failure, preserved work, and consequence using `AGENTS.md` section 9; do not mention metadata, harness, window, or worktree unless the path itself is needed for action.
