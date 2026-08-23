@@ -123,6 +123,19 @@ poll_entry() {
     esac
     fm_pr_bitbucket_slug_valid "$seg" || { debug_msg "$debug" "$id: unsafe branch segment $seg"; return 1; }
   done
+  # The queued base (destination) is embedded in the q query the same way as the
+  # source branch, so it gets the same quote/whitespace/per-segment validation.
+  case "$base" in
+    ''|*'"'*|*[[:space:]]*) debug_msg "$debug" "$id: unsafe base name"; return 1 ;;
+  esac
+  rest=$base
+  while [ -n "$rest" ]; do
+    case "$rest" in
+      */*) seg=${rest%%/*}; rest=${rest#*/} ;;
+      *) seg=$rest; rest= ;;
+    esac
+    fm_pr_bitbucket_slug_valid "$seg" || { debug_msg "$debug" "$id: unsafe base segment $seg"; return 1; }
+  done
   api_base_v=$(api_base) || { debug_msg "$debug" "$id: invalid API base"; return 1; }
   command -v curl >/dev/null 2>&1 || { debug_msg "$debug" "$id: curl missing"; return 1; }
   command -v jq >/dev/null 2>&1 || { debug_msg "$debug" "$id: jq missing"; return 1; }
@@ -133,7 +146,7 @@ poll_entry() {
     --header 'Accept: application/json' \
     --data-urlencode 'state=ALL' \
     --data-urlencode 'pagelen=50' \
-    --data-urlencode "q=source.branch.name=\"$qbranch\"" \
+    --data-urlencode "q=source.branch.name=\"$qbranch\" AND destination.branch.name=\"$base\"" \
     "$api_base_v/2.0/repositories/$ws/$repo/pullrequests" 2>/dev/null)
   rm -f -- "$cfg"
   [ -n "$response" ] || { debug_msg "$debug" "$id: empty API response"; return 1; }

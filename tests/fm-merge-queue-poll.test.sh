@@ -40,9 +40,55 @@ default_response() {
 }
 
 pr_json() {
-  local id=$1 state=$2
-  printf '{"id":%s,"state":"%s","source":{"branch":{"name":"x"}},"destination":{"branch":{"name":"dev"}}}' \
-    "$id" "$state"
+  local id=$1 state=$2 dest=${3:-dev}
+  printf '{"id":%s,"state":"%s","source":{"branch":{"name":"x"}},"destination":{"branch":{"name":"%s"}}}' \
+    "$id" "$state" "$dest"
+}
+
+# A destination-aware fakebin: like make_fakebin, but emulates Bitbucket's
+# server-side destination.branch.name filter by dropping every .values entry
+# whose destination does not match the base parsed out of the q argument. This
+# lets a test prove the poll ranks only the PRs that target the queued base.
+make_fakebin_destaware() {
+  local dir=$1
+  mkdir -p "$dir"
+  cat > "$dir/curl" <<'SH'
+#!/usr/bin/env bash
+url=
+enc=
+cfg=
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --config) cfg=$2; shift 2 ;;
+    --data-urlencode) enc="$enc $2"; shift 2 ;;
+    --request) url="$2 $url"; shift 2 ;;
+    --max-time) shift 2 ;;
+    --header|--write-out|--output|--get) shift 2 ;;
+    --silent|--show-error) shift ;;
+    -*) shift ;;
+    *) url=$1; shift ;;
+  esac
+done
+{ printf 'URL %s\n' "$url"; printf 'ENC%s\n' "$enc"; } >> "$FM_TEST_LOG"
+[ -z "$cfg" ] || cat "$cfg" > "$FM_TEST_CFG" 2>/dev/null || true
+resp=
+for f in "$FM_TEST_RESP"/*.json; do
+  [ -e "$f" ] || continue
+  b=$(basename "$f" .json)
+  b=${b//__/\/}
+  case "$enc" in
+    *"source.branch.name=\"$b\""*) resp=$f; break ;;
+  esac
+done
+[ -n "$resp" ] || resp="$FM_TEST_RESP/_default.json"
+dest=$(printf '%s' "$enc" | sed -n 's/.*destination\.branch\.name="\([^"]*\)".*/\1/p')
+if [ -n "$dest" ]; then
+  jq --arg d "$dest" '.values |= map(select(.destination.branch.name == $d))' "$resp" 2>/dev/null || cat "$resp"
+else
+  cat "$resp"
+fi
+SH
+  chmod +x "$dir/curl"
 }
 
 # Build a fakebin curl that logs its argv to FM_TEST_LOG and copies the
@@ -249,6 +295,37 @@ TSV
   pass "one queue poll wakes merged and declined and stays silent on open"
 }
 
+test_other_destination_stays_silent() {
+  local fixture; fixture="$TMP_ROOT/other-dest"; make_fixture "$fixture"
+  make_fakebin_destaware "$fixture/fakebin"
+  # The branch's only PR targets main, but the queue entry is queued to dev, so
+  # after the destination filter there is nothing to rank: stay silent.
+  write_response "$fixture/resp" fm/merged-branch \
+    "{\"size\":1,\"values\":[$(pr_json 42 DECLINED main)]}"
+  local out
+  out=$(FM_TEST_LOG="$fixture/curl.log" FM_TEST_CFG="$fixture/cfg.captured" \
+    FM_TEST_RESP="$fixture/resp" PATH="$fixture/fakebin:$PATH" run_poll "$fixture")
+  [ -z "$out" ] || fail "a PR to a different destination should stay silent, got: $out"
+  grep -qF 'destination.branch.name="dev"' "$fixture/curl.log" \
+    || fail "q query missing destination filter: $(cat "$fixture/curl.log")"
+  pass "PRs targeting a different destination than the queued base stay silent"
+}
+
+test_queued_base_merged_outranks_other_base_declined() {
+  local fixture; fixture="$TMP_ROOT/base-merged"; make_fixture "$fixture"
+  make_fakebin_destaware "$fixture/fakebin"
+  # Same branch: MERGED into the queued base (dev) plus a DECLINED into main.
+  # Only the queued-base PR survives the filter, so the poll wakes merged.
+  write_response "$fixture/resp" fm/merged-branch \
+    "{\"size\":2,\"values\":[$(pr_json 44 DECLINED main),$(pr_json 42 MERGED dev)]}"
+  local out
+  out=$(FM_TEST_LOG="$fixture/curl.log" FM_TEST_CFG="$fixture/cfg.captured" \
+    FM_TEST_RESP="$fixture/resp" PATH="$fixture/fakebin:$PATH" run_poll "$fixture")
+  grep -qxF 'merged: merged-task fm/merged-branch -> dev https://bitbucket.org/dashnow/hyfin-server/pull-requests/42' \
+    <<<"$out" || fail "queued-base merged should wake, got: $out"
+  pass "a MERGED PR to the queued base wakes even when another base is declined"
+}
+
 test_missing_queue_is_silent() {
   local fixture; fixture="$TMP_ROOT/absent"; make_fixture "$fixture"
   rm -f "$fixture/data/merge-queue.tsv"
@@ -426,6 +503,8 @@ test_open_outranks_declined
 test_merged_outranks_everything
 test_superseded_wakes_when_no_open_replacement
 test_no_prs_is_silent
+test_other_destination_stays_silent
+test_queued_base_merged_outranks_other_base_declined
 test_github_and_malformed_entries_skipped
 test_all_states_from_one_queue
 test_missing_queue_is_silent
