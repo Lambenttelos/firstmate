@@ -492,9 +492,19 @@ printf 'Projection abort fixture B.\n' > "$HOME_DIR/data/abort-b/brief.md"
 printf 'Projection lock contention fixture.\n' > "$HOME_DIR/data/lock-contended/brief.md"
 make_project "$PROJECT_DIR"
 
+# The never-torn-down anchor keeps its own clone under the shared projects dir.
+# Its 'sleep 120' command exits well before the ~5 min suite ends, so treehouse
+# would recycle anchor's idle worktree slot for a later spawn drawing from the
+# same pool - but anchor.meta still claims it, so assert_worktree_unclaimed
+# rightly refuses that later launch (observed as restart1's flat fallback
+# aliasing anchor's worktree). Giving anchor a private clone keeps its recycled
+# slot out of every other task's pool without weakening the product guard.
+ANCHOR_PROJECT="$PROJECTS/anchor-project"
+make_project "$ANCHOR_PROJECT"
+
 # Keep one ordinary primary task live so the durable firstmate workspace is
 # first and remains present while disposable workers are projected around it.
-spawn_task anchor "$HOME_DIR" "$PROJECT_DIR" > "$TMP_ROOT/anchor.out" 2> "$TMP_ROOT/anchor.err" \
+spawn_task anchor "$HOME_DIR" "$ANCHOR_PROJECT" > "$TMP_ROOT/anchor.out" 2> "$TMP_ROOT/anchor.err" \
   || fail "flag-off anchor spawn failed: $(cat "$TMP_ROOT/anchor.err")"
 ANCHOR_META="$HOME_DIR/state/anchor.meta"
 remember_meta_worktree "$ANCHOR_META" >/dev/null
