@@ -1122,7 +1122,21 @@ pass "real Herdr lab: multi-home exact-pane teardowns restore captain focus with
 # agent.
 # The next spawn must leave that old projection untouched and use the flat
 # home workspace.
-spawn_task restart1 "$HOME_DIR" "$PROJECT_DIR" > "$TMP_ROOT/restart-first.out" 2> "$TMP_ROOT/restart-first.err" \
+#
+# This block reprovisions the whole isolated Herdr session below to strip
+# restart1's registered agent, which also kills every other pane's process -
+# including the durable `anchor` task's. Treehouse frees a pool slot by process
+# liveness and re-hands the lowest-numbered free worktree, so a restart1
+# re-spawn sharing anchor's clone would deterministically draw anchor's slot-1
+# worktree while anchor.meta still claims it, and fm-spawn's cross-task claim
+# guard would (correctly) refuse. anchor is never torn down, so give restart1
+# its own project clone: a separate Treehouse pool whose slot 1 is restart1's
+# own same-id original, which the claim guard skips. The flat "firstmate"
+# fallback workspace is keyed by FM_HOME, not the project, so the assertions
+# below are unaffected.
+RESTART_PROJECT_DIR="$PROJECTS/restart-project"
+make_project "$RESTART_PROJECT_DIR"
+spawn_task restart1 "$HOME_DIR" "$RESTART_PROJECT_DIR" > "$TMP_ROOT/restart-first.out" 2> "$TMP_ROOT/restart-first.err" \
   || fail "restart fixture's projected spawn failed: $(cat "$TMP_ROOT/restart-first.err")"
 RESTART_META="$HOME_DIR/state/restart1.meta"
 OLD_RESTART_WT=$(remember_meta_worktree "$RESTART_META")
@@ -1140,7 +1154,7 @@ lab pane get "$OLD_RESTART_PANE" >/dev/null 2>&1 \
 if lab agent get "$OLD_RESTART_PANE" >/dev/null 2>&1; then
   fail "restart fixture unexpectedly retained a registered agent"
 fi
-spawn_task restart1 "$HOME_DIR" "$PROJECT_DIR" > "$TMP_ROOT/restart-flat.out" 2> "$TMP_ROOT/restart-flat.err" \
+spawn_task restart1 "$HOME_DIR" "$RESTART_PROJECT_DIR" > "$TMP_ROOT/restart-flat.out" 2> "$TMP_ROOT/restart-flat.err" \
   || fail "flat fallback after restart failed: $(cat "$TMP_ROOT/restart-flat.err")"
 NEW_RESTART_WT=$(remember_meta_worktree "$RESTART_META")
 NEW_RESTART_WSID=$(grep '^herdr_workspace_id=' "$RESTART_META" | cut -d= -f2-)
