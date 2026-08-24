@@ -1,0 +1,749 @@
+#!/usr/bin/env python3
+"""jira-axi - a small Jira Cloud CLI for the fleet's ticket pipeline.
+
+Credentials come from the environment, never from flags and never logged:
+  JIRA_EMAIL      Atlassian account email
+  JIRA_API_TOKEN  Atlassian API token (https://id.atlassian.com/manage-profile/security/api-tokens)
+  JIRA_BASE_URL   e.g. https://dashnow.atlassian.net
+
+The token is sent only in the Authorization header, never on argv and never
+printed. Run any verb with --help for its options.
+
+Verbs:
+  whoami                        auth sanity check
+  create                        create an issue, print its KEY
+  update KEY                    change summary/description/labels
+  transition KEY --to NAME      move an issue to a workflow state
+  transitions KEY               list available transitions for an issue
+  comment KEY --body-file f     add a comment
+  sprint-assign KEY... --sprint move issues into a sprint (agile API)
+  get KEY                       fetch one issue
+  search --jql '...'            run a JQL search
+  bulk-create --from-file f     idempotent batch create from a JSON array
+"""
+
+import argparse
+import base64
+import json
+import os
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+
+TIMEOUT = 60
+
+
+def _fail(msg, code=1):
+    sys.stderr.write("jira-axi: " + msg.rstrip("\n") + "\n")
+    sys.exit(code)
+
+
+def _creds():
+    email = os.environ.get("JIRA_EMAIL")
+    token = os.environ.get("JIRA_API_TOKEN")
+    base = os.environ.get("JIRA_BASE_URL")
+    missing = [
+        n
+        for n, v in (
+            ("JIRA_EMAIL", email),
+            ("JIRA_API_TOKEN", token),
+            ("JIRA_BASE_URL", base),
+        )
+        if not v
+    ]
+    if missing:
+        _fail("missing required environment: " + ", ".join(missing))
+    return email, token, base.rstrip("/")
+
+
+def _auth_header():
+    email, token, base = _creds()
+    raw = ("%s:%s" % (email, token)).encode("utf-8")
+    return "Basic " + base64.b64encode(raw).decode("ascii"), base
+
+
+def api(method, path, body=None, query=None):
+    """Call the Jira REST API. path is relative to the base URL.
+
+    Returns (status, parsed_json_or_None, raw_text).
+    """
+    auth, base = _auth_header()
+    url = base + path
+    if query:
+        url += "?" + urllib.parse.urlencode(query)
+    data = None
+    headers = {
+        "Authorization": auth,
+        "Accept": "application/json",
+    }
+    if body is not None:
+        data = json.dumps(body).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+            text = resp.read().decode("utf-8", "replace")
+            parsed = json.loads(text) if text.strip() else None
+            return resp.status, parsed, text
+    except urllib.error.HTTPError as e:
+        text = e.read().decode("utf-8", "replace")
+        try:
+            parsed = json.loads(text) if text.strip() else None
+        except ValueError:
+            parsed = None
+        return e.code, parsed, text
+    except urllib.error.URLError as e:
+        _fail("network error contacting Jira: %s" % e.reason)
+
+
+def _err_text(status, parsed, text):
+    if isinstance(parsed, dict):
+        msgs = []
+        if parsed.get("errorMessages"):
+            msgs.extend(parsed["errorMessages"])
+        if isinstance(parsed.get("errors"), dict):
+            msgs.extend("%s: %s" % (k, v) for k, v in parsed["errors"].items())
+        if msgs:
+            return "HTTP %s: %s" % (status, "; ".join(msgs))
+    return "HTTP %s: %s" % (status, text.strip()[:500])
+
+
+# --------------------------------------------------------------------------
+# Markdown -> Atlassian Document Format (ADF)
+# --------------------------------------------------------------------------
+
+import re
+
+_LINK_RE = re.compile(r"\[([^\]]+)\]\((https?://[^)\s]+)\)")
+_BARE_URL_RE = re.compile(r"(https?://[^\s)]+)")
+_BOLD_RE = re.compile(r"\*\*([^*]+)\*\*")
+_CODE_RE = re.compile(r"`([^`]+)`")
+
+
+def _inline_nodes(text):
+    """Turn one line of markdown-ish text into ADF inline nodes.
+
+    Handles [label](url) links, bare URLs as links, **bold**, and `code`.
+    Order matters: markdown links first so their URL is not double-matched.
+    """
+    nodes = []
+
+    # Tokenize on markdown links first, keeping the surrounding text.
+    pos = 0
+    for m in _LINK_RE.finditer(text):
+        if m.start() > pos:
+            nodes.extend(_inline_plain(text[pos:m.start()]))
+        nodes.append(
+            {
+                "type": "text",
+                "text": m.group(1),
+                "marks": [{"type": "link", "attrs": {"href": m.group(2)}}],
+            }
+        )
+        pos = m.end()
+    if pos < len(text):
+        nodes.extend(_inline_plain(text[pos:]))
+    return nodes or [{"type": "text", "text": text}]
+
+
+def _inline_plain(text):
+    """Inline handling for a chunk with no markdown links: bare URLs, bold, code."""
+    if not text:
+        return []
+    nodes = []
+    pos = 0
+    for m in _BARE_URL_RE.finditer(text):
+        if m.start() > pos:
+            nodes.extend(_inline_marks(text[pos:m.start()]))
+        nodes.append(
+            {
+                "type": "text",
+                "text": m.group(1),
+                "marks": [{"type": "link", "attrs": {"href": m.group(1)}}],
+            }
+        )
+        pos = m.end()
+    if pos < len(text):
+        nodes.extend(_inline_marks(text[pos:]))
+    return nodes
+
+
+def _inline_marks(text):
+    """Apply **bold** and `code` marks in a chunk with no links."""
+    if not text:
+        return []
+    # Process code spans first (they suppress bold inside).
+    out = []
+    pos = 0
+    for m in _CODE_RE.finditer(text):
+        if m.start() > pos:
+            out.extend(_bold_nodes(text[pos:m.start()]))
+        out.append(
+            {"type": "text", "text": m.group(1), "marks": [{"type": "code"}]}
+        )
+        pos = m.end()
+    if pos < len(text):
+        out.extend(_bold_nodes(text[pos:]))
+    return out
+
+
+def _bold_nodes(text):
+    if not text:
+        return []
+    out = []
+    pos = 0
+    for m in _BOLD_RE.finditer(text):
+        if m.start() > pos:
+            out.append({"type": "text", "text": text[pos:m.start()]})
+        out.append(
+            {"type": "text", "text": m.group(1), "marks": [{"type": "strong"}]}
+        )
+        pos = m.end()
+    if pos < len(text):
+        out.append({"type": "text", "text": text[pos:]})
+    return out
+
+
+def md_to_adf(md):
+    """Convert a subset of Markdown to an ADF document.
+
+    Supported: ATX headings (#..######), unordered lists (-,*,+), ordered
+    lists (1.), fenced code blocks (```), and paragraphs with inline links,
+    bold, and code. Everything else falls back to plain paragraphs. This is a
+    best-effort v1 converter; its one hard requirement is that links render as
+    clickable ADF link marks.
+    """
+    lines = md.replace("\r\n", "\n").split("\n")
+    content = []
+    i = 0
+    n = len(lines)
+
+    def flush_para(buf):
+        if buf:
+            joined = " ".join(x.strip() for x in buf).strip()
+            if joined:
+                content.append(
+                    {"type": "paragraph", "content": _inline_nodes(joined)}
+                )
+
+    para = []
+    while i < n:
+        line = lines[i]
+        stripped = line.strip()
+
+        # Fenced code block.
+        if stripped.startswith("```"):
+            flush_para(para)
+            para = []
+            lang = stripped[3:].strip()
+            code_lines = []
+            i += 1
+            while i < n and not lines[i].strip().startswith("```"):
+                code_lines.append(lines[i])
+                i += 1
+            i += 1  # skip closing fence
+            block = {
+                "type": "codeBlock",
+                "content": [{"type": "text", "text": "\n".join(code_lines)}],
+            }
+            if lang:
+                block["attrs"] = {"language": lang}
+            content.append(block)
+            continue
+
+        # Blank line ends a paragraph.
+        if not stripped:
+            flush_para(para)
+            para = []
+            i += 1
+            continue
+
+        # Heading.
+        hm = re.match(r"^(#{1,6})\s+(.*)$", stripped)
+        if hm:
+            flush_para(para)
+            para = []
+            content.append(
+                {
+                    "type": "heading",
+                    "attrs": {"level": len(hm.group(1))},
+                    "content": _inline_nodes(hm.group(2).strip()),
+                }
+            )
+            i += 1
+            continue
+
+        # Unordered list block.
+        if re.match(r"^[-*+]\s+", stripped):
+            flush_para(para)
+            para = []
+            items = []
+            while i < n and re.match(r"^[-*+]\s+", lines[i].strip()):
+                item_text = re.sub(r"^[-*+]\s+", "", lines[i].strip())
+                items.append(
+                    {
+                        "type": "listItem",
+                        "content": [
+                            {"type": "paragraph", "content": _inline_nodes(item_text)}
+                        ],
+                    }
+                )
+                i += 1
+            content.append({"type": "bulletList", "content": items})
+            continue
+
+        # Ordered list block.
+        if re.match(r"^\d+[.)]\s+", stripped):
+            flush_para(para)
+            para = []
+            items = []
+            while i < n and re.match(r"^\d+[.)]\s+", lines[i].strip()):
+                item_text = re.sub(r"^\d+[.)]\s+", "", lines[i].strip())
+                items.append(
+                    {
+                        "type": "listItem",
+                        "content": [
+                            {"type": "paragraph", "content": _inline_nodes(item_text)}
+                        ],
+                    }
+                )
+                i += 1
+            content.append({"type": "orderedList", "content": items})
+            continue
+
+        # Otherwise accumulate into a paragraph.
+        para.append(line)
+        i += 1
+
+    flush_para(para)
+
+    if not content:
+        content = [{"type": "paragraph", "content": [{"type": "text", "text": ""}]}]
+    return {"type": "doc", "version": 1, "content": content}
+
+
+def _adf_from_args(description_file, description_text):
+    if description_file:
+        try:
+            with open(description_file, "r", encoding="utf-8") as fh:
+                return md_to_adf(fh.read())
+        except OSError as e:
+            _fail("cannot read description file %s: %s" % (description_file, e))
+    if description_text is not None:
+        return md_to_adf(description_text)
+    return None
+
+
+# --------------------------------------------------------------------------
+# Verbs
+# --------------------------------------------------------------------------
+
+
+def cmd_whoami(args):
+    status, parsed, text = api("GET", "/rest/api/3/myself")
+    if status != 200:
+        _fail(_err_text(status, parsed, text))
+    if args.json:
+        print(json.dumps(parsed, indent=2))
+    else:
+        print(
+            "%s <%s>  accountId=%s"
+            % (
+                parsed.get("displayName", "?"),
+                parsed.get("emailAddress", "?"),
+                parsed.get("accountId", "?"),
+            )
+        )
+
+
+def _create_issue(project, summary, issuetype, adf, labels, assignee, sprint_id):
+    fields = {
+        "project": {"key": project},
+        "summary": summary,
+        "issuetype": {"name": issuetype},
+    }
+    if adf is not None:
+        fields["description"] = adf
+    if labels:
+        fields["labels"] = labels
+    if assignee:
+        fields["assignee"] = {"accountId": assignee}
+    status, parsed, text = api("POST", "/rest/api/3/issue", {"fields": fields})
+    if status not in (200, 201):
+        return None, _err_text(status, parsed, text)
+    key = parsed.get("key")
+    if sprint_id and key:
+        s, p, t = api(
+            "POST",
+            "/rest/agile/1.0/sprint/%s/issue" % sprint_id,
+            {"issues": [key]},
+        )
+        if s not in (200, 204):
+            return key, "created %s but sprint move failed: %s" % (
+                key,
+                _err_text(s, p, t),
+            )
+    return key, None
+
+
+def cmd_create(args):
+    adf = _adf_from_args(args.description_file, None)
+    key, err = _create_issue(
+        args.project,
+        args.summary,
+        args.type,
+        adf,
+        args.label,
+        args.assignee,
+        args.sprint,
+    )
+    if key is None:
+        _fail(err)
+    if err:
+        # Created but a follow-up (sprint move) failed; surface loudly.
+        sys.stderr.write("jira-axi: %s\n" % err)
+    print(key)
+
+
+def cmd_update(args):
+    fields = {}
+    update = {}
+    if args.summary is not None:
+        fields["summary"] = args.summary
+    adf = _adf_from_args(args.description_file, None)
+    if adf is not None:
+        fields["description"] = adf
+    label_ops = []
+    for l in args.label_add or []:
+        label_ops.append({"add": l})
+    for l in args.label_remove or []:
+        label_ops.append({"remove": l})
+    if label_ops:
+        update["labels"] = label_ops
+    if not fields and not update:
+        _fail("update: nothing to change (give --summary, --description-file, "
+              "--label-add, or --label-remove)")
+    payload = {}
+    if fields:
+        payload["fields"] = fields
+    if update:
+        payload["update"] = update
+    status, parsed, text = api(
+        "PUT", "/rest/api/3/issue/%s" % args.key, payload
+    )
+    if status not in (200, 204):
+        _fail(_err_text(status, parsed, text))
+    print("%s updated" % args.key)
+
+
+def _get_transitions(key):
+    status, parsed, text = api(
+        "GET", "/rest/api/3/issue/%s/transitions" % key
+    )
+    if status != 200:
+        _fail(_err_text(status, parsed, text))
+    return parsed.get("transitions", [])
+
+
+def cmd_transitions(args):
+    trs = _get_transitions(args.key)
+    if args.json:
+        print(json.dumps(trs, indent=2))
+        return
+    for t in trs:
+        print("%s\t-> %s" % (t.get("id"), t.get("name")))
+
+
+def cmd_transition(args):
+    trs = _get_transitions(args.key)
+    match = None
+    for t in trs:
+        if t.get("name", "").lower() == args.to.lower():
+            match = t
+            break
+    if not match:
+        names = ", ".join(t.get("name", "?") for t in trs) or "(none available)"
+        _fail("no transition named %r; available: %s" % (args.to, names))
+    status, parsed, text = api(
+        "POST",
+        "/rest/api/3/issue/%s/transitions" % args.key,
+        {"transition": {"id": match["id"]}},
+    )
+    if status not in (200, 204):
+        _fail(_err_text(status, parsed, text))
+    print("%s -> %s" % (args.key, match["name"]))
+
+
+def cmd_comment(args):
+    try:
+        with open(args.body_file, "r", encoding="utf-8") as fh:
+            body = fh.read()
+    except OSError as e:
+        _fail("cannot read body file %s: %s" % (args.body_file, e))
+    status, parsed, text = api(
+        "POST",
+        "/rest/api/3/issue/%s/comment" % args.key,
+        {"body": md_to_adf(body)},
+    )
+    if status not in (200, 201):
+        _fail(_err_text(status, parsed, text))
+    print("%s comment added (id=%s)" % (args.key, parsed.get("id", "?")))
+
+
+def cmd_sprint_assign(args):
+    status, parsed, text = api(
+        "POST",
+        "/rest/agile/1.0/sprint/%s/issue" % args.sprint,
+        {"issues": args.keys},
+    )
+    if status not in (200, 204):
+        _fail(_err_text(status, parsed, text))
+    print("moved %d issue(s) to sprint %s: %s" % (len(args.keys), args.sprint, ", ".join(args.keys)))
+
+
+def cmd_get(args):
+    status, parsed, text = api("GET", "/rest/api/3/issue/%s" % args.key)
+    if status != 200:
+        _fail(_err_text(status, parsed, text))
+    if args.json:
+        print(json.dumps(parsed, indent=2))
+        return
+    f = parsed.get("fields", {})
+    print("Key:      %s" % parsed.get("key"))
+    print("Summary:  %s" % f.get("summary"))
+    print("Type:     %s" % (f.get("issuetype") or {}).get("name"))
+    print("Status:   %s" % (f.get("status") or {}).get("name"))
+    print("Labels:   %s" % ", ".join(f.get("labels") or []))
+    assignee = f.get("assignee") or {}
+    print("Assignee: %s" % (assignee.get("displayName") or "(unassigned)"))
+
+
+def cmd_search(args):
+    # Jira Cloud's newer /search/jql endpoint is the supported path.
+    body = {
+        "jql": args.jql,
+        "maxResults": args.max_results,
+        "fields": ["summary", "status", "labels", "issuetype"],
+    }
+    status, parsed, text = api("POST", "/rest/api/3/search/jql", body)
+    if status != 200:
+        # Fall back to the classic GET search for older instances.
+        status, parsed, text = api(
+            "GET",
+            "/rest/api/3/search",
+            query={
+                "jql": args.jql,
+                "maxResults": args.max_results,
+                "fields": "summary,status,labels,issuetype",
+            },
+        )
+    if status != 200:
+        _fail(_err_text(status, parsed, text))
+    if args.json:
+        print(json.dumps(parsed, indent=2))
+        return
+    issues = parsed.get("issues", [])
+    print("%d issue(s)" % parsed.get("total", len(issues)))
+    for it in issues:
+        f = it.get("fields", {})
+        print(
+            "%s\t%s\t%s"
+            % (
+                it.get("key"),
+                (f.get("status") or {}).get("name", "?"),
+                f.get("summary", ""),
+            )
+        )
+
+
+def _label_exists(label):
+    """Return True if any issue already carries this label (idempotence key)."""
+    jql = 'labels = "%s"' % label.replace('"', '\\"')
+    body = {"jql": jql, "maxResults": 1, "fields": ["key"]}
+    status, parsed, text = api("POST", "/rest/api/3/search/jql", body)
+    if status != 200:
+        status, parsed, text = api(
+            "GET",
+            "/rest/api/3/search",
+            query={"jql": jql, "maxResults": 1, "fields": "key"},
+        )
+    if status != 200:
+        _fail("idempotence check failed: " + _err_text(status, parsed, text))
+    issues = parsed.get("issues", [])
+    if issues:
+        return issues[0].get("key")
+    return None
+
+
+def cmd_bulk_create(args):
+    try:
+        with open(args.from_file, "r", encoding="utf-8") as fh:
+            entries = json.load(fh)
+    except OSError as e:
+        _fail("cannot read batch file %s: %s" % (args.from_file, e))
+    except ValueError as e:
+        _fail("batch file is not valid JSON: %s" % e)
+    if not isinstance(entries, list):
+        _fail("batch file must be a JSON array of create payloads")
+
+    limit = args.limit if args.limit is not None else len(entries)
+    created = []
+    skipped = []
+    failed = []
+    processed = 0
+    for idx, entry in enumerate(entries):
+        if processed >= limit:
+            break
+        summary = entry.get("summary")
+        project = entry.get("project") or args.default_project
+        if not summary or not project:
+            failed.append((idx, "missing summary or project"))
+            processed += 1
+            continue
+        labels = entry.get("labels") or []
+        ext_key = entry.get("external_key")
+        # Prefer explicit external_key; else the first mm-<slug> label.
+        if not ext_key:
+            for l in labels:
+                if l.startswith("mm-") and l != "mm-triage":
+                    ext_key = l
+                    break
+        if ext_key:
+            existing = _label_exists(ext_key)
+            if existing:
+                skipped.append((idx, ext_key, existing))
+                processed += 1
+                continue
+        # Description: prefer inline description (markdown) then description_file.
+        if entry.get("description") is not None:
+            adf = md_to_adf(entry["description"])
+        elif entry.get("description_file"):
+            adf = _adf_from_args(entry["description_file"], None)
+        else:
+            adf = None
+        issuetype = entry.get("type") or entry.get("issuetype") or "Task"
+        sprint_id = entry.get("sprint") or args.default_sprint
+        assignee = entry.get("assignee")
+        if args.dry_run:
+            created.append((idx, "(dry-run)", summary))
+            processed += 1
+            continue
+        key, err = _create_issue(
+            project, summary, issuetype, adf, labels, assignee, sprint_id
+        )
+        if key is None:
+            failed.append((idx, err))
+        else:
+            created.append((idx, key, summary))
+            if err:
+                sys.stderr.write("jira-axi: %s\n" % err)
+        processed += 1
+
+    _, _, base = _creds()
+    print("=== bulk-create summary ===")
+    print("created: %d, skipped(existing): %d, failed: %d"
+          % (len(created), len(skipped), len(failed)))
+    for idx, key, summary in created:
+        if key == "(dry-run)":
+            print("  DRY  [%d] %s" % (idx, summary[:80]))
+        else:
+            print("  NEW  %s/browse/%s  %s" % (base, key, summary[:80]))
+    for idx, ext, key in skipped:
+        print("  SKIP [%d] %s already exists as %s" % (idx, ext, key))
+    for idx, err in failed:
+        print("  FAIL [%d] %s" % (idx, err))
+    if failed:
+        sys.exit(1)
+
+
+# --------------------------------------------------------------------------
+# Argument parsing
+# --------------------------------------------------------------------------
+
+
+def build_parser():
+    p = argparse.ArgumentParser(
+        prog="jira-axi",
+        description="Small Jira Cloud CLI. Credentials come from JIRA_EMAIL, "
+        "JIRA_API_TOKEN, and JIRA_BASE_URL in the environment.",
+    )
+    sub = p.add_subparsers(dest="cmd")
+
+    sp = sub.add_parser("whoami", help="auth sanity check")
+    sp.add_argument("--json", action="store_true")
+    sp.set_defaults(func=cmd_whoami)
+
+    sp = sub.add_parser("create", help="create an issue")
+    sp.add_argument("--project", required=True, help="project KEY, e.g. DEV")
+    sp.add_argument("--summary", required=True)
+    sp.add_argument("--type", default="Task", help="issue type name (default Task)")
+    sp.add_argument("--description-file", help="markdown file for the description")
+    sp.add_argument("--label", action="append", help="add a label (repeatable)")
+    sp.add_argument("--sprint", help="sprint id to move the new issue into")
+    sp.add_argument("--assignee", help="accountId to assign")
+    sp.set_defaults(func=cmd_create)
+
+    sp = sub.add_parser("update", help="update an issue")
+    sp.add_argument("key")
+    sp.add_argument("--summary")
+    sp.add_argument("--description-file")
+    sp.add_argument("--label-add", action="append")
+    sp.add_argument("--label-remove", action="append")
+    sp.set_defaults(func=cmd_update)
+
+    sp = sub.add_parser("transitions", help="list available transitions")
+    sp.add_argument("key")
+    sp.add_argument("--json", action="store_true")
+    sp.set_defaults(func=cmd_transitions)
+
+    sp = sub.add_parser("transition", help="move an issue to a workflow state")
+    sp.add_argument("key")
+    sp.add_argument("--to", required=True, help="target state name")
+    sp.set_defaults(func=cmd_transition)
+
+    sp = sub.add_parser("comment", help="add a comment")
+    sp.add_argument("key")
+    sp.add_argument("--body-file", required=True)
+    sp.set_defaults(func=cmd_comment)
+
+    sp = sub.add_parser("sprint-assign", help="move issues into a sprint")
+    sp.add_argument("keys", nargs="+", metavar="KEY")
+    sp.add_argument("--sprint", required=True, help="sprint id")
+    sp.set_defaults(func=cmd_sprint_assign)
+
+    sp = sub.add_parser("get", help="fetch one issue")
+    sp.add_argument("key")
+    sp.add_argument("--json", action="store_true")
+    sp.set_defaults(func=cmd_get)
+
+    sp = sub.add_parser("search", help="run a JQL search")
+    sp.add_argument("--jql", required=True)
+    sp.add_argument("--max-results", type=int, default=50)
+    sp.add_argument("--json", action="store_true")
+    sp.set_defaults(func=cmd_search)
+
+    sp = sub.add_parser("bulk-create", help="idempotent batch create from JSON")
+    sp.add_argument("--from-file", required=True)
+    sp.add_argument("--limit", type=int, help="create at most N (default all)")
+    sp.add_argument("--default-project", help="project KEY when an entry omits it")
+    sp.add_argument("--default-sprint", help="sprint id when an entry omits it")
+    sp.add_argument("--dry-run", action="store_true",
+                    help="show what would be created without calling Jira")
+    sp.set_defaults(func=cmd_bulk_create)
+
+    return p
+
+
+def main(argv):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if not getattr(args, "cmd", None):
+        parser.print_help()
+        return 2
+    args.func(args)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
