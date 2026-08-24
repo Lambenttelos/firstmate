@@ -1867,3 +1867,9 @@ if [ "$KIND" = secondmate ]; then
 fi
 
 echo "spawned $ID harness=$HARNESS kind=$KIND mode=$MODE yolo=$YOLO window=$META_WINDOW worktree=$WT"
+
+# Keep the captain's already-published desk current: a new worker just changed
+# fleet state, so rebuild the desk file in place if one is live. Best-effort and
+# silent by contract (no-op without a live desk, never re-serves, never wakes);
+# it self-detaches so it cannot delay this spawn. See bin/fm-desk-event.sh.
+FM_HOME="$FM_HOME" "$SCRIPT_DIR/fm-desk-event.sh" spawn >/dev/null 2>&1 || true

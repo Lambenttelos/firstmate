@@ -1758,3 +1758,9 @@ echo "teardown $ID complete (window $T, worktree $WT)"
 fm_completions_record "$DATA" "$ID" "$(date -u +%Y-%m-%d)" "$KIND" "$COMPLETION_REPO" "$LANDING_SHA" \
   || echo "teardown: WARNING could not append $ID to the completion ledger" >&2
 backlog_refresh_reminder
+
+# A task just finished and was cleaned up, which changes what the desk shows
+# (one fewer worker, possibly a new landed/ready entry), so rebuild the live desk
+# in place if one exists. Best-effort and silent (no-op without a live desk,
+# never re-serves, never wakes); it self-detaches. See bin/fm-desk-event.sh.
+FM_HOME="$FM_HOME" "$SCRIPT_DIR/fm-desk-event.sh" teardown >/dev/null 2>&1 || true

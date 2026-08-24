@@ -7,8 +7,12 @@
 # script: no resident process, no memory cost, no supervision turn. It is
 # READ-ONLY over fleet state and SILENT by construction - see NEVER WAKES below.
 #
-# Invoked MANUALLY, on request. It is deliberately not on any schedule and is not
-# wired into the watcher cycle: the captain asks for the desk when they want it.
+# Invoked on request when the captain asks for the desk, and also in place by
+# bin/fm-desk-event.sh on a task-lifecycle event once a desk already exists, so an
+# open page stays current without a manual rebuild. It is still deliberately not
+# on any schedule and not a watcher POLL: nothing here polls fleet state on a
+# timer. The event trigger owns its own coalescing and only ever rebuilds this
+# file; it never re-serves.
 #
 # Usage:
 #   fm-desk-refresh.sh              render the desk to the stable output path
@@ -225,6 +229,20 @@ DESK_MAX_DECISIONS=${FM_DESK_MAX_DECISIONS:-12}
 usage() {
   awk 'NR>=2 { if ($0 ~ /^set -u/) exit; sub(/^# ?/, ""); print }' "${BASH_SOURCE[0]}"
 }
+
+# Entry-point argument parse, done HERE so --path and --help are cheap: they must
+# not pay for the ~2-minute fleet gather below just to print a path or the help.
+# fm-desk-event.sh (the lifecycle auto-refresh trigger) calls --path on every
+# event to learn whether a desk exists, so that read has to be instant. Placing
+# the parse before the gather also means an unknown argument is rejected up front
+# instead of after two minutes of work. The empty-argument case falls through to
+# the normal collect-and-render path below.
+case "${1:-}" in
+  --path) printf '%s\n' "$OUT"; exit 0 ;;
+  -h|--help) usage; exit 0 ;;
+  '') ;;
+  *) printf 'fm-desk-refresh: unknown argument: %s\n' "$1" >&2; usage >&2; exit 64 ;;
+esac
 
 # --- internal-vocabulary translation ----------------------------------------
 #
@@ -2334,13 +2352,11 @@ HTML
 }
 
 # --- entry point ------------------------------------------------------------
-
-case "${1:-}" in
-  --path) printf '%s\n' "$OUT"; exit 0 ;;
-  -h|--help) usage; exit 0 ;;
-  '') ;;
-  *) printf 'fm-desk-refresh: unknown argument: %s\n' "$1" >&2; usage >&2; exit 64 ;;
-esac
+#
+# Arguments (--path, --help, unknown) are parsed up near the top of the script,
+# before the fleet gather, so --path/--help stay cheap; see that case block. By
+# the time control reaches here the argument was empty (the render path), so this
+# proceeds straight to writing the page.
 
 OUT_DIR=$(dirname "$OUT")
 if ! mkdir -p "$OUT_DIR" 2>/dev/null; then
