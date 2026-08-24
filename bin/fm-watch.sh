@@ -138,6 +138,8 @@ mkdir -p "$STATE"
 # passes (hourly_pass_sweep below). Unarmed homes never run them.
 # shellcheck source=bin/fm-hourly-lib.sh
 . "$SCRIPT_DIR/fm-hourly-lib.sh"
+# shellcheck source=bin/fm-token-sessions-lib.sh
+. "$SCRIPT_DIR/fm-token-sessions-lib.sh"
 
 # Shared per-task telemetry writer (state/<id>.telemetry, key=value). The
 # hot-path 429 anomaly scan (quota_anomaly_scan below, Visibility Gap-2) uses
@@ -1365,6 +1367,73 @@ heartbeat_scan_finds_actionable() {
   return 1
 }
 
+# jcode_drift_sweep: the heartbeat model/effort drift watch for live jcode
+# lanes. A jcode session's model and reasoning effort are applied per-session
+# through /model and /effort after launch, and the slash-popup submit race can
+# lose a slash command silently (incident 2026-08-23, data/learnings.md "MODEL
+# DRIFT INCIDENT": three tooling lanes ran the wrong model at max effort for
+# hours) - and a worker can also change its own profile later. The session
+# store (~/.jcode/sessions/session_<sid>.json, fields model and
+# reasoning_effort) is the ONLY truth; pane echo is not. For every live jcode
+# task this compares the profile the meta records (last-write-wins: fm-spawn
+# stamps the CONFIRMED values after a verified apply) against the store's
+# CURRENT values, and wakes firstmate once per drift signature with a `check:
+# model-drift <id> wanted=<m>/<e> actual=<m>/<e>` line. The marker re-arms
+# silently when the store comes back to the recorded profile. Fail-closed on
+# every uncertainty: an unrequested axis, a supervise=off pane, a task that is
+# not jcode, an unresolvable session id, or an unreadable store is skipped -
+# never guessed. Cheap by design: one json read per jcode task per heartbeat,
+# nothing for any other harness.
+jcode_drift_sweep() {
+  local meta task model effort sid worktree profile kv actual_model actual_effort
+  local wanted actual sig marker key
+  for meta in "$STATE"/*.meta; do
+    [ -e "$meta" ] || continue
+    [ "$(fm_meta_get "$meta" supervise 2>/dev/null || true)" = off ] && continue
+    [ "$(fm_meta_get "$meta" harness)" = jcode ] || continue
+    task=$(basename "$meta"); task=${task%.meta}
+    key=$(printf '%s' "$task" | tr ':/.' '___')
+    model=$(fm_meta_get "$meta" model)
+    effort=$(fm_meta_get "$meta" effort)
+    [ "$model" = default ] && model=
+    [ "$effort" = default ] && effort=
+    { [ -n "$model" ] || [ -n "$effort" ]; } || continue
+    sid=$(fm_meta_get "$meta" session_id)
+    if [ -z "$sid" ]; then
+      worktree=$(fm_meta_get "$meta" worktree)
+      [ -n "$worktree" ] || continue
+      sid=$(fm_resolve_crew_session_id "$worktree" "" 2>/dev/null || true)
+    fi
+    [ -n "$sid" ] || continue
+    profile=$(fm_session_store_profile "$sid" 2>/dev/null || true)
+    [ -n "$profile" ] || continue
+    actual_model= actual_effort=
+    while IFS= read -r kv; do
+      case "$kv" in
+        model=*) actual_model=${kv#model=} ;;
+        effort=*) actual_effort=${kv#effort=} ;;
+      esac
+    done <<EOF
+$profile
+EOF
+    wanted="${model:--}/${effort:--}"
+    actual="${actual_model:--}/${actual_effort:--}"
+    if { [ -n "$model" ] && [ "$actual_model" != "$model" ]; } \
+      || { [ -n "$effort" ] && [ "$actual_effort" != "$effort" ]; }; then
+      sig="$wanted|$actual"
+      marker="$STATE/.drift-surfaced-$key"
+      [ "$(cat "$marker" 2>/dev/null || true)" = "$sig" ] && continue
+      printf '%s' "$sig" > "$marker"
+      reason="check: model-drift $task wanted=$wanted actual=$actual"
+      fm_wake_append check "model-drift-$task" "$reason" || exit 1
+      touch "$STATE/.last-check"
+      wake "$reason"
+    else
+      rm -f "$STATE/.drift-surfaced-$key"
+    fi
+  done
+}
+
 # event_wait_or_sleep: the terminal wait of each supervision cycle. For a home
 # with push-capable windows (herdr), it replaces the blind `sleep POLL` with a
 # bounded wait on the backend's native transition stream, so a crew going
@@ -1973,6 +2042,12 @@ EOF
   hb=$(( HEARTBEAT * (1 << streak) ))
   [ "$hb" -gt "$HEARTBEAT_MAX" ] && hb=$HEARTBEAT_MAX
   if [ "$(age_of "$STATE/.last-heartbeat")" -ge "$hb" ]; then
+    # Model/effort drift watch for live jcode lanes: the session store is the
+    # only truth for what a session runs, and a silently-lost /model|/effort or
+    # a later in-session switch must surface, never run hours on the wrong
+    # profile. One json read per jcode task per heartbeat; wakes once per drift
+    # signature via `check: model-drift <id>`; re-arms when the store matches.
+    jcode_drift_sweep
     # Triage: in always-on mode a heartbeat is benign unless the cheap fleet-scan
     # turns up a captain-relevant status the per-wake path missed. Absorb the
     # no-change case (advance the schedule and back off exactly as wake() would,

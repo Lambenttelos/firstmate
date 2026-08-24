@@ -202,3 +202,43 @@ PY
   printf '%s' "$out"
   return 0
 }
+
+# Read a session's ACTUAL model and reasoning effort from the jcode session
+# store - the ground truth for whether /model and /effort actually applied to a
+# session (pane echo is not proof; incident 2026-08-23, data/learnings.md
+# "MODEL DRIFT INCIDENT": the slash-popup race lost /model|/effort silently).
+# The store file is <sessions_dir>/<sid>.json (the session id already carries
+# its `session_` prefix, so it is NOT doubled) with fields `model` and
+# `reasoning_effort`; a null field reads as empty. Used by fm-spawn.sh's
+# spawn-time verify-and-retry and by fm-watch.sh's heartbeat drift sweep, so the
+# store format contract lives here, once.
+#
+# Args: <session-id> [sessions_dir]
+# Prints one line per field, `model=<value>` and `effort=<value>`, and returns
+# 0. Returns 1 and prints NOTHING when the session id is empty, python3 is
+# missing, the file is missing/unreadable, or the JSON does not parse - a caller
+# that got nothing must treat verification as impossible, never as passed.
+fm_session_store_profile() {
+  local sid=$1 sessions_dir=${2:-${JCODE_SESSIONS_DIR:-$HOME/.jcode/sessions}}
+  [ -n "$sid" ] || return 1
+  command -v python3 >/dev/null 2>&1 || return 1
+  local out
+  out=$(FM_TOK_SID="$sid" FM_TOK_DIR="$sessions_dir" python3 - <<'PY'
+import json, os, sys
+
+sid = os.environ["FM_TOK_SID"]
+sess_dir = os.environ["FM_TOK_DIR"]
+try:
+    with open(os.path.join(sess_dir, "%s.json" % sid)) as fh:
+        data = json.load(fh)
+except (OSError, ValueError):
+    sys.exit(1)
+model = data.get("model") or ""
+effort = data.get("reasoning_effort") or ""
+sys.stdout.write("model=%s\neffort=%s\n" % (model, effort))
+PY
+) || return 1
+  [ -n "$out" ] || return 1
+  printf '%s\n' "$out"
+  return 0
+}
