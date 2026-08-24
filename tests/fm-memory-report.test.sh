@@ -143,7 +143,11 @@ build_listings() {
     printf '1002\t%s\n' "$WT_TASK"
     printf '1003\t%s\n' "$WT_SECOND"
     printf '1005\t%s\n' "$WT_STALE"
-    printf '1008\t/tmp\n'
+    # The foreign agent's cwd must NOT be an ancestor of the unclaimed checkout
+    # (WT_STALE): shares_agent_dir adopts tooling under a live agent's cwd, so a
+    # cwd of /tmp would shadow the leftover on hosts whose temp root is /tmp
+    # (CI), classifying it as "live agent, not this fleet" instead of unclaimed.
+    printf '1008\t%s\n' "$TMPROOT/foreign-agent"
     printf '1006\t%s\n' "$HOME_DIR"
     printf '1010\t%s\n' "$WT_BACKEND"
   } > "$LSOF"
