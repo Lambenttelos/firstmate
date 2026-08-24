@@ -43,6 +43,14 @@ Never add an agent name as a commit co-author.
 
 `docs/configuration.md` is the single owner of the top-level operational-home layout and configuration schemas, including the full annotated layout tree; each producing script's header and help own exact child fields and mutation mechanics.
 Consult that tree when a file, flag, or ownership question comes up.
+
+The rows below stay pinned here for the byte-for-byte safety-string guard; the complete annotated tree lives in `docs/configuration.md`:
+    completions.tsv    append-only, NEVER-pruned completion ledger, one line per task that reaches teardown; firstmate-private, owned by fm-completions-lib.sh (the single owner of exact field mechanics)
+    token-sessions.tsv  append-only, NEVER-pruned harness-session ledger, many rows per task id (one per spawn/relaunch, deduped only by exact id+session_id pair) plus a row under the sentinel id `__firstmate__` for firstmate's own session; captain-private, gitignored, owned by fm-token-sessions-lib.sh (the single owner of append mechanics and fm_resolve_crew_session_id); left untouched by teardown so per-ticket token/cost rollup survives task-metadata pruning
+    <id>/report.md     scout task deliverable, written by the crewmate; survives teardown
+    heavy-runs/        heavy-run lease queue when FM_HEAVY_RUN_DIR points here; by default the ledger is host-global outside any home; bin/fm-heavy-run.sh owns it, never edit by hand (docs/configuration.md "Heavy-run serialization")
+    .hash-* .count-* .stale-* .stale-since-* .paused-* .wedge-escalations-* .seen-* .hb-surfaced-* .last-* .resource-* .heartbeat-streak   watcher internals; never touch
+    .subsuper-* .supervise-daemon.*   sub-supervisor internals; never touch
 `FM_HOME` selects an instance's private `data/`, `state/`, `config/`, and `projects/`, while scripts continue to come from their tracked code root.
 Each secondmate has a persistent isolated `FM_HOME`, including its own state, backlog, projects, and session lock.
 `bin/fm-send.sh` fails closed unless `FM_HOME` is explicit, so a steer cannot silently resolve against another home.
