@@ -20,6 +20,13 @@
 #   - record and remove fail rather than proceed unlocked when the lock is held
 #   - a branch-gone sweep clears with distinct wording, never worded as a merge
 #   - compare-url builds github and bitbucket links and falls back for unknown hosts
+#   - auto-merge eligibility is an ORIGIN allowlist: an owned github.com/<owner>
+#     clone is eligible, a Bitbucket product clone and a non-owned github clone are
+#     skipped, and a missing/originless clone is skipped (fail closed)
+#   - the dispatch plan groups the queue by clone and classifies each as
+#     eligible/below-threshold/skip, keeping product repos off the eligible list
+#   - the dispatch CLI prints a dry plan and spawns nothing by default, and
+#     --execute spawns one worker only per eligible clone, never for a product repo
 set -u
 
 # shellcheck source=tests/lib.sh disable=SC1091
@@ -274,6 +281,230 @@ test_compare_url_hosts() {
   pass "compare-url builds github and bitbucket links and falls back for unknown hosts"
 }
 
+# Make a bare git repo that stands in for a clone with a chosen origin URL. The
+# eligibility gate only reads `git remote get-url origin`, so a directory that is
+# a git repo with that origin set is a sufficient fixture - no commits needed.
+# Echoes the clone dir path.
+make_clone_with_origin() {
+  local dir=$1 origin=$2
+  mkdir -p "$dir"
+  git -C "$dir" init -q
+  git -C "$dir" remote add origin "$origin"
+  printf '%s\n' "$dir"
+}
+
+test_repo_auto_mergeable_owned_github() {
+  local base="$TMP_ROOT/elig-owned" clone
+  clone=$(make_clone_with_origin "$base/firstmate" 'git@github.com:yjuyjuy/firstmate.git')
+  local out rc=0
+  out=$(fm_merge_queue_repo_auto_mergeable "$clone") || rc=$?
+  [ "$rc" -eq 0 ] || fail "owned github clone not eligible (rc=$rc): $out"
+  case "$out" in eligible:*) : ;; *) fail "owned github reason not 'eligible:': $out" ;; esac
+  pass "auto-merge eligibility accepts an owned github.com tooling fork"
+}
+
+test_repo_auto_mergeable_skips_bitbucket_product() {
+  # The hard captain rule: a Bitbucket dashnow product repo is NEVER eligible.
+  local base="$TMP_ROOT/elig-bb" clone
+  clone=$(make_clone_with_origin "$base/hyfin-server" 'git@bitbucket.org:dashnow/hyfin-server.git')
+  local out rc=0
+  out=$(fm_merge_queue_repo_auto_mergeable "$clone") || rc=$?
+  [ "$rc" -eq 1 ] || fail "bitbucket product clone was NOT skipped (rc=$rc): $out"
+  case "$out" in skip:*) : ;; *) fail "bitbucket product reason not 'skip:': $out" ;; esac
+  pass "auto-merge eligibility skips a Bitbucket product repo (hard captain rule)"
+}
+
+test_repo_auto_mergeable_skips_unowned_github() {
+  # A github.com repo under a different owner is not ours to merge.
+  local base="$TMP_ROOT/elig-unowned" clone
+  clone=$(make_clone_with_origin "$base/paseo" 'git@github.com:getpaseo/paseo.git')
+  local rc=0
+  fm_merge_queue_repo_auto_mergeable "$clone" >/dev/null || rc=$?
+  [ "$rc" -eq 1 ] || fail "non-owned github clone was NOT skipped (rc=$rc)"
+  pass "auto-merge eligibility skips a github repo under an owner we do not own"
+}
+
+test_repo_auto_mergeable_fails_closed_on_missing_clone() {
+  # A missing clone path cannot be verified as ours, so it must be skipped, never
+  # eligible. This is the fail-closed guarantee.
+  local rc=0
+  fm_merge_queue_repo_auto_mergeable "$TMP_ROOT/does-not-exist-clone" >/dev/null || rc=$?
+  [ "$rc" -eq 1 ] || fail "missing clone was treated as eligible (rc=$rc)"
+  rc=0
+  # An originless git repo is likewise unverifiable -> skip.
+  local noremote="$TMP_ROOT/noremote"
+  mkdir -p "$noremote"; git -C "$noremote" init -q
+  fm_merge_queue_repo_auto_mergeable "$noremote" >/dev/null || rc=$?
+  [ "$rc" -eq 1 ] || fail "originless clone was treated as eligible (rc=$rc)"
+  pass "auto-merge eligibility fails closed on a missing or originless clone"
+}
+
+test_repo_auto_mergeable_owner_override() {
+  # The owned owner is configurable via FM_MERGE_QUEUE_OWNED_GITHUB_OWNER so a
+  # differently-forked fleet is not hard-wired to one owner.
+  local base="$TMP_ROOT/elig-override" clone rc=0
+  clone=$(make_clone_with_origin "$base/tool" 'https://github.com/acme/tool.git')
+  FM_MERGE_QUEUE_OWNED_GITHUB_OWNER=acme fm_merge_queue_repo_auto_mergeable "$clone" >/dev/null || rc=$?
+  [ "$rc" -eq 0 ] || fail "override owner clone not eligible (rc=$rc)"
+  rc=0
+  # yjuyjuy is now NOT the owned owner, so an old yjuyjuy clone is skipped.
+  local other
+  other=$(make_clone_with_origin "$base/other" 'git@github.com:yjuyjuy/firstmate.git')
+  FM_MERGE_QUEUE_OWNED_GITHUB_OWNER=acme fm_merge_queue_repo_auto_mergeable "$other" >/dev/null || rc=$?
+  [ "$rc" -eq 1 ] || fail "non-override owner clone was eligible (rc=$rc)"
+  pass "auto-merge eligibility honors the owned-owner override both ways"
+}
+
+test_dispatch_plan_groups_and_classifies() {
+  # Build a queue spanning one owned tooling clone (2 branches), one Bitbucket
+  # product clone (1 branch), and one non-owned github clone (1 branch). The plan
+  # must group by clone, mark only the owned one eligible, and skip the rest.
+  local data="$TMP_ROOT/plan/data" base="$TMP_ROOT/plan/repos"
+  mkdir -p "$data"
+  local tool prod unowned
+  tool=$(make_clone_with_origin "$base/firstmate" 'git@github.com:yjuyjuy/firstmate.git')
+  prod=$(make_clone_with_origin "$base/hyfin-server" 'git@bitbucket.org:dashnow/hyfin-server.git')
+  unowned=$(make_clone_with_origin "$base/paseo" 'git@github.com:getpaseo/paseo.git')
+  fm_merge_queue_record "$data" t1 "$tool" fm/t1 c1 main url1
+  fm_merge_queue_record "$data" t2 "$tool" fm/t2 c2 main url2
+  fm_merge_queue_record "$data" p1 "$prod" fm/p1 c3 dev url3
+  fm_merge_queue_record "$data" u1 "$unowned" fm/u1 c4 main url4
+  local plan
+  plan=$(fm_merge_queue_dispatch_plan "$data" 1)
+  # Owned tooling clone: eligible with count 2.
+  printf '%s\n' "$plan" | grep -F "$(printf 'eligible\t%s\t2' "$tool")" >/dev/null \
+    || fail "owned clone not eligible with count 2: $plan"
+  # Product clone: skip, never eligible.
+  printf '%s\n' "$plan" | grep -F "$(printf 'skip\t%s' "$prod")" >/dev/null \
+    || fail "product clone not marked skip: $plan"
+  printf '%s\n' "$plan" | grep -E "^eligible	$prod	" >/dev/null \
+    && fail "product clone wrongly marked eligible: $plan"
+  # Non-owned github clone: skip.
+  printf '%s\n' "$plan" | grep -F "$(printf 'skip\t%s' "$unowned")" >/dev/null \
+    || fail "non-owned clone not marked skip: $plan"
+  pass "dispatch plan groups by clone and marks only owned tooling eligible"
+}
+
+test_dispatch_plan_below_threshold() {
+  # A single queued branch on an owned clone is eligible only at min_batch 1; at
+  # min_batch 2 it becomes below-threshold, not skip (still ours, just not a batch).
+  local data="$TMP_ROOT/thresh/data" base="$TMP_ROOT/thresh/repos" tool
+  mkdir -p "$data"
+  tool=$(make_clone_with_origin "$base/no-mistakes" 'git@github.com:yjuyjuy/no-mistakes.git')
+  fm_merge_queue_record "$data" o1 "$tool" fm/o1 c1 main url1
+  local plan
+  plan=$(fm_merge_queue_dispatch_plan "$data" 2)
+  printf '%s\n' "$plan" | grep -E "^below-threshold	$tool	1" >/dev/null \
+    || fail "single owned branch not below-threshold at min_batch 2: $plan"
+  plan=$(fm_merge_queue_dispatch_plan "$data" 1)
+  printf '%s\n' "$plan" | grep -E "^eligible	$tool	1" >/dev/null \
+    || fail "single owned branch not eligible at min_batch 1: $plan"
+  pass "dispatch plan holds an eligible clone below the batch threshold rather than skipping it"
+}
+
+# Run the dispatch CLI through a shim bin dir: every real bin entry is symlinked
+# in so the CLI's sourced libs resolve, then a fake fm-spawn.sh is overlaid so an
+# execute run records its invocations instead of launching anything real. Echoes
+# the shim CLI path so a caller can invoke "<shim>/fm-merge-queue.sh".
+build_dispatch_shim_bin() {
+  local shimbin=$1 spawnlog=$2 f
+  mkdir -p "$shimbin"
+  for f in "$ROOT"/bin/*.sh; do
+    ln -sf "$f" "$shimbin/$(basename "$f")"
+  done
+  rm -f "$shimbin/fm-spawn.sh"
+  cat > "$shimbin/fm-spawn.sh" <<SPAWN
+#!/usr/bin/env bash
+printf 'SPAWN %s\n' "\$*" >> "$spawnlog"
+echo "spawned \$1 (fake)"
+SPAWN
+  chmod +x "$shimbin/fm-spawn.sh"
+  printf '%s\n' "$shimbin"
+}
+
+test_dispatch_cli_dry_run_spawns_nothing() {
+  local data="$TMP_ROOT/cli-dry/data" home="$TMP_ROOT/cli-dry/home" base="$TMP_ROOT/cli-dry/repos"
+  mkdir -p "$data" "$home/state" "$home/config"
+  local tool prod
+  tool=$(make_clone_with_origin "$base/firstmate" 'git@github.com:yjuyjuy/firstmate.git')
+  prod=$(make_clone_with_origin "$base/hyfin-server" 'git@bitbucket.org:dashnow/hyfin-server.git')
+  fm_merge_queue_record "$data" c1 "$tool" fm/c1 s1 main url1
+  fm_merge_queue_record "$data" c2 "$prod" fm/c2 s2 dev url2
+  local out
+  out=$(FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$home" FM_DATA_OVERRIDE="$data" \
+    FM_CONFIG_OVERRIDE="$home/config" FM_STATE_OVERRIDE="$home/state" \
+    "$CLI" dispatch 2>&1)
+  printf '%s\n' "$out" | grep -F 'DISPATCH' | grep -F "$tool" >/dev/null \
+    || fail "dry plan did not mark the owned clone for dispatch: $out"
+  printf '%s\n' "$out" | grep -F 'SKIP' | grep -F "$prod" >/dev/null \
+    || fail "dry plan did not mark the product clone skip: $out"
+  printf '%s\n' "$out" | grep -F 'Dry run' >/dev/null || fail "dry plan missing dry-run notice: $out"
+  # No worker metadata may have been written for either clone.
+  local m meta_found=0
+  for m in "$home"/state/*.meta; do
+    [ -e "$m" ] && meta_found=1
+  done
+  [ "$meta_found" -eq 0 ] || fail "dry run left task metadata behind"
+  pass "dispatch dry run prints the plan and spawns nothing"
+}
+
+test_dispatch_cli_execute_spawns_only_eligible() {
+  # --execute must spawn a worker for the owned clone and NEVER for the product
+  # clone. fm-spawn.sh is shimmed so nothing real launches.
+  local data="$TMP_ROOT/cli-exec/data" home="$TMP_ROOT/cli-exec/home" base="$TMP_ROOT/cli-exec/repos"
+  local shimbin="$TMP_ROOT/cli-exec/shimbin" spawnlog="$TMP_ROOT/cli-exec/spawn.log"
+  mkdir -p "$data" "$home/state" "$home/config"
+  : > "$spawnlog"
+  build_dispatch_shim_bin "$shimbin" "$spawnlog" >/dev/null
+  local tool prod
+  tool=$(make_clone_with_origin "$base/firstmate" 'git@github.com:yjuyjuy/firstmate.git')
+  prod=$(make_clone_with_origin "$base/hyfin-server" 'git@bitbucket.org:dashnow/hyfin-server.git')
+  fm_merge_queue_record "$data" e1 "$tool" fm/e1 s1 main url1
+  fm_merge_queue_record "$data" e2 "$tool" fm/e2 s2 main url2
+  fm_merge_queue_record "$data" e3 "$prod" fm/e3 s3 dev url3
+  local out
+  out=$(FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$home" FM_DATA_OVERRIDE="$data" \
+    FM_CONFIG_OVERRIDE="$home/config" FM_STATE_OVERRIDE="$home/state" \
+    "$shimbin/fm-merge-queue.sh" dispatch --execute 2>&1)
+  # Exactly one spawn, for the owned tooling clone.
+  local spawn_count
+  spawn_count=$(grep -c '^SPAWN ' "$spawnlog" || true)
+  [ "$spawn_count" = 1 ] || fail "expected exactly 1 spawn, got $spawn_count: $(cat "$spawnlog")"
+  grep -F "$tool" "$spawnlog" >/dev/null || fail "owned clone was not spawned: $(cat "$spawnlog")"
+  grep -F "$prod" "$spawnlog" >/dev/null && fail "PRODUCT clone was spawned - hard rule violated: $(cat "$spawnlog")"
+  printf '%s\n' "$out" | grep -F '1 worker(s) spawned' >/dev/null || fail "execute summary wrong: $out"
+  # The worker's brief was written and embeds ONLY the owned clone's branches.
+  local brief b
+  brief=
+  for b in "$data"/merge-batch-firstmate-*/brief.md; do
+    [ -e "$b" ] && { brief=$b; break; }
+  done
+  [ -n "$brief" ] || fail "no merge-worker brief written"
+  grep -F 'fm/e1' "$brief" >/dev/null || fail "brief missing owned branch fm/e1"
+  grep -F 'fm/e2' "$brief" >/dev/null || fail "brief missing owned branch fm/e2"
+  grep -F 'fm/e3' "$brief" >/dev/null && fail "brief leaked a product branch fm/e3"
+  grep -F 'yjuyjuy/firstmate' "$brief" >/dev/null || fail "brief missing the owned slug"
+  pass "dispatch --execute spawns only the eligible tooling clone, never the product repo"
+}
+
+test_dispatch_cli_execute_requires_harness_with_dispatch_profile() {
+  # When a crew-dispatch profile file is active, --execute without --harness must
+  # refuse, mirroring fm-spawn.sh, so the profile is never silently skipped.
+  local data="$TMP_ROOT/cli-harness/data" home="$TMP_ROOT/cli-harness/home" base="$TMP_ROOT/cli-harness/repos"
+  mkdir -p "$data" "$home/state" "$home/config"
+  printf '{}\n' > "$home/config/crew-dispatch.json"
+  local tool
+  tool=$(make_clone_with_origin "$base/firstmate" 'git@github.com:yjuyjuy/firstmate.git')
+  fm_merge_queue_record "$data" h1 "$tool" fm/h1 s1 main url1
+  local rc=0
+  FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$home" FM_DATA_OVERRIDE="$data" \
+    FM_CONFIG_OVERRIDE="$home/config" FM_STATE_OVERRIDE="$home/state" \
+    "$CLI" dispatch --execute >/dev/null 2>&1 || rc=$?
+  [ "$rc" -ne 0 ] || fail "execute did not refuse a missing harness under an active dispatch profile"
+  pass "dispatch --execute refuses without --harness when a crew-dispatch profile is active"
+}
+
+
 test_record_and_list
 test_record_replaces_same_id
 test_unsafe_field_refused
@@ -288,3 +519,13 @@ test_remove_refuses_short_rewrite
 test_lock_timeout_fails_closed
 test_sweep_branch_gone_wording_is_distinct
 test_compare_url_hosts
+test_repo_auto_mergeable_owned_github
+test_repo_auto_mergeable_skips_bitbucket_product
+test_repo_auto_mergeable_skips_unowned_github
+test_repo_auto_mergeable_fails_closed_on_missing_clone
+test_repo_auto_mergeable_owner_override
+test_dispatch_plan_groups_and_classifies
+test_dispatch_plan_below_threshold
+test_dispatch_cli_dry_run_spawns_nothing
+test_dispatch_cli_execute_spawns_only_eligible
+test_dispatch_cli_execute_requires_harness_with_dispatch_profile

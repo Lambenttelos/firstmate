@@ -123,8 +123,62 @@ explicit word, or a `yolo`-approved routine posture for a green branch), firstma
 spawn one merge worker per repo per batch to land the queued branches, then tear it
 down.
 The queue is what makes each batch discoverable; there is no daemon and no poller.
-For a repo with no PR automation (Bitbucket), the merge worker lands content into the
-base branch directly, and the same content-in-base sweep clears the entries afterward.
+
+### The `dispatch` subcommand
+
+`bin/fm-merge-queue.sh dispatch` is the on-demand batch merger that automates the
+"one worker per repo per batch" step.
+It groups the live queue by clone, classifies each clone for auto-merge, and, with
+`--execute`, spawns one merge worker for each eligible clone through the ordinary
+`bin/fm-spawn.sh` path.
+Without `--execute` it is a dry plan: it prints every clone's verdict and spawns
+nothing, so the operator always sees what would happen (including which product
+repos are skipped and why) before anything launches.
+`--min-batch N` (default 1) holds an eligible clone with fewer than `N` queued
+branches as `below-threshold` rather than dispatching a whole worker for a single
+stray branch.
+`--harness`, `--model`, and `--effort` are forwarded to `bin/fm-spawn.sh`; when a
+`config/crew-dispatch.json` profile file is active, `--harness` is required for
+`--execute`, exactly as `fm-spawn.sh` requires, so profile consultation is never
+silently skipped.
+
+Each dispatched worker lands only its own repo's queued branches, one at a time,
+through the guarded `bin/fm-pr-merge.sh` path (squash by default, which refuses a
+red or conflicting pull request and refuses any repository override).
+The worker opens no PR, writes no code, never forces anything, and touches no other
+repo.
+Firstmate's own content-in-base `sweep` clears the entries once the merges land, so
+the worker never edits the queue file.
+
+### The hard product-repo exclusion
+
+Auto-merge eligibility is the hard safety gate the captain set on 2026-08-23: our
+PRODUCT repos are NEVER auto-merged - the captain reviews and merges those pull
+requests himself.
+That covers hyfin, hyfin-server, dashposserver3, and every other Bitbucket
+`dashnow` repo.
+Only the tooling forks we own on GitHub (`github.com/yjuyjuy/*`) are eligible.
+
+The gate is an ALLOWLIST on the clone's live git origin, owned by
+`fm_merge_queue_repo_auto_mergeable` in `bin/fm-merge-queue-lib.sh`, deliberately
+never a denylist of product-repo names.
+A denylist fails open: the day a new product repo is cloned, its name is not on the
+list yet, so it would slip through and be auto-merged - exactly the mistake this gate
+exists to prevent.
+An origin allowlist fails closed: a repo is eligible only when it provably resolves
+to a `github.com/<owned-owner>` origin, so a Bitbucket product repo, a GitHub repo
+under any other owner, and a clone with no resolvable origin are all skipped by
+construction.
+The owned owner defaults to `yjuyjuy` and is overridable through
+`FM_MERGE_QUEUE_OWNED_GITHUB_OWNER` for a differently-forked fleet.
+The check reads the clone's real origin URL (a config read, never the network), so it
+tracks where the code actually lands rather than a name that can drift.
+
+For a repo with no PR automation (Bitbucket), the merge worker would land content into
+the base branch directly, and the same content-in-base sweep clears the entries
+afterward - but no such repo is auto-merge-eligible under the gate above, so a
+Bitbucket landing only happens on an explicit captain-driven merge, never through
+`dispatch`.
 
 ## Never against upstream
 

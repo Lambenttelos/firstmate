@@ -109,7 +109,7 @@ The shared no-mistakes gate refusal for fleet lifecycle entrypoints is summarize
 | `fm-pr-merge.sh`         | Record PR metadata, then merge a task's canonical full GitHub or Bitbucket URL; `--orphan` and a records-gone auto-detect merge a cleaned-up task's PR after a pre-merge green/mergeable check, recording evidence to `data/orphan-merges.log` |
 | `fm-promote.sh`          | Promote a scout task in place to a protected ship task                               |
 | `fm-teardown.sh`         | Fail-closed teardown: return landed or fully pushed ship worktrees, require completed scout deliverables, retire secondmate homes |
-| `fm-merge-queue.sh`      | Surface, sweep, and prune the durable list of released-but-unmerged ship branches (docs/merge-queue.md) |
+| `fm-merge-queue.sh`      | Surface, sweep, prune, and `dispatch` (batch-merge owned tooling forks, never product repos) the durable list of released-but-unmerged ship branches (docs/merge-queue.md) |
 | `fm-merge-queue-lib.sh`  | Own the `data/merge-queue.tsv` format, locked record/remove writes, and the fresh content-in-base merged check |
 | `fm-merge-queue-poll.sh` | Silent Bitbucket merge-queue watch: poll each queued branch's PR state and wake on merged/declined/superseded; arm and disarm the registered custom check (docs/bitbucket-merge-watch.md) |
 | `fm-completions-lib.sh`  | Own the append-only `data/completions.tsv` ledger format, its atomic, idempotent per-completion append, and the exact-id lookup used by the pre-spawn duplicate-dispatch guard |
