@@ -59,6 +59,29 @@ mtime_of() {
   stat -f %m "$1" 2>/dev/null || stat -c %Y "$1"
 }
 
+# make_fake_ps_claude <fakebin>: bin/fm-lock.sh's harness_pid() walks `ps`
+# ancestry looking for a harness command name. CI runners have no harness in
+# the test shell's ancestry, so lock acquisition (fm-lock.sh acquire) fails
+# with "cannot locate harness process in ancestry" and fm-session-start.sh
+# falls into read-only mode, which never arms the hourly passes. This fake
+# reports EVERY queried pid as a live `claude` harness so the very first
+# ancestry query matches and lock acquisition succeeds deterministically.
+# Mirrors fm-session-start.test.sh's make_fake_ps_claude.
+make_fake_ps_claude() {
+  local fakebin=$1
+  mkdir -p "$fakebin"
+  cat > "$fakebin/ps" <<'SH'
+#!/usr/bin/env bash
+set -u
+case "$*" in
+  *"comm="*) printf '/usr/local/bin/claude\n'; exit 0 ;;
+  *"args="*) printf 'claude\n'; exit 0 ;;
+esac
+exit 1
+SH
+  chmod +x "$fakebin/ps"
+}
+
 # backdate <path> <seconds>: age a file or directory by <seconds>.
 backdate() {
   local path=$1 secs=$2 stamp
@@ -388,14 +411,19 @@ t_arm_keeps_existing_stamp() {
 
 # --- arming ---------------------------------------------------------------------
 t_session_start_arms() {
-  local home root out holder_pid
+  local home root out holder_pid fakebin
   home=$(new_home arm-home)
   root="$TMP_ROOT/arm-root"
+  fakebin="$TMP_ROOT/arm-fakebin"
   mkdir -p "$root"
   git init -q -b main "$root"
   git -C "$root" commit -q --allow-empty -m init
+  # The lock is acquirable only when a harness shows up in `ps` ancestry; CI
+  # has none, so fake every queried pid as a harness (see make_fake_ps_claude).
+  make_fake_ps_claude "$fakebin"
 
   out=$(env -u CLAUDECODE -u PI_CODING_AGENT -u GROK_AGENT \
+    PATH="$fakebin:$PATH" \
     FM_HOME="$home" FM_ROOT_OVERRIDE="$root" "$SESSION_START")
   assert_contains "$out" "HOURLY PASSES" "session start must report the hourly passes"
   assert_contains "$out" "armed:" "session start must arm the hourly passes when it holds the lock"

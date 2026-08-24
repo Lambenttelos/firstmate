@@ -458,6 +458,21 @@ test_bad_secondmate_homes_never_revive_parent_work() {
   fakebin=$(make_fakebin "$home")
   json=$(FAKE_NM_SLEEP=1 FM_SNAPSHOT_SECONDMATE_TIMEOUT=1 run "$home" "$fakebin" --json)
   chmod 700 "$unreadable/data"
+  if [ -r "$unreadable/data" ]; then
+    # Running as root (or a user with CAP_DAC_OVERRIDE): mode 000 cannot hide
+    # the home, so the unreadable-home assertion cannot hold here. The home
+    # reads as a fresh valid home with no active work instead; the other four
+    # bad homes must still stay explicit unknowns and never revive work.
+    printf '%s\n' "$json" | jq -e '
+      (.secondmates | length) == 5
+        and ([.secondmates[] | select(.id != "unreadable")]
+          | all(.state == "unknown"))
+        and (.secondmates | any(.[]; .id == "unreadable" and .state == "no_active_work"))
+        and (.in_flight | map(.id) | all(. != "invalid" and . != "unreadable" and . != "malformed" and . != "timedout"))
+    ' >/dev/null || fail "root-readable unreadable home broke the unknown projection: $json"
+    pass "unreadable-home strictness skipped as root (mode 000 is root-readable); remaining unknowns still hold"
+    return 0
+  fi
   printf '%s' "$json" | jq -e '
     (.secondmates | length) == 5
       and all(.secondmates[]; .state == "unknown")

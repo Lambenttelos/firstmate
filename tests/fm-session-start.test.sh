@@ -259,13 +259,15 @@ SH
 # run_session_start <home> <root> <path>
 # Drop every harness env marker from bin/fm-harness.sh detect_own so the
 # surrounding interactive shell cannot leak past the suite's fake ps harness.
-# Markers today: CLAUDECODE (claude), PI_CODING_AGENT (pi), GROK_AGENT (grok).
+# Markers today: CLAUDECODE (claude), PI_CODING_AGENT (pi), GROK_AGENT (grok),
+# JCODE_ACTIVE_PROVIDER / JCODE_RUNTIME_PROVIDER (jcode).
 # codex and opencode have no env markers (ancestry only). Without this, a local
-# claude/pi/grok session fails cases that pin a different fake harness while CI
+# claude/pi/grok/jcode session fails cases that pin a different fake harness while CI
 # (no ambient markers) still passes.
 run_session_start() {
   local home=$1 root=$2 path=$3
   env -u CLAUDECODE -u PI_CODING_AGENT -u GROK_AGENT \
+    -u JCODE_ACTIVE_PROVIDER -u JCODE_RUNTIME_PROVIDER \
     FM_HOME="$home" FM_ROOT_OVERRIDE="$root" PATH="$path" \
     "$SESSION_START"
 }
@@ -1357,7 +1359,10 @@ EOF
   printf 'kind=ship\n' > "$home/state/t1.meta"
   printf 'account=claude-1\n' > "$home/state/t1.telemetry"
   out=$(TZ=UTC run_session_start "$home" "$root" "$fakebin:$BASE_PATH")
-  printf '%s\n' "$out" | grep -A1 -F 'Account quotas' | grep -qF 'unavailable' \
+  # The digest renders every subsection (Account quotas included) with the
+  # standard divider line under the heading, so the unavailable value sits on
+  # the line AFTER the divider: grep -A2.
+  printf '%s\n' "$out" | grep -A2 -F 'Account quotas' | grep -qF 'unavailable' \
     || fail "missing quota data must render unavailable under the Account quotas subsection: $out"
   pass "fleet-state digest renders unavailable when no quota data exists"
 }
