@@ -396,8 +396,22 @@ test_ci_and_docs_call_the_owner() {
     || fail "Herdr CI job must use bounded lab cleanup"
   grep -Fq 'tests-timing-aggregate:' "$CI" \
     || fail "CI must aggregate per-lane timing artifacts"
-  grep -Fq 'timeout-minutes: 20' "$CI" \
-    || fail "portable serial hang tripwire must be timeout-minutes: 20"
+  # The portable serial lane keeps a hang tripwire, scoped to its OWN job block
+  # so a parallel shard's 10m cap can never satisfy it. The value is a tripwire
+  # above the healthy ~20 min wall, not a fixed number: assert it is present and
+  # comfortably above that wall (>= 25m) rather than pinning one literal, which
+  # would force a test edit every time the suite's real duration shifts.
+  local serial_body serial_cap
+  serial_body=$(awk '
+    $0 == "  tests-portable-serial:" { in_job=1; next }
+    in_job && /^  [a-zA-Z0-9_-]+:/ { exit }
+    in_job { print }
+  ' "$CI")
+  serial_cap=$(printf '%s\n' "$serial_body" | sed -nE 's/^[[:space:]]*timeout-minutes:[[:space:]]*([0-9]+).*/\1/p' | head -1)
+  [ -n "$serial_cap" ] \
+    || fail "portable serial lane must keep a timeout-minutes hang tripwire"
+  [ "$serial_cap" -ge 25 ] \
+    || fail "portable serial hang tripwire must sit above the ~20m healthy wall (>= 25m), got $serial_cap"
   grep -Fq 'timeout-minutes: 10' "$CI" \
     || fail "portable parallel shards must keep a hang tripwire (10m)"
   # Interim full-suite 25m portable timeout must not remain after sharding.

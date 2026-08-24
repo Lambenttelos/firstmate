@@ -333,17 +333,32 @@ assert_raw_presentation_mutations_preserved_since() {  # <line-count> <case-name
 
 assert_cleanup_focus_steal_was_restored() {  # <line-count> <pane-id> <expected-focus>
   local start=$1 pane_id=$2 expected=$3
+  # The invariant is that closing the exact projected task pane never LEAVES the
+  # captain focused elsewhere. Two herdr behaviors both satisfy it:
+  #   1. The pane close steals focus to a neighbor (the herdr 0.7.4 regression),
+  #      and product cleanup immediately restores the exact prior tab - the
+  #      pane-close row drifts (before != after) and a matching tab-focus row
+  #      brings it back.
+  #   2. The pane close does NOT steal focus (a herdr build that fixed the
+  #      regression, e.g. the pinned 0.7.5-fm.1) - the pane-close row shows
+  #      before == after and product cleanup correctly emits no restore
+  #      (fm_backend_herdr_projection_focus_restore returns early on no drift).
+  # Only an UNRESTORED steal is a failure. Requiring the steal to be demonstrated
+  # would make the test depend on the pinned herdr version reproducing the very
+  # bug the product defends against, which is not this test's contract - the
+  # caller already asserts the captain's focus is intact with assert_focus_is.
   sed -n "$((start + 1)),\$p" "$FOCUS_AUDIT_LOG" | awk -F '\t' -v pane="$pane_id" -v expected="$expected" '
-    $1 == "pane-close" && $4 == pane && $2 == expected && $3 != expected {
-      drift = $3
+    $1 == "pane-close" && $4 == pane && $2 == expected {
       saw_close = 1
+      if ($3 == expected) { no_steal = 1 }        # close preserved focus: fine
+      else { drift = $3 }                         # close stole focus: needs a restore
       next
     }
-    saw_close && $1 == "tab-focus" && $2 == drift && $3 == expected {
+    saw_close && drift != "" && $1 == "tab-focus" && $2 == drift && $3 == expected {
       restored = 1
     }
-    END { exit(restored ? 0 : 1) }
-  ' || fail "projected task-pane close did not demonstrate and immediately restore the exact focus-steal regression"
+    END { exit((no_steal || restored) ? 0 : 1) }
+  ' || fail "projected task-pane close left the captain focused off its prior tab without restoring it"
 }
 
 assert_cleanup_focus_preserved() {  # <line-count> <pane-id> <expected-focus>
