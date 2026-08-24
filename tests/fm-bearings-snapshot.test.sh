@@ -457,7 +457,6 @@ test_bad_secondmate_homes_never_revive_parent_work() {
 
   fakebin=$(make_fakebin "$home")
   json=$(FAKE_NM_SLEEP=1 FM_SNAPSHOT_SECONDMATE_TIMEOUT=1 run "$home" "$fakebin" --json)
-  chmod 700 "$unreadable/data"
   if [ -r "$unreadable/data" ]; then
     # Running as root (or a user with CAP_DAC_OVERRIDE): mode 000 cannot hide
     # the home, so the unreadable-home assertion cannot hold here. The home
@@ -473,6 +472,8 @@ test_bad_secondmate_homes_never_revive_parent_work() {
     pass "unreadable-home strictness skipped as root (mode 000 is root-readable); remaining unknowns still hold"
     return 0
   fi
+  # Restore readability so the suite's temp cleanup can remove the fixture home.
+  chmod 700 "$unreadable/data"
   printf '%s' "$json" | jq -e '
     (.secondmates | length) == 5
       and all(.secondmates[]; .state == "unknown")
@@ -902,6 +903,12 @@ test_afk_guard_blocks_but_readonly_bypass_yields_real_data() {
     NET_LOG="$home/net.log" "$BEARINGS" --json >/dev/null 2>&1; rc=$?
   set -e
   [ "$rc" -eq 3 ] || fail "away gate must remain armed after a read-only bypass, got rc=$rc"
+  # Restore errexit OFF (the suite default): this function toggles set -e
+  # around failure-capturing substitutions, and if it returns while errexit
+  # is still on, every later failing command - e.g. the fail-closed test's
+  # deliberately failing projection run - silently terminates the suite
+  # instead of exercising its assertions.
+  set +e
   pass "away-return guard blocks ordinary reads while a read-only bypass yields real data"
 }
 
