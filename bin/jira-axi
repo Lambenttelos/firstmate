@@ -20,6 +20,8 @@ Verbs:
   get KEY                       fetch one issue
   search --jql '...'            run a JQL search
   bulk-create --from-file f     idempotent batch create from a JSON array
+  sync --source md              scripted zero-token round-trip: reconcile every
+                                mapped ticket from the triage markdown
 
 Design notes (AXI, github.com/kunchenguid/axi):
   This tool follows the AXI agent-ergonomic principles where they apply to a
@@ -345,6 +347,138 @@ def _adf_from_args(description_file, description_text):
     if description_text is not None:
         return md_to_adf(description_text)
     return None
+
+
+# --------------------------------------------------------------------------
+# MM dev-support triage parser (shared by the sync verb and gen-batch.py)
+#
+# One section per `## [N] Title`. Each becomes one ticket payload:
+#   summary     = the section title
+#   labels      = mm-triage, <category>, mm-<permalink-slug>
+#   external_key= mm-<permalink-slug>  (the idempotence + mapping key)
+#   description = MM permalink first, then the DRAFT REPLY fact sheet only
+#                 (never the captain-only REVIEW CONTEXT block)
+# This is the single canonical parser: gen-batch.py imports it so the batch
+# file and the scripted sync can never drift.
+# --------------------------------------------------------------------------
+
+TRIAGE_PROJECT = "DEV"
+TRIAGE_SPRINT = "895"
+
+_SECTION_RE = re.compile(r"^## \[(\d+)\]\s+(.*)$")
+_MM_FIRST_URL_RE = re.compile(r"^MM:\s*(https?://\S+)", re.IGNORECASE)
+_MM_ALL_URLS_RE = re.compile(r"https?://\S*/pl/\w+")
+_MM_CATEGORY_RE = re.compile(r"Category:\s*([A-Za-z0-9/_-]+)", re.IGNORECASE)
+
+
+def triage_slug(url):
+    """Last path segment of an MM permalink (the mm-<slug> idempotence key)."""
+    return url.rstrip("/").rsplit("/", 1)[-1]
+
+
+def triage_parse(md_path):
+    """Split the triage markdown into `## [N] Title` sections."""
+    with open(md_path, "r", encoding="utf-8") as fh:
+        lines = fh.readlines()
+    sections = []
+    cur = None
+    for line in lines:
+        m = _SECTION_RE.match(line.rstrip("\n"))
+        if m:
+            if cur:
+                sections.append(cur)
+            cur = {"num": int(m.group(1)), "title": m.group(2).strip(), "body": []}
+            continue
+        if cur is not None:
+            cur["body"].append(line.rstrip("\n"))
+    if cur:
+        sections.append(cur)
+    return sections
+
+
+def triage_payload(sec, project=TRIAGE_PROJECT, sprint=TRIAGE_SPRINT):
+    """Build one ticket payload from a section, or None if it is not a ticket."""
+    body = sec["body"]
+    mm_url = None
+    category = None
+    for line in body:
+        s = line.strip()
+        m = _MM_FIRST_URL_RE.match(s)
+        if m:
+            urls = _MM_ALL_URLS_RE.findall(s)
+            mm_url = urls[0] if urls else m.group(1).rstrip("|").strip()
+            cm = _MM_CATEGORY_RE.search(s)
+            if cm:
+                category = cm.group(1).lower()
+            break
+    if not mm_url:
+        return None
+    if not category:
+        category = "uncategorized"
+
+    slug = triage_slug(mm_url)
+
+    desc_lines = []
+    in_draft = False
+    for line in body:
+        if line.strip().startswith("### DRAFT REPLY"):
+            in_draft = True
+            continue
+        if line.strip().startswith("### REVIEW CONTEXT"):
+            in_draft = False
+            continue
+        if in_draft:
+            desc_lines.append(line)
+    while desc_lines and not desc_lines[0].strip():
+        desc_lines.pop(0)
+    while desc_lines and (
+        not desc_lines[-1].strip() or desc_lines[-1].strip() == "---"
+    ):
+        desc_lines.pop()
+    fact_sheet = "\n".join(desc_lines).strip()
+
+    description = (
+        "MM thread: %s\n\nCategory: %s\n\n%s" % (mm_url, category, fact_sheet)
+    ).strip()
+
+    labels = ["mm-triage", category, "mm-%s" % slug]
+    labels = [re.sub(r"[^\w.-]", "-", l) for l in labels]
+
+    return {
+        "num": sec["num"],
+        "project": project,
+        "sprint": sprint,
+        "summary": sec["title"],
+        "type": "Task",
+        "labels": labels,
+        "external_key": "mm-%s" % slug,
+        "mm_url": mm_url,
+        "slug": slug,
+        "description": description,
+    }
+
+
+def triage_payloads(md_path, project=TRIAGE_PROJECT, sprint=TRIAGE_SPRINT):
+    """Parse the file into de-duplicated ticket payloads in source order.
+
+    Returns (payloads, skipped). A section repeats a slug only when two thread
+    numbers share a canonical permalink; the first wins, the rest are skipped.
+    """
+    sections = triage_parse(md_path)
+    payloads = []
+    seen = {}
+    skipped = []
+    for sec in sections:
+        p = triage_payload(sec, project, sprint)
+        if p is None:
+            skipped.append(sec["num"])
+            continue
+        if p["external_key"] in seen:
+            skipped.append(("dup", sec["num"], p["external_key"]))
+            continue
+        seen[p["external_key"]] = sec["num"]
+        payloads.append(p)
+    return payloads, skipped
 
 
 # --------------------------------------------------------------------------
@@ -728,6 +862,229 @@ def cmd_bulk_create(args):
 
 
 # --------------------------------------------------------------------------
+# sync: the scripted, zero-LLM-token round-trip pipeline
+# --------------------------------------------------------------------------
+
+import hashlib
+
+
+def _search_all(jql, fields, page=100):
+    """Page through a JQL search, returning every matching issue.
+
+    Uses the newer /search/jql token-cursor endpoint, falling back to the
+    classic paginated /search for older instances.
+    """
+    issues = []
+    # Newer endpoint: nextPageToken cursor.
+    token = None
+    used_new = True
+    while True:
+        body = {"jql": jql, "maxResults": page, "fields": fields}
+        if token:
+            body["nextPageToken"] = token
+        status, parsed, text = api("POST", "/rest/api/3/search/jql", body)
+        if status != 200:
+            used_new = False
+            break
+        issues.extend(parsed.get("issues", []))
+        token = parsed.get("nextPageToken")
+        if not token or parsed.get("isLast", token is None):
+            return issues
+        if not token:
+            return issues
+    # Fallback: classic startAt pagination.
+    if not used_new:
+        issues = []
+        start = 0
+        while True:
+            status, parsed, text = api(
+                "GET",
+                "/rest/api/3/search",
+                query={
+                    "jql": jql,
+                    "maxResults": page,
+                    "startAt": start,
+                    "fields": ",".join(fields),
+                },
+            )
+            if status != 200:
+                _fail("search failed: " + _err_text(status, parsed, text))
+            batch = parsed.get("issues", [])
+            issues.extend(batch)
+            total = parsed.get("total", len(issues))
+            start += len(batch)
+            if not batch or start >= total:
+                break
+    return issues
+
+
+def _content_hash(summary, description, labels):
+    """Stable hash of the fields sync manages, so unchanged tickets are skipped."""
+    h = hashlib.sha256()
+    h.update((summary or "").encode("utf-8"))
+    h.update(b"\x00")
+    h.update((description or "").encode("utf-8"))
+    h.update(b"\x00")
+    h.update(",".join(sorted(labels or [])).encode("utf-8"))
+    return h.hexdigest()
+
+
+def _load_ledger(path):
+    if not path or not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_ledger(path, data):
+    if not path:
+        return
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, indent=2, sort_keys=True)
+        fh.write("\n")
+    os.replace(tmp, path)
+
+
+def cmd_sync(args):
+    """Parse the triage markdown and reconcile every mapped ticket in one pass.
+
+    Zero LLM tokens: pure script. For each thread it computes a content hash of
+    the fields it manages; unchanged tickets are skipped without an API write.
+    New threads are created with the same label/sprint rules as bulk-create.
+    Existing tickets found by their mm-<slug> label have their summary and
+    description brought into line with the markdown. Emits a thread-ticket map
+    TSV so the mapping survives outside Jira.
+    """
+    payloads, skipped = triage_payloads(
+        args.source, args.project or TRIAGE_PROJECT, args.sprint or TRIAGE_SPRINT
+    )
+    _, _, base = _creds()
+
+    # One sweep: every mm-triage ticket in the project, mapped by its mm-<slug>
+    # external-key label. This is the whole existing-state read - no per-ticket
+    # lookups.
+    project = args.project or TRIAGE_PROJECT
+    jql = 'project = %s AND labels = "mm-triage"' % project
+    existing = _search_all(
+        jql, ["summary", "labels", "description"]
+    )
+    by_key = {}
+    for it in existing:
+        f = it.get("fields", {})
+        for lab in f.get("labels") or []:
+            if lab.startswith("mm-") and lab != "mm-triage":
+                by_key[lab] = it.get("key")
+
+    ledger = _load_ledger(args.state_file)
+
+    created, updated, unchanged, failed = [], [], [], []
+    rows = []  # (num, slug, key, url) for the map file
+
+    limit = args.limit if args.limit is not None else len(payloads)
+    for p in payloads[:limit]:
+        ext = p["external_key"]
+        summary = p["summary"]
+        description = p["description"]
+        labels = p["labels"]
+        chash = _content_hash(summary, description, labels)
+        key = by_key.get(ext)
+
+        if key is None:
+            # New thread: create it (unless dry-run).
+            if args.dry_run:
+                created.append((p["num"], "(dry-run)", summary))
+                rows.append((p["num"], p["slug"], "(dry-run)", ""))
+                continue
+            adf = md_to_adf(description)
+            newkey, err = _create_issue(
+                p["project"], summary, p["type"], adf, labels,
+                None, p["sprint"],
+            )
+            if newkey is None:
+                failed.append((p["num"], ext, err))
+                continue
+            key = newkey
+            by_key[ext] = key
+            created.append((p["num"], key, summary))
+            ledger[ext] = {"key": key, "hash": chash}
+            rows.append((p["num"], p["slug"], key, "%s/browse/%s" % (base, key)))
+            continue
+
+        # Existing ticket. Skip when the ledger already recorded this exact
+        # content for this key - no API write at all.
+        prev = ledger.get(ext)
+        if prev and prev.get("key") == key and prev.get("hash") == chash and not args.force:
+            unchanged.append((p["num"], key))
+            rows.append((p["num"], p["slug"], key, "%s/browse/%s" % (base, key)))
+            continue
+
+        if args.dry_run:
+            updated.append((p["num"], key, summary))
+            rows.append((p["num"], p["slug"], key, "%s/browse/%s" % (base, key)))
+            continue
+
+        # Push summary + description into line with the markdown.
+        payload = {
+            "fields": {
+                "summary": summary,
+                "description": md_to_adf(description),
+            }
+        }
+        status, parsed, text = api(
+            "PUT", "/rest/api/3/issue/%s" % key, payload
+        )
+        if status not in (200, 204):
+            failed.append((p["num"], ext, _err_text(status, parsed, text)))
+            continue
+        updated.append((p["num"], key, summary))
+        ledger[ext] = {"key": key, "hash": chash}
+        rows.append((p["num"], p["slug"], key, "%s/browse/%s" % (base, key)))
+
+    if not args.dry_run:
+        _save_ledger(args.state_file, ledger)
+
+    # Emit the thread-ticket map TSV.
+    if args.map_file:
+        with open(args.map_file, "w", encoding="utf-8") as fh:
+            fh.write("thread_num\tmm_slug\tticket_key\tticket_url\n")
+            for num, slug, key, url in sorted(rows, key=lambda r: r[0]):
+                fh.write("%s\t%s\t%s\t%s\n" % (num, slug, key, url))
+
+    print("=== sync summary ===")
+    print(
+        "parsed %d threads (skipped %d) | created %d, updated %d, unchanged %d, failed %d"
+        % (
+            len(payloads),
+            len(skipped),
+            len(created),
+            len(updated),
+            len(unchanged),
+            len(failed),
+        )
+    )
+    for num, key, summary in created:
+        if key == "(dry-run)":
+            print("  NEW  [%s] %s" % (num, summary[:70]))
+        else:
+            print("  NEW  [%s] %s/browse/%s" % (num, base, key))
+    for num, key, summary in updated:
+        print("  UPD  [%s] %s/browse/%s" % (num, base, key))
+    if args.verbose:
+        for num, key in unchanged:
+            print("  --   [%s] %s (unchanged)" % (num, key))
+    for num, ext, err in failed:
+        print("  FAIL [%s] %s %s" % (num, ext, err))
+    if args.map_file:
+        print("map: %s (%d rows)" % (args.map_file, len(rows)))
+    if failed:
+        sys.exit(1)
+
+
+# --------------------------------------------------------------------------
 # Argument parsing
 # --------------------------------------------------------------------------
 
@@ -801,6 +1158,29 @@ def build_parser():
     sp.add_argument("--dry-run", action="store_true",
                     help="show what would be created without calling Jira")
     sp.set_defaults(func=cmd_bulk_create)
+
+    sp = sub.add_parser(
+        "sync",
+        help="scripted zero-token round-trip: parse the triage markdown and "
+        "reconcile every mapped ticket (create missing, update changed, skip "
+        "unchanged), emitting a thread-ticket map TSV",
+    )
+    sp.add_argument("--source", required=True,
+                    help="path to draft-replies.md (the triage markdown)")
+    sp.add_argument("--map-file", help="write the thread-ticket map TSV here")
+    sp.add_argument("--state-file",
+                    help="content-hash ledger for skip-if-unchanged (JSON); "
+                    "persist it to make future runs zero-write when nothing changed")
+    sp.add_argument("--project", help="project KEY (default DEV)")
+    sp.add_argument("--sprint", help="sprint id for newly created tickets (default 895)")
+    sp.add_argument("--limit", type=int, help="process at most N threads")
+    sp.add_argument("--force", action="store_true",
+                    help="push every mapped ticket even if the hash is unchanged")
+    sp.add_argument("--dry-run", action="store_true",
+                    help="show what would change without calling Jira")
+    sp.add_argument("--verbose", action="store_true",
+                    help="also list unchanged tickets")
+    sp.set_defaults(func=cmd_sync)
 
     return p
 
