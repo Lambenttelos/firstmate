@@ -711,7 +711,7 @@ launch_template() {
 jcode_post_launch_delivery() {  # <target> <brief-path> <model> <effort> [<account>] [<worktree> <spawn_ts> <status-file> <meta-file>]
   local target=$1 brief=$2 model=$3 effort=$4 account=${5:-} i=0 state=unknown verdict line
   local worktree=${6:-} spawn_ts=${7:-} status_file=${8:-} meta_file=${9:-}
-  local slash_lines=() verify_lines=() want_model=- want_effort=- actual_model= actual_effort=
+  local slash_lines=() verify_lines=() want_model=- want_effort=- actual_model='' actual_effort=''
   local attempt=0 ok=0 sid tmp kv drift_msg
   # Wait for the TUI: until its composer row exists there is nothing to type
   # into, and a message typed into the still-starting client is lost.
@@ -779,7 +779,7 @@ jcode_post_launch_delivery() {  # <target> <brief-path> <model> <effort> [<accou
           echo "warning: jcode session store unreadable for $sid on $target; cannot verify the launch profile (wanted ${want_model}/${want_effort})" >&2
           return 0
         fi
-        actual_model= actual_effort=
+        actual_model='' actual_effort=''
         while IFS= read -r kv; do
           case "$kv" in
             model=*) actual_model=${kv#model=} ;;

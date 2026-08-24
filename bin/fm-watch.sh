@@ -1407,7 +1407,7 @@ jcode_drift_sweep() {
     [ -n "$sid" ] || continue
     profile=$(fm_session_store_profile "$sid" 2>/dev/null || true)
     [ -n "$profile" ] || continue
-    actual_model= actual_effort=
+    actual_model='' actual_effort=''
     while IFS= read -r kv; do
       case "$kv" in
         model=*) actual_model=${kv#model=} ;;
