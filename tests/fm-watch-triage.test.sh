@@ -698,11 +698,13 @@ test_nonterminal_stale_provably_working_absorbed_then_escalated() {
   reap "$pid"
 
   # Phase B: backdate the idle timer past the threshold; the next run escalates.
-  # (The subsequent-sight timer path does not re-read the crew state.)
+  # (The subsequent-sight timer path does not re-read the crew state.) The
+  # re-prompt sender FAILS, so the first expiry escalates exactly as before.
   echo $(( $(date +%s) - 500 )) > "$state/.stale-since-$key"
   : > "$out"
   PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
     FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_STALE_ESCALATE_SECS=240 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_STALE_NUDGE_BIN="$fakebin/fm-send.sh" FM_NUDGE_LOG="$dir/nudge.log" \
     FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
   pid=$!
   wait_for_exit "$pid" 40 || fail "watcher did not escalate a provably-working non-terminal stale past the threshold"
@@ -737,10 +739,15 @@ test_nonterminal_stale_not_working_surfaced() {
   printf '1\n' > "$state/.count-$key"
   # No running pipeline; the pane is idle. NOT provably working.
   export FM_FAKE_CREW_STATE='state: unknown · source: none · no current-state source available'
+  # The re-prompt sender FAILS (default stub): an undeliverable nudge must fall
+  # back to the immediate surface, never swallow the stopped crew.
+  nudge_log="$dir/nudge.log"
 
-  # Even with a high wedge threshold, a not-provably-working stale surfaces at once.
+  # Even with a high wedge threshold, a not-provably-working stale surfaces at once
+  # when the first-line nudge cannot be delivered.
   PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
     FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_STALE_ESCALATE_SECS=999 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_STALE_NUDGE_BIN="$fakebin/fm-send.sh" FM_NUDGE_LOG="$nudge_log" \
     FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
   pid=$!
   wait_for_exit "$pid" 40 || fail "watcher did not surface a not-provably-working non-terminal stale at once"
@@ -748,9 +755,197 @@ test_nonterminal_stale_not_working_surfaced() {
   grep -F "possible wedge" "$out" >/dev/null && fail "an immediate stopped-crew stale was mislabeled a wedge"
   [ "$(cat "$state/.stale-$key" 2>/dev/null || true)" = "$pane_hash" ] || fail "stale suppressor was not advanced on surface"
   [ ! -e "$state/.stale-since-$key" ] || fail "stale-since timer should not be set when surfacing immediately"
+  [ ! -e "$state/.stale-nudged-$key" ] || fail "a failed nudge must not be recorded as sent"
+  grep -F "data/stopped/brief.md" "$nudge_log" >/dev/null || fail "the failed nudge did not attempt delivery to the task brief"
   FM_STATE_OVERRIDE="$state" "$DRAIN" > "$drain_out" 2>/dev/null || fail "drain after the immediate stale failed"
   grep "$(printf '\tstale\t')" "$drain_out" | grep -F "$window" >/dev/null || fail "immediate stale wake was not queued"
-  pass "a not-provably-working non-terminal stale is surfaced immediately (never left to wait out the timer)"
+  pass "an undeliverable first-line nudge falls back to the immediate stopped-crew surface"
+}
+
+# --- first-line stale nudge -------------------------------------------------
+# On a stale wake for an ordinary crew task, the watcher sends ONE re-prompt
+# via fm-send pointing the worker back at its brief and asking for a status
+# append, records it in state/.stale-nudged-<key> so it never repeats for the
+# same stall episode, and only escalates the wake to firstmate when the worker
+# stays silent past the next grace window (one more STALE_ESCALATE_SECS).
+test_nonterminal_stale_not_working_nudged_once_then_escalated() {
+  local dir state fakebin out drain_out capture_file window key pane_hash sig pid nudge_log i
+  dir=$(make_case nonterminal-stale-nudge); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; drain_out="$dir/drain.out"; capture_file="$dir/pane.txt"; nudge_log="$dir/nudge.log"
+  window="test:fm-nudged"
+  printf 'idle prompt, finished' > "$capture_file"
+  printf 'window=%s\nkind=ship\n' "$window" > "$state/nudged.meta"
+  # Non-terminal status (the crew never wrote a captain-relevant verb), .seen-*
+  # primed so the signal scan does not pre-empt the stale path.
+  printf 'working: implementing\n' > "$state/nudged.status"
+  sig=$(seen_sig "$state/nudged.status"); printf '%s' "$sig" > "$state/.seen-nudged_status"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  pane_hash=$(hash_text "idle prompt, finished")
+  printf '%s' "$pane_hash" > "$state/.hash-$key"
+  printf '1\n' > "$state/.count-$key"
+  # No running pipeline; the pane is idle. NOT provably working.
+  export FM_FAKE_CREW_STATE='state: unknown · source: none · no current-state source available'
+
+  # Phase A: the first sighting of the stopped crew sends ONE re-prompt and
+  # absorbs - no wake, no exit, and the next-grace timer is armed.
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_STALE_ESCALATE_SECS=999 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_STALE_NUDGE_BIN="$fakebin/fm-send.sh" FM_FAKE_NUDGE_OK=1 FM_NUDGE_LOG="$nudge_log" \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  i=0
+  while [ "$i" -lt 40 ]; do
+    kill -0 "$pid" 2>/dev/null || { reap "$pid"; fail "watcher exited for a first-sight stopped crew (should nudge and absorb): $(cat "$out")"; }
+    [ -e "$state/.stale-nudged-$key" ] && break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  [ -e "$state/.stale-nudged-$key" ] || { reap "$pid"; fail "stopped crew was not recorded as nudged"; }
+  [ ! -s "$out" ] || { reap "$pid"; fail "stopped crew printed a wake while nudged (absorbed)"; }
+  [ ! -s "$state/.wake-queue" ] || { reap "$pid"; fail "stopped crew enqueued a wake while nudged (absorbed)"; }
+  [ "$(cat "$state/.stale-$key" 2>/dev/null || true)" = "$pane_hash" ] || { reap "$pid"; fail "stale suppressor not advanced on nudge absorb"; }
+  [ -s "$state/.stale-since-$key" ] || { reap "$pid"; fail "next-grace timer was not armed on nudge absorb"; }
+  [ "$(wc -l < "$nudge_log" 2>/dev/null || echo 0)" = 1 ] || { reap "$pid"; fail "stopped crew was not nudged exactly once"; }
+  grep -F "data/nudged/brief.md" "$nudge_log" >/dev/null || { reap "$pid"; fail "nudge did not point back at the task brief"; }
+  grep -F "status line" "$nudge_log" >/dev/null || { reap "$pid"; fail "nudge did not ask for a status append"; }
+  reap "$pid"
+
+  # Phase B: still silent past the next grace window - escalate once, send no
+  # second nudge for the same stall episode.
+  echo $(( $(date +%s) - 500 )) > "$state/.stale-since-$key"
+  : > "$out"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_STALE_ESCALATE_SECS=240 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_STALE_NUDGE_BIN="$fakebin/fm-send.sh" FM_FAKE_NUDGE_OK=1 FM_NUDGE_LOG="$nudge_log" \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  wait_for_exit "$pid" 40 || fail "silent stopped crew did not escalate past the next grace window"
+  grep -F "stale: $window" "$out" >/dev/null || fail "escalation did not print a stale wake"
+  [ -e "$state/.stale-nudged-$key" ] || fail "nudge marker was lost after escalation (still one episode)"
+  [ "$(wc -l < "$nudge_log" 2>/dev/null || echo 0)" = 1 ] || fail "a second nudge was sent for the same stall episode"
+  FM_STATE_OVERRIDE="$state" "$DRAIN" > "$drain_out" 2>/dev/null || fail "drain after the nudge escalation failed"
+  grep "$(printf '\tstale\t')" "$drain_out" | grep -F "$window" >/dev/null || fail "nudge escalation was not queued"
+  unset FM_FAKE_CREW_STATE
+  pass "a stopped ordinary crew is nudged once, then escalates only when it stays silent past the next grace window"
+}
+
+test_provably_working_wedge_nudged_once_then_escalated() {
+  local dir state fakebin out capture_file window key pane_hash sig pid nudge_log i
+  dir=$(make_case wedge-stale-nudge); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; capture_file="$dir/pane.txt"; nudge_log="$dir/nudge.log"
+  window="test:fm-quiet-nudge"
+  printf 'idle building output' > "$capture_file"
+  printf 'window=%s\nkind=ship\n' "$window" > "$state/quiet-nudge.meta"
+  printf 'working: still monitoring ci\n' > "$state/quiet-nudge.status"
+  sig=$(seen_sig "$state/quiet-nudge.status"); printf '%s' "$sig" > "$state/.seen-quiet-nudge_status"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  pane_hash=$(hash_text "idle building output")
+  printf '%s' "$pane_hash" > "$state/.hash-$key"
+  printf '1\n' > "$state/.count-$key"
+  # The crew's pipeline is actively running: a static pane is normal (waiting on CI).
+  export FM_FAKE_CREW_STATE='state: working · source: run-step · validating (running)'
+
+  # Phase A: first sighting absorbs (establishing .stale and the wedge timer)
+  # and sends no nudge yet.
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_STALE_ESCALATE_SECS=999 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_STALE_NUDGE_BIN="$fakebin/fm-send.sh" FM_FAKE_NUDGE_OK=1 FM_NUDGE_LOG="$nudge_log" \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  i=0
+  while [ "$i" -lt 40 ]; do
+    kill -0 "$pid" 2>/dev/null || { reap "$pid"; fail "watcher exited on the wedge priming round (should absorb): $(cat "$out")"; }
+    [ -s "$state/.stale-since-$key" ] && break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  [ -s "$state/.stale-since-$key" ] || { reap "$pid"; fail "wedge timer was not armed on the priming round"; }
+  [ ! -e "$state/.stale-nudged-$key" ] || { reap "$pid"; fail "priming round sent a nudge before the grace window"; }
+  [ ! -s "$nudge_log" ] || { reap "$pid"; fail "priming round sent a nudge before the grace window"; }
+  reap "$pid"
+
+  # Phase B: the first wedge-timer expiry sends the one nudge and restarts the
+  # timer instead of escalating.
+  echo $(( $(date +%s) - 500 )) > "$state/.stale-since-$key"
+  : > "$out"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_STALE_ESCALATE_SECS=240 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_STALE_NUDGE_BIN="$fakebin/fm-send.sh" FM_FAKE_NUDGE_OK=1 FM_NUDGE_LOG="$nudge_log" \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  i=0
+  while [ "$i" -lt 40 ]; do
+    kill -0 "$pid" 2>/dev/null || { reap "$pid"; fail "watcher exited on the first wedge expiry (should nudge and absorb): $(cat "$out")"; }
+    [ -e "$state/.stale-nudged-$key" ] && break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  [ -e "$state/.stale-nudged-$key" ] || { reap "$pid"; fail "wedge expiry was not recorded as nudged"; }
+  [ ! -s "$out" ] || { reap "$pid"; fail "first wedge expiry printed a wake while nudged (absorbed)"; }
+  [ ! -s "$state/.wake-queue" ] || { reap "$pid"; fail "first wedge expiry enqueued a wake while nudged (absorbed)"; }
+  [ -s "$state/.stale-since-$key" ] || { reap "$pid"; fail "wedge nudge did not restart the grace timer"; }
+  [ "$(wc -l < "$nudge_log" 2>/dev/null || echo 0)" = 1 ] || { reap "$pid"; fail "wedge expiry was not nudged exactly once"; }
+  reap "$pid"
+
+  # Phase C: still silent past the restarted grace window - escalate with the
+  # ordinary escalation count, never a second nudge.
+  echo $(( $(date +%s) - 500 )) > "$state/.stale-since-$key"
+  : > "$out"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_STALE_ESCALATE_SECS=240 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_STALE_NUDGE_BIN="$fakebin/fm-send.sh" FM_FAKE_NUDGE_OK=1 FM_NUDGE_LOG="$nudge_log" \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  wait_for_exit "$pid" 40 || fail "silent provably-working crew did not escalate after the nudge grace window"
+  grep -F "escalation 1" "$out" >/dev/null || fail "post-nudge escalation did not carry escalation count 1"
+  [ -e "$state/.stale-nudged-$key" ] || fail "nudge marker was lost after the wedge escalation (still one episode)"
+  [ "$(wc -l < "$nudge_log" 2>/dev/null || echo 0)" = 1 ] || fail "a second nudge was sent for the same wedge episode"
+  unset FM_FAKE_CREW_STATE
+  pass "a provably-working wedge is nudged once at the first expiry, then escalates past the restarted grace window"
+}
+
+test_stale_nudge_never_sent_to_secondmate_or_unsupervised() {
+  local dir state fakebin out log rc sm_key unsup_key ctl_key
+  dir=$(make_case stale-nudge-guards); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/helper.out"; log="$dir/nudge.log"
+  printf 'window=second:fm-sm\nkind=secondmate\n' > "$state/sm.meta"
+  printf 'window=test:fm-unsup\nkind=ship\nsupervise=off\n' > "$state/unsup.meta"
+  printf 'window=test:fm-control\nkind=ship\n' > "$state/control.meta"
+  sm_key=$(printf '%s' "second:fm-sm" | tr ':/.' '___')
+  unsup_key=$(printf '%s' "test:fm-unsup" | tr ':/.' '___')
+  ctl_key=$(printf '%s' "test:fm-control" | tr ':/.' '___')
+
+  # A secondmate endpoint is never nudged: its idle pane is healthy by contract.
+  rc=$(FM_STATE_OVERRIDE="$state" FM_STALE_NUDGE_BIN="$fakebin/fm-send.sh" \
+    FM_FAKE_NUDGE_OK=1 FM_NUDGE_LOG="$log" bash -c \
+    '. "$1" >/dev/null 2>&1; nudge_stale_worker "$2"; echo "rc=$?"' _ "$WATCH" "second:fm-sm" 2>/dev/null)
+  [ "$rc" = "rc=1" ] || fail "secondmate nudge was not refused (rc=$rc)"
+  [ ! -e "$state/.stale-nudged-$sm_key" ] || fail "secondmate nudge marker was written"
+  [ ! -s "$log" ] || fail "secondmate nudge was sent"
+
+  # An unsupervised pane (supervise=off) is never nudged.
+  rc=$(FM_STATE_OVERRIDE="$state" FM_STALE_NUDGE_BIN="$fakebin/fm-send.sh" \
+    FM_FAKE_NUDGE_OK=1 FM_NUDGE_LOG="$log" bash -c \
+    '. "$1" >/dev/null 2>&1; nudge_stale_worker "$2"; echo "rc=$?"' _ "$WATCH" "test:fm-unsup" 2>/dev/null)
+  [ "$rc" = "rc=1" ] || fail "unsupervised-pane nudge was not refused (rc=$rc)"
+  [ ! -e "$state/.stale-nudged-$unsup_key" ] || fail "unsupervised-pane nudge marker was written"
+  [ ! -s "$log" ] || fail "unsupervised-pane nudge was sent"
+
+  # Control: an ordinary ship crew IS nudged once, and the marker prevents a
+  # repeat for the same stall episode.
+  rc=$(FM_STATE_OVERRIDE="$state" FM_STALE_NUDGE_BIN="$fakebin/fm-send.sh" \
+    FM_FAKE_NUDGE_OK=1 FM_NUDGE_LOG="$log" bash -c \
+    '. "$1" >/dev/null 2>&1; nudge_stale_worker "$2"; echo "rc=$?"' _ "$WATCH" "test:fm-control" 2>/dev/null)
+  [ "$rc" = "rc=0" ] || fail "ordinary crew nudge was refused (rc=$rc)"
+  [ -e "$state/.stale-nudged-$ctl_key" ] || fail "ordinary crew nudge marker was not written"
+  [ "$(wc -l < "$log" 2>/dev/null || echo 0)" = 1 ] || fail "ordinary crew was not nudged exactly once"
+  grep -F "control" "$log" >/dev/null || fail "nudge did not target the control task"
+  rc=$(FM_STATE_OVERRIDE="$state" FM_STALE_NUDGE_BIN="$fakebin/fm-send.sh" \
+    FM_FAKE_NUDGE_OK=1 FM_NUDGE_LOG="$log" bash -c \
+    '. "$1" >/dev/null 2>&1; nudge_stale_worker "$2"; echo "rc=$?"' _ "$WATCH" "test:fm-control" 2>/dev/null)
+  [ "$rc" = "rc=1" ] || fail "repeat nudge for the same stall episode was not refused (rc=$rc)"
+  [ "$(wc -l < "$log" 2>/dev/null || echo 0)" = 1 ] || fail "repeat nudge was sent for the same stall episode"
+  pass "secondmates and unsupervised panes are never nudged; an ordinary crew is nudged once per stall episode"
 }
 
 # --- non-terminal stale, crew DECLARED a pause: absorbed, re-surfaced on a long
@@ -899,10 +1094,12 @@ test_exited_declared_pause_is_bounded_but_live_gate_surfaces() {
   printf '1\n' > "$state/.count-$key"
 
   # First sight must surface promptly so a live external-decision gate is not
-  # hidden behind the pause cadence.
+  # hidden behind the pause cadence. The sender WOULD succeed here; a declared
+  # pause must still never be nudged.
   PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
     FM_FAKE_TMUX_CURRENT_COMMAND=grok FM_FAKE_CREW_STATE='state: paused · source: status-log · waiting at an active external-decision gate' \
     FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_PAUSE_RESURFACE_SECS=999 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_STALE_NUDGE_BIN="$fakebin/fm-send.sh" FM_FAKE_NUDGE_OK=1 FM_NUDGE_LOG="$dir/nudge.log" \
     FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" >> "$out" &
   pid=$!
   wait_for_exit "$pid" 40 || fail "live external-decision gate did not surface immediately"
@@ -915,6 +1112,7 @@ test_exited_declared_pause_is_bounded_but_live_gate_surfaces() {
   PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
     FM_FAKE_TMUX_CURRENT_COMMAND=grok FM_FAKE_CREW_STATE='state: paused · source: status-log · waiting at an active external-decision gate' \
     FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_STALE_ESCALATE_SECS=240 FM_PAUSE_RESURFACE_SECS=999 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_STALE_NUDGE_BIN="$fakebin/fm-send.sh" FM_FAKE_NUDGE_OK=1 FM_NUDGE_LOG="$dir/nudge.log" \
     FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" >> "$out" &
   pid=$!
   if ! wait_live "$pid" 30; then
@@ -928,7 +1126,8 @@ test_exited_declared_pause_is_bounded_but_live_gate_surfaces() {
   bare=$(awk -F '\t' -v w="$window" '$3 == "stale" && $4 == w && $5 == "stale: " w { n++ } END { print n + 0 }' "$state/.wake-queue")
   [ "$wakes" -eq 1 ] || fail "live external-decision gate should surface once, got $wakes wakes"
   [ "$bare" -eq 1 ] || fail "live external-decision gate lost its immediate bare stale surface"
-  pass "exited declared-pause and captain-held panes use bounded pause cadence while a live decision gate still surfaces once"
+  [ ! -s "$dir/nudge.log" ] || fail "live external-decision gate was nudged despite its declared pause"
+  pass "exited declared-pause and captain-held panes use bounded pause cadence while a live decision gate still surfaces once, never nudged"
 }
 
 test_secondmate_paused_resurfaces_in_normal_mode() {
@@ -1127,6 +1326,7 @@ test_paused_authoritative_working_preserves_wedge_timer() {
   : > "$out"
   PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
     FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_STALE_ESCALATE_SECS=240 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_STALE_NUDGE_BIN="$fakebin/fm-send.sh" FM_NUDGE_LOG="$dir/nudge.log" \
     FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
   pid=$!
   wait_for_exit "$pid" 40 || fail "authoritative working state did not wedge-escalate past the threshold"
@@ -1176,6 +1376,8 @@ test_wedge_escalation_marks_demand_deep_inspection_after_threshold() {
   reap "$pid"
 
   n=1
+  # The re-prompt sender FAILS on every round, so each expiry escalates exactly
+  # as before and the consecutive-escalation counting is unchanged.
   while [ "$n" -le 3 ]; do
     # Backdate the wedge timer past the threshold before each round, mirroring
     # the existing wedge-escalation tests' Phase B (the subsequent-sight timer
@@ -1184,6 +1386,7 @@ test_wedge_escalation_marks_demand_deep_inspection_after_threshold() {
     : > "$out"
     PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
       FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_STALE_ESCALATE_SECS=240 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+      FM_STALE_NUDGE_BIN="$fakebin/fm-send.sh" FM_NUDGE_LOG="$dir/nudge.log" \
       FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
     pid=$!
     wait_for_exit "$pid" 40 || fail "watcher did not escalate on consecutive wedge round $n: $(cat "$out")"
@@ -1213,8 +1416,10 @@ test_wedge_escalation_resets_when_pane_becomes_active() {
   pane_hash=$(hash_text "idle building output")
   printf '%s' "$pane_hash" > "$state/.hash-$key"
   printf '1\n' > "$state/.count-$key"
-  # Pre-seed one escalation as if a prior wedge round already fired.
+  # Pre-seed one escalation as if a prior wedge round already fired, plus the
+  # stale-nudge marker of the same episode.
   printf '1\n' > "$state/.wedge-escalations-$key"
+  : > "$state/.stale-nudged-$key"
   export FM_FAKE_CREW_STATE='state: working · source: run-step · validating (running)'
 
   # The pane content changes (the crew is active again): the hash no longer
@@ -1228,9 +1433,10 @@ test_wedge_escalation_resets_when_pane_becomes_active() {
     reap "$pid"; fail "watcher exited on a fresh (changed) pane hash: $(cat "$out")"
   fi
   [ ! -e "$state/.wedge-escalations-$key" ] || fail "a changed pane hash did not reset the wedge-escalation counter"
+  [ ! -e "$state/.stale-nudged-$key" ] || fail "a changed pane hash did not reset the stale-nudge marker"
   reap "$pid"
   unset FM_FAKE_CREW_STATE
-  pass "a pane becoming active again resets the consecutive wedge-escalation counter"
+  pass "a pane becoming active again resets the consecutive wedge-escalation counter and the nudge marker"
 }
 
 test_nonterminal_stale_repairs_missing_or_corrupt_timer() {
@@ -1711,6 +1917,9 @@ test_nonterminal_stale_provably_working_absorbed_then_escalated
 test_wedge_escalation_marks_demand_deep_inspection_after_threshold
 test_wedge_escalation_resets_when_pane_becomes_active
 test_nonterminal_stale_not_working_surfaced
+test_nonterminal_stale_not_working_nudged_once_then_escalated
+test_provably_working_wedge_nudged_once_then_escalated
+test_stale_nudge_never_sent_to_secondmate_or_unsupervised
 test_nonterminal_stale_paused_absorbed_then_resurfaced
 test_exited_declared_pause_is_bounded_but_live_gate_surfaces
 test_secondmate_paused_resurfaces_in_normal_mode

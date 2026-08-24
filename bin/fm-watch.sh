@@ -26,10 +26,19 @@
 #                          re-surface cadence, never as a wedge. Only when neither
 #                          absorb class applies does the log's last line decide:
 #                          terminal (captain-relevant) or non-terminal (no verb),
-#                          both surfaced at once. A provably-working stale past the
-#                          wedge threshold also surfaces, with an "escalation N"
-#                          count in the reason; at FM_WEDGE_DEMAND_INSPECT_COUNT
-#                          consecutive escalations on the SAME pane, the reason
+#                          both surfaced at once. For an ordinary crew whose stale
+#                          is NOT captain-relevant (a stopped non-terminal crew, or
+#                          a provably-working stale past the wedge threshold), the
+#                          watcher first sends ONE re-prompt via fm-send pointing
+#                          back at the task brief and asking for a status append,
+#                          records it in state/.stale-nudged-<key> so it never
+#                          repeats for the same stall episode, and escalates the
+#                          stale wake only when the worker stays silent past the
+#                          next grace window (secondmates and supervise=off panes
+#                          are never nudged). A surfaced wedge carries an
+#                          "escalation N" count in the reason; at
+#                          FM_WEDGE_DEMAND_INSPECT_COUNT consecutive escalations
+#                          on the SAME pane, the reason
 #                          also carries a "demand-deep-inspection" marker so the
 #                          wake payload itself, not just repetition, forces a
 #                          closer look instead of another routine supervision
@@ -760,8 +769,12 @@ FM_WEDGE_DEMAND_INSPECT_COUNT=${FM_WEDGE_DEMAND_INSPECT_COUNT:-3}
 # both places a hash can be absorbed this way: the plain non-terminal path,
 # and the stale_is_terminal-overridden path (a captain-relevant status-log
 # line that an active run/busy pane outranked).
-wedge_timer_check() {  # <window> <since-file> <triage-label> <escalation-count-file>
-  local win=$1 since_file=$2 label=$3 escalation_file=$4 since age n reason
+# When <nudgeable> is 1 (the plain non-terminal paths), the FIRST expiry of a
+# stall episode sends nudge_stale_worker's one re-prompt instead of escalating;
+# the timer restarts so the worker has one full grace window to reply, and the
+# second expiry escalates because the recorded nudge already exists.
+wedge_timer_check() {  # <window> <since-file> <triage-label> <escalation-count-file> [nudgeable]
+  local win=$1 since_file=$2 label=$3 escalation_file=$4 nudgeable=${5:-0} since age n reason
   since=$(cat "$since_file" 2>/dev/null || true)
   case "$since" in
     ''|*[!0-9]*)
@@ -771,6 +784,11 @@ wedge_timer_check() {  # <window> <since-file> <triage-label> <escalation-count-
     *)
       age=$(( $(date +%s) - since ))
       if [ "$age" -ge "$STALE_ESCALATE_SECS" ]; then
+        if [ "$nudgeable" = 1 ] && nudge_stale_worker "$win"; then
+          date +%s > "$since_file"
+          triage_log "stale nudge sent (wedge): $win"
+          return 0
+        fi
         n=$(( $(cat "$escalation_file" 2>/dev/null || echo 0) + 1 ))
         echo "$n" > "$escalation_file"
         reason="stale: $win (idle ${age}s, possible wedge, escalation $n)"
@@ -830,7 +848,7 @@ clear_pause_tracking() {  # <window>
   key=${key//\//_}
   key=${key//./_}
   clear_pause_state "$win"
-  rm -f "$STATE/.stale-$key" "$STATE/.stale-since-$key" "$STATE/.wedge-escalations-$key" "$STATE/.stale-verdict-$key"
+  rm -f "$STATE/.stale-$key" "$STATE/.stale-since-$key" "$STATE/.wedge-escalations-$key" "$STATE/.stale-verdict-$key" "$STATE/.stale-nudged-$key"
 }
 
 # --- account-switch orchestrator tripwire rotation ---------------------------
@@ -1185,14 +1203,59 @@ pause_state_class() {  # <window> <task>
   printf '%s' "$class"
 }
 
+# ---- first-line stale nudge -------------------------------------------------
+#
+# On a stale wake for an ordinary crew task, the watcher sends ONE re-prompt
+# via fm-send pointing the worker back at its brief and asking for a status
+# append, records the nudge in state/.stale-nudged-<key> so it never repeats
+# for the same stall episode, and only escalates the wake to firstmate if the
+# worker stays silent past the next grace window (one more STALE_ESCALATE_SECS,
+# which the callers arm by restarting the timer). Never nudges secondmates
+# (their idle endpoint is healthy by contract) or unsupervised panes
+# (supervise=off - recorded_windows already drops those, the guard here keeps
+# the helper's contract single-place). A nudge that cannot be delivered
+# escalates immediately exactly as before, so a failing sender never swallows
+# a stalled worker. FM_STALE_NUDGE_BIN is the send seam (default: this repo's
+# fm-send.sh); tests stub it.
+# Prints 0 when the nudge was sent (caller absorbs and restarts the grace
+# timer), 1 when it must not or could not be sent (caller escalates as before).
+FM_STALE_NUDGE_BIN=${FM_STALE_NUDGE_BIN:-"$SCRIPT_DIR/fm-send.sh"}
+nudge_stale_worker() {  # <window>
+  local win=$1 key meta task out
+  key=$(printf '%s' "$win" | tr ':/.' '___')
+  [ -e "$STATE/.stale-nudged-$key" ] && return 1
+  [ "$(window_kind "$win")" = secondmate ] && return 1
+  meta=$(fm_backend_meta_for_window "$win" "$STATE" 2>/dev/null || true)
+  [ -n "$meta" ] || return 1
+  [ "$(grep '^supervise=' "$meta" | cut -d= -f2- || true)" = off ] && return 1
+  task=$(window_to_task "$win" "$STATE")
+  [ -n "$task" ] || return 1
+  out=$(FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" \
+    "$FM_STALE_NUDGE_BIN" "$task" \
+    "Auto-nudge: you have been silent for a while. Re-read your task brief (data/$task/brief.md) and append a status line (working:/paused:/blocked: ...) so supervision can see you are alive." 2>&1) \
+    || { triage_log "stale nudge send failed for $win: $(printf '%s' "$out" | tail -n 1)"; return 1; }
+  : > "$STATE/.stale-nudged-$key"
+  return 0
+}
+
 surface_nonterminal_stale() {  # <window> <hash>
   local win=$1 h=$2 key task last
   key=$(printf '%s' "$win" | tr ':/.' '___')
+  task=$(window_to_task "$win" "$STATE")
+  last=$(last_status_line "$STATE/$task.status")
+  # First-line nudge before the wake reaches firstmate: a stopped ordinary crew
+  # gets ONE re-prompt, then the next-grace timer decides. A crew under a
+  # declared pause or captain-held is never nudged - that wait is legitimate and
+  # this surface is its bounded hold-recheck, so it escalates exactly as before.
+  if ! status_is_paused_or_captain_held "$last" && nudge_stale_worker "$win"; then
+    printf '%s' "$h" > "$STATE/.stale-$key"
+    date +%s > "$STATE/.stale-since-$key"
+    rm -f "$STATE/.wedge-escalations-$key" "$STATE/.stale-verdict-$key"
+    return 0
+  fi
   fm_wake_append stale "$win" "stale: $win" || exit 1
   printf '%s' "$h" > "$STATE/.stale-$key"
   rm -f "$STATE/.stale-since-$key" "$STATE/.stale-verdict-$key"
-  task=$(window_to_task "$win" "$STATE")
-  last=$(last_status_line "$STATE/$task.status")
   if status_is_paused_or_captain_held "$last"; then
     : > "$STATE/.paused-$key"
     date +%s > "$STATE/.paused-rechecked-$key"
@@ -1905,10 +1968,11 @@ EOF
           #     captain hold is paired with a confidently dead agent, so absorb on
           #     the long PAUSE_RESURFACE_SECS cadence instead of wedge-escalating;
           #   - none: no running pipeline, idle pane, no busy signature, no declared
-          #     pause - the crew has STOPPED. Surface immediately so firstmate peeks
-          #     (it may be done via an interactive menu that wrote no done: status,
-          #     waiting on a decision, or wedged) instead of leaving the finish to
-          #     wait out the timer.
+          #     pause - the crew has STOPPED. The first stale sighting sends the
+          #     one auto-nudge and absorbs; the wake reaches firstmate only when
+          #     the crew stays silent past the next grace window, so a crew that
+          #     finished via an interactive menu without a done: status is caught
+          #     by that timer too, never left to rot invisibly.
           if [ "$(cat "$sf" 2>/dev/null || true)" != "$h" ]; then
             task=$(window_to_task "$w" "$STATE")
             case "$(pause_state_class "$w" "$task")" in
@@ -1932,18 +1996,19 @@ EOF
                 paused)  handle_paused_stale "$w" "$task" "$h" ;;
                 working) clear_pause_state "$w"
                          printf '%s' "$h" > "$sf"
-                         wedge_timer_check "$w" "$ssf" "non-terminal stale (provably working after a declared pause)" "$ewf"
+                         wedge_timer_check "$w" "$ssf" "non-terminal stale (provably working after a declared pause)" "$ewf" 1
                          triage_log "absorbed non-terminal stale (provably working): $w" ;;
                 *)       handle_paused_stale "$w" "$task" "$h" ;;
               esac
             else
-              wedge_timer_check "$w" "$ssf" "non-terminal stale" "$ewf"
+              wedge_timer_check "$w" "$ssf" "non-terminal stale" "$ewf" 1
             fi
           fi
         fi
       else
-        # Pane busy or not yet stably stale: reset pending escalation bookkeeping.
-        rm -f "$ssf" "$ewf"
+        # Pane busy or not yet stably stale: reset pending escalation bookkeeping
+        # (a fresh nudge for a future episode too - this stall is over).
+        rm -f "$ssf" "$ewf" "$STATE/.stale-nudged-$key"
         if [ -e "$pf" ] && { [ "$n" -ge 2 ] || ! status_is_paused_or_captain_held "$(last_status_line "$STATE/$(window_to_task "$w" "$STATE").status")"; }; then
           clear_pause_tracking "$w"
         fi
@@ -1951,7 +2016,7 @@ EOF
     else
       printf '%s' "$h" > "$hf"
       echo 0 > "$cf"
-      rm -f "$ssf" "$ewf"
+      rm -f "$ssf" "$ewf" "$STATE/.stale-nudged-$key"
       task=$(window_to_task "$w" "$STATE")
       if ! afk_daemon_owns_triage && status_is_paused_or_captain_held "$(last_status_line "$STATE/$task.status")" && ! window_is_busy "$w" "$tail40"; then
         case "$(pause_state_class "$w" "$task")" in
