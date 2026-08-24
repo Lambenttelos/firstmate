@@ -3,8 +3,10 @@
 #
 # A send that cannot be tied to a recorded task/lane or to an explicit
 # well-formed backend target must fail loudly. These tests pin the historical
-# silent-fallback failures: missing FM_HOME, unresolved selectors, prefixless
-# herdr pane ids, dead explicit endpoints, and the healthy exact/fm-id paths.
+# silent-fallback failures: missing FM_HOME (cwd default when the cwd is a
+# valid home, loud refusal otherwise, explicit env always winning), unresolved
+# selectors, prefixless herdr pane ids, dead explicit endpoints, and the
+# healthy exact/fm-id paths.
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -85,17 +87,62 @@ test_exact_lane_id_send_still_works() {
   pass "fm-send strict: exact task/lane ids resolve through home metadata"
 }
 
-test_unset_fm_home_fails() {
+test_unset_fm_home_non_home_cwd_fails() {
   local dir fb err log rc
   dir="$TMP_ROOT/nohome"; mkdir -p "$dir"
   fb=$(make_stubs "$dir"); err="$dir/send.err"; log="$dir/tmux.log"; : > "$log"
 
-  env -u FM_HOME PATH="$fb:$PATH" FM_ROOT_OVERRIDE="$dir" FM_TMUX_LOG="$log" FM_SEND_SETTLE=0 \
-    "$SEND" sess:win "hello" >/dev/null 2>"$err"; rc=$?
-  [ "$rc" -ne 0 ] || fail "unset FM_HOME should fail"
+  ( cd "$dir" && PATH="$fb:$PATH" FM_TMUX_LOG="$log" FM_SEND_SETTLE=0 \
+      env -u FM_HOME "$SEND" sess:win "hello" >/dev/null 2>"$err" ); rc=$?
+  [ "$rc" -ne 0 ] || fail "unset FM_HOME from a non-home cwd should fail"
   assert_contains "$(cat "$err")" "FM_HOME is not set" "unset FM_HOME diagnostic should be explicit"
+  assert_contains "$(cat "$err")" "not a firstmate home" "unset FM_HOME diagnostic should name the cwd default attempt"
   [ ! -s "$log" ] || fail "unset FM_HOME still attempted a send"$'\n'"$(cat "$log")"
-  pass "fm-send strict: unset FM_HOME fails before target resolution"
+  pass "fm-send strict: unset FM_HOME from a non-home cwd fails before target resolution"
+}
+
+make_valid_home() {  # <dir> -> creates a valid firstmate home skeleton in <dir>
+  mkdir -p "$1/data" "$1/state" "$1/config"
+  printf '# firstmate\n' > "$1/AGENTS.md"
+}
+
+test_unset_fm_home_valid_cwd_defaults() {
+  local dir fb home err log rc got
+  dir="$TMP_ROOT/cwddefault"; mkdir -p "$dir"
+  fb=$(make_stubs "$dir"); home="$dir/home"; make_valid_home "$home"
+  err="$dir/send.err"; log="$dir/tmux.log"; : > "$log"
+  fm_write_meta "$home/state/cwd-lane.meta" "window=sess:fm-cwd-lane" "kind=ship"
+
+  ( cd "$home" && PATH="$fb:$PATH" FM_TMUX_LOG="$log" FM_SEND_SETTLE=0 \
+      env -u FM_HOME "$SEND" cwd-lane "hello" >/dev/null 2>"$err" ); rc=$?
+  expect_code 0 "$rc" "unset FM_HOME from a valid home cwd should default to the cwd"
+  got=$(cat "$log")
+  assert_contains "$got" "target=sess:fm-cwd-lane literal=1 arg=hello" "cwd-default send should type literal text to the cwd home's meta target"
+  assert_contains "$got" "target=sess:fm-cwd-lane literal=0 arg=Enter" "cwd-default send should submit with Enter"
+  pass "fm-send strict: unset FM_HOME defaults to a valid home cwd"
+}
+
+test_explicit_fm_home_wins_over_valid_cwd() {
+  local dir fb home_a home_b err log rc got
+  dir="$TMP_ROOT/envwins"; mkdir -p "$dir"
+  fb=$(make_stubs "$dir"); home_a="$dir/home-a"; home_b="$dir/home-b"
+  make_valid_home "$home_a"; make_valid_home "$home_b"
+  err="$dir/send.err"; log="$dir/tmux.log"; : > "$log"
+  fm_write_meta "$home_a/state/a-lane.meta" "window=sess:fm-a-lane" "kind=ship"
+  fm_write_meta "$home_b/state/b-lane.meta" "window=sess:fm-b-lane" "kind=ship"
+
+  ( cd "$home_a" && PATH="$fb:$PATH" FM_HOME="$home_b" FM_ROOT_OVERRIDE="$home_b" FM_TMUX_LOG="$log" FM_SEND_SETTLE=0 \
+      "$SEND" b-lane "hello" >/dev/null 2>"$err" ); rc=$?
+  expect_code 0 "$rc" "explicit FM_HOME should win over a valid cwd home"
+  got=$(cat "$log")
+  assert_contains "$got" "target=sess:fm-b-lane literal=1 arg=hello" "explicit FM_HOME send should resolve the env home's meta target, not the cwd's"
+
+  : > "$log"; : > "$err"
+  ( cd "$home_a" && PATH="$fb:$PATH" FM_HOME="$home_b" FM_ROOT_OVERRIDE="$home_b" FM_TMUX_LOG="$log" FM_SEND_SETTLE=0 \
+      "$SEND" a-lane "hello" >/dev/null 2>"$err" ); rc=$?
+  [ "$rc" -ne 0 ] || fail "explicit FM_HOME should not fall back to the cwd home's meta"
+  [ ! -s "$log" ] || fail "explicit FM_HOME still resolved the cwd home's target"$'\n'"$(cat "$log")"
+  pass "fm-send strict: explicit FM_HOME wins over a valid cwd home"
 }
 
 test_unresolvable_target_does_not_tmux_fallback() {
@@ -161,7 +208,9 @@ test_healthy_fm_id_send_still_works() {
 }
 
 test_exact_lane_id_send_still_works
-test_unset_fm_home_fails
+test_unset_fm_home_non_home_cwd_fails
+test_unset_fm_home_valid_cwd_defaults
+test_explicit_fm_home_wins_over_valid_cwd
 test_unresolvable_target_does_not_tmux_fallback
 test_prefixless_herdr_pane_id_fails
 test_unmatched_single_colon_target_must_exist

@@ -55,6 +55,11 @@
 # footer appears, so an immediate peek would otherwise see the stale idle pane.
 # The pause is fm-send-only; the shared submit core (used by the away-mode daemon,
 # which only needs "submitted") does not pay it, and the --key path is unaffected.
+# Home resolution: an explicit FM_HOME always wins. When FM_HOME is unset or
+# empty, fm-send defaults it to the current working directory IF that directory
+# is a valid firstmate home (data/, state/, config/ and AGENTS.md present);
+# anywhere else it refuses loudly, so a steer can never silently resolve
+# against another home.
 set -eu
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -66,9 +71,17 @@ FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 # a crewmate (see bin/fm-gate-refuse-lib.sh).
 fm_refuse_if_gate_agent
 
+fm_send_is_valid_home() {  # <dir>
+  [ -d "$1/data" ] && [ -d "$1/state" ] && [ -d "$1/config" ] && [ -f "$1/AGENTS.md" ]
+}
+
 if [ -z "${FM_HOME+x}" ] || [ -z "${FM_HOME:-}" ]; then
-  echo "error: FM_HOME is not set; fm-send refuses to resolve targets without an explicit firstmate home" >&2
-  exit 1
+  if fm_send_is_valid_home "$PWD"; then
+    FM_HOME=$PWD
+  else
+    echo "error: FM_HOME is not set and the current directory is not a firstmate home; fm-send refuses to resolve targets without an explicit firstmate home" >&2
+    exit 1
+  fi
 fi
 
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
