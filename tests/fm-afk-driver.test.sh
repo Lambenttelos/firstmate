@@ -14,6 +14,11 @@ set -u
 # shellcheck source=tests/lib.sh
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
+# Source fm_pid_identity once at file scope so seed_live_daemon can record the
+# fake daemon's process identity by a direct call, not a per-write subshell.
+# shellcheck source=bin/fm-pid-lib.sh
+. "$ROOT/bin/fm-pid-lib.sh"
+
 TMP_ROOT=$(fm_test_tmproot fm-afk-driver-tests)
 
 # --- fixtures ---------------------------------------------------------------
@@ -411,7 +416,7 @@ seed_live_daemon() {  # <case-dir>
   # stable re-read the probe performs.
   i=0
   while [ "$i" -lt 50 ]; do
-    if ( . "$ROOT/bin/fm-pid-lib.sh"; fm_pid_identity "$pid" ) > "$lock/pid-identity" 2>/dev/null \
+    if fm_pid_identity "$pid" > "$lock/pid-identity" 2>/dev/null \
       && [ -s "$lock/pid-identity" ]; then
       return 0
     fi
