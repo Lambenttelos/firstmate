@@ -117,7 +117,7 @@ OLD_BIN_UNCHANGED_SIBLINGS="fm-gate-refuse-lib.sh fm-guard.sh fm-lock-lib.sh fm-
 # fm-operational-input.sh is the current owner fm-marker-lib.sh sources; an
 # older baseline whose marker lib still carried that content itself does not
 # have the file, so it is copied when present rather than required.
-OLD_BIN_OPTIONAL_SIBLINGS="fm-pending-reply-lib.sh fm-operational-input.sh"
+OLD_BIN_OPTIONAL_SIBLINGS="fm-pending-reply-lib.sh fm-operational-input.sh fm-resume-lib.sh"
 OLD_BIN_REFACTORED="fm-send.sh fm-peek.sh fm-watch.sh fm-spawn.sh fm-teardown.sh fm-marker-lib.sh"
 
 build_old_bin() {  # <name> -> echoes root dir (root/bin/<script> is the entry point)
