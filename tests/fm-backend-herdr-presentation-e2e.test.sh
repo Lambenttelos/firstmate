@@ -384,8 +384,13 @@ make_project() {  # <dir>
 
 spawn_task() {  # <id> <home> <project>
   local id=$1 home=$2 project=$3
+  # FM_SPAWN_ALLOW_DUPLICATE is forwarded from the caller so a deliberate
+  # same-id re-spawn (this test runs 'shape' flag-off, tears it down, then
+  # flag-on) can opt past fm-spawn's completion-ledger duplicate guard, which
+  # teardown populates via data/completions.tsv (fm-completions-lib.sh).
   FM_GATE_REFUSE_BYPASS=1 FM_SPAWN_NO_GUARD=1 FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" \
     FM_PROJECTS_OVERRIDE="$PROJECTS" \
+    FM_SPAWN_ALLOW_DUPLICATE="${FM_SPAWN_ALLOW_DUPLICATE:-}" \
     "$ROOT/bin/fm-spawn.sh" "$id" "$project" "sh -c 'sleep 120'" --backend herdr
 }
 
@@ -520,7 +525,11 @@ assert_focus_is "$CAPTAIN_FOCUS" "focused secondmate fixture"
 : > "$TREEHOUSE_CALL_LOG"
 : > "$HOME_DIR/config/herdr-presentation-spaces"
 SHAPE_FOCUS_AUDIT_START=$(focus_audit_line_count)
-spawn_task shape "$HOME_DIR" "$PROJECT_DIR" > "$TMP_ROOT/on.out" 2> "$TMP_ROOT/on.err" \
+# Deliberate same-id re-spawn: 'shape' ran flag-off above and was torn down,
+# which recorded it in data/completions.tsv. Opt past the completion-ledger
+# duplicate guard so the flag-on projection can reuse the identical id/project.
+FM_SPAWN_ALLOW_DUPLICATE=1 \
+  spawn_task shape "$HOME_DIR" "$PROJECT_DIR" > "$TMP_ROOT/on.out" 2> "$TMP_ROOT/on.err" \
   || fail "projected spawn failed: $(cat "$TMP_ROOT/on.err")"
 assert_focus_is "$CAPTAIN_FOCUS" "projected spawn"
 assert_raw_presentation_mutations_preserved_since "$SHAPE_FOCUS_AUDIT_START" "projected spawn"
