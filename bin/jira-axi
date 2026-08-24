@@ -20,6 +20,18 @@ Verbs:
   get KEY                       fetch one issue
   search --jql '...'            run a JQL search
   bulk-create --from-file f     idempotent batch create from a JSON array
+
+Design notes (AXI, github.com/kunchenguid/axi):
+  This tool follows the AXI agent-ergonomic principles where they apply to a
+  single-file stdlib-only client: structured errors with a jira-axi: prefix
+  and non-zero exit (P6), non-interactive idempotent mutations - bulk-create
+  never duplicates and never prompts (P6), definitive empty states (P5),
+  pre-computed aggregate counts on search (P4), a content-first no-argument
+  dashboard (P8), next-step suggestions after mutations (P9), and consistent
+  per-verb --help (P10). It deliberately emits plain text and --json rather
+  than TOON (P1): the batch pipeline and other tooling parse this output, and
+  a stdlib-only executable carries no TOON encoder. --json is the
+  machine-readable path; the plain lines stay compact for agents.
 """
 
 import argparse
@@ -357,6 +369,55 @@ def cmd_whoami(args):
         )
 
 
+def cmd_dashboard(args):
+    """P8 content-first: no-argument invocation shows live data, not help.
+
+    Prints who you are plus your open assigned work, then the next steps.
+    """
+    status, parsed, text = api("GET", "/rest/api/3/myself")
+    if status != 200:
+        _fail(_err_text(status, parsed, text))
+    account = parsed.get("accountId")
+    print(
+        "%s <%s>"
+        % (parsed.get("displayName", "?"), parsed.get("emailAddress", "?"))
+    )
+    jql = "assignee = currentUser() AND resolution = EMPTY ORDER BY updated DESC"
+    body = {
+        "jql": jql,
+        "maxResults": 15,
+        "fields": ["summary", "status"],
+    }
+    s, p, t = api("POST", "/rest/api/3/search/jql", body)
+    if s != 200:
+        s, p, t = api(
+            "GET",
+            "/rest/api/3/search",
+            query={"jql": jql, "maxResults": 15, "fields": "summary,status"},
+        )
+    if s == 200:
+        issues = p.get("issues", [])
+        total = p.get("total", len(issues))
+        print("my_open_workitems[%d]:" % total)
+        if not issues:
+            print("  (none)")
+        for it in issues:
+            f = it.get("fields", {})
+            print(
+                "  %s  %s  %s"
+                % (
+                    it.get("key"),
+                    (f.get("status") or {}).get("name", "?"),
+                    f.get("summary", ""),
+                )
+            )
+    print("help[3]:")
+    print("  jira-axi search --jql '...'      run any JQL query")
+    print("  jira-axi get KEY                 view one issue")
+    print("  jira-axi create --project ...    create an issue")
+
+
+
 def _create_issue(project, summary, issuetype, adf, labels, assignee, sprint_id):
     fields = {
         "project": {"key": project},
@@ -404,6 +465,10 @@ def cmd_create(args):
         # Created but a follow-up (sprint move) failed; surface loudly.
         sys.stderr.write("jira-axi: %s\n" % err)
     print(key)
+    # P9 contextual disclosure: suggest the obvious next steps.
+    _, _, base = _creds()
+    sys.stderr.write("  %s/browse/%s\n" % (base, key))
+    sys.stderr.write("  next: jira-axi get %s | jira-axi transition %s --to <state>\n" % (key, key))
 
 
 def cmd_update(args):
@@ -544,7 +609,12 @@ def cmd_search(args):
         print(json.dumps(parsed, indent=2))
         return
     issues = parsed.get("issues", [])
-    print("%d issue(s)" % parsed.get("total", len(issues)))
+    total = parsed.get("total", len(issues))
+    if not issues:
+        # P5 definitive empty state: explicit, never an ambiguous blank.
+        print("0 issues match")
+        return
+    print("%d issue(s)" % total)
     for it in issues:
         f = it.get("fields", {})
         print(
@@ -739,8 +809,9 @@ def main(argv):
     parser = build_parser()
     args = parser.parse_args(argv)
     if not getattr(args, "cmd", None):
-        parser.print_help()
-        return 2
+        # P8 content-first: bare invocation shows live data, not help text.
+        cmd_dashboard(args)
+        return 0
     args.func(args)
     return 0
 
