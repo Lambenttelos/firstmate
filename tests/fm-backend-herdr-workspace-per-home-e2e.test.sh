@@ -78,9 +78,16 @@ fm_herdr_lab_prepare "$SESSION" || fail "could not prepare isolated Herdr lab se
 fm_backend_source herdr || fail "fm_backend_source herdr failed"
 
 # --- scratch world: a primary-shaped home, a secondmate-shaped home, two projects ---
+# One shared projects dir serves both homes: fm-spawn's clone-identity assertion
+# requires the spawned project to be a direct child of the projects dir, and the
+# documented test escape is to move the whole projects dir with
+# FM_PROJECTS_OVERRIDE (bin/fm-spawn.sh validate_project_is_own_clone).
 
 PRIMARY_HOME="$TMP_ROOT/primary-home"
 mkdir -p "$PRIMARY_HOME/state" "$PRIMARY_HOME/data/cm1" "$PRIMARY_HOME/config"
+
+PROJECTS="$TMP_ROOT/shared-projects"
+mkdir -p "$PROJECTS"
 printf 'trivial e2e primary crewmate brief: nothing to do.\n' > "$PRIMARY_HOME/data/cm1/brief.md"
 
 SM_HOME="$TMP_ROOT/secondmate-home"
@@ -99,13 +106,14 @@ make_scratch_project() {  # <dir>
   git -C "$dir" -c user.name='Firstmate Tests' -c user.email='tests@example.invalid' commit -qm initial
 }
 
-PROJ1="$TMP_ROOT/scratch-project-1"; make_scratch_project "$PROJ1"
-PROJ2="$TMP_ROOT/scratch-project-2"; make_scratch_project "$PROJ2"
+PROJ1="$PROJECTS/scratch-project-1"; make_scratch_project "$PROJ1"
+PROJ2="$PROJECTS/scratch-project-2"; make_scratch_project "$PROJ2"
 
 # --- 1. primary-shaped home: a crewmate spawns into the "firstmate" space ---
 
 CM1_OUT="$TMP_ROOT/cm1.out"; CM1_ERR="$TMP_ROOT/cm1.err"
 FM_SPAWN_NO_GUARD=1 FM_HOME="$PRIMARY_HOME" FM_ROOT_OVERRIDE="$ROOT" \
+  FM_PROJECTS_OVERRIDE="$PROJECTS" \
   "$ROOT/bin/fm-spawn.sh" cm1 "$PROJ1" "sh -c 'echo primary-crew-ok'" --backend herdr \
   >"$CM1_OUT" 2>"$CM1_ERR"
 rc=$?
@@ -135,6 +143,7 @@ pass "real herdr E2E: the primary-shaped home's crewmate landed in the 'firstmat
 
 SM_OUT="$TMP_ROOT/sm.out"; SM_ERR="$TMP_ROOT/sm.err"
 FM_SPAWN_NO_GUARD=1 FM_HOME="$PRIMARY_HOME" FM_ROOT_OVERRIDE="$ROOT" \
+  FM_PROJECTS_OVERRIDE="$PROJECTS" \
   "$ROOT/bin/fm-spawn.sh" e2esm1 "$SM_HOME" "sh -c 'echo secondmate-launch-ok'" --secondmate --backend herdr \
   >"$SM_OUT" 2>"$SM_ERR"
 rc=$?
@@ -161,6 +170,7 @@ pass "real herdr E2E: a --secondmate spawn by the PRIMARY lands in the SECONDMAT
 
 CM2_OUT="$TMP_ROOT/cm2.out"; CM2_ERR="$TMP_ROOT/cm2.err"
 FM_SPAWN_NO_GUARD=1 FM_HOME="$SM_HOME" FM_ROOT_OVERRIDE="$ROOT" \
+  FM_PROJECTS_OVERRIDE="$PROJECTS" \
   "$ROOT/bin/fm-spawn.sh" cm2 "$PROJ2" "sh -c 'echo sm-crew-ok'" --backend herdr \
   >"$CM2_OUT" 2>"$CM2_ERR"
 rc=$?

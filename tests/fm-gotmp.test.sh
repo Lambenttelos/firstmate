@@ -71,6 +71,9 @@ make_fake_root() {
   ln -s "$ROOT/bin/fm-merge-queue-lib.sh" "$fake/bin/fm-merge-queue-lib.sh"
   ln -s "$ROOT/bin/fm-mutex-lib.sh" "$fake/bin/fm-mutex-lib.sh"
   ln -s "$ROOT/bin/fm-pid-lib.sh" "$fake/bin/fm-pid-lib.sh"
+  # fm-completions-lib.sh: teardown sources it to append the completion-ledger
+  # row at the authoritative done point; a missing sibling aborts teardown.
+  ln -s "$ROOT/bin/fm-completions-lib.sh" "$fake/bin/fm-completions-lib.sh"
   # fm-guard.sh: stub (teardown calls it with `|| true`).
   cat > "$fake/bin/fm-guard.sh" <<'SH'
 #!/usr/bin/env bash
@@ -177,6 +180,9 @@ test_teardown_skips_gracefully_without_tasktmp() {
   ln -s "$ROOT/bin/fm-merge-queue-lib.sh" "$fake/bin/fm-merge-queue-lib.sh"
   ln -s "$ROOT/bin/fm-mutex-lib.sh" "$fake/bin/fm-mutex-lib.sh"
   ln -s "$ROOT/bin/fm-pid-lib.sh" "$fake/bin/fm-pid-lib.sh"
+  # fm-completions-lib.sh: teardown sources it to append the completion-ledger
+  # row at the authoritative done point; a missing sibling aborts teardown.
+  ln -s "$ROOT/bin/fm-completions-lib.sh" "$fake/bin/fm-completions-lib.sh"
   cat > "$fake/bin/fm-guard.sh" <<'SH'
 #!/usr/bin/env bash
 exit 0

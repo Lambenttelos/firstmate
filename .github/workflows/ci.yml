@@ -107,10 +107,11 @@ jobs:
   tests-portable-serial:
     name: Behavior portable serial
     runs-on: ubuntu-latest
-    # Measured serial remainder is ~13 min wall without Herdr. Cap is a hang
-    # tripwire above observed p99 script cost and suite wall, not the expected
-    # healthy end (interim 25m full-suite slack reduced after sharding).
-    timeout-minutes: 20
+    # Full serial remainder wall is ~19-20 min now that every script runs to
+    # completion (the earlier ~13 min figure predated several scripts and
+    # counted fast-failing red tests that exited early). Cap is a hang tripwire
+    # above the observed healthy suite wall with margin, not the expected end.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v6
         with:
@@ -193,8 +194,8 @@ jobs:
           printf '%s\n' "$status"
           version=$(printf '%s' "$status" | jq -r '.client.version // empty')
           protocol=$(printf '%s' "$status" | jq -r '.client.protocol // empty')
-          [ "$version" = "0.7.4" ] || {
-            echo "::error::expected exact Herdr pin 0.7.4, got ${version:-<empty>}"
+          [ "$version" = "0.7.5-fm.1" ] || {
+            echo "::error::expected exact Herdr pin 0.7.5-fm.1, got ${version:-<empty>}"
             exit 1
           }
           case "$protocol" in
@@ -327,16 +328,16 @@ jobs:
           snapshot_output=$(/bin/bash tests/fm-fleet-snapshot-view.test.sh)
           printf '%s\n' "$snapshot_output"
           snapshot_count=$(printf '%s\n' "$snapshot_output" | grep -c '^ok - ')
-          [ "$snapshot_count" -eq 15 ] || {
-            echo "::error::expected 15 snapshot/fleet-view tests, got $snapshot_count"
+          [ "$snapshot_count" -eq 20 ] || {
+            echo "::error::expected 20 snapshot/fleet-view tests, got $snapshot_count"
             exit 1
           }
 
           bearings_output=$(/bin/bash tests/fm-bearings-snapshot.test.sh)
           printf '%s\n' "$bearings_output"
           bearings_count=$(printf '%s\n' "$bearings_output" | grep -c '^ok - ')
-          [ "$bearings_count" -eq 42 ] || {
-            echo "::error::expected 42 Bearings tests, got $bearings_count"
+          [ "$bearings_count" -eq 43 ] || {
+            echo "::error::expected 43 Bearings tests, got $bearings_count"
             exit 1
           }
 
@@ -353,7 +354,10 @@ jobs:
       - name: Personal fleet paths must not be tracked
         run: |
           set -eu
-          tracked=$(git ls-files -- data state config projects .no-mistakes)
+          # config/token-prices.json is an intentionally tracked default price
+          # snapshot shipped with the repo and read by bin/fm-token-lib.sh; every
+          # other config/ path is personal fleet state and must stay untracked.
+          tracked=$(git ls-files -- data state config projects .no-mistakes ':!config/token-prices.json')
           if [ -n "$tracked" ]; then
             echo "::error::Personal fleet paths are tracked in git:"
             printf '%s\n' "$tracked"

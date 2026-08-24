@@ -700,6 +700,11 @@ run_routine_bootstrap_fixture() {
 test_routine_bootstrap_confirmations_are_silent() {
   local out
   out=$(run_routine_bootstrap_fixture bash "$TMP_ROOT/routine-silent")
+  # The fixture's secondmate is idle and has no work in flight, so the lazy
+  # CONFIG_REREAD nudge policy (fm-config-inherit-lib.sh) deliberately records
+  # one BOOTSTRAP_INFO skip line instead of waking it; that line is part of the
+  # save-convergence contract and must not count as a routine confirmation.
+  out=$(printf '%s\n' "$out" | grep -v '^BOOTSTRAP_INFO: skipped CONFIG_REREAD nudge for fm-sm ' || true)
   [ -z "$out" ] || fail "routine bootstrap confirmations should be silent, got: $out"
   pass "bootstrap keeps routine tasks-axi, harness, dispatch, and already-live liveness confirmations silent"
 }
@@ -708,6 +713,7 @@ test_routine_bootstrap_contract_runs_under_system_bash() {
   local out
   [ -x /bin/bash ] || { pass "bootstrap routine contract skipped without /bin/bash"; return; }
   out=$(run_routine_bootstrap_fixture /bin/bash "$TMP_ROOT/routine-bash")
+  out=$(printf '%s\n' "$out" | grep -v '^BOOTSTRAP_INFO: skipped CONFIG_REREAD nudge for fm-sm ' || true)
   [ -z "$out" ] || fail "routine bootstrap contract should be silent under /bin/bash, got: $out"
   pass "bootstrap routine contract runs under system /bin/bash"
 }

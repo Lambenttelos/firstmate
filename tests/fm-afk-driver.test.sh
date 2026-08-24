@@ -14,6 +14,11 @@ set -u
 # shellcheck source=tests/lib.sh
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
+# Source fm_pid_identity once at file scope so seed_live_daemon can record the
+# fake daemon's process identity by a direct call, not a per-write subshell.
+# shellcheck source=bin/fm-pid-lib.sh
+. "$ROOT/bin/fm-pid-lib.sh"
+
 TMP_ROOT=$(fm_test_tmproot fm-afk-driver-tests)
 
 # --- fixtures ---------------------------------------------------------------
@@ -393,13 +398,32 @@ test_unreadable_lanes_still_count_against_the_cap() {
 # the daemon lock records it.
 DAEMON_SLEEPERS=()
 seed_live_daemon() {  # <case-dir>
-  local dir=$1 lock="$1/home/state/.supervise-daemon.lock" pid
+  local dir=$1 lock="$1/home/state/.supervise-daemon.lock" pid i
   sleep 120 &
   pid=$!
   DAEMON_SLEEPERS+=("$pid")
   mkdir -p "$lock"
   printf '%s\n' "$pid" > "$lock/pid"
-  ( . "$ROOT/bin/fm-pid-lib.sh"; fm_pid_identity "$pid" > "$lock/pid-identity" ) 2>/dev/null || true
+  # Record the daemon's process identity the same way a settled daemon holds it,
+  # and make the write reliable rather than best-effort. A brand-new forked
+  # sleeper's /proc entry can momentarily lose a stat race under CI fork pressure,
+  # so a single best-effort read truncates pid-identity to empty; the liveness
+  # probe then falls back to the command line, sees a bare 'sleep 120' instead of
+  # the daemon path, reads the daemon as DEAD, and the reader-check returns early
+  # with no AFK_READER line - the exact intermittent failure. Retry until the
+  # process has settled and the identity is non-empty (a real daemon is always
+  # settled by the time reader-check runs), so the stored identity matches the
+  # stable re-read the probe performs.
+  i=0
+  while [ "$i" -lt 50 ]; do
+    if fm_pid_identity "$pid" > "$lock/pid-identity" 2>/dev/null \
+      && [ -s "$lock/pid-identity" ]; then
+      return 0
+    fi
+    sleep 0.1
+    i=$((i + 1))
+  done
+  fail "seed_live_daemon could not record a stable daemon identity for pid $pid"
 }
 
 stop_daemon_sleepers() {
