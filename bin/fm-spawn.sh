@@ -193,6 +193,18 @@ SUB_HOME_MARKER=".fm-secondmate-home"
 . "$SCRIPT_DIR/fm-completions-lib.sh"
 # shellcheck source=bin/fm-token-sessions-lib.sh
 . "$SCRIPT_DIR/fm-token-sessions-lib.sh"
+# Resume-command mapping + resume-token helper for stuck-crewmate recovery
+# (bin/fm-resume-lib.sh). Side-effect-free on source, like the two libs above;
+# the post-launch capture below stamps the resume token so a dead session can be
+# resumed in place instead of restarted from scratch.
+# shellcheck source=bin/fm-resume-lib.sh
+. "$SCRIPT_DIR/fm-resume-lib.sh"
+# Backlog backend opt-out probe (fm_backlog_backend_manual): the post-launch
+# capture mirrors the resume token into the durable task record via
+# tasks-axi --resume, unless config/backlog-backend=manual opts out. Cheap
+# single-file read on source; no tasks-axi call here.
+# shellcheck source=bin/fm-tasks-axi-lib.sh
+. "$SCRIPT_DIR/fm-tasks-axi-lib.sh"
 # Shared per-task telemetry writer (state/<id>.telemetry, key=value). Gap-1
 # stamps the resolved Claude account (account=/account_source=) at spawn; the
 # same library owns the in-place key update for sibling producers. No side
@@ -1819,6 +1831,27 @@ if [ "$HARNESS" = jcode ]; then
   if [ -n "$CREW_SESSION_ID" ]; then
     if fm_token_sessions_record "$DATA" "$ID" "$CREW_SESSION_ID" "$WT" "$SPAWN_TS" "$HARNESS" 2>/dev/null; then
       echo "session_id=$CREW_SESSION_ID" >> "$STATE/$ID.meta"
+    fi
+    # Resume-token capture (best-effort, NEVER a spawn blocker). The dead-session
+    # recovery counterpart to the attribution ledger above: stuck-crewmate
+    # recovery can RESUME this harness session in place - restoring its full turn
+    # history, the brief and every step of progress - instead of restarting from
+    # scratch. For jcode the resolved session id IS the `jcode --resume <id>`
+    # token (fm_resume_token_for_harness), so no second lookup is needed; a future
+    # harness whose resume token differs would diverge inside that helper. The
+    # token is stamped resume= into meta (bin/fm-resume-cmd.sh reads it during
+    # recovery) and, for a backlog-tracked ship/scout task, mirrored into the
+    # durable task record via `tasks-axi update --resume` so it survives even a
+    # meta teardown. A secondmate is persistent and never a backlog item, so it
+    # gets the meta stamp only. Empty token, a manual backlog backend, an
+    # incompatible tasks-axi, or a task the backlog does not know all resolve to
+    # "no mirror", silently - none fails the spawn.
+    RESUME_TOKEN=$(fm_resume_token_for_harness "$HARNESS" "$CREW_SESSION_ID")
+    if [ -n "$RESUME_TOKEN" ]; then
+      echo "resume=$RESUME_TOKEN" >> "$STATE/$ID.meta"
+      if [ "$KIND" != secondmate ] && fm_tasks_axi_backend_available "$CONFIG"; then
+        ( cd "$FM_HOME" && tasks-axi update "$ID" --resume "$RESUME_TOKEN" ) >/dev/null 2>&1 || true
+      fi
     fi
   fi
 fi
