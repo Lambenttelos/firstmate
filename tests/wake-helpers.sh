@@ -87,6 +87,19 @@ fi
 exit 1
 SH
   chmod +x "$fakebin/tmux"
+  # Hermetic fm-send stub for the watcher's stale nudge (FM_STALE_NUDGE_BIN).
+  # Records each invocation (target + message) as one line to $FM_NUDGE_LOG,
+  # succeeds only when FM_FAKE_NUDGE_OK=1, so the default is the fail-open
+  # escalation path (an undeliverable nudge surfaces immediately).
+  cat > "$fakebin/fm-send.sh" <<'SH'
+#!/usr/bin/env bash
+set -u
+printf '%s\t%s\n' "${1:-}" "${2:-}" >> "${FM_NUDGE_LOG:-/dev/null}"
+if [ "${FM_FAKE_NUDGE_OK:-0}" = 1 ]; then exit 0; fi
+echo "stub: nudge not accepted" >&2
+exit 1
+SH
+  chmod +x "$fakebin/fm-send.sh"
   make_fake_crew_state "$fakebin" >/dev/null
   printf '%s\n' "$dir"
 }
