@@ -123,12 +123,20 @@ relay_alive_pid() {
 }
 
 # Discover a LAN-reachable IPv4 address to show in the URL. The src of the default
-# route is the address other hosts use to reach this machine; fall back to the
-# first address hostname reports. This is display only - the relay's actual reach
+# route is a last resort; the Tailscale address is preferred because the captain's
+# phone arrives over the VPN. This is display only - the relay's actual reach
 # is set by --bind, not by this discovery.
 discover_lan_ip() {
   local ip
-  ip=$(ip -4 route get 1.1.1.1 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p' | head -n1)
+  # Prefer the Tailscale address: the captain's phone arrives over the VPN, and
+  # in containers the default-route src is a bridge address no phone can reach.
+  ip=$(tailscale ip -4 2>/dev/null | head -n1)
+  if [ -z "$ip" ]; then
+    ip=$(ip -4 addr show tailscale0 2>/dev/null | sed -n 's/.*inet \([0-9.]*\).*/\1/p' | head -n1)
+  fi
+  if [ -z "$ip" ]; then
+    ip=$(ip -4 route get 1.1.1.1 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p' | head -n1)
+  fi
   if [ -z "$ip" ]; then
     ip=$(hostname -I 2>/dev/null | tr ' ' '\n' | grep -E '^[0-9.]+$' | head -n1)
   fi
