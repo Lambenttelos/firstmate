@@ -716,6 +716,12 @@ families_for_changed_path() {
       families_for_test_reference "$(basename "$path")" \
         || printf '%s\n' "__unmapped__:$path"
       ;;
+    # jira-axi is no longer bundled here: it lives in yjuyjuy/jira-axi and is
+    # resolved from PATH. Must precede the bin/* arm, which would otherwise
+    # claim it and fail the unmapped-source gate on the removal itself or on a
+    # stale local copy; the tool carries its own tests in its own repo.
+    bin/jira-axi)
+      ;;
     bin/*)
       families_for_test_reference "$(basename "$path")" \
         || printf '%s\n' "__unmapped__:$path"

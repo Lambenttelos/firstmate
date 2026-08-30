@@ -731,6 +731,8 @@ Orca provides both the task worktree and terminal endpoint (see "Runtime backend
 A herdr, zellij, or cmux home is therefore never told `tmux` is missing, and the `treehouse` durable-lease upgrade check runs only for the backends that actually use treehouse.
 When `config/crew-dispatch.json` exists, bootstrap also requires `jq` for dispatch profile validation.
 When X mode is opted in, bootstrap also requires `curl` and `jq` before arming the relay poll shim.
+The chat-thread bug triage pipeline's Jira steps require `jira-axi` on `PATH`, from the standalone repo [yjuyjuy/jira-axi](https://github.com/yjuyjuy/jira-axi) (clone it and run its `install.sh`), with `JIRA_EMAIL`, `JIRA_API_TOKEN`, and `JIRA_BASE_URL` in the environment.
+It is not part of the universal toolchain because only that pipeline uses it, and firstmate no longer bundles a copy: the standalone repo is the one canonical copy, so a bundled second copy could only drift.
 `tasks-axi` and `quota-axi` are required bootstrap tools in every profile, the same class as `lavish-axi`.
 An absent or incompatible `tasks-axi` reports `MISSING: tasks-axi (install: npm install -g tasks-axi)`; when `config/backlog-backend` is not `manual` and compatible `tasks-axi` is on `PATH`, bootstrap stays silent and firstmate uses its verbs for routine backlog mutations, otherwise it hand-edits `data/backlog.md` until installation is approved and completed.
 An absent `quota-axi` reports `MISSING: quota-axi (install: npm install -g quota-axi)`; `bin/fm-dispatch-select.sh` still selects uniformly from the valid candidate array with an OS-backed random source when quota data is unavailable.
