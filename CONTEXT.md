@@ -3,6 +3,14 @@
 Glossary of domain terms.
 Terms are canonical; use them exactly as defined.
 
+## Captain's dashboard
+
+- **Dashboard**: the captain-run TUI (`fm-dashboard.sh`) rendering fleet-wide backlog, captain decisions, in-flight crew states, and recent completions. Replaces the retired HTML desk page.
+  _Avoid_: desk (retired term for the HTML page)
+- **Captain decision**: any item whose progress is blocked solely on captain judgment, regardless of which ledger records it (a captain-kind backlog hold, a decision-desk request, or an unanswered transcript question). A dashboard rendering of captain decisions must draw from all three sources and tag each item's source.
+- **Transcript**: the durable captain-private feed of captain-facing turns and questions (`state/desk-transcript.jsonl`, producer `fm-desk-transcript.sh`, both to be renamed). Survives the desk retirement as dashboard infrastructure.
+  _Avoid_: desk transcript
+
 ## Account orchestration
 
 - **Account**: one authenticated identity on a provider (e.g. `claude-1`, an OpenAI login, an opencode subscription). Identified in the account registry by provider + label. Never stores credentials; points at the credential store that holds them.
