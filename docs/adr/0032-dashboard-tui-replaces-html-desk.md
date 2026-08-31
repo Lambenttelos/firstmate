@@ -2,7 +2,7 @@
 
 The captain's desk was an event-refreshed HTML page (`fm-desk-refresh.sh` + `fm-desk-event.sh`), chosen originally over a standing agent so fleet status cost no resident process.
 We decided (2026-08-31) to replace it with `bin/fm-dashboard.sh`, a terminal TUI the captain runs on demand: an fzf-driven, fleet-wide view of the backlog and of captain decisions, with snapshot-at-launch freshness and a manual refresh key.
-The captain accepts losing browser/LAN glanceability; the HTML desk's event trigger and `/desk` skill are retired in the same change rather than left dormant.
+The captain accepts losing browser/LAN glanceability once retirement lands, but retirement is STAGED: the HTML desk stays alive and event-refreshed until the captain has used the dashboard and explicitly confirms it works better, and only then are the desk renderers retired (in one change with the transcript rename).
 
 ## Constraints carried forward
 
@@ -17,5 +17,5 @@ The captain accepts losing browser/LAN glanceability; the HTML desk's event trig
 
 ## Considered options
 
-- Keep both renders (TUI sibling + HTML page): rejected to avoid two drifting "truths" and dead-code rot.
+- Keep both renders permanently (TUI sibling + HTML page): rejected to avoid two drifting "truths" and dead-code rot. The overlap window is deliberate and bounded: it ends when the captain confirms the dashboard is the better tool.
 - fzf as the TUI engine over pure bash/tput or gum: one static binary buys list + fuzzy filter + preview-pane expand, which is exactly the collapsed-row/expandable-description requirement.
