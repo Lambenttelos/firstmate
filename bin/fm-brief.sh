@@ -448,38 +448,22 @@ The report is the only thing that survives, so anything worth keeping must be in
 # Rules
 1. Never push to any remote and never open a PR.
 2. Stay inside this worktree; the only files you may write outside it are the report and the status file below.
-3. Use gh-axi for GitHub operations and chrome-devtools-axi for browser operations.
-4. Report status by appending one line:
-   \`echo "{state}: {one short line}" >> $STATUS_FILE\`
-   States: working, needs-decision, blocked, $PAUSED_VERB, done, failed.
-   Each append wakes firstmate, so report sparingly: only phase changes a supervisor
-   would act on and the needs-decision/blocked/paused/done/failed states. No step-by-step
-   FYI progress lines; firstmate reads your pane for that.
-   Use \`$PAUSED_VERB: {why}\` - distinct from \`blocked:\` - ONLY when you are deliberately idling on a
-   known external wait you expect to clear on its own (an upstream release, a rate-limit reset):
-   firstmate then leaves your idle pane alone and rechecks it on a long cadence instead of
-   treating it as a possible wedge. Use \`blocked:\` when you are stuck and need help.
-   A Claude/auth session-limit, a usage-window or quota exhaustion, or a revoked/expired token is
-   NOT such a wait: it is captain-fixable (switch account or relog in), so report it \`blocked:\`, never \`$PAUSED_VERB:\`.
-5. If you hit the same obstacle twice, append \`blocked: {why}\` and stop; firstmate will help.
-6. If a decision belongs to a human (product choices, destructive actions),
-   append \`needs-decision: {summary of options}\` and stop. Firstmate will reply with the decision.
-   When firstmate replies or a blocker clears and you resume, append \`resolved: {how it was decided or unblocked}\` (add the same \`[key=<slug>]\` if you opened it with one) so the decision or blocker is durably closed and does not keep resurfacing.
-7. Never stop, restart, or update the shared \`no-mistakes\` daemon - it is one instance serving
-   every lane/home, so restarting it kills other lanes' in-flight pipeline runs. On ANY no-mistakes
-   daemon error, append \`blocked: {the daemon error}\` and stop; only firstmate manages the daemon.
-8. Run every heavy command - unit suites, end-to-end suites, lint sweeps, builds - through
-   \`$FM_ROOT/bin/fm-heavy-run.sh --task $ID -- <command>\`. It queues the run so the whole fleet
-   is not thrashing one machine, then gives you the command's real output and exit status.
-   It prints a queued notice while you wait; that is normal, not a hang.
-   Cap test parallelism at \`VITEST_MAX_WORKERS=2\` - never 4: vitest sizes its pool from the CPU
-   count and is the fleet's dominant memory consumer.
-9. Announce every test run in the status file: \`working: TEST START - {what is running, rough scale}\`
-   before it, \`working: TEST END - {outcome}\` after it. Firstmate coordinates the shared machine
-   from those two lines, so a silent suite is a defect.
-10. Announce live browser use in the status file so the shared-machine log shows browser activity:
-   \`working: BROWSER START - {what you will drive}\` before it, \`working: BROWSER END - {outcome}\`
-   after it. This is a non-blocking coordination announce only - never wait on firstmate for a slot.
+3. Use gh-axi for GitHub and chrome-devtools-axi for browser operations.
+4. Report status by appending one line: \`echo "{state}: {one short line}" >> $STATUS_FILE\`
+   States: working, needs-decision, blocked, $PAUSED_VERB, done, failed. Each append wakes firstmate, so report only
+   supervisor-actionable phase changes plus the needs-decision/blocked/$PAUSED_VERB/done/failed states; no FYI lines.
+   Use \`$PAUSED_VERB: {why}\` (distinct from \`blocked:\`) ONLY when deliberately idling on a known external wait that self-clears;
+   use \`blocked:\` when stuck. An auth session-limit, usage-window/quota exhaustion, or revoked/expired token is
+   captain-fixable, so report it \`blocked:\`, NEVER \`$PAUSED_VERB:\`.
+5. If you hit the same obstacle twice, append \`blocked: {why}\` and stop.
+6. If a decision belongs to a human (product choices, destructive actions), append \`needs-decision: {options}\`
+   and stop. On reply or a blocker clears, append \`resolved: {how}\` (same \`[key=<slug>]\` if you opened with one).
+7. Never stop, restart, or update the shared \`no-mistakes\` daemon. On ANY daemon error, append
+   \`blocked: {the daemon error}\` and stop.
+8. Run heavy commands (unit/e2e suites, lint, builds) through
+   \`$FM_ROOT/bin/fm-heavy-run.sh --task $ID -- <command>\` (it prints a queued notice while you wait; that is normal, not a hang). Cap \`VITEST_MAX_WORKERS=2\` (never 4).
+9. Announce test runs: \`working: TEST START - {what, rough scale}\` before, \`working: TEST END - {outcome}\` after.
+10. Announce live browser use: \`working: BROWSER START - {what}\` before, \`working: BROWSER END - {outcome}\` after - a non-blocking announce, never wait on firstmate for a slot.
 
 $RTK_SECTION
 
@@ -536,25 +520,14 @@ EOF
 2. Run \`no-mistakes doctor\`; if it reports the repo is not initialized here, run \`no-mistakes init\`."
     # Shared direct-push pipeline body: identical whether or not the lane self-lands.
     DP_BODY=$(cat <<EOF
-YOU own the entire finish on a direct-push lane. Committing locally is NEVER done, and pushing is NEVER done either. Do not stop after committing or after pushing to wait for firstmate to tell you to validate - drive the whole sequence yourself in one continuous flow: implement, commit, run the FULL /no-mistakes pipeline yourself, then complete the closing steps below.
+YOU own the entire finish on a direct-push lane. Committing locally is NEVER done, and pushing is NEVER done either. Drive the whole sequence yourself in one continuous flow: implement, commit, run the FULL /no-mistakes pipeline yourself, then complete the closing steps - do not stop for firstmate.
+The pipeline's \`pr\`/\`ci\` steps not applying is expected; a run ending \`passed\` with those steps skipped is COMPLETE. A run reporting \`missing NO_MISTAKES_BITBUCKET_EMAIL\` is expected and is NOT a blocker.
 
-You run the FULL /no-mistakes pipeline yourself; its \`pr\` and \`ci\` steps not applying is expected, and a run ending \`passed\` with those steps skipped is COMPLETE - do not treat skipped PR/CI as a failure or a wait.
-A run reporting \`missing NO_MISTAKES_BITBUCKET_EMAIL\` is expected and is NOT a blocker; do not append \`blocked:\` for it.
-
-Before you invoke /no-mistakes, run \`$FM_ROOT/bin/fm-nm-preflight.sh\` from this worktree.
-If it refuses, do NOT invoke /no-mistakes: append \`blocked: {the refusal it printed}\` and stop.
-It refuses when the pipeline already has a run in flight on a different branch, because a run started here would silently attach to that one and validate that branch instead of yours - never respond to or abort that run, because its findings belong to the lane that started it.
-
-ALWAYS pass \`--intent "{one-line description of what this change does}"\` when you invoke \`no-mistakes axi run\`, on EVERY run. It is required, never optional: without it the pipeline spends an extra model call deriving the intent itself, wasting tokens and latency on every run. Write the intent yourself from the Task above.
-
-You drive no-mistakes by responding to its gates, not by implementing fixes.
-Follow the guidance no-mistakes itself provides for the mechanics: it loads when you invoke /no-mistakes, and \`no-mistakes axi run --help\` plus the \`help\` lines in each \`axi\` response are authoritative and version-matched to the installed binary.
-Do not hand-edit, commit, or fix findings yourself while a run is active - the pipeline applies every fix.
-
-Two firstmate-specific rules layer on top of that guidance:
-- ask-user findings are not yours to answer: escalate to firstmate (rule 6) and stop.
-  When the decision comes back, feed it to the gate with \`no-mistakes axi respond\` and let the pipeline apply it - do not route the question to "the user" or implement the fix yourself.
-- Avoid \`--yes\`: the captain, not you, owns the ask-user decisions it would silently auto-resolve.
+Follow /no-mistakes' own version-matched guidance for mechanics (\`no-mistakes axi run --help\`, each \`axi\` response's \`help\`). Firstmate-specific rules on top:
+- Before invoking, run \`$FM_ROOT/bin/fm-nm-preflight.sh\`; if it refuses, do NOT invoke - append \`blocked: {the refusal}\` and stop. It refuses when a run is in flight on a different branch; never respond to or abort that run.
+- ALWAYS pass \`--intent "{one-line description}"\` on EVERY \`axi run\`.
+- Respond to gates; never hand-edit/commit/fix findings while a run is active.
+- ask-user findings are NOT yours: escalate via rule 6, then feed the decision with \`no-mistakes axi respond\`. Avoid \`--yes\`.
 EOF
 )
     if [ "$AUTOLAND" = on ]; then
@@ -672,41 +645,24 @@ If the top-level path is the primary checkout or not the worktree you were launc
 # Rules
 $RULE1
 2. Stay inside this worktree; modify nothing outside it.
-3. Use gh-axi for GitHub operations and chrome-devtools-axi for browser operations.
-4. Report status by appending one line:
-   \`echo "{state}: {one short line}" >> $STATUS_FILE\`
-   States: working, needs-decision, blocked, $PAUSED_VERB, done, failed.
-   Each append wakes firstmate, so report sparingly: only phase changes a supervisor
-   would act on (setup done, bug reproduced, fix implemented, validation passed) and the
-   needs-decision/blocked/paused/done/failed states. No step-by-step FYI progress lines;
-   firstmate reads your pane for that.
-   A mid-task \`working:\` line (including setup complete) is nonterminal: do not end the
-   turn after it; continue the same stage until a defined \`done:\` gate under Definition of done.
-   Use \`$PAUSED_VERB: {why}\` - distinct from \`blocked:\` - ONLY when you are deliberately idling on a
-   known external wait you expect to clear on its own (an upstream release, a rate-limit reset,
-   a scheduled window): firstmate then leaves your idle pane alone and rechecks it on a long
-   cadence instead of treating it as a possible wedge. Use \`blocked:\` when you are stuck and need help.
-   A Claude/auth session-limit, a usage-window or quota exhaustion, or a revoked/expired token is
-   NOT such a wait: it is captain-fixable (switch account or relog in), so report it \`blocked:\`, never \`$PAUSED_VERB:\`.
-5. If you hit the same obstacle twice, append \`blocked: {why}\` and stop; firstmate will help.
-6. If a decision belongs to a human (product choices, destructive actions, ask-user findings),
-   append \`needs-decision: {summary of options}\` and stop. Firstmate will reply with the decision.
-   When firstmate replies or a blocker clears and you resume, append \`resolved: {how it was decided or unblocked}\` (add the same \`[key=<slug>]\` if you opened it with one) so the decision or blocker is durably closed and does not keep resurfacing.
-7. Never stop, restart, or update the shared \`no-mistakes\` daemon - it is one instance serving
-   every lane/home, so restarting it kills other lanes' in-flight pipeline runs. On ANY no-mistakes
-   daemon error, append \`blocked: {the daemon error}\` and stop; only firstmate manages the daemon.
-8. Run every heavy command - unit suites, end-to-end suites, lint sweeps, builds - through
-   \`$FM_ROOT/bin/fm-heavy-run.sh --task $ID -- <command>\`. It queues the run so the whole fleet
-   is not thrashing one machine, then gives you the command's real output and exit status.
-   It prints a queued notice while you wait; that is normal, not a hang.
-   Cap test parallelism at \`VITEST_MAX_WORKERS=2\` - never 4: vitest sizes its pool from the CPU
-   count and is the fleet's dominant memory consumer.
-9. Announce every test run in the status file: \`working: TEST START - {what is running, rough scale}\`
-   before it, \`working: TEST END - {outcome}\` after it. Firstmate coordinates the shared machine
-   from those two lines, so a silent suite is a defect.
-10. Announce live browser use in the status file so the shared-machine log shows browser activity:
-   \`working: BROWSER START - {what you will drive}\` before it, \`working: BROWSER END - {outcome}\`
-   after it. This is a non-blocking coordination announce only - never wait on firstmate for a slot.
+3. Use gh-axi for GitHub and chrome-devtools-axi for browser operations.
+4. Report status by appending one line: \`echo "{state}: {one short line}" >> $STATUS_FILE\`
+   States: working, needs-decision, blocked, $PAUSED_VERB, done, failed. Each append wakes firstmate, so report only
+   supervisor-actionable phase changes plus the needs-decision/blocked/$PAUSED_VERB/done/failed states; no FYI lines.
+   A mid-task \`working:\` line (including setup complete) is nonterminal: continue until a defined \`done:\` gate.
+   Use \`$PAUSED_VERB: {why}\` (distinct from \`blocked:\`) ONLY when deliberately idling on a known external wait that self-clears;
+   use \`blocked:\` when stuck. An auth session-limit, usage-window/quota exhaustion, or revoked/expired token is
+   captain-fixable, so report it \`blocked:\`, NEVER \`$PAUSED_VERB:\`.
+5. If you hit the same obstacle twice, append \`blocked: {why}\` and stop.
+6. If a decision belongs to a human (product choices, destructive actions, ask-user findings), append
+   \`needs-decision: {options}\` and stop. On reply or a blocker clears, append \`resolved: {how}\`
+   (same \`[key=<slug>]\` if you opened with one).
+7. Never stop, restart, or update the shared \`no-mistakes\` daemon. On ANY daemon error, append
+   \`blocked: {the daemon error}\` and stop.
+8. Run heavy commands (unit/e2e suites, lint, builds) through
+   \`$FM_ROOT/bin/fm-heavy-run.sh --task $ID -- <command>\` (it prints a queued notice while you wait; that is normal, not a hang). Cap \`VITEST_MAX_WORKERS=2\` (never 4).
+9. Announce test runs: \`working: TEST START - {what, rough scale}\` before, \`working: TEST END - {outcome}\` after.
+10. Announce live browser use: \`working: BROWSER START - {what}\` before, \`working: BROWSER END - {outcome}\` after - a non-blocking announce, never wait on firstmate for a slot.
 
 $RTK_SECTION
 
