@@ -1,0 +1,3 @@
+# Compiled build output for the fm-desk crate. The launcher (bin/fm-desk) builds
+# this on demand; it is never committed.
+/target/

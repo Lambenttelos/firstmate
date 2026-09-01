@@ -1,0 +1,26 @@
+[package]
+name = "fm-desk"
+version = "0.1.0"
+edition = "2021"
+description = "Compiled TUI captain's desk: a consumer of the fm-desk.v1 model. No LLM, read-only."
+publish = false
+
+[[bin]]
+name = "fm-desk"
+path = "src/main.rs"
+
+[dependencies]
+ratatui = "0.30"
+crossterm = "0.29"
+notify = "8.2"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+signal-hook = "0.3"
+# Direct hangup detection on the input tty. crossterm's event::poll busy-loops
+# on a hung-up controlling terminal (a torn-down worktree/validation run), and
+# signal-hook installs SA_RESTART handlers, so SIGTERM/SIGHUP cannot break that
+# spin - libc::poll for POLLHUP/POLLERR/POLLNVAL is what makes the loop exit.
+libc = "0.2"
+
+[profile.release]
+strip = true

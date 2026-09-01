@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+# fm-desk - launcher for the compiled TUI captain's desk (the desk/ crate).
+#
+# ONE command for the captain: resolve the rustup toolchain, build the release
+# binary if it is missing or stale (a source file newer than the binary), then
+# exec it. The captain never types a raw cargo invocation.
+#
+# Rust here is installed but NOT on PATH, and ~/.cargo/bin does not exist. This
+# launcher and every build it runs add the rustup toolchain bin dir to PATH and
+# set CARGO_HOME so the local registry cache is used - the build works offline
+# from that cache (crates.io returns 403 from this box; do not depend on it).
+#
+# Usage:
+#   fm-desk [args...]     build-if-needed, then exec the release binary with args
+#   fm-desk --help        this help (and pass --help on to a built binary? no:
+#                         --help is handled here so it works before a build)
+#
+# Any argument other than --help/-h is passed through to the fm-desk binary.
+# Degradation, terminal restore, and the interactive loop all live in the binary
+# (desk/src/main.rs), not here.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+FM_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+CRATE_DIR="$FM_ROOT/desk"
+BIN="$CRATE_DIR/target/release/fm-desk"
+
+usage() { sed -n '2,19p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+
+case "${1:-}" in
+  -h | --help)
+    usage
+    exit 0
+    ;;
+esac
+
+# The verified toolchain for this box. Pinned so the launcher does not depend on
+# a global rustup default that may not exist.
+TOOLCHAIN_BIN="$HOME/.rustup/toolchains/1.96.1-x86_64-unknown-linux-gnu/bin"
+if [ ! -x "$TOOLCHAIN_BIN/cargo" ]; then
+  # Fall back to any cargo already reachable (a future box with a normal setup).
+  if command -v cargo >/dev/null 2>&1; then
+    TOOLCHAIN_BIN="$(dirname "$(command -v cargo)")"
+  else
+    echo "fm-desk: no cargo found (looked in $TOOLCHAIN_BIN and PATH)" >&2
+    echo "fm-desk: install the Rust toolchain, or point TOOLCHAIN_BIN at it" >&2
+    exit 1
+  fi
+fi
+export PATH="$TOOLCHAIN_BIN:$PATH"
+export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
+
+# Rebuild when the binary is missing or any tracked source is newer than it.
+needs_build() {
+  [ ! -x "$BIN" ] && return 0
+  local src
+  while IFS= read -r src; do
+    [ "$src" -nt "$BIN" ] && return 0
+  done < <(find "$CRATE_DIR/src" "$CRATE_DIR/Cargo.toml" "$CRATE_DIR/Cargo.lock" -type f 2>/dev/null)
+  return 1
+}
+
+if needs_build; then
+  echo "fm-desk: building release binary (offline)..." >&2
+  # --offline: build from the local registry cache; never reach for crates.io.
+  # --locked: honor the committed Cargo.lock exactly (reproducible build).
+  if ! (cd "$CRATE_DIR" && cargo build --release --offline --locked) >&2; then
+    echo "fm-desk: build failed" >&2
+    exit 1
+  fi
+fi
+
+# Let the binary find the static board for its non-tty fallback without walking.
+# Respect a caller-set FM_DESK_STATIC (a test seam); default to this home's board.
+export FM_DESK_STATIC="${FM_DESK_STATIC:-$SCRIPT_DIR/fm-desk-tui.sh}"
+
+exec "$BIN" "$@"
