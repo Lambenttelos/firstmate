@@ -93,12 +93,29 @@ test_recorded_windows_drops_supervise_off() {
   pass "recorded_windows excludes a supervise=off pane from supervision"
 }
 
+test_interactive_implies_unsupervised() {
+  local out status
+  # --interactive must be accepted (falling through to the later missing-brief
+  # fast-fail, not a flag error) and implies the hands-off pane.
+  out=$(run_spawn nope-interactive-i1 projects/none --interactive 2>&1)
+  status=$?
+  [ "$status" -ne 0 ] || fail "spawn with no brief should still fail"
+  assert_not_contains "$out" "error: --interactive" "--interactive should be an accepted flag"
+  # If --interactive were NOT a recognized flag it would fall through to the
+  # positional bucket and be misread as a harness argument, surfacing as
+  # "harness '--interactive'". A recognized flag leaves the harness at its
+  # default (which reads 'unknown' in a config-less environment such as clean
+  # CI, so a bare "unknown" substring is not a valid signal here).
+  assert_not_contains "$out" "harness '--interactive'" "--interactive must not be misread as a positional harness argument"
+  pass "--interactive is accepted for a spawn"
+}
+
 test_unsupervised_accepted_for_ship
 test_unsupervised_refused_with_secondmate
+test_interactive_implies_unsupervised
 test_recorded_windows_drops_supervise_off
 
 # --- end-to-end spawn -------------------------------------------------------
-#
 # Drive a real fm-spawn.sh through a fake tmux + treehouse (same fixture shape
 # as fm-spawn-worktree-settle.test.sh) and assert the on-disk consequences of
 # --unsupervised: the meta records supervise=off, and NO claude turn-end hook
